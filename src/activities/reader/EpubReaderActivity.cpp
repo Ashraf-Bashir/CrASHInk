@@ -7024,18 +7024,21 @@ bool EpubReaderActivity::handleTouchClippingTap(const int touchX, const int touc
   return true;
 }
 
+#if CROSSINK_APP_CAP_TOUCH
 void EpubReaderActivity::showClippingDeleteMenu(const size_t clippingIndex) {
   if (clippingIndex >= CLIPPINGS.clippingCount()) return;
 
   const auto callback = [this, clippingIndex](int selected) {
-    if (selected == 0) {
-      if (CLIPPINGS.removeClippingAt(clippingIndex)) {
-        pagesUntilFullRefresh = 1;
-      }
+    if (selected == 0 && CLIPPINGS.removeClippingAt(clippingIndex)) {
+      pagesUntilFullRefresh = 1;
     }
   };
-  quickActionsPopup.show("Clipping", new const char*[]{"Delete", "Cancel"}, 2, 1, callback);
+  std::vector<std::string> options = {"Delete", "Cancel"};
+  quickActionsPopup.show("Delete Clipping?", options, 1, callback);
+  quickActionsPopup.setDismissOnOutsideTouchDown(true);
+  Activity::requestUpdate();
 }
+#endif
 #endif
 
 void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
@@ -7123,7 +7126,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
   const TextBlock* previousHighlightBlock = nullptr;
   bool hasPreviousHighlight = false;
 #if CROSSINK_APP_CAP_TOUCH
-  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> clippingBounds;
+  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> clippingBounds{};
 #endif
   forEachVisiblePageWord(page, [&](const uint16_t pageWordIndex, const PageTextLine& line, const TextBlock& block,
                                    const size_t i) {
@@ -7216,6 +7219,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
       currentPageClippingTouchTargets[currentPageClippingTouchTargetCount++] = clippingBounds[i];
     }
   }
+  LOG_DBG("CLIP", "Built %zu touch targets from %u matches", currentPageClippingTouchTargetCount, matchCount);
 #endif
 }
 
