@@ -10,7 +10,11 @@ inline constexpr size_t CLIPPING_CHAPTER_TITLE_MAX = 48;
 // record. Match the reader's bounded selection-text budget so previews retain
 // a complete multi-paragraph selection without growing the saved-item index.
 inline constexpr size_t CLIPPING_TEXT_MAX = 4U * 1024U;
+#ifdef FREEINK_DEVICE_X4PRO
+inline constexpr uint16_t CLIPPING_MAX_PER_BOOK = 1024;
+#else
 inline constexpr uint16_t CLIPPING_MAX_PER_BOOK = 256;
+#endif
 inline constexpr uint16_t CLIPPING_MAX_PAGE_MATCHES = 16;
 inline constexpr uint32_t CLIPPING_WORD_LAYOUT_VERSION = 2;
 inline constexpr uint8_t CLIPPING_LAYOUT_START_RESOLVED = 1U << 0;
@@ -75,6 +79,7 @@ class ClippingStore {
   bool removeClippingAt(size_t index);
   bool saveToFile();
   void clearAll();
+  void rebuildExportFile();
 
   bool hasClippings() const { return !clippings.empty(); }
   size_t clippingCount() const { return clippings.size(); }
@@ -101,6 +106,7 @@ class ClippingStore {
   std::string bookAuthor;
   std::string storeFilePath;
   bool dirty = false;
+  bool exportDirty = false;
 
   bool readFromFile();
   bool readFromFile(const std::string& path, std::vector<Clipping>& out) const;

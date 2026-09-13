@@ -116,12 +116,14 @@ bool ClippingStore::loadForBook(const std::string& filePath, const std::string& 
 
 void ClippingStore::unload() {
   if (dirty) saveToFile();
+  if (exportDirty) rebuildExportFile();
   clippings.clear();
   bookFilePath.clear();
   bookTitle.clear();
   bookAuthor.clear();
   storeFilePath.clear();
   dirty = false;
+  exportDirty = false;
 }
 
 ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, const uint16_t startPage,
@@ -171,6 +173,8 @@ bool ClippingStore::removeClippingAt(const size_t index) {
     dirty = true;
     return false;
   }
+  dirty = false;
+  exportDirty = true;
   return true;
 }
 
@@ -568,4 +572,28 @@ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std
     Storage.remove(backupPath.c_str());
   }
   return true;
+}
+
+void ClippingStore::rebuildExportFile() {
+  FsFile file = Storage.open("/My Clippings.txt", O_RDWR | O_CREAT | O_TRUNC);
+  if (!file) return;
+
+  for (const auto& clipping : clippings) {
+    std::string text;
+    if (!readClippingText(clipping, text)) continue;
+
+    std::string entry;
+    entry.reserve(bookTitle.size() + bookAuthor.size() + text.size() + 256);
+    
+    entry += bookTitle + " (" + bookAuthor + ")\n";
+    entry += "- Your Highlight on Page " + std::to_string(clipping.startPage + 1);
+    if (clipping.chapterTitle[0] != '\0') {
+      entry += " | " + std::string(clipping.chapterTitle);
+    }
+    entry += "\n\n" + text.substr(0, 2000) + "\n==========\n";
+
+    file.write(entry.data(), entry.size());
+  }
+  file.flush();
+  file.close();
 }
