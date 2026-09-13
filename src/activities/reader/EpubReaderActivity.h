@@ -14,6 +14,7 @@
 
 #include "BookReadingStats.h"
 #include "BookmarkStore.h"
+#include "ClippingStore.h"
 #include "EndOfBookOptions.h"
 #include "EpubReaderMenuActivity.h"
 #include "GlobalReadingStats.h"
@@ -249,6 +250,15 @@ class EpubReaderActivity final : public Activity {
     int16_t height = 0;
   };
   std::array<FootnoteTouchTarget, EPUB_MAX_FOOTNOTES_PER_PAGE> currentPageFootnoteTouchTargets{};
+  struct ClippingTouchTarget {
+    int16_t x = 0;
+    int16_t y = 0;
+    int16_t width = 0;
+    int16_t height = 0;
+    size_t clippingIndex = SIZE_MAX;
+  };
+  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> currentPageClippingTouchTargets{};
+  size_t currentPageClippingTouchTargetCount = 0;
 #endif
   struct SavedPosition {
     int spineIndex;
@@ -308,7 +318,7 @@ class EpubReaderActivity final : public Activity {
                       int orientedMarginBottom, int orientedMarginLeft, bool updatePanel);
   bool ensureGrayscaleStripScratch();
   void releaseGrayscaleStripScratch(bool force = false);
-  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
+  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
   void renderStatusBar() const;
   void refreshChapterGroupEstimate(uint16_t viewportWidth, uint16_t viewportHeight);
   bool resolveChapterGroupPageProgress(int& currentPage, int& pageCount, float& chapterProgress,
@@ -417,6 +427,8 @@ class EpubReaderActivity final : public Activity {
   void resetPinchFontGesture();
   void buildFootnoteTouchTargets(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
   bool handleTouchFootnoteLink(int touchX, int touchY);
+  bool handleTouchClippingTap(int touchX, int touchY);
+  void showClippingDeleteMenu(size_t clippingIndex);
 #endif
   void suppressPowerShortcutRelease();
   bool consumeLongPowerButtonRelease();
