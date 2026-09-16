@@ -1,0 +1,182 @@
+name: Auto-build on CrossInk Release
+
+on:
+  schedule:
+    # Check for new releases every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout crASHink repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Set up PlatformIO
+        run: |
+          python -m pip install platformio
+          pio platform install espressif32
+
+      - name: Check for new CrossInk release
+        id: check-release
+        run: |
+          # Get latest CrossInk release tag
+          LATEST=$(curl -s https://api.github.com/repos/uxjulia/CrossInk/releases/latest | jq -r '.tag_name')
+          echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+
+          # Check if we already have this version built
+          if [ -f "builds/${LATEST}/.built" ]; then
+            echo "already_built=true" >> $GITHUB_OUTPUT
+          else
+            echo "already_built=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Latest CrossInk: $LATEST"
+
+      - name: Clone CrossInk source
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          VERSION=${{ steps.check-release.outputs.latest_version }}
+          git clone --depth 1 --branch "$VERSION" https://github.com/uxjulia/CrossInk.git crossink-source
+          echo "Cloned CrossInk $VERSION"
+
+      - name: Apply patches
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          cd crossink-source
+          git apply ../patches/0001-remove-clipping-limit.patch
+          git apply ../patches/0002-clickable-clippings-with-modal-dialog.patch
+          echo "Patches applied successfully"
+
+      - name: Build firmware for default (X3/X4)
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          cd crossink-source
+          pio run -e default
+
+      - name: Build firmware for sticky
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          cd crossink-source
+          pio run -e sticky
+
+      - name: Build firmware for x4-pro
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          cd crossink-source
+          pio run -e x4-pro
+
+      - name: Organize build outputs
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          VERSION=${{ steps.check-release.outputs.latest_version }}
+          mkdir -p "builds/${VERSION}"
+          cp crossink-source/.pio/build/default/firmware.bin "builds/${VERSION}/crASHink-${VERSION}-x3x4.bin"
+          cp crossink-source/.pio/build/sticky/firmware.bin "builds/${VERSION}/crASHink-${VERSION}-sticky.bin"
+          cp crossink-source/.pio/build/x4-pro/firmware.bin "builds/${VERSION}/crASHink-${VERSION}-x4pro.bin"
+          touch "builds/${VERSION}/.built"
+          ls -lh "builds/${VERSION}/"
+
+      - name: Update CHANGELOG
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          VERSION=${{ steps.check-release.outputs.latest_version }}
+          DATE=$(date -u +%Y-%m-%d)
+
+          # Create new changelog entry
+          cat > /tmp/new_entry.md << 'EOF'
+          ## [${VERSION}-patched] — ${DATE}
+
+          ### Added
+          - Unlimited clippings per book (increased from 256 limit)
+          - Single-tap action modal for clippings (Delete/Cancel)
+          - Modal dismissible by tapping outside
+
+          ### Changed
+          - Clipping interaction now single-tap instead of long-press only
+
+          ### Base
+          - Built on CrossInk ${VERSION} (stable)
+
+          ### Devices
+          - Xteink X3/X4 (crASHink-${VERSION}-x3x4.bin)
+          - reTerminal Sticky (crASHink-${VERSION}-sticky.bin)
+          - Xteink X4 Pro (crASHink-${VERSION}-x4pro.bin)
+
+          ---
+
+          EOF
+
+          cat CHANGELOG.md >> /tmp/new_entry.md
+          cp /tmp/new_entry.md CHANGELOG.md
+          sed -i "s/\${VERSION}/$VERSION/g" CHANGELOG.md
+          sed -i "s/\${DATE}/$DATE/g" CHANGELOG.md
+
+      - name: Commit build outputs
+        if: steps.check-release.outputs.already_built == 'false'
+        run: |
+          VERSION=${{ steps.check-release.outputs.latest_version }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add builds/ CHANGELOG.md
+          git commit -m "chore: add crASHink ${VERSION} builds
+
+- Builds for x3x4, sticky, x4-pro
+- Patches applied: remove-clipping-limit, clickable-clippings-with-modal-dialog" || echo "No changes to commit"
+          git push
+
+      - name: Create GitHub release
+        if: steps.check-release.outputs.already_built == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${{ steps.check-release.outputs.latest_version }}
+
+          gh release create "$VERSION" \
+            --title "crASHink $VERSION" \
+            --notes "CrossInk v${VERSION} with clipping patches
+
+          ## Changes
+          - Unlimited clippings per book (removed 256 limit)
+          - Single-tap Delete/Cancel modal for clippings
+          - Modal dismissible by tapping outside
+
+          ## Binaries
+          - crASHink-${VERSION}-x3x4.bin (Xteink X3/X4)
+          - crASHink-${VERSION}-sticky.bin (reTerminal Sticky)
+          - crASHink-${VERSION}-x4pro.bin (Xteink X4 Pro)
+          " \
+            "builds/${VERSION}/crASHink-${VERSION}-x3x4.bin" \
+            "builds/${VERSION}/crASHink-${VERSION}-sticky.bin" \
+            "builds/${VERSION}/crASHink-${VERSION}-x4pro.bin"
+
+      - name: Summary
+        if: always()
+        run: |
+          VERSION=${{ steps.check-release.outputs.latest_version }}
+          ALREADY_BUILT=${{ steps.check-release.outputs.already_built }}
+
+          echo "=== Build Summary ==="
+          echo "Latest CrossInk version: $VERSION"
+          echo "Already built: $ALREADY_BUILT"
+
+          if [ "$ALREADY_BUILT" = "false" ]; then
+            echo "✓ Build completed successfully"
+            echo "✓ Binaries committed to repository"
+            echo "✓ GitHub release created"
+            echo "Release: https://github.com/${{ github.repository }}/releases/tag/$VERSION"
+          else
+            echo "✓ Version already built, skipped"
+          fi
