@@ -3,9 +3,6 @@ name: Build crASHink X4 Pro
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -17,16 +14,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-
-      - name: Install PlatformIO
-        run: pip install platformio && pio platform install espressif32
-
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: ~/.platformio
-          key: ${{ runner.os }}-platformio-${{ hashFiles('source/**/platformio.ini') }}
-          restore-keys: ${{ runner.os }}-platformio-
 
       - name: Get latest CrossInk release
         id: get-release
@@ -41,39 +28,38 @@ jobs:
           cd source
           git submodule update --init --recursive
 
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-platformio-${{ hashFiles('source/platformio.ini') }}
+          restore-keys: ${{ runner.os }}-platformio-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
       - name: Apply patches
         run: |
           cd source
-          echo "🔧 Applying code patches..."
-
-          # Unlimited clippings
-          sed -i 's/CLIPPING_MAX_PER_BOOK = [0-9]\+/CLIPPING_MAX_PER_BOOK = 65535/' src/ClippingStore.h
-
-          # Clickable clippings modal - replace navigation with modal dialog
-          FILE="src/activities/reader/EpubReaderClippingListActivity.cpp"
-
-          sed -i 's/jumpToSelectedClipping();/showClippingActionMenu(false);/g' "$FILE"
-          sed -i 's/openSelectedDetail();/showClippingActionMenu(false);/g' "$FILE"
-
-          echo "✅ Modal dialog patches applied"
-
-          echo "✅ Code patches applied"
+          for p in ../patches/*.patch; do
+            echo "Applying $(basename "$p")"
+            git apply --verbose "$p"
+          done
+          grep -n "CLIPPING_MAX_PER_BOOK" src/ClippingStore.h
+          grep -n "Delete Clipping?" src/activities/reader/EpubReaderActivity.cpp
 
       - name: Build X4 Pro
         run: |
           cd source
           pio run -e x4-pro
-
-          # Rename binary with version
           VERSION="${{ steps.get-release.outputs.version }}"
           mkdir -p ../builds
           cp .pio/build/x4-pro/firmware.bin "../builds/crASHink-${VERSION}-x4pro.bin"
           ls -lh ../builds/
 
       - name: Upload binary
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: crASHink-${{ steps.get-release.outputs.version }}-x4pro.bin
+          name: crASHink-${{ steps.get-release.outputs.version }}-x4pro
           path: builds/crASHink-*.bin
           retention-days: 30

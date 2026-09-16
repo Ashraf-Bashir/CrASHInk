@@ -1,0 +1,232 @@
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index db17926..abd5bfd 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -2823,6 +2823,9 @@ void EpubReaderActivity::loop() {
+   if (!atEndOfBook && touch.tapped && handleTouchFootnoteLink(touch.x, touch.y)) {
+     return;
+   }
++  if (!atEndOfBook && touch.tapped && handleTouchClippingTap(touch.x, touch.y)) {
++    return;
++  }
+ #endif
+ 
+   // Long-press Confirm: execute the configured reader action without opening the menu.
+@@ -6980,10 +6983,66 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
+   navigateToHref(currentPageFootnotes[bestIndex].href, true, /*preferFootnotePreview=*/true);
+   return true;
+ }
++
++bool EpubReaderActivity::handleTouchClippingTap(const int touchX, const int touchY) {
++  if (!SETTINGS.touchReaderControls || !mappedInput.hasTouch() || RenderLock::peek() ||
++      currentPageClippingTouchTargetCount == 0) {
++    return false;
++  }
++
++  int bestIndex = -1;
++  int64_t bestDistance = std::numeric_limits<int64_t>::max();
++  for (size_t i = 0; i < currentPageClippingTouchTargetCount && i < currentPageClippingTouchTargets.size(); ++i) {
++    const auto& target = currentPageClippingTouchTargets[i];
++    if (target.width <= 0 || target.height <= 0 || target.clippingIndex >= CLIPPINGS.clippingCount()) continue;
++
++    const int expandedWidth = std::max<int>(target.width, TOUCH_FOOTNOTE_TARGET_SIZE);
++    const int expandedHeight = std::max<int>(target.height, TOUCH_FOOTNOTE_TARGET_SIZE);
++    const int screenWidth = renderer.getScreenWidth();
++    const int screenHeight = renderer.getScreenHeight();
++    const int left = std::max(0, std::min(target.x - (expandedWidth - target.width) / 2,
++                                          screenWidth - std::min(screenWidth, expandedWidth)));
++    const int top = std::max(0, std::min(target.y - (expandedHeight - target.height) / 2,
++                                         screenHeight - std::min(screenHeight, expandedHeight)));
++    const int right = std::min(screenWidth, left + expandedWidth);
++    const int bottom = std::min(screenHeight, top + expandedHeight);
++    if (touchX < left || touchX >= right || touchY < top || touchY >= bottom) continue;
++
++    const int centerX = target.x + target.width / 2;
++    const int centerY = target.y + target.height / 2;
++    const int64_t deltaX = static_cast<int64_t>(touchX) - centerX;
++    const int64_t deltaY = static_cast<int64_t>(touchY) - centerY;
++    const int64_t distance = deltaX * deltaX + deltaY * deltaY;
++    if (distance < bestDistance) {
++      bestDistance = distance;
++      bestIndex = static_cast<int>(i);
++    }
++  }
++
++  if (bestIndex < 0) return false;
++  showClippingDeleteMenu(currentPageClippingTouchTargets[bestIndex].clippingIndex);
++  return true;
++}
++
++#if CROSSINK_APP_CAP_TOUCH
++void EpubReaderActivity::showClippingDeleteMenu(const size_t clippingIndex) {
++  if (clippingIndex >= CLIPPINGS.clippingCount()) return;
++
++  const auto callback = [this, clippingIndex](int selected) {
++    if (selected == 0 && CLIPPINGS.removeClippingAt(clippingIndex)) {
++      pagesUntilFullRefresh = 1;
++    }
++  };
++  std::vector<std::string> options = {"Delete", "Cancel"};
++  quickActionsPopup.show("Delete Clipping?", options, 1, callback);
++  quickActionsPopup.setDismissOnOutsideTouchDown(true);
++  Activity::requestUpdate();
++}
++#endif
+ #endif
+ 
+ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
+-                                                const int orientedMarginLeft) const {
++                                                const int orientedMarginLeft) {
+   if (!section || !CLIPPINGS.hasClippings() || renderer.getRenderMode() != GfxRenderer::BW) {
+     return;
+   }
+@@ -6992,7 +7051,13 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+   // that marker in the grayscale anti-aliasing planes overlays gray pixels on
+   // the glyphs and makes a saved clipping look washed out.
+ 
++#if CROSSINK_APP_CAP_TOUCH
++  currentPageClippingTouchTargets.fill({});
++  currentPageClippingTouchTargetCount = 0;
++#endif
++
+   std::array<ClippingPageMatch, CLIPPING_MAX_PAGE_MATCHES> matches;
++  std::array<size_t, CLIPPING_MAX_PAGE_MATCHES> matchClippingIndices;
+   uint16_t matchCount = 0;
+   const bool canUseStoredRanges = section->pageCount > 0 && section->pageCount <= UINT16_MAX &&
+                                   section->currentPage >= 0 && section->currentPage < section->pageCount;
+@@ -7035,7 +7100,9 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+       }
+     }
+     if (matchedStoredRange || matchedText) {
+-      matches[matchCount++] = match;
++      matches[matchCount] = match;
++      matchClippingIndices[matchCount] = clippingIndex;
++      matchCount++;
+       if (matchCount >= matches.size()) {
+         break;
+       }
+@@ -7045,22 +7112,26 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+     return;
+   }
+ 
+-  const auto isHighlightedWord = [&matches, matchCount](const uint16_t pageWordIndex, const PageTextLine& line) {
++  const auto getMatchIndexForWord = [&matches, matchCount](const uint16_t pageWordIndex, const PageTextLine& line) -> int {
+     for (uint16_t matchIndex = 0; matchIndex < matchCount; ++matchIndex) {
+       if (pageWordIndex >= matches[matchIndex].startWord && pageWordIndex <= matches[matchIndex].endWord &&
+           ClippingHighlightGeometry::matchesTableSelection(matches[matchIndex].tableSelection, line.tableSelection)) {
+-        return true;
++        return matchIndex;
+       }
+     }
+-    return false;
++    return -1;
+   };
+ 
+   ClippingHighlightGeometry::WordRect previousHighlight;
+   const TextBlock* previousHighlightBlock = nullptr;
+   bool hasPreviousHighlight = false;
++#if CROSSINK_APP_CAP_TOUCH
++  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> clippingBounds{};
++#endif
+   forEachVisiblePageWord(page, [&](const uint16_t pageWordIndex, const PageTextLine& line, const TextBlock& block,
+                                    const size_t i) {
+-    if (!isHighlightedWord(pageWordIndex, line)) {
++    const int matchIndex = getMatchIndexForWord(pageWordIndex, line);
++    if (matchIndex < 0) {
+       hasPreviousHighlight = false;
+       return true;
+     }
+@@ -7089,7 +7160,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+       const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(fontId, "\xe2\x80\x83", nextTextStyle) : 0;
+       const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
+       const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
+-      if (isHighlightedWord(pageWordIndex + 1, line) && nextWordX > wordX + wordW) {
++      if (getMatchIndexForWord(pageWordIndex + 1, line) >= 0 && nextWordX > wordX + wordW) {
+         wordW = nextWordX - wordX;
+       } else if (nextWordX > wordX && wordW > nextWordX - wordX) {
+         wordW = nextWordX - wordX;
+@@ -7117,6 +7188,22 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+       if (line.clipWidth > 0 && line.clipHeight > 0) {
+         renderer.endTextClip();
+       }
++#if CROSSINK_APP_CAP_TOUCH
++      if (matchIndex >= 0 && matchIndex < static_cast<int>(clippingBounds.size())) {
++        auto& bounds = clippingBounds[matchIndex];
++        if (bounds.width <= 0 || bounds.height <= 0) {
++          bounds = {static_cast<int16_t>(wordX), static_cast<int16_t>(wordY), static_cast<int16_t>(wordW),
++                    static_cast<int16_t>(wordH), matchClippingIndices[matchIndex]};
++        } else {
++          const int left = std::min<int>(bounds.x, wordX);
++          const int top = std::min<int>(bounds.y, wordY);
++          const int right = std::max<int>(bounds.x + bounds.width, wordX + wordW);
++          const int bottom = std::max<int>(bounds.y + bounds.height, wordY + wordH);
++          bounds = {static_cast<int16_t>(left), static_cast<int16_t>(top), static_cast<int16_t>(right - left),
++                    static_cast<int16_t>(bottom - top), matchClippingIndices[matchIndex]};
++        }
++      }
++#endif
+       previousHighlight = currentHighlight;
+       previousHighlightBlock = &block;
+       hasPreviousHighlight = true;
+@@ -7125,6 +7212,15 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+     }
+     return true;
+   });
++
++#if CROSSINK_APP_CAP_TOUCH
++  for (uint16_t i = 0; i < matchCount && currentPageClippingTouchTargetCount < currentPageClippingTouchTargets.size(); ++i) {
++    if (clippingBounds[i].width > 0 && clippingBounds[i].height > 0) {
++      currentPageClippingTouchTargets[currentPageClippingTouchTargetCount++] = clippingBounds[i];
++    }
++  }
++  LOG_DBG("CLIP", "Built %zu touch targets from %u matches", currentPageClippingTouchTargetCount, matchCount);
++#endif
+ }
+ 
+ void EpubReaderActivity::renderStatusBar() const {
+diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+index b4fd72d..59ecf00 100644
+--- a/src/activities/reader/EpubReaderActivity.h
++++ b/src/activities/reader/EpubReaderActivity.h
+@@ -14,6 +14,7 @@
+ 
+ #include "BookReadingStats.h"
+ #include "BookmarkStore.h"
++#include "ClippingStore.h"
+ #include "EndOfBookOptions.h"
+ #include "EpubReaderMenuActivity.h"
+ #include "GlobalReadingStats.h"
+@@ -249,6 +250,15 @@ class EpubReaderActivity final : public Activity {
+     int16_t height = 0;
+   };
+   std::array<FootnoteTouchTarget, EPUB_MAX_FOOTNOTES_PER_PAGE> currentPageFootnoteTouchTargets{};
++  struct ClippingTouchTarget {
++    int16_t x = 0;
++    int16_t y = 0;
++    int16_t width = 0;
++    int16_t height = 0;
++    size_t clippingIndex = SIZE_MAX;
++  };
++  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> currentPageClippingTouchTargets{};
++  size_t currentPageClippingTouchTargetCount = 0;
+ #endif
+   struct SavedPosition {
+     int spineIndex;
+@@ -308,7 +318,7 @@ class EpubReaderActivity final : public Activity {
+                       int orientedMarginBottom, int orientedMarginLeft, bool updatePanel);
+   bool ensureGrayscaleStripScratch();
+   void releaseGrayscaleStripScratch(bool force = false);
+-  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
++  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
+   void renderStatusBar() const;
+   void refreshChapterGroupEstimate(uint16_t viewportWidth, uint16_t viewportHeight);
+   bool resolveChapterGroupPageProgress(int& currentPage, int& pageCount, float& chapterProgress,
+@@ -417,6 +427,8 @@ class EpubReaderActivity final : public Activity {
+   void resetPinchFontGesture();
+   void buildFootnoteTouchTargets(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
+   bool handleTouchFootnoteLink(int touchX, int touchY);
++  bool handleTouchClippingTap(int touchX, int touchY);
++  void showClippingDeleteMenu(size_t clippingIndex);
+ #endif
+   void suppressPowerShortcutRelease();
+   bool consumeLongPowerButtonRelease();
