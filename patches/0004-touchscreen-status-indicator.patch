@@ -1,0 +1,225 @@
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 7d24031..2d293d3 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -2562,6 +2562,14 @@ void EpubReaderActivity::loop() {
+     requestUpdate();
+     return;
+   }
++  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
++                                                     touch.x, touch.y)) {
++    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
++    // hit while the touchscreen is off, so no separate guard is needed here.
++    SETTINGS.disableReaderTouchscreen = 1;
++    requestUpdate();
++    return;
++  }
+   if (touch.tapped &&
+       ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
+     if (SETTINGS.tapToHideStatusBar) {
+diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
+index 532ca25..e37ede4 100644
+--- a/src/activities/reader/TxtReaderActivity.cpp
++++ b/src/activities/reader/TxtReaderActivity.cpp
+@@ -207,6 +207,14 @@ void TxtReaderActivity::loop() {
+     requestUpdate();
+     return;
+   }
++  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
++                                                     touch.x, touch.y)) {
++    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
++    // hit while the touchscreen is off, so no separate guard is needed here.
++    SETTINGS.disableReaderTouchscreen = 1;
++    requestUpdate();
++    return;
++  }
+   if (touch.tapped &&
+       ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
+     if (SETTINGS.tapToHideStatusBar) {
+diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
+index 202b2a5..d8b0d58 100644
+--- a/src/components/themes/BaseTheme.cpp
++++ b/src/components/themes/BaseTheme.cpp
+@@ -51,6 +51,33 @@ constexpr uint8_t icon_lightbulb_off_h_bits[] = {
+     0xB3, 0x8F, 0xDF, 0xB3, 0xC7, 0x9F, 0xF3, 0x33, 0x9F, 0xFF, 0x11, 0xFF, 0xFF, 0xC0, 0xFF,
+     0xFF, 0xF0, 0x7F, 0xFF, 0xFE, 0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x9F, 0xFF, 0xFF, 0xFF};
+ 
++// Breathing room between the lamp icon and the touchscreen indicator that
++// follows it, so the two don't read as one blob in the thin status-bar row.
++constexpr int statusIndicatorGap = 8;
++
++// Status-bar-sized (20x20) hand glyph, drawn from scratch (not derived from
++// an existing icon) rather than reusing the settings-menu tablet icon
++// (icon_device_tablet_24 / icon_device_tablet_off_24, EpubReaderMenuActivity),
++// because that icon is meant to be read at menu-row size with a label next to
++// it, not alone at a glance in the status bar. Packed with the same
++// convention as icon_lightbulb_h_bits above (top-to-bottom row order
++// reversed to render upright on real hardware, per the same fix that
++// corrected the lamp icon).
++constexpr int touchStatusIconSize = 20;
++constexpr uint8_t icon_hand_bits[] = {
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF8, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xC0, 0x00, 0x7F,
++    0xC0, 0x00, 0x7F, 0xC0, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xFC, 0x92, 0x7F,
++    0xFC, 0x92, 0x7F, 0xFC, 0x92, 0x7F, 0xFC, 0x93, 0xFF, 0xFF, 0x93, 0xFF, 0xFF, 0x9F, 0xFF,
++    0xFF, 0x9F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
++// Same hand, with a diagonal strike through it - "touch is off" needs no
++// separate label, the same way the lightbulb-off icon's strike-through
++// already says "off" on its own.
++constexpr uint8_t icon_hand_off_bits[] = {
++    0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x88, 0x00, 0x7F, 0xC0, 0x00, 0x7F, 0xC0, 0x00, 0x7F,
++    0xC0, 0x00, 0x7F, 0xC0, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xFC, 0x12, 0x7F,
++    0xFC, 0x82, 0x7F, 0xFC, 0x82, 0x7F, 0xFC, 0x83, 0xFF, 0xFF, 0x91, 0xFF, 0xFF, 0x98, 0xFF,
++    0xFF, 0x9C, 0x7F, 0xFF, 0xFE, 0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x8F, 0xFF, 0xFF, 0xCF};
++
+ }  // namespace
+ 
+ void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
+@@ -211,12 +238,95 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
+   const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
+ 
+   // Generous hit box, not the icon's own tight bounds: the whole top status
+-  // bar row's height, and from the screen edge out to well past the icon's
+-  // right edge, since a 20px glyph is a hard target to hit precisely with a
+-  // finger.
+-  constexpr int tapPaddingRight = 24;
++  // bar row's height, and from the screen edge out to partway into the gap
++  // before the touchscreen indicator, since a 20px glyph is a hard target to
++  // hit precisely with a finger. Stops at the midpoint of that gap (rather
++  // than overshooting well past the icon, as it did before the touchscreen
++  // indicator existed) so the two icons' hit zones split the row instead of
++  // overlapping - see isTouchscreenIndicatorTap below, which claims the rest.
++  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
+   const int hitLeft = 0;
+-  const int hitRight = orientedMarginLeft + metrics.statusBarHorizontalMargin + frontlightStatusIconSize + tapPaddingRight;
++  const int hitRight = lampX + frontlightStatusIconSize + statusIndicatorGap / 2;
++  const int hitTop = baseTopY;
++  const int hitBottom = baseTopY + statusBarHeight;
++
++  return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
++}
++
++void BaseTheme::drawTouchscreenIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  // Sits immediately to the right of the frontlight lamp icon, in the same
++  // top status bar row - drawn from drawTopStatusBarClock() right after
++  // drawFrontlightTempIndicators() so it shares that function's placement
++  // guarantees (renders every time, independent of clock/battery settings).
++  //
++  // Shows whether the reader touchscreen (SETTINGS.disableReaderTouchscreen)
++  // is currently usable: a plain hand when it is, the same hand with a
++  // diagonal strike through it when it's been turned off. Only relevant on
++  // touch hardware, so it's skipped entirely on button-only devices.
++  if (!gpio.hasTouch()) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int iconY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
++  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
++  const int x = lampX + frontlightStatusIconSize + statusIndicatorGap;
++
++  const uint8_t* bits = SETTINGS.disableReaderTouchscreen ? icon_hand_off_bits : icon_hand_bits;
++  if (darkMode) {
++    renderer.drawIconInverted(bits, x, iconY, touchStatusIconSize);
++  } else {
++    renderer.drawIcon(bits, x, iconY, touchStatusIconSize);
++  }
++}
++
++bool BaseTheme::isTouchscreenIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  // Only meaningful while the touchscreen is currently on: this only answers
++  // "was the tap on the indicator" for the disable direction. Re-enabling it
++  // by tapping isn't handled here (or anywhere) - once
++  // SETTINGS.disableReaderTouchscreen is set, MappedInputManager stops
++  // reporting taps in the reader at all (touchInputEnabled() reads that same
++  // setting), so a tap could never reach this check in the first place; it
++  // can only be turned back on through the button shortcut.
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
++  const int x = lampX + frontlightStatusIconSize + statusIndicatorGap;
++
++  // Picks up where the lamp's hit box (above) leaves off, at the midpoint of
++  // the gap between the two icons, then extends generously past this icon's
++  // own right edge - it's the last thing in the row, so there's nothing to
++  // share that padding with.
++  constexpr int tapPaddingRight = 24;
++  const int hitLeft = lampX + frontlightStatusIconSize + statusIndicatorGap / 2;
++  const int hitRight = x + touchStatusIconSize + tapPaddingRight;
+   const int hitTop = baseTopY;
+   const int hitBottom = baseTopY + statusBarHeight;
+ 
+@@ -1141,10 +1251,12 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
+                                       const bool readerContext, const int textYOffset, const bool darkMode,
+                                       const bool forceVisible) const {
+   // Deliberately ahead of the clock's own visibility/availability checks
+-  // below, so the frontlight indicators keep rendering even when the clock
+-  // is hidden (no RTC, or the user turned the clock off) - this function is
+-  // the one place every screen, reader and non-reader alike, already calls.
++  // below, so the frontlight and touchscreen indicators keep rendering even
++  // when the clock is hidden (no RTC, or the user turned the clock off) -
++  // this function is the one place every screen, reader and non-reader
++  // alike, already calls.
+   drawFrontlightTempIndicators(renderer, topY, darkMode);
++  drawTouchscreenIndicator(renderer, topY, darkMode);
+ 
+   if (!forceVisible &&
+       !(readerContext ? SETTINGS.shouldShowClockInReader() : SETTINGS.shouldShowClockOutsideReader())) {
+diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
+index 843ecd3..7b8de2e 100644
+--- a/src/components/themes/BaseTheme.h
++++ b/src/components/themes/BaseTheme.h
+@@ -265,6 +265,27 @@ class BaseTheme {
+   // light or consume the touch itself, since callers differ in what "handle
+   // this touch" means for them.
+   bool isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // Touchscreen on/off indicator, drawn immediately to the right of the
++  // frontlight lamp icon in the same top status bar row: a plain hand when
++  // SETTINGS.disableReaderTouchscreen is off, the same hand with a diagonal
++  // strike through it when it's on - the strike alone says "off", no
++  // separate label needed, the same way the lightbulb-off icon works.
++  // Touch-hardware only (gpio.hasTouch()); skipped entirely on button-only
++  // devices. Called from drawTopStatusBarClock() right after
++  // drawFrontlightTempIndicators(), so it renders every time on the same
++  // terms as the lamp icon.
++  void drawTouchscreenIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  // Hit-test for the indicator above, tappable only in the disable
++  // direction: true only while the touchscreen is currently on. Once
++  // SETTINGS.disableReaderTouchscreen is set, MappedInputManager stops
++  // reporting taps in the reader at all (touchInputEnabled() gates on that
++  // same setting), so a tap can never reach this check while it's off -
++  // turning it back on is a button-shortcut-only action, not something this
++  // hit-test needs to handle. Splits the row's tappable width with
++  // isFrontlightIndicatorTap rather than overlapping it. Callers check this
++  // on a tap and, on a hit, set SETTINGS.disableReaderTouchscreen = 1 and
++  // call requestUpdate() themselves.
++  bool isTouchscreenIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
+   // Button hint labels use three states: non-empty labels draw an active hint,
+   // an empty string clears an inactive slot, and nullptr preserves the existing
+   // background without drawing or registering a target.
