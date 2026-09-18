@@ -7,10 +7,13 @@ Pin a warm/cold frontlight percentage readout to the top-left corner,
 drawn on every screen (reader and non-reader) that already renders the
 top status bar clock.
 
-frontlightWarmth is stored as 0 (cool) .. 100 (warm); the cold reading
-shown is its complement (100 - warmth) rather than a separate setting.
-It has a default (50) and is loaded at boot, so there is always a value
-to display from the first frame.
+Reads Frontlight.warmth() (the live HalFrontlight/driver state) rather
+than SETTINGS.frontlightWarmth, which is only synced once when the
+frontlight panel closes - reading it while adjusting the slider would
+show a stale value. Frontlight.setWarmth() is called on every drag tick,
+so warmth() always reflects what is currently applied to the light.
+Skipped entirely on hardware with no color-temperature channel, since
+warmth has no meaning there.
 
 Placement: hooked into drawTopStatusBarClock() rather than drawHeader(),
 because drawHeader() is not actually called on every screen - MinimalTheme
@@ -29,10 +32,18 @@ circle primitive; the sun is a filled square core with four rays, the
 snowflake is three crossed lines.
 
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index cf647f0..0a749e6 100644
+index cf647f0..e03d38a 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
-@@ -122,6 +122,83 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const b
+@@ -3,6 +3,7 @@
+ #include <FreeInkUIGfxRenderer.h>
+ #include <GfxRenderer.h>
+ #include <HalClock.h>
++#include <HalFrontlight.h>
+ #include <HalGPIO.h>
+ #include <HalPowerManager.h>
+ #include <HalStorage.h>
+@@ -122,6 +123,98 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const b
    fillBatteryIcon(renderer, iconRect, percentage, foregroundBlack);
  }
  
@@ -71,12 +82,27 @@ index cf647f0..0a749e6 100644
 +void BaseTheme::drawFrontlightTempIndicators(const GfxRenderer& renderer, int topY, bool darkMode) const {
 +  // Pinned to the top-left corner, positioned entirely independently of the
 +  // clock (centered) and battery (wherever its own header/status-bar logic
-+  // puts it) so neither is affected. Reads frontlightWarmth directly off
-+  // SETTINGS on every call - no cached/stale copy - so it always shows the
-+  // current value; CrossPointSettings gives frontlightWarmth a default (50)
-+  // and loads the persisted value at boot, so there is always a value to
-+  // show from the very first frame, before the user ever opens the
-+  // frontlight panel.
++  // puts it) so neither is affected.
++  //
++  // Reads Frontlight.warmth() - the live HAL/driver state - rather than
++  // SETTINGS.frontlightWarmth. The settings copy is only synced once, when
++  // the frontlight panel closes ("Debounced persistence: one SPIFFS write
++  // on close, never per slider tick" - FrontlightPanelActivity::onExit), so
++  // it would show a stale value while the user is actively dragging the
++  // warmth slider. Frontlight.setWarmth() is called on every drag tick
++  // (FrontlightPanelActivity::onWarmthEvent), and warmth() reads that same
++  // live state straight back, so this always reflects what is on screen
++  // right now. HalFrontlight::begin() applies the persisted value at boot,
++  // so there is always a value to show from the very first frame.
++  //
++  // Skipped entirely on hardware with no color-temperature channel (warmth
++  // is meaningless there - HalFrontlight::setWarmth() is a no-op on those
++  // boards), so a warm/cold split is never shown for a light that cannot
++  // actually produce one.
++  if (!Frontlight.present() || !Frontlight.hasColorTemperature()) {
++    return;
++  }
++
 +  const bool foregroundBlack = !darkMode;
 +  const auto& metrics = UITheme::getInstance().getMetrics();
 +  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
@@ -90,7 +116,7 @@ index cf647f0..0a749e6 100644
 +  (void)orientedMarginRight;
 +  (void)orientedMarginBottom;
 +
-+  const uint8_t warmPercent = SETTINGS.frontlightWarmth;
++  const uint8_t warmPercent = Frontlight.warmth();
 +  const uint8_t coldPercent = 100 - warmPercent;
 +  constexpr int iconSize = 7;
 +  constexpr int iconTextGap = 2;
@@ -116,7 +142,7 @@ index cf647f0..0a749e6 100644
  int BaseTheme::homeHeaderClockTextYOffset(const GfxRenderer& renderer) {
    const auto& metrics = UITheme::getInstance().getMetrics();
    const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
-@@ -1039,6 +1116,12 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
+@@ -1039,6 +1132,12 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
  void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, const char* previewTime,
                                        const bool readerContext, const int textYOffset, const bool darkMode,
                                        const bool forceVisible) const {
@@ -130,20 +156,21 @@ index cf647f0..0a749e6 100644
        !(readerContext ? SETTINGS.shouldShowClockInReader() : SETTINGS.shouldShowClockOutsideReader())) {
      return;
 diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 714d127..b3a4d78 100644
+index 714d127..4992b5d 100644
 --- a/src/components/themes/BaseTheme.h
 +++ b/src/components/themes/BaseTheme.h
-@@ -243,6 +243,16 @@ class BaseTheme {
+@@ -243,6 +243,17 @@ class BaseTheme {
                          bool foregroundBlack = true) const;  // Right aligned (UI headers)
    virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
                                 bool foregroundBlack = true) const;
 +  // Frontlight warm/cold percentage indicators (sun/snowflake icons), pinned
-+  // to the top-left corner. Reads SETTINGS.frontlightWarmth fresh on every
-+  // call, so it always reflects the current value with no separate init.
-+  // Deliberately independent of the clock/battery layout: called from
-+  // drawTopStatusBarClock() - the one function every screen (reader and
-+  // non-reader) already calls - ahead of its own visibility checks, so it
-+  // renders every time regardless of clock or battery settings.
++  // to the top-left corner. Reads the live HalFrontlight state on every
++  // call (not the settings copy, which only syncs when the frontlight panel
++  // closes), so it tracks the slider in real time. Deliberately independent
++  // of the clock/battery layout: called from drawTopStatusBarClock() - the
++  // one function every screen (reader and non-reader) already calls -
++  // ahead of its own visibility checks, so it renders every time regardless
++  // of clock or battery settings.
 +  void drawFrontlightTempIndicators(const GfxRenderer& renderer, int topY, bool darkMode) const;
 +  void drawSunIcon(const GfxRenderer& renderer, int x, int y, int size, bool foregroundBlack) const;
 +  void drawSnowflakeIcon(const GfxRenderer& renderer, int x, int y, int size, bool foregroundBlack) const;
