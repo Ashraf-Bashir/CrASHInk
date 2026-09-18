@@ -1,96 +1,128 @@
 From: Ashraf Bashir <eng.bashir@gmail.com>
-Date: Wed, 18 Sep 2026 15:30:00 +0200
-Subject: [PATCH 3/3] Add frontlight warm/cold percentage indicators to status bar
+Date: Fri, 18 Sep 2026 15:30:00 +0200
+Subject: [PATCH 3/3] Add frontlight warm/cold percentage indicators to status
+ bar
 
-Display frontlight warm and cold percentages next to the battery percentage
-in the status bar. Uses snowflake icon for cold percentage and sun icon for
-warm percentage, positioned at the top right of the view.
+Display frontlight warm and cold percentages next to the battery icon in
+the status bar. Uses a sun icon for the warm percentage and a snowflake
+icon for the cold percentage.
 
-Temperature percentages are displayed independently:
-- Cold percentage: frontlightCold (0-100)
-- Warm percentage: frontlightWarmth (0-100)
+frontlightWarmth is already stored as 0 (cool) .. 100 (warm); the cold
+reading shown is its complement (100 - warmth) rather than a separate
+setting. Icons are drawn with drawLine/fillRect only, since GfxRenderer
+has no circle primitive.
 
-This provides at-a-glance visibility of current frontlight color temperature
-during reading.
-
----
- src/components/themes/BaseTheme.h   |  9 ++++++++
- src/components/themes/BaseTheme.cpp | 38 +++++++++++++++++++++++++++++
- 2 files changed, 47 insertions(+)
-
-diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 1234567..abcdefg 100644
---- a/src/components/themes/BaseTheme.h
-+++ b/src/components/themes/BaseTheme.h
-@@ -18,6 +18,9 @@ struct Rect {
-   explicit Rect(int x = 0, int y = 0, int width = 0, int height = 0) : x(x), y(y), width(width), height(height) {}
- };
-
-+// Frontlight temp indicator icon sizes (small to fit in status bar)
-+constexpr int FRONTLIGHT_TEMP_ICON_SIZE = 6;
-+constexpr int FRONTLIGHT_TEMP_ICON_SPACING = 8;
-
- struct TabInfo {
-   const char* label;
-@@ -87,6 +90,12 @@ class BaseTheme {
-   void drawBatteryLeft(const GfxRenderer& renderer, Rect rect, const bool showPercentage,
-                        const bool foregroundBlack = true) const;
-
-+  // Draw frontlight warm and cold temperature indicators with icons
-+  void drawFrontlightTempIndicators(const GfxRenderer& renderer, Rect rect,
-+                                     const bool foregroundBlack = true) const;
-+  void drawSnowflakeIcon(const GfxRenderer& renderer, int x, int y, int size, bool filled) const;
-+  void drawSunIcon(const GfxRenderer& renderer, int x, int y, int size, bool filled) const;
-+
-   void drawBatteryRight(const GfxRenderer& renderer, Rect rect, const bool showPercentage,
-                         const bool foregroundBlack = true) const;
+Wired into drawHeader() right after the existing battery draw call, so it
+follows the same battery-left/battery-right layout the themes already use.
 
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index 7890123..fedcba9 100644
+index cf647f0..e8fe5f7 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
-@@ -123,6 +123,44 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const
+@@ -122,6 +122,81 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const b
    fillBatteryIcon(renderer, iconRect, percentage, foregroundBlack);
  }
-
-+void BaseTheme::drawSnowflakeIcon(const GfxRenderer& renderer, int x, int y, int size, bool filled) const {
-+  // Draw a small snowflake icon (6-pointed star) for cold indicator
+ 
++void BaseTheme::drawSunIcon(const GfxRenderer& renderer, int x, int y, int size, bool foregroundBlack) const {
++  // Small sun: filled square core with four cardinal rays. No drawCircle
++  // primitive exists in GfxRenderer, so the core is a square rather than
++  // a disc - at this pixel size (6-7px) the two are visually equivalent.
++  const int cx = x + size / 2;
++  const int cy = y + size / 2;
++  const int core = std::max(1, size / 3);
++
++  renderer.fillRect(cx - core / 2, cy - core / 2, core, core, foregroundBlack);
++
++  const int rayInner = core / 2 + 1;
++  const int rayOuter = size / 2;
++  renderer.drawLine(cx, cy - rayOuter, cx, cy - rayInner, foregroundBlack);  // up
++  renderer.drawLine(cx, cy + rayInner, cx, cy + rayOuter, foregroundBlack);  // down
++  renderer.drawLine(cx - rayOuter, cy, cx - rayInner, cy, foregroundBlack);  // left
++  renderer.drawLine(cx + rayInner, cy, cx + rayOuter, cy, foregroundBlack);  // right
++}
++
++void BaseTheme::drawSnowflakeIcon(const GfxRenderer& renderer, int x, int y, int size, bool foregroundBlack) const {
++  // Small snowflake: three lines through a common center (vertical,
++  // horizontal, and both diagonals), matching the sun icon's line weight.
 +  const int cx = x + size / 2;
 +  const int cy = y + size / 2;
 +  const int r = size / 2;
++  const int d = std::max(1, r * 2 / 3);  // diagonal reach, kept inside the box
 +
-+  // Draw 6-pointed star as 3 perpendicular lines through center
-+  renderer.drawLine(cx, cy - r, cx, cy + r, filled);           // Vertical
-+  renderer.drawLine(cx - r, cy, cx + r, cy, filled);           // Horizontal
-+  renderer.drawLine(cx - r/2, cy - r/2, cx + r/2, cy + r/2, filled);  // Diagonal \
-+  renderer.drawLine(cx - r/2, cy + r/2, cx + r/2, cy - r/2, filled);  // Diagonal /
++  renderer.drawLine(cx, cy - r, cx, cy + r, foregroundBlack);
++  renderer.drawLine(cx - r, cy, cx + r, cy, foregroundBlack);
++  renderer.drawLine(cx - d, cy - d, cx + d, cy + d, foregroundBlack);
++  renderer.drawLine(cx - d, cy + d, cx + d, cy - d, foregroundBlack);
 +}
 +
-+void BaseTheme::drawSunIcon(const GfxRenderer& renderer, int x, int y, int size, bool filled) const {
-+  // Draw a small sun icon (circle with rays) for warm indicator
-+  const int cx = x + size / 2;
-+  const int cy = y + size / 2;
-+  const int r = size / 3;
++void BaseTheme::drawFrontlightTempIndicators(const GfxRenderer& renderer, Rect batteryRect, bool batteryLeft,
++                                             bool foregroundBlack) const {
++  // Warm/cold frontlight percentages, drawn as small icon+percentage pairs
++  // beside the battery. frontlightWarmth is 0 (cool) .. 100 (warm); the cold
++  // reading is its complement rather than a separately stored setting.
++  const uint8_t warmPercent = SETTINGS.frontlightWarmth;
++  const uint8_t coldPercent = 100 - warmPercent;
++  constexpr int iconSize = 7;
++  constexpr int iconTextGap = 2;
++  constexpr int pairGap = 6;
 +
-+  // Draw sun circle
-+  renderer.drawCircle(cx, cy, r, filled);
++  const auto warmText = std::to_string(warmPercent) + "%";
++  const auto coldText = std::to_string(coldPercent) + "%";
++  const int warmTextWidth = renderer.getTextWidth(SMALL_FONT_ID, warmText.c_str());
++  const int coldTextWidth = renderer.getTextWidth(SMALL_FONT_ID, coldText.c_str());
++  const int iconY = batteryRect.y + (batteryRect.height - iconSize) / 2;
++  const int textY = batteryRect.y;
 +
-+  // Draw 4 rays (cardinal directions)
-+  const int rayLen = r + 1;
-+  renderer.drawLine(cx, cy - rayLen, cx, cy - r, filled);      // Top
-+  renderer.drawLine(cx, cy + r, cx, cy + rayLen, filled);      // Bottom
-+  renderer.drawLine(cx - rayLen, cy, cx - r, cy, filled);      // Left
-+  renderer.drawLine(cx + r, cy, cx + rayLen, cy, filled);      // Right
++  if (batteryLeft) {
++    // Battery icon sits at the left; extend further left: [cold][warm][battery]
++    int x = batteryRect.x - pairGap;
++    x -= warmTextWidth;
++    renderer.drawText(SMALL_FONT_ID, x, textY, warmText.c_str(), foregroundBlack);
++    x -= iconTextGap + iconSize;
++    drawSunIcon(renderer, x, iconY, iconSize, foregroundBlack);
++    x -= pairGap;
++    x -= coldTextWidth;
++    renderer.drawText(SMALL_FONT_ID, x, textY, coldText.c_str(), foregroundBlack);
++    x -= iconTextGap + iconSize;
++    drawSnowflakeIcon(renderer, x, iconY, iconSize, foregroundBlack);
++  } else {
++    // Battery icon sits at the right; extend further right: [battery][cold][warm]
++    int x = batteryRect.x + batteryRect.width + pairGap;
++    drawSnowflakeIcon(renderer, x, iconY, iconSize, foregroundBlack);
++    x += iconSize + iconTextGap;
++    renderer.drawText(SMALL_FONT_ID, x, textY, coldText.c_str(), foregroundBlack);
++    x += coldTextWidth + pairGap;
++    drawSunIcon(renderer, x, iconY, iconSize, foregroundBlack);
++    x += iconSize + iconTextGap;
++    renderer.drawText(SMALL_FONT_ID, x, textY, warmText.c_str(), foregroundBlack);
++  }
 +}
 +
-+void BaseTheme::drawFrontlightTempIndicators(const GfxRenderer& renderer, Rect rect,
-+                                              const bool foregroundBlack) const {
-+  // Get frontlight settings (0-100 for both warm and cold)
-+  int xOffset = rect.x + rect.width + FRONTLIGHT_TEMP_ICON_SPACING;
-+
-+  drawSnowflakeIcon(renderer, xOffset, rect.y + 4, FRONTLIGHT_TEMP_ICON_SIZE, foregroundBlack);
-+  drawSunIcon(renderer, xOffset + FRONTLIGHT_TEMP_ICON_SIZE + 4, rect.y + 4, FRONTLIGHT_TEMP_ICON_SIZE, foregroundBlack);
-+}
-
  int BaseTheme::homeHeaderClockTextYOffset(const GfxRenderer& renderer) {
    const auto& metrics = UITheme::getInstance().getMetrics();
+   const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
+@@ -509,6 +584,7 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
+   } else {
+     drawBatteryRight(renderer, batteryRect, showBatteryPercentage);
+   }
++  drawFrontlightTempIndicators(renderer, batteryRect, batteryLeft);
+ 
+   drawTopStatusBarClock(renderer, rect.y, nullptr, readerContext, clockYOffset);
+ }
+diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
+index 714d127..2d5a541 100644
+--- a/src/components/themes/BaseTheme.h
++++ b/src/components/themes/BaseTheme.h
+@@ -243,6 +243,12 @@ class BaseTheme {
+                         bool foregroundBlack = true) const;  // Right aligned (UI headers)
+   virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
+                                bool foregroundBlack = true) const;
++  // Frontlight warm/cold percentage indicators, drawn next to the battery icon
++  // in the status bar. warmPercent and coldPercent are both 0-100.
++  void drawFrontlightTempIndicators(const GfxRenderer& renderer, Rect batteryRect, bool batteryLeft,
++                                    bool foregroundBlack = true) const;
++  void drawSunIcon(const GfxRenderer& renderer, int x, int y, int size, bool foregroundBlack) const;
++  void drawSnowflakeIcon(const GfxRenderer& renderer, int x, int y, int size, bool foregroundBlack) const;
+   // Button hint labels use three states: non-empty labels draw an active hint,
+   // an empty string clears an inactive slot, and nullptr preserves the existing
+   // background without drawing or registering a target.
