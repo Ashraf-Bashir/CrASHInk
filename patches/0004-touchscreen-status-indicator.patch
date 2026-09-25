@@ -1,8 +1,28 @@
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index 96c94986..dda43a13 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -1534,6 +1534,15 @@ void HomeActivity::loop() {
+       requestUpdate();
+       return;
+     }
++    // The hand next to it toggles the reader touchscreen. Touch always works
++    // here, so unlike in the reader it can switch it back on as well.
++    if (mappedInput.wasScreenTapped(tapX, tapY) &&
++        GUI.isTouchscreenIndicatorHit(renderer, UITheme::getInstance().getMetrics().topPadding, tapX, tapY)) {
++      SETTINGS.disableReaderTouchscreen = SETTINGS.disableReaderTouchscreen ? 0 : 1;
++      activityManager.persistGlobalSettings();
++      requestUpdate();
++      return;
++    }
+   }
+ 
+   if (usesMinimalHomeInteraction()) {
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 7d24031..2d293d3 100644
+index a71dc104..0d276a8f 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -2562,6 +2562,14 @@ void EpubReaderActivity::loop() {
+@@ -2653,6 +2653,15 @@ void EpubReaderActivity::loop() {
      requestUpdate();
      return;
    }
@@ -11,6 +31,7 @@ index 7d24031..2d293d3 100644
 +    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
 +    // hit while the touchscreen is off, so no separate guard is needed here.
 +    SETTINGS.disableReaderTouchscreen = 1;
++    activityManager.persistGlobalSettings();
 +    requestUpdate();
 +    return;
 +  }
@@ -18,10 +39,10 @@ index 7d24031..2d293d3 100644
        ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
      if (SETTINGS.tapToHideStatusBar) {
 diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
-index 532ca25..e37ede4 100644
+index 2b01c3bc..9e66cc40 100644
 --- a/src/activities/reader/TxtReaderActivity.cpp
 +++ b/src/activities/reader/TxtReaderActivity.cpp
-@@ -207,6 +207,14 @@ void TxtReaderActivity::loop() {
+@@ -212,6 +212,15 @@ void TxtReaderActivity::loop() {
      requestUpdate();
      return;
    }
@@ -30,6 +51,7 @@ index 532ca25..e37ede4 100644
 +    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
 +    // hit while the touchscreen is off, so no separate guard is needed here.
 +    SETTINGS.disableReaderTouchscreen = 1;
++    activityManager.persistGlobalSettings();
 +    requestUpdate();
 +    return;
 +  }
@@ -37,7 +59,7 @@ index 532ca25..e37ede4 100644
        ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
      if (SETTINGS.tapToHideStatusBar) {
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index 202b2a5..d8b0d58 100644
+index d4c36f3b..238414c3 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
 @@ -51,6 +51,33 @@ constexpr uint8_t icon_lightbulb_off_h_bits[] = {
@@ -74,7 +96,7 @@ index 202b2a5..d8b0d58 100644
  }  // namespace
  
  void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
-@@ -211,12 +238,95 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
+@@ -211,12 +238,104 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
    const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
  
    // Generous hit box, not the icon's own tight bounds: the whole top status
@@ -144,8 +166,17 @@ index 202b2a5..d8b0d58 100644
 +  // SETTINGS.disableReaderTouchscreen is set, MappedInputManager stops
 +  // reporting taps in the reader at all (touchInputEnabled() reads that same
 +  // setting), so a tap could never reach this check in the first place; it
-+  // can only be turned back on through the button shortcut.
-+  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++  // can only be turned back on through the button shortcut (or a tap on the
++  // home screen, which uses isTouchscreenIndicatorHit directly).
++  if (SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++  return isTouchscreenIndicatorHit(renderer, topY, touchX, touchY);
++}
++
++bool BaseTheme::isTouchscreenIndicatorHit(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  // Pure hit test on the hand icon, whatever the touchscreen state.
++  if (!gpio.hasTouch()) {
 +    return false;
 +  }
 +
@@ -175,7 +206,7 @@ index 202b2a5..d8b0d58 100644
    const int hitTop = baseTopY;
    const int hitBottom = baseTopY + statusBarHeight;
  
-@@ -1141,10 +1251,12 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
+@@ -1147,10 +1266,12 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
                                        const bool readerContext, const int textYOffset, const bool darkMode,
                                        const bool forceVisible) const {
    // Deliberately ahead of the clock's own visibility/availability checks
@@ -192,10 +223,10 @@ index 202b2a5..d8b0d58 100644
    if (!forceVisible &&
        !(readerContext ? SETTINGS.shouldShowClockInReader() : SETTINGS.shouldShowClockOutsideReader())) {
 diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 843ecd3..7b8de2e 100644
+index 628a4602..569703cd 100644
 --- a/src/components/themes/BaseTheme.h
 +++ b/src/components/themes/BaseTheme.h
-@@ -265,6 +265,27 @@ class BaseTheme {
+@@ -265,6 +265,30 @@ class BaseTheme {
    // light or consume the touch itself, since callers differ in what "handle
    // this touch" means for them.
    bool isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
@@ -220,6 +251,9 @@ index 843ecd3..7b8de2e 100644
 +  // on a tap and, on a hit, set SETTINGS.disableReaderTouchscreen = 1 and
 +  // call requestUpdate() themselves.
 +  bool isTouchscreenIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // Hit test on the hand icon regardless of the current touchscreen state
++  // (for screens where touch always works, e.g. home).
++  bool isTouchscreenIndicatorHit(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
    // Button hint labels use three states: non-empty labels draw an active hint,
    // an empty string clears an inactive slot, and nullptr preserves the existing
    // background without drawing or registering a target.
