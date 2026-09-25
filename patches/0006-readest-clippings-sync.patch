@@ -1,5 +1,5 @@
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a589c5a..b83fcb7d 100644
+index 3a589c5a..78835a60 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -845,3 +845,41 @@ STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
@@ -9,7 +9,7 @@ index 3a589c5a..b83fcb7d 100644
 +STR_READEST_SYNC: "Readest Sync"
 +STR_READEST_SYNC_BOOK: "Sync Readest"
 +STR_READEST_SYNCING_POSITION: "Syncing reading position..."
-+STR_READEST_DOWNLOADING_BOOK: "Downloading Readest's copy of the book..."
++STR_READEST_DOWNLOADING_BOOK: "Downloading the text of Readest's copy..."
 +STR_READEST_REMOVED_FORMAT: "%d deleted highlights synced"
 +STR_READEST_COPY_MISSING: "Readest's copy is not in its cloud; locations may be off"
 +STR_READEST_SYNC_DONE: "Synced with Readest"
@@ -1077,7 +1077,7 @@ index 73ba26bf..9a177d9e 100644
  
  void silentRestart();                                            // home screen
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 85902c3e..8e46390f 100644
+index 8b5849b7..507dcfb3 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -28,6 +28,7 @@
@@ -1104,7 +1104,7 @@ index 85902c3e..8e46390f 100644
  #if CROSSINK_APP_CAP_TOUCH
  #include "components/TouchHeaderBackButton.h"
  #endif
-@@ -3918,6 +3921,38 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction
+@@ -3923,6 +3926,38 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction
        }
        break;
      }
@@ -1225,14 +1225,15 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..6485c169
+index 00000000..605058bc
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,824 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
 +#include <GfxRenderer.h>
++#include <HalFrontlight.h>
 +#include <HalStorage.h>
 +#include <I18n.h>
 +#include <Logging.h>
@@ -1370,6 +1371,13 @@ index 00000000..6485c169
 +
 +  const bool hasReaderOrientation = readerOrientation < CrossPointSettings::ORIENTATION_COUNT;
 +  if (restartBeforeNetwork) {
++    // The network reboot restores the frontlight from the saved setting; make
++    // sure it matches the light the user actually has on.
++    const uint8_t lightOn = Frontlight.isOn() ? 1 : 0;
++    if (SETTINGS.frontlightOn != lightOn) {
++      SETTINGS.frontlightOn = lightOn;
++      activityManager.persistGlobalSettings();
++    }
 +    if (hasReaderOrientation) ReaderUtils::applyOrientation(renderer, readerOrientation);
 +    silentRestartToNetwork(NetworkBootTarget::READEST_SYNC, encodeBootPayload(readerOrientation));
 +    return;
@@ -1986,9 +1994,20 @@ index 00000000..6485c169
 +                      screen.height};
 +  UITheme::drawCenteredWrappedText(renderer, textArea, UI_10_FONT_ID, top, statusMessage.c_str(), 2, true,
 +                                   finished ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR, 4);
-+  if (!detailMessage.empty()) {
-+    UITheme::drawCenteredWrappedText(renderer, textArea, UI_10_FONT_ID, top + lineHeight * 2 + 10,
-+                                     detailMessage.c_str(), 5, true, EpdFontFamily::REGULAR, 4);
++  // The wrapped-text helper does not break on '\n', so draw each summary line
++  // as its own block.
++  int y = top + lineHeight * 2 + 10;
++  size_t lineStart = 0;
++  while (lineStart < detailMessage.size()) {
++    size_t lineEnd = detailMessage.find('\n', lineStart);
++    if (lineEnd == std::string::npos) lineEnd = detailMessage.size();
++    const std::string line = detailMessage.substr(lineStart, lineEnd - lineStart);
++    if (!line.empty()) {
++      y += UITheme::drawCenteredWrappedText(renderer, textArea, UI_10_FONT_ID, y, line.c_str(), 2, true,
++                                            EpdFontFamily::REGULAR, 4) +
++           6;
++    }
++    lineStart = lineEnd + 1;
 +  }
 +
 +  // The chooser draws its own button hints and pushes the frame itself.
@@ -2326,18 +2345,20 @@ index 00000000..44b8c0c7
 +};
 diff --git a/src/activities/settings/ReadestSettingsActivity.cpp b/src/activities/settings/ReadestSettingsActivity.cpp
 new file mode 100644
-index 00000000..25d2b452
+index 00000000..611c867d
 --- /dev/null
 +++ b/src/activities/settings/ReadestSettingsActivity.cpp
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,226 @@
 +#include "ReadestSettingsActivity.h"
 +
 +#include <GfxRenderer.h>
++#include <HalFrontlight.h>
 +#include <I18n.h>
 +
 +#include <string>
 +#include <vector>
 +
++#include "CrossPointSettings.h"
 +#include "MappedInputManager.h"
 +#include "SilentRestart.h"
 +#include "activities/util/KeyboardEntryActivity.h"
@@ -2426,6 +2447,10 @@ index 00000000..25d2b452
 +  if (pendingStep == PendingStep::Connect) {
 +    pendingStep = PendingStep::None;
 +    // Sign-in needs Wi-Fi + TLS; reboot into the lean network mode first.
++    // That reboot restores the frontlight from the saved setting, so save the
++    // light's actual state first.
++    SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
++    SETTINGS.saveToFile();
 +    silentRestartToNetwork(NetworkBootTarget::READEST_AUTH);
 +    return;
 +  }
@@ -2834,14 +2859,13 @@ index 00000000..3990337e
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
 new file mode 100644
-index 00000000..c82f2423
+index 00000000..0fa92045
 --- /dev/null
 +++ b/src/readest/ReadestClient.cpp
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,556 @@
 +#include "ReadestClient.h"
 +
 +#include <ArduinoJson.h>
-+#include <HalStorage.h>
 +#include <I18n.h>
 +#include <Logging.h>
 +#include <SecureHttpClient.h>
@@ -2857,6 +2881,7 @@ index 00000000..c82f2423
 +#include <vector>
 +
 +#include "ReadestStore.h"
++#include "ReadestTextEpub.h"
 +
 +namespace {
 +constexpr char SUPABASE_AUTH_URL[] = "https://readest.supabase.co/auth/v1/token?grant_type=";
@@ -2868,6 +2893,8 @@ index 00000000..c82f2423
 +    "ImFub24iLCJpYXQiOjE3MzQxMjM2NzEsImV4cCI6MjA0OTY5OTY3MX0.3U5Uqaou_1SgrVe1eo9rApc0uKjqhpQdUXhvwUHmUfg";
 +constexpr char USER_AGENT[] = "CrossInk-Readest/1.0";
 +constexpr uint32_t REQUEST_TIMEOUT_MS = 20000;
++// Safety cap for the text part of Readest's copy of a book.
++constexpr size_t MAX_TEXT_BYTES = 16 * 1024 * 1024;
 +
 +// Small library pages keep each buffered response to a few tens of KB even
 +// when rows carry long metadata blobs.
@@ -3230,49 +3257,9 @@ index 00000000..c82f2423
 +    downloadUrl = doc["downloadUrl"].as<const char*>();
 +  }
 +
-+  const std::string partPath = destPath + ".part";
-+  HalFile file;
-+  if (!Storage.openFileForWrite("RDS", partPath, file)) {
-+    LOG_ERR("RDS", "Cannot create %s", partPath.c_str());
-+    return SERVER_ERROR;
-+  }
-+  size_t written = 0;
-+  bool writeFailed = false;
-+  int code = 0;
-+  bool complete = false;
-+  {
-+    freeink::SecureHttpClient http;
-+    http.setInsecure();
-+    http.setTimeout(REQUEST_TIMEOUT_MS);
-+    http.setUserAgent(USER_AGENT);
-+    http.setFollowRedirects(3);
-+    if (http.begin(downloadUrl)) {
-+      // Streamed chunk by chunk to the SD card; nothing is buffered in RAM.
-+      code = http.GET([&](const uint8_t* data, const size_t len) {
-+        if (file.write(data, len) != len) {
-+          writeFailed = true;
-+          return false;
-+        }
-+        written += len;
-+        return true;
-+      });
-+      complete = http.responseComplete();
-+    }
-+    http.end();
-+  }
-+  file.close();
-+  if (code != 200 || !complete || writeFailed || written == 0) {
-+    LOG_ERR("RDS", "Book download failed: code=%d complete=%d written=%u", code, complete ? 1 : 0,
-+            static_cast<unsigned>(written));
-+    Storage.remove(partPath.c_str());
-+    return code <= 0 ? NETWORK_ERROR : (code == 404 ? BOOK_NOT_FOUND : SERVER_ERROR);
-+  }
-+  Storage.remove(destPath.c_str());
-+  if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
-+    LOG_ERR("RDS", "Cannot move downloaded book into place");
-+    return SERVER_ERROR;
-+  }
-+  LOG_INF("RDS", "Downloaded Readest copy (%u bytes)", static_cast<unsigned>(written));
++  // Only the text: chapters, OPF/NCX and container, fetched with range
++  // requests. Images and fonts, usually most of the file, are never downloaded.
++  if (!ReadestTextEpub::download(downloadUrl, destPath, MAX_TEXT_BYTES)) return SERVER_ERROR;
 +  return OK;
 +}
 +
@@ -3434,7 +3421,7 @@ index 00000000..c82f2423
 +}
 diff --git a/src/readest/ReadestClient.h b/src/readest/ReadestClient.h
 new file mode 100644
-index 00000000..a9245f0c
+index 00000000..c2f252c4
 --- /dev/null
 +++ b/src/readest/ReadestClient.h
 @@ -0,0 +1,96 @@
@@ -3518,8 +3505,8 @@ index 00000000..a9245f0c
 +  // All highlight/excerpt notes Readest has for the book, tombstones included.
 +  Error pullNotes(const ReadestBook& book, std::vector<ReadestNote>& out);
 +
-+  // Download Readest's own copy of the book (EPUB only) from Readest cloud
-+  // storage to `destPath`, streaming straight to the SD card.
++  // Download the text of Readest's own copy of the book (EPUB only) from
++  // Readest cloud storage into a slim EPUB at `destPath` (see ReadestTextEpub).
 +  Error downloadBook(const ReadestBook& book, const std::string& destPath);
 +
 +  // Reading position for exactly this Readest book (same book_hash).
@@ -3674,3 +3661,331 @@ index 00000000..fa7f3025
 +};
 +
 +#define READEST_STORE ReadestStore::getInstance()
+diff --git a/src/readest/ReadestTextEpub.cpp b/src/readest/ReadestTextEpub.cpp
+new file mode 100644
+index 00000000..a7f72572
+--- /dev/null
++++ b/src/readest/ReadestTextEpub.cpp
+@@ -0,0 +1,294 @@
++#include "ReadestTextEpub.h"
++
++#include <HalStorage.h>
++#include <Logging.h>
++#include <SecureHttpClient.h>
++
++#include <algorithm>
++#include <cctype>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace {
++constexpr uint32_t SIG_EOCD = 0x06054b50;
++constexpr uint32_t SIG_CENTRAL = 0x02014b50;
++constexpr size_t EOCD_SIZE = 22;
++constexpr size_t CENTRAL_HEADER_SIZE = 46;
++// EOCD plus the largest possible archive comment.
++constexpr size_t TAIL_SIZE = EOCD_SIZE + 0xFFFF;
++// Gaps up to this size between wanted entries are downloaded and dropped
++// rather than paying for another request.
++constexpr size_t MERGE_GAP = 16 * 1024;
++constexpr uint32_t REQUEST_TIMEOUT_MS = 30000;
++constexpr char USER_AGENT[] = "CrossInk-Readest/1.0";
++
++uint16_t rd16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
++uint32_t rd32(const uint8_t* p) {
++  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
++         (static_cast<uint32_t>(p[3]) << 24);
++}
++void wr16(uint8_t* p, const uint16_t v) {
++  p[0] = static_cast<uint8_t>(v);
++  p[1] = static_cast<uint8_t>(v >> 8);
++}
++void wr32(uint8_t* p, const uint32_t v) {
++  p[0] = static_cast<uint8_t>(v);
++  p[1] = static_cast<uint8_t>(v >> 8);
++  p[2] = static_cast<uint8_t>(v >> 16);
++  p[3] = static_cast<uint8_t>(v >> 24);
++}
++
++bool endsWith(const std::string& s, const char* suffix) {
++  const size_t n = std::strlen(suffix);
++  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
++}
++
++// Entries needed to parse the book and read its text.
++bool isTextEntry(std::string name) {
++  std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
++  return name == "mimetype" || endsWith(name, ".xhtml") || endsWith(name, ".html") || endsWith(name, ".htm") ||
++         endsWith(name, ".opf") || endsWith(name, ".ncx") || endsWith(name, ".xml");
++}
++
++struct Entry {
++  size_t record;        // offset of the central directory record in `central`
++  size_t recordSize;    // size of that record
++  uint32_t localStart;  // local header offset in the remote archive
++  uint32_t localEnd;    // start of the next entry (local header + data + descriptor)
++  uint32_t newOffset;   // local header offset in the slim archive
++  bool keep;
++};
++
++// Parses "bytes a-b/total".
++bool parseContentRange(const std::string& value, size_t& total) {
++  const size_t slash = value.rfind('/');
++  if (slash == std::string::npos || slash + 1 >= value.size() || value[slash + 1] == '*') return false;
++  total = std::strtoul(value.c_str() + slash + 1, nullptr, 10);
++  return total > 0;
++}
++
++// Range GET that streams the body to `sink`. Anything but a 206 is refused
++// before its body is consumed.
++bool rangeGet(freeink::SecureHttpClient& http, const std::string& url, const size_t first, const size_t last,
++              const std::function<bool(const uint8_t*, size_t)>& sink, std::string* contentRange = nullptr) {
++  if (!http.begin(url)) return false;
++  const std::string range = last == SIZE_MAX ? "bytes=-" + std::to_string(first)
++                                             : "bytes=" + std::to_string(first) + "-" + std::to_string(last);
++  http.addHeader("Range", range);
++  http.addHeader("Accept-Encoding", "identity");
++  bool refused = false;
++  const int code = http.GET([&](const uint8_t* data, const size_t len) {
++    if (http.getStatus() != 206) {
++      refused = true;
++      return false;
++    }
++    return sink(data, len);
++  });
++  if (code != 206 || refused || !http.responseComplete()) {
++    LOG_ERR("RDS", "Range %s failed: code=%d complete=%d", range.c_str(), code, http.responseComplete() ? 1 : 0);
++    return false;
++  }
++  if (contentRange) *contentRange = http.getHeader("content-range");
++  return true;
++}
++}  // namespace
++
++namespace ReadestTextEpub {
++
++bool download(const std::string& url, const std::string& destPath, const size_t maxTextBytes) {
++  freeink::SecureHttpClient http;  // one kept-alive TLS connection for every range
++  http.setInsecure();
++  http.setTimeout(REQUEST_TIMEOUT_MS);
++  http.setUserAgent(USER_AGENT);
++  http.setFollowRedirects(3);
++
++  // 1. The tail of the archive holds the end-of-central-directory record.
++  std::string tail;
++  std::string contentRange;
++  if (!rangeGet(
++          http, url, TAIL_SIZE, SIZE_MAX,
++          [&](const uint8_t* data, const size_t len) {
++            if (tail.size() + len > TAIL_SIZE) return false;
++            tail.append(reinterpret_cast<const char*>(data), len);
++            return true;
++          },
++          &contentRange)) {
++    return false;
++  }
++  size_t archiveSize = 0;
++  if (!parseContentRange(contentRange, archiveSize) || tail.size() < EOCD_SIZE) {
++    LOG_ERR("RDS", "Unusable Content-Range '%s'", contentRange.c_str());
++    return false;
++  }
++  const size_t tailStart = archiveSize - tail.size();
++  const auto* tailBytes = reinterpret_cast<const uint8_t*>(tail.data());
++  size_t eocd = SIZE_MAX;
++  for (size_t i = tail.size() - EOCD_SIZE + 1; i-- > 0;) {
++    if (rd32(tailBytes + i) == SIG_EOCD) {
++      eocd = i;
++      break;
++    }
++  }
++  if (eocd == SIZE_MAX) {
++    LOG_ERR("RDS", "No ZIP end record");
++    return false;
++  }
++  const uint16_t entryCount = rd16(tailBytes + eocd + 10);
++  const uint32_t centralSize = rd32(tailBytes + eocd + 12);
++  const uint32_t centralOffset = rd32(tailBytes + eocd + 16);
++  if (entryCount == 0xFFFF || centralSize == 0xFFFFFFFF || centralOffset == 0xFFFFFFFF ||
++      static_cast<size_t>(centralOffset) + centralSize > archiveSize) {
++    LOG_ERR("RDS", "ZIP64 or damaged archive; not supported");
++    return false;
++  }
++
++  // 2. The central directory (usually already inside the tail).
++  std::string central;
++  if (centralOffset >= tailStart) {
++    central = tail.substr(centralOffset - tailStart, centralSize);
++  } else {
++    central.reserve(centralSize);
++    if (!rangeGet(http, url, centralOffset, static_cast<size_t>(centralOffset) + centralSize - 1,
++                  [&](const uint8_t* data, const size_t len) {
++                    central.append(reinterpret_cast<const char*>(data), len);
++                    return central.size() <= centralSize;
++                  })) {
++      return false;
++    }
++  }
++  tail.clear();
++  tail.shrink_to_fit();
++
++  // 3. Pick the text entries and work out each entry's exact byte span.
++  std::vector<Entry> entries;
++  entries.reserve(entryCount);
++  const auto* cd = reinterpret_cast<const uint8_t*>(central.data());
++  for (size_t pos = 0; pos + CENTRAL_HEADER_SIZE <= central.size();) {
++    if (rd32(cd + pos) != SIG_CENTRAL) break;
++    const uint32_t compSize = rd32(cd + pos + 20);
++    const uint16_t nameLen = rd16(cd + pos + 28);
++    const uint16_t extraLen = rd16(cd + pos + 30);
++    const uint16_t commentLen = rd16(cd + pos + 32);
++    const uint32_t localOffset = rd32(cd + pos + 42);
++    const size_t recordSize = CENTRAL_HEADER_SIZE + nameLen + extraLen + commentLen;
++    if (pos + recordSize > central.size() || compSize == 0xFFFFFFFF || localOffset == 0xFFFFFFFF) {
++      LOG_ERR("RDS", "Bad or ZIP64 central directory record");
++      return false;
++    }
++    const std::string name(reinterpret_cast<const char*>(cd + pos + CENTRAL_HEADER_SIZE), nameLen);
++    entries.push_back({pos, recordSize, localOffset, 0, 0, isTextEntry(name)});
++    pos += recordSize;
++  }
++  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.localStart < b.localStart; });
++  size_t textBytes = 0;
++  for (size_t i = 0; i < entries.size(); ++i) {
++    entries[i].localEnd = i + 1 < entries.size() ? entries[i + 1].localStart : centralOffset;
++    if (entries[i].localEnd < entries[i].localStart) return false;
++    if (entries[i].keep) textBytes += entries[i].localEnd - entries[i].localStart;
++  }
++  if (textBytes == 0 || textBytes > maxTextBytes) {
++    LOG_ERR("RDS", "Text part is %u bytes (limit %u)", static_cast<unsigned>(textBytes),
++            static_cast<unsigned>(maxTextBytes));
++    return false;
++  }
++  LOG_INF("RDS", "Text-only copy: %u of %u bytes", static_cast<unsigned>(textBytes),
++          static_cast<unsigned>(archiveSize));
++
++  // 4. Fetch the kept spans (merging near neighbours) straight to the file.
++  const std::string partPath = destPath + ".part";
++  HalFile file;
++  if (!Storage.openFileForWrite("RDS", partPath, file)) {
++    LOG_ERR("RDS", "Cannot create %s", partPath.c_str());
++    return false;
++  }
++  uint32_t written = 0;
++  bool ok = true;
++  size_t i = 0;
++  while (ok && i < entries.size()) {
++    if (!entries[i].keep) {
++      ++i;
++      continue;
++    }
++    size_t j = i;  // last kept entry in this request
++    for (size_t k = i + 1; k < entries.size(); ++k) {
++      if (!entries[k].keep) continue;
++      if (entries[k].localStart - entries[j].localEnd > MERGE_GAP) break;
++      j = k;
++    }
++    const uint32_t rangeStart = entries[i].localStart;
++    const uint32_t rangeEnd = entries[j].localEnd;  // exclusive
++    size_t current = i;
++    uint32_t position = rangeStart;
++    ok = rangeGet(http, url, rangeStart, rangeEnd - 1, [&](const uint8_t* data, size_t len) {
++      while (len > 0) {
++        while (current <= j && (!entries[current].keep || position >= entries[current].localEnd)) ++current;
++        if (current > j) return true;  // trailing bytes of the range
++        Entry& entry = entries[current];
++        if (position < entry.localStart) {  // skipped neighbour
++          const size_t skip = std::min<size_t>(len, entry.localStart - position);
++          data += skip;
++          len -= skip;
++          position += static_cast<uint32_t>(skip);
++          continue;
++        }
++        if (position == entry.localStart) entry.newOffset = written;
++        const size_t take = std::min<size_t>(len, entry.localEnd - position);
++        if (file.write(data, take) != take) return false;
++        written += static_cast<uint32_t>(take);
++        data += take;
++        len -= take;
++        position += static_cast<uint32_t>(take);
++      }
++      return true;
++    });
++    i = j + 1;
++  }
++
++  // 5. New central directory: the original records with patched offsets.
++  if (ok) {
++    const uint32_t newCentralOffset = written;
++    uint16_t keptCount = 0;
++    for (const Entry& entry : entries) {
++      if (!entry.keep) continue;
++      std::string record = central.substr(entry.record, entry.recordSize);
++      wr32(reinterpret_cast<uint8_t*>(&record[0]) + 42, entry.newOffset);
++      if (file.write(reinterpret_cast<const uint8_t*>(record.data()), record.size()) != record.size()) {
++        ok = false;
++        break;
++      }
++      written += static_cast<uint32_t>(record.size());
++      keptCount++;
++    }
++    if (ok) {
++      uint8_t end[EOCD_SIZE] = {};
++      wr32(end, SIG_EOCD);
++      wr16(end + 8, keptCount);
++      wr16(end + 10, keptCount);
++      wr32(end + 12, written - newCentralOffset);
++      wr32(end + 16, newCentralOffset);
++      ok = file.write(end, sizeof(end)) == sizeof(end);
++    }
++  }
++  file.close();
++  http.end();
++
++  if (!ok) {
++    LOG_ERR("RDS", "Text-only download failed");
++    Storage.remove(partPath.c_str());
++    return false;
++  }
++  Storage.remove(destPath.c_str());
++  if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
++    LOG_ERR("RDS", "Cannot move text-only copy into place");
++    Storage.remove(partPath.c_str());
++    return false;
++  }
++  LOG_INF("RDS", "Saved text-only Readest copy (%u bytes)", static_cast<unsigned>(written));
++  return true;
++}
++
++}  // namespace ReadestTextEpub
+diff --git a/src/readest/ReadestTextEpub.h b/src/readest/ReadestTextEpub.h
+new file mode 100644
+index 00000000..1b5ac077
+--- /dev/null
++++ b/src/readest/ReadestTextEpub.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <cstddef>
++#include <string>
++
++/**
++ * Downloads only the text of a remote EPUB into a slim, valid EPUB file.
++ *
++ * An EPUB is a ZIP whose size is mostly images and fonts. Using HTTP range
++ * requests against the (signed) URL, this reads the ZIP central directory
++ * from the end of the file, then fetches only mimetype, container.xml, the
++ * OPF/NCX and the (X)HTML chapters, copying each entry's bytes verbatim and
++ * writing a fresh central directory. Adjacent entries are fetched in one
++ * request over a single kept-alive TLS connection; everything streams
++ * straight to the SD card.
++ *
++ * Returns false (and leaves no file) if the server ignores range requests,
++ * the archive is ZIP64, or the text part exceeds maxTextBytes.
++ */
++namespace ReadestTextEpub {
++bool download(const std::string& url, const std::string& destPath, size_t maxTextBytes);
++}  // namespace ReadestTextEpub

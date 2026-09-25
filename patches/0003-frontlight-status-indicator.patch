@@ -1,8 +1,42 @@
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index fae7162a..96c94986 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -4,6 +4,7 @@
+ #include <Epub.h>
+ #include <FsHelpers.h>
+ #include <GfxRenderer.h>
++#include <HalFrontlight.h>
+ #include <HalDisplay.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+@@ -1520,6 +1521,21 @@ void HomeActivity::loop() {
+ 
+   if (quickActionsPopup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
+ 
++  // Tapping the lamp in the top status row toggles the frontlight, as in the reader.
++  {
++    int tapX = 0;
++    int tapY = 0;
++    if (mappedInput.wasScreenTapped(tapX, tapY) &&
++        GUI.isFrontlightIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding, tapX, tapY)) {
++      const bool lightOn = !Frontlight.isOn();
++      Frontlight.setOn(lightOn);
++      SETTINGS.frontlightOn = lightOn ? 1 : 0;
++      activityManager.persistGlobalSettings();
++      requestUpdate();
++      return;
++    }
++  }
++
+   if (usesMinimalHomeInteraction()) {
+     const int pressedFrontButton = mappedInput.getPressedFrontButton();
+     const int releasedFrontButton = mappedInput.getReleasedFrontButton();
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index db17926..7d24031 100644
+index d02e5182..a71dc104 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -7,6 +7,7 @@
+@@ -8,6 +8,7 @@
  #include <FontCacheManager.h>
  #include <FsHelpers.h>
  #include <GfxRenderer.h>
@@ -10,13 +44,18 @@ index db17926..7d24031 100644
  #include <HalStorage.h>
  #include <I18n.h>
  #include <Logging.h>
-@@ -2555,6 +2556,12 @@ void EpubReaderActivity::loop() {
+@@ -2641,6 +2642,17 @@ void EpubReaderActivity::loop() {
  #endif
  
    const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
 +  if (touch.tapped && GUI.isFrontlightIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
 +                                                    touch.x, touch.y)) {
-+    Frontlight.setOn(!Frontlight.isOn());
++    const bool lightOn = !Frontlight.isOn();
++    Frontlight.setOn(lightOn);
++    // Save it like the other light toggles do, so restarts (e.g. into Wi-Fi
++    // mode for a sync) restore the light the user actually sees.
++    SETTINGS.frontlightOn = lightOn ? 1 : 0;
++    activityManager.persistGlobalSettings();
 +    requestUpdate();
 +    return;
 +  }
@@ -24,7 +63,7 @@ index db17926..7d24031 100644
        ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
      if (SETTINGS.tapToHideStatusBar) {
 diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
-index 9b60594..532ca25 100644
+index 9b605947..2b01c3bc 100644
 --- a/src/activities/reader/TxtReaderActivity.cpp
 +++ b/src/activities/reader/TxtReaderActivity.cpp
 @@ -3,6 +3,7 @@
@@ -35,13 +74,18 @@ index 9b60594..532ca25 100644
  #include <HalStorage.h>
  #include <I18n.h>
  #include <Memory.h>
-@@ -200,6 +201,12 @@ void TxtReaderActivity::loop() {
+@@ -200,6 +201,17 @@ void TxtReaderActivity::loop() {
    if (handlePinchFontResize()) return;
  #endif
    const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
 +  if (touch.tapped && GUI.isFrontlightIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
 +                                                    touch.x, touch.y)) {
-+    Frontlight.setOn(!Frontlight.isOn());
++    const bool lightOn = !Frontlight.isOn();
++    Frontlight.setOn(lightOn);
++    // Save it like the other light toggles do, so restarts (e.g. into Wi-Fi
++    // mode for a sync) restore the light the user actually sees.
++    SETTINGS.frontlightOn = lightOn ? 1 : 0;
++    activityManager.persistGlobalSettings();
 +    requestUpdate();
 +    return;
 +  }
@@ -49,7 +93,7 @@ index 9b60594..532ca25 100644
        ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
      if (SETTINGS.tapToHideStatusBar) {
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index cf647f0..202b2a5 100644
+index 514f41f6..d4c36f3b 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
 @@ -3,6 +3,7 @@
@@ -174,7 +218,7 @@ index cf647f0..202b2a5 100644
  int BaseTheme::homeHeaderClockTextYOffset(const GfxRenderer& renderer) {
    const auto& metrics = UITheme::getInstance().getMetrics();
    const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
-@@ -1039,6 +1140,12 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
+@@ -1045,6 +1146,12 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
  void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, const char* previewTime,
                                        const bool readerContext, const int textYOffset, const bool darkMode,
                                        const bool forceVisible) const {
@@ -188,7 +232,7 @@ index cf647f0..202b2a5 100644
        !(readerContext ? SETTINGS.shouldShowClockInReader() : SETTINGS.shouldShowClockOutsideReader())) {
      return;
 diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 714d127..843ecd3 100644
+index 714d1277..628a4602 100644
 --- a/src/components/themes/BaseTheme.h
 +++ b/src/components/themes/BaseTheme.h
 @@ -243,6 +243,28 @@ class BaseTheme {
