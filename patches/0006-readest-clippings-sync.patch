@@ -42,10 +42,10 @@ index 3a589c5a..ec0baf17 100644
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 9f66ac0d..913c36a5 100644
+index 9f66ac0d..efdd16fc 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
-@@ -8,6 +8,7 @@
+@@ -8,12 +8,15 @@
  
  #include <algorithm>
  #include <cmath>
@@ -53,18 +53,48 @@ index 9f66ac0d..913c36a5 100644
  #include <cstring>
  #include <string>
  #include <string_view>
-@@ -680,3 +681,413 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
+ #include <utility>
+ #include <vector>
+ 
++#include "Epub/htmlEntities.h"
++
+ namespace {
+ std::string stripPrefix(const XML_Char* name) {
+   if (!name) {
+@@ -680,3 +683,478 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
    }
    return resolver.getXPath();
  }
 +
 +namespace {
-+// Characters the clipping matcher skips on both sides: whitespace of any kind
-+// and soft hyphens. Clipping text is rebuilt from laid-out words, so its
-+// spacing and hyphenation never match the XHTML source byte-for-byte.
-+bool isMatchIgnorable(const uint32_t cp) {
++// How strictly clipping text must agree with the chapter text.
++//  Strict: ignore whitespace and soft hyphens only.
++//  Loose:  also ignore case, punctuation and symbols, so curly vs straight
++//          quotes, dashes and ellipses differing between readers still match.
++enum class MatchMode : uint8_t { Strict, Loose };
++
++bool isWhitespaceOrSoftHyphen(const uint32_t cp) {
 +  return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == 0xA0 || cp == 0xAD ||
 +         (cp >= 0x2000 && cp <= 0x200B) || cp == 0x202F || cp == 0x205F || cp == 0x3000 || cp == 0xFEFF;
++}
++
++bool isPunctuationOrSymbol(const uint32_t cp) {
++  if (cp < 0x80) return !((cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z'));
++  return (cp >= 0xA1 && cp <= 0xBF) || cp == 0xD7 || cp == 0xF7 || (cp >= 0x2010 && cp <= 0x206F) ||
++         (cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F);
++}
++
++// Returns false when `cp` does not take part in matching; otherwise writes the
++// comparison form of the character.
++bool matchChar(const uint32_t cp, const MatchMode mode, uint32_t& out) {
++  if (isWhitespaceOrSoftHyphen(cp)) return false;
++  if (mode == MatchMode::Loose) {
++    if (isPunctuationOrSymbol(cp)) return false;
++    out = (cp >= 'A' && cp <= 'Z') ? cp + ('a' - 'A') : cp;
++    return true;
++  }
++  out = cp;
++  return true;
 +}
 +
 +// crengine collapses only ASCII whitespace runs when counting xpointer offsets.
@@ -92,14 +122,14 @@ index 9f66ac0d..913c36a5 100644
 +// JS string offsets (what Readest resolves against) count UTF-16 code units.
 +size_t utf16Units(const uint32_t cp) { return cp > 0xFFFF ? 2 : 1; }
 +
-+std::vector<uint32_t> matchCodepoints(const std::string& text) {
++std::vector<uint32_t> matchCodepoints(const std::string& text, const MatchMode mode) {
 +  std::vector<uint32_t> out;
 +  out.reserve(text.size());
 +  const unsigned char* ptr = reinterpret_cast<const unsigned char*>(text.c_str());
 +  const unsigned char* end = ptr + text.size();
 +  while (ptr < end) {
-+    const uint32_t cp = utf8NextCodepoint(&ptr);
-+    if (!isMatchIgnorable(cp)) out.push_back(cp);
++    uint32_t folded = 0;
++    if (matchChar(utf8NextCodepoint(&ptr), mode, folded)) out.push_back(folded);
 +  }
 +  return out;
 +}
@@ -114,7 +144,10 @@ index 9f66ac0d..913c36a5 100644
 +  return xpath;
 +}
 +
-+// Shared expat plumbing for the two clipping passes below.
++// Shared expat plumbing for the clipping passes below. HTML named entities
++// (&nbsp;, &mdash;, &rsquo;...) are expanded exactly like the reader's
++// ChapterHtmlSlimParser does; plain expat would silently drop them and shift
++// every offset after them.
 +class ExpatTextStream : public Print {
 + public:
 +  ExpatTextStream() {
@@ -126,6 +159,7 @@ index 9f66ac0d..913c36a5 100644
 +    XML_SetUserData(parser, this);
 +    XML_SetElementHandler(parser, &ExpatTextStream::startElement, &ExpatTextStream::endElement);
 +    XML_SetCharacterDataHandler(parser, &ExpatTextStream::characterData);
++    XML_SetDefaultHandlerExpand(parser, &ExpatTextStream::defaultHandler);
 +  }
 +
 +  ~ExpatTextStream() override { destroyXmlParser(parser); }
@@ -187,24 +221,34 @@ index 9f66ac0d..913c36a5 100644
 +    static_cast<ExpatTextStream*>(userData)->onCharacterData(data, len);
 +  }
 +
++  static void XMLCALL defaultHandler(void* userData, const XML_Char* s, const int len) {
++    if (len < 3 || s[0] != '&' || s[len - 1] != ';') return;
++    auto* self = static_cast<ExpatTextStream*>(userData);
++    const char* utf8Value = lookupHtmlEntity(s, static_cast<size_t>(len));
++    if (utf8Value) {
++      self->onCharacterData(utf8Value, static_cast<int>(strlen(utf8Value)));
++    } else {
++      self->onCharacterData(s, len);  // unknown entity: keep "&name;" like the reader
++    }
++  }
++
 +  XML_Parser parser = nullptr;
 +  bool parseOk = true;
 +};
 +
 +// Pass 1: find every occurrence of the clipping text, counted in "match
-+// positions" (visible codepoints that are not ignorable), with the <p>
-+// ordinal each occurrence starts in. KMP keeps this single-pass and O(n).
++// positions" (visible codepoints that take part in matching). KMP keeps this
++// single-pass and O(n) with no chapter buffering.
 +class TextMatchScanner final : public ExpatTextStream {
 + public:
 +  struct Match {
 +    uint32_t start;
 +    uint32_t end;  // inclusive
-+    uint16_t paragraph;
 +  };
 +  static constexpr size_t MAX_MATCHES = 32;
 +
-+  explicit TextMatchScanner(const std::vector<uint32_t>& needle)
-+      : needle(needle), failure(needle.size(), 0), paragraphRing(needle.size(), 0) {
++  TextMatchScanner(const std::vector<uint32_t>& needle, const MatchMode mode)
++      : needle(needle), mode(mode), failure(needle.size(), 0) {
 +    size_t k = 0;
 +    for (size_t i = 1; i < needle.size(); i++) {
 +      while (k > 0 && needle[i] != needle[k]) k = failure[k - 1];
@@ -227,7 +271,6 @@ index 9f66ac0d..913c36a5 100644
 +      depth++;
 +      return;
 +    }
-+    if (name == "p" && paragraphCount < UINT16_MAX - 1) paragraphCount++;
 +    if (isNonVisibleTextTag(name)) nonVisibleDepth++;
 +    depth++;
 +  }
@@ -248,15 +291,13 @@ index 9f66ac0d..913c36a5 100644
 +    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
 +    const unsigned char* end = ptr + len;
 +    while (ptr < end) {
-+      const uint32_t cp = utf8NextCodepoint(&ptr);
-+      if (isMatchIgnorable(cp)) continue;
-+      paragraphRing[position % n] = paragraphCount;
++      uint32_t cp = 0;
++      if (!matchChar(utf8NextCodepoint(&ptr), mode, cp)) continue;
 +      while (matched > 0 && cp != needle[matched]) matched = failure[matched - 1];
 +      if (cp == needle[matched]) matched++;
 +      if (matched == n) {
-+        const uint32_t start = position + 1 - static_cast<uint32_t>(n);
 +        if (matches.size() < MAX_MATCHES) {
-+          matches.push_back({start, position, paragraphRing[start % n]});
++          matches.push_back({position + 1 - static_cast<uint32_t>(n), position});
 +        }
 +        matched = failure[matched - 1];
 +      }
@@ -266,12 +307,11 @@ index 9f66ac0d..913c36a5 100644
 +
 + private:
 +  const std::vector<uint32_t>& needle;
++  const MatchMode mode;
 +  std::vector<size_t> failure;
-+  std::vector<uint16_t> paragraphRing;
 +  std::vector<Match> matches;
 +  size_t matched = 0;
 +  uint32_t position = 0;
-+  uint16_t paragraphCount = 0;
 +  bool insideBody = false;
 +  int depth = 0;
 +  int bodyDepth = -1;
@@ -283,8 +323,8 @@ index 9f66ac0d..913c36a5 100644
 +// crengine keeps, and the offset counts whitespace-collapsed characters.
 +class XPathPointResolver final : public ExpatTextStream {
 + public:
-+  XPathPointResolver(const int spineIndex, const uint32_t startPos, const uint32_t endPos)
-+      : spineIndex(spineIndex), startPos(startPos), endPos(endPos) {}
++  XPathPointResolver(const int spineIndex, const MatchMode mode, const uint32_t startPos, const uint32_t endPos)
++      : spineIndex(spineIndex), mode(mode), startPos(startPos), endPos(endPos) {}
 +
 +  bool complete() const { return !startXPath.empty() && !endXPath.empty(); }
 +
@@ -355,7 +395,8 @@ index 9f66ac0d..913c36a5 100644
 +        textCounted = true;
 +        frame.textNodes++;
 +      }
-+      if (!isMatchIgnorable(cp)) {
++      uint32_t folded = 0;
++      if (matchChar(cp, mode, folded)) {
 +        if (position == startPos) {
 +          startXPath = buildTextPointXPath(spineIndex, path, frame.textNodes, nodeOffset);
 +        }
@@ -383,6 +424,7 @@ index 9f66ac0d..913c36a5 100644
 +  };
 +
 +  const int spineIndex;
++  const MatchMode mode;
 +  const uint32_t startPos;
 +  const uint32_t endPos;
 +  std::vector<Frame> frames;
@@ -398,40 +440,25 @@ index 9f66ac0d..913c36a5 100644
 +  int bodyDepth = -1;
 +  int nonVisibleDepth = 0;
 +};
-+}  // namespace
 +
-+bool ChapterXPathResolver::locateText(const std::shared_ptr<Epub>& epub, const int spineIndex, const std::string& text,
-+                                      const uint16_t paragraphHint, XPathTextLocation& out) {
-+  out = XPathTextLocation{};
-+  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) {
-+    return false;
-+  }
++// Runs pass 1 in `mode` and picks the occurrence nearest `positionHint`.
++bool locateTextWithMode(const std::shared_ptr<Epub>& epub, const std::string& href, const std::string& text,
++                        const float positionHint, const MatchMode mode, XPathTextLocation& out) {
++  const std::vector<uint32_t> needle = matchCodepoints(text, mode);
++  if (needle.empty()) return false;
 +
-+  const auto href = epub->getSpineItem(spineIndex).href;
-+  if (href.empty()) {
-+    return false;
-+  }
-+
-+  const std::vector<uint32_t> needle = matchCodepoints(text);
-+  if (needle.empty()) {
-+    return false;
-+  }
-+
-+  TextMatchScanner scanner(needle);
++  TextMatchScanner scanner(needle, mode);
 +  if (!scanner.ok() || !epub->readItemContentsToStream(href, scanner, 1024) || !scanner.finish()) {
 +    return false;
 +  }
-+
 +  const auto& matches = scanner.getMatches();
-+  if (matches.empty()) {
-+    LOG_DBG("KOX", "Clipping text not found in spine %d", spineIndex);
-+    return false;
-+  }
++  if (matches.empty()) return false;
 +
++  const uint32_t total = scanner.totalPositions();
 +  const TextMatchScanner::Match* best = &matches.front();
-+  if (paragraphHint != UINT16_MAX) {
-+    const auto distance = [paragraphHint](const TextMatchScanner::Match& match) {
-+      return std::abs(static_cast<int>(match.paragraph) - static_cast<int>(paragraphHint));
++  if (positionHint >= 0.0f && total > 0 && matches.size() > 1) {
++    const auto distance = [total, positionHint](const TextMatchScanner::Match& match) {
++      return std::fabs(static_cast<float>(match.start) / static_cast<float>(total) - positionHint);
 +    };
 +    for (const auto& match : matches) {
 +      if (distance(match) < distance(*best)) best = &match;
@@ -440,22 +467,44 @@ index 9f66ac0d..913c36a5 100644
 +
 +  out.start = best->start;
 +  out.end = best->end;
-+  out.paragraph = best->paragraph;
-+  out.total = scanner.totalPositions();
++  out.total = total;
++  out.loose = mode == MatchMode::Loose;
 +  return true;
++}
++}  // namespace
++
++bool ChapterXPathResolver::locateText(const std::shared_ptr<Epub>& epub, const int spineIndex, const std::string& text,
++                                      const float positionHint, XPathTextLocation& out) {
++  out = XPathTextLocation{};
++  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) {
++    return false;
++  }
++  const auto href = epub->getSpineItem(spineIndex).href;
++  if (href.empty()) {
++    return false;
++  }
++
++  if (locateTextWithMode(epub, href, text, positionHint, MatchMode::Strict, out)) return true;
++  if (locateTextWithMode(epub, href, text, positionHint, MatchMode::Loose, out)) {
++    LOG_DBG("KOX", "Clipping text matched loosely in spine %d", spineIndex);
++    return true;
++  }
++  LOG_DBG("KOX", "Clipping text not found in spine %d", spineIndex);
++  return false;
 +}
 +
 +bool ChapterXPathResolver::findXPathRangeForText(const std::shared_ptr<Epub>& epub, const int spineIndex,
-+                                                 const std::string& text, const uint16_t paragraphHint,
++                                                 const std::string& text, const float positionHint,
 +                                                 XPathTextRange& out) {
 +  out = XPathTextRange{};
 +  XPathTextLocation location;
-+  if (!locateText(epub, spineIndex, text, paragraphHint, location)) {
++  if (!locateText(epub, spineIndex, text, positionHint, location)) {
 +    return false;
 +  }
 +
 +  const auto href = epub->getSpineItem(spineIndex).href;
-+  XPathPointResolver resolver(spineIndex, location.start, location.end);
++  XPathPointResolver resolver(spineIndex, location.loose ? MatchMode::Loose : MatchMode::Strict, location.start,
++                              location.end);
 +  if (!resolver.ok() || !epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish() ||
 +      !resolver.complete()) {
 +    LOG_DBG("KOX", "Could not resolve clipping range in spine %d", spineIndex);
@@ -467,8 +516,32 @@ index 9f66ac0d..913c36a5 100644
 +  LOG_DBG("KOX", "Resolved clipping in spine %d -> %s .. %s", spineIndex, out.start.c_str(), out.end.c_str());
 +  return true;
 +}
++
++std::string ChapterXPathResolver::looseTextKey(const std::string& text) {
++  const std::vector<uint32_t> codepoints = matchCodepoints(text, MatchMode::Loose);
++  std::string key;
++  key.reserve(codepoints.size());
++  for (const uint32_t cp : codepoints) {
++    if (cp < 0x80) {
++      key += static_cast<char>(cp);
++    } else if (cp < 0x800) {
++      key += static_cast<char>(0xC0 | (cp >> 6));
++      key += static_cast<char>(0x80 | (cp & 0x3F));
++    } else if (cp < 0x10000) {
++      key += static_cast<char>(0xE0 | (cp >> 12));
++      key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
++      key += static_cast<char>(0x80 | (cp & 0x3F));
++    } else {
++      key += static_cast<char>(0xF0 | (cp >> 18));
++      key += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
++      key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
++      key += static_cast<char>(0x80 | (cp & 0x3F));
++    }
++  }
++  return key;
++}
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.h b/lib/KOReaderSync/ChapterXPathResolver.h
-index 6f18700c..00c409f8 100644
+index 6f18700c..b02de58c 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.h
 +++ b/lib/KOReaderSync/ChapterXPathResolver.h
 @@ -6,6 +6,20 @@
@@ -480,39 +553,47 @@ index 6f18700c..00c409f8 100644
 +  std::string end;    // xpointer just past the last matched character
 +};
 +
-+// Where a text snippet sits inside a spine item, counted in visible
-+// non-whitespace codepoints ("match positions").
++// Where a text snippet sits inside a spine item, counted in "match
++// positions" (visible characters that take part in matching).
 +struct XPathTextLocation {
-+  uint32_t start = 0;      // first matched position
-+  uint32_t end = 0;        // last matched position (inclusive)
-+  uint32_t total = 0;      // positions in the whole spine item
-+  uint16_t paragraph = 0;  // 1-based <p> ordinal the match starts in (0 = before any <p>)
++  uint32_t start = 0;  // first matched position
++  uint32_t end = 0;    // last matched position (inclusive)
++  uint32_t total = 0;  // positions in the whole spine item
++  bool loose = false;  // matched ignoring case and punctuation
 +};
 +
  class ChapterXPathResolver {
   public:
    /**
-@@ -39,4 +53,21 @@ class ChapterXPathResolver {
+@@ -39,4 +53,29 @@ class ChapterXPathResolver {
    // page position stored in CrossInk's section cache, independent of layout.
    static std::string findXPathForVisibleTextOffset(const std::shared_ptr<Epub>& epub, int spineIndex,
                                                     uint32_t visibleTextOffset);
 +
 +  /**
-+   * Locate `text` inside a spine item and return KOReader xpointers for the
-+   * matched range, e.g. .../p[4]/text()[1].12 to .../p[4]/text()[1].57.
++   * Find `text` inside a spine item purely by text.
 +   *
-+   * Matching ignores whitespace and soft hyphens so layout-joined clipping
-+   * text still finds its source. Offsets follow crengine rules (whitespace
-+   * runs collapsed, 0-based within the text node) so Readest/KOReader resolve
-+   * them to the same characters. When the text repeats, the occurrence whose
-+   * <p> ordinal is closest to `paragraphHint` (1-based, UINT16_MAX = none)
-+   * wins. Returns false if the text cannot be found.
++   * Tries a strict match (whitespace and soft hyphens ignored) and then a
++   * loose one (also case and punctuation ignored). HTML entities are expanded
++   * like the reader does. When the text occurs more than once, the
++   * occurrence nearest `positionHint` (0..1 through the chapter, <0 = none)
++   * wins.
 +   */
-+  static bool locateText(const std::shared_ptr<Epub>& epub, int spineIndex, const std::string& text,
-+                         uint16_t paragraphHint, XPathTextLocation& out);
++  static bool locateText(const std::shared_ptr<Epub>& epub, int spineIndex, const std::string& text, float positionHint,
++                         XPathTextLocation& out);
++
++  /**
++   * locateText() plus KOReader xpointers for the matched range, e.g.
++   * .../p[4]/text()[1].12 to .../p[4]/text()[1].57. Offsets follow crengine
++   * rules (whitespace runs collapsed, 0-based within the text node) so
++   * Readest/KOReader resolve them to the same characters.
++   */
++  // Text reduced to what loose matching compares (letters and digits, case
++  // folded), for "is this the same highlight?" checks across readers.
++  static std::string looseTextKey(const std::string& text);
 +
 +  static bool findXPathRangeForText(const std::shared_ptr<Epub>& epub, int spineIndex, const std::string& text,
-+                                    uint16_t paragraphHint, XPathTextRange& out);
++                                    float positionHint, XPathTextRange& out);
  };
 diff --git a/lib/KOReaderSync/ProgressMapper.cpp b/lib/KOReaderSync/ProgressMapper.cpp
 index 3cfee453..62f7aad2 100644
@@ -755,10 +836,10 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..65dc4db3
+index 00000000..cedee49e
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,639 @@
+@@ -0,0 +1,634 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -842,25 +923,6 @@ index 00000000..65dc4db3
 +    if (step >= 2) return step / 2 - 1;
 +  }
 +  return -1;
-+}
-+
-+// Clipping text with whitespace, NBSP and soft hyphens removed, for dedupe.
-+std::string compareKey(const std::string& text) {
-+  std::string out;
-+  out.reserve(text.size());
-+  for (size_t i = 0; i < text.size(); ++i) {
-+    const auto c = static_cast<unsigned char>(text[i]);
-+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') continue;
-+    if (c == 0xC2 && i + 1 < text.size()) {
-+      const auto next = static_cast<unsigned char>(text[i + 1]);
-+      if (next == 0xA0 || next == 0xAD) {
-+        ++i;
-+        continue;
-+      }
-+    }
-+    out += static_cast<char>(c);
-+  }
-+  return out;
 +}
 +
 +uint16_t countWords(const std::string& text) {
@@ -1108,43 +1170,54 @@ index 00000000..65dc4db3
 +bool ReadestSyncActivity::pullClippings(const std::vector<ReadestNote>& remote, int& added, int& skipped) {
 +  // What the device already has, so repeated syncs (and our own pushed
 +  // highlights coming back) don't create duplicates.
-+  std::vector<std::pair<uint16_t, std::string>> existing;
++  std::vector<std::string> existing;
 +  existing.reserve(CLIPPINGS.clippingCount() + remote.size());
 +  {
 +    std::string text;
 +    for (size_t i = 0; i < CLIPPINGS.clippingCount(); ++i) {
 +      const Clipping* clipping = CLIPPINGS.clippingAt(i);
 +      text.clear();
-+      if (clipping && CLIPPINGS.readClippingText(i, text))
-+        existing.emplace_back(clipping->spineIndex, compareKey(text));
++      if (clipping && CLIPPINGS.readClippingText(i, text)) existing.push_back(ChapterXPathResolver::looseTextKey(text));
 +    }
 +  }
 +
 +  const int spineCount = epub->getSpineItemsCount();
 +  for (const ReadestNote& note : remote) {
 +    if (note.deleted) continue;
-+    const int spine = currentSpineForNote(epub, note);
++    int spine = currentSpineForNote(epub, note);
 +    if (spine < 0 || spine >= spineCount) {
 +      skipped++;
 +      continue;
 +    }
 +
-+    const std::string key = compareKey(note.text);
++    const std::string key = ChapterXPathResolver::looseTextKey(note.text);
 +    bool duplicate = false;
 +    for (const auto& item : existing) {
-+      if (item.first == spine && item.second == key) {
++      if (item == key) {
 +        duplicate = true;
 +        break;
 +      }
 +    }
 +    if (duplicate) continue;
 +
++    // Chapter numbering can differ slightly between readers (non-linear
++    // spine items), so look in the neighbouring chapters too.
 +    XPathTextLocation location;
-+    if (!ChapterXPathResolver::locateText(epub, spine, note.text, UINT16_MAX, location)) {
-+      LOG_DBG("RDS", "Readest note %s not located in spine %d", note.id.c_str(), spine);
++    int foundSpine = -1;
++    for (const int delta : {0, 1, -1, 2, -2}) {
++      const int candidate = spine + delta;
++      if (candidate < 0 || candidate >= spineCount) continue;
++      if (ChapterXPathResolver::locateText(epub, candidate, note.text, -1.0f, location)) {
++        foundSpine = candidate;
++        break;
++      }
++    }
++    if (foundSpine < 0) {
++      LOG_DBG("RDS", "Readest note %s not located near spine %d", note.id.c_str(), spine);
 +      skipped++;
 +      continue;
 +    }
++    spine = foundSpine;
 +
 +    const uint16_t page =
 +        location.total > 0
@@ -1166,7 +1239,7 @@ index 00000000..65dc4db3
 +      fail(tr(STR_READEST_SAVE_FAILED));
 +      return false;
 +    }
-+    existing.emplace_back(static_cast<uint16_t>(spine), key);
++    existing.push_back(key);
 +    added++;
 +  }
 +  return true;
@@ -1180,7 +1253,7 @@ index 00000000..65dc4db3
 +  // covers clippings just pulled and highlights removed on purpose in Readest.
 +  std::vector<std::string> remoteKeys;
 +  remoteKeys.reserve(remote.size());
-+  for (const ReadestNote& note : remote) remoteKeys.push_back(compareKey(note.text));
++  for (const ReadestNote& note : remote) remoteKeys.push_back(ChapterXPathResolver::looseTextKey(note.text));
 +
 +  const time_t now = time(nullptr);
 +  const int64_t nowMs = now > 1600000000 ? static_cast<int64_t>(now) * 1000 : 0;
@@ -1209,7 +1282,7 @@ index 00000000..65dc4db3
 +    text.clear();
 +    if (!clipping || !CLIPPINGS.readClippingText(i, text) || text.empty()) continue;
 +
-+    const std::string key = compareKey(text);
++    const std::string key = ChapterXPathResolver::looseTextKey(text);
 +    bool known = false;
 +    for (const auto& remoteKey : remoteKeys) {
 +      if (remoteKey == key) {
@@ -1219,9 +1292,12 @@ index 00000000..65dc4db3
 +    }
 +    if (known) continue;
 +
++    // Where in the chapter the clipping was made; only used to choose between
++    // repeated occurrences of the same text.
++    const float positionHint =
++        clipping->pageCount > 1 ? (static_cast<float>(clipping->startPage) + 0.5f) / clipping->pageCount : -1.0f;
 +    XPathTextRange range;
-+    if (!ChapterXPathResolver::findXPathRangeForText(epub, clipping->spineIndex, text, clipping->paragraphIndex,
-+                                                     range) ||
++    if (!ChapterXPathResolver::findXPathRangeForText(epub, clipping->spineIndex, text, positionHint, range) ||
 +        !ProgressMapper::currentXPathToSource(epub, clipping->spineIndex, range.start) ||
 +        !ProgressMapper::currentXPathToSource(epub, clipping->spineIndex, range.end)) {
 +      LOG_DBG("RDS", "Clipping %u not located in spine %u", static_cast<unsigned>(i), clipping->spineIndex);
