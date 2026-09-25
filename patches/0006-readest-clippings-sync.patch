@@ -1225,10 +1225,10 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..a4a56a13
+index 00000000..7f204a49
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,852 @@
+@@ -0,0 +1,844 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1281,8 +1281,6 @@ index 00000000..a4a56a13
 +// Position differences below this fraction count as "already in sync".
 +constexpr float POSITION_EPSILON = 0.002f;
 +constexpr unsigned long AUTO_RETURN_DELAY_MS = 2000;
-+// Readest's text-only copy of the book, kept only while a sync runs.
-+constexpr char READEST_COPY_PATH[] = "/.crosspoint/readest_sync_copy.epub";
 +// Text taken at a reading position to find the same spot in the other copy.
 +constexpr size_t POSITION_SNIPPET_CHARS = 64;
 +
@@ -1409,7 +1407,7 @@ index 00000000..a4a56a13
 +  if (restartBeforeNetwork) return;
 +
 +  CLIPPINGS.unload();
-+  removeReadestCopy();
++  readestEpub.reset();
 +  epub.reset();
 +  if (wifiActivated) wifiOff();
 +  // Always return through a clean reboot; this instance only exists in the
@@ -1536,51 +1534,49 @@ index 00000000..a4a56a13
 +    return true;
 +  }
 +
-+  // Readest's copy only lives for the duration of this sync (see
-+  // removeReadestCopy()); nothing accumulates on the SD card.
-+  removeReadestCopy();
-+  setStatus(tr(STR_READEST_DOWNLOADING_BOOK));
-+  const auto result = client.downloadBook(book, READEST_COPY_PATH);
-+  if (result != ReadestClient::OK) {
-+    LOG_ERR("RDS", "Readest copy unavailable (%d); matching against the device copy", static_cast<int>(result));
-+    readestEpub = epub;
-+    readestCopyMissing = true;
-+    return true;
-+  }
-+
-+  auto copy = std::make_shared<Epub>(READEST_COPY_PATH, "/.crosspoint");
-+  copy->setupCacheDir();
-+  // Spine/TOC only: the copy is never rendered, just streamed for text.
-+  if (!copy->load(true, true, Epub::XLocationLoadMode::Skip, true)) {
-+    LOG_ERR("RDS", "Cannot open Readest copy");
++  // Text-only copies are kept for the last ReadestCopies::MAX_COPIES synced
++  // books; anything older is evicted when a new one is downloaded.
++  const std::string path = ReadestCopies::pathFor(book.hash);
++  for (int attempt = 0; attempt < 2; ++attempt) {
++    if (!Storage.exists(path.c_str())) {
++      setStatus(tr(STR_READEST_DOWNLOADING_BOOK));
++      const auto result = client.downloadBook(book, path);
++      if (result != ReadestClient::OK) {
++        LOG_ERR("RDS", "Readest copy unavailable (%d); matching against the device copy", static_cast<int>(result));
++        break;
++      }
++    }
++    auto copy = std::make_shared<Epub>(path, "/.crosspoint");
++    copy->setupCacheDir();
++    // Spine/TOC only: the copy is never rendered, just streamed for text.
++    if (copy->load(true, true, Epub::XLocationLoadMode::Skip, true)) {
++      readestEpub = std::move(copy);
++      ReadestCopies::markUsed(book.hash);
++      return true;
++    }
++    LOG_ERR("RDS", "Cannot open Readest copy %s; downloading it again", path.c_str());
 +    copy.reset();
-+    removeReadestCopy();
-+    readestEpub = epub;
-+    readestCopyMissing = true;
-+    return true;
++    ReadestCopies::remove(book.hash);
 +  }
-+  readestEpub = std::move(copy);
++  readestEpub = epub;
++  readestCopyMissing = true;
 +  return true;
 +}
 +
-+void ReadestSyncActivity::removeReadestCopy() {
-+  if (readestEpub && readestEpub != epub) readestEpub.reset();
-+  // The temporary file and the metadata cache CrossInk builds when opening it.
-+  Storage.remove(READEST_COPY_PATH);
-+  const std::string cache = Epub::cachePathForFilePath(READEST_COPY_PATH, "/.crosspoint");
-+  if (Storage.exists(cache.c_str())) Storage.removeDir(cache.c_str());
-+}
-+
 +void ReadestSyncActivity::removeLegacyReadestCopies() {
-+  // Earlier builds kept full copies as /.crosspoint/readest_<hash>.epub.
-+  for (const std::string& hash : ReadestBookMap::allReadestHashes()) {
-+    const std::string path = "/.crosspoint/readest_" + hash + ".epub";
-+    if (!Storage.exists(path.c_str())) continue;
++  const auto removeWithCache = [](const std::string& path) {
++    if (!Storage.exists(path.c_str())) return;
 +    Storage.remove(path.c_str());
 +    const std::string cache = Epub::cachePathForFilePath(path, "/.crosspoint");
 +    if (Storage.exists(cache.c_str())) Storage.removeDir(cache.c_str());
-+    LOG_INF("RDS", "Removed cached Readest copy %s", path.c_str());
++    LOG_INF("RDS", "Removed old Readest copy %s", path.c_str());
++  };
++  // Earlier builds kept full copies as readest_<hash>.epub, then briefly a
++  // single temporary readest_sync_copy.epub.
++  for (const std::string& hash : ReadestBookMap::allReadestHashes()) {
++    removeWithCache("/.crosspoint/readest_" + hash + ".epub");
 +  }
++  removeWithCache("/.crosspoint/readest_sync_copy.epub");
 +}
 +
 +void ReadestSyncActivity::syncWithBook(const ReadestBook& book) {
@@ -1592,13 +1588,9 @@ index 00000000..a4a56a13
 +  openReadestCopy(book);
 +
 +  HighlightCounts counts;
-+  if (!syncHighlights(book, counts)) {
-+    removeReadestCopy();
-+    return;
-+  }
++  if (!syncHighlights(book, counts)) return;
 +  setStatus(tr(STR_READEST_SYNCING_POSITION));
 +  const std::string position = syncPosition(book);
-+  removeReadestCopy();
 +
 +  LOG_INF("RDS", "Sync done: pulled=%d pushed=%d removedHere=%d removedThere=%d skipped=%d", counts.pulled,
 +          counts.pushed, counts.removedHere, counts.removedThere, counts.skipped);
@@ -2083,10 +2075,10 @@ index 00000000..a4a56a13
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 00000000..6b36e165
+index 00000000..96f83bdf
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,108 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -2181,7 +2173,6 @@ index 00000000..6b36e165
 +  void showChooser();
 +  void syncWithBook(const ReadestBook& book);
 +  bool openReadestCopy(const ReadestBook& book);
-+  void removeReadestCopy();
 +  void removeLegacyReadestCopies();
 +  struct HighlightCounts {
 +    int pulled = 0;
@@ -2375,10 +2366,10 @@ index 00000000..44b8c0c7
 +};
 diff --git a/src/activities/settings/ReadestSettingsActivity.cpp b/src/activities/settings/ReadestSettingsActivity.cpp
 new file mode 100644
-index 00000000..611c867d
+index 00000000..505a5cec
 --- /dev/null
 +++ b/src/activities/settings/ReadestSettingsActivity.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,228 @@
 +#include "ReadestSettingsActivity.h"
 +
 +#include <GfxRenderer.h>
@@ -2535,12 +2526,14 @@ index 00000000..611c867d
 +  } else if (selectedIndex == ROW_RESET_MATCHES) {
 +    // Next sync of each book asks again which Readest book it is.
 +    ReadestBookMap::clearAll();
++    ReadestCopies::clearAll();
 +    requestUpdate();
 +  } else if (selectedIndex == ROW_DISCONNECT) {
 +    READEST_STORE.clear();
 +    READEST_STORE.saveToFile();
-+    // Matches point at the old account's library.
++    // Matches and cached copies belong to the old account's library.
 +    ReadestBookMap::clearAll();
++    ReadestCopies::clearAll();
 +    requestUpdate();
 +  }
 +}
@@ -2756,16 +2749,19 @@ index cd01e87c..2b7e2178 100644
          if (fontsActivity) {
 diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
 new file mode 100644
-index 00000000..d298635b
+index 00000000..05d4ba55
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,156 @@
 +#include "ReadestBookMap.h"
 +
 +#include <ArduinoJson.h>
++#include <Epub.h>
 +#include <HalStorage.h>
 +#include <Logging.h>
 +#include <PersistableStore.h>
++
++#include <algorithm>
 +
 +namespace {
 +constexpr char MAP_PATH[] = "/.crosspoint/readest_books.json";
@@ -2826,6 +2822,63 @@ index 00000000..d298635b
 +
 +}  // namespace ReadestBookMap
 +
++namespace ReadestCopies {
++namespace {
++constexpr char INDEX_PATH[] = "/.crosspoint/readest_copies.json";
++
++std::vector<std::string> loadOrder() {
++  std::vector<std::string> order;
++  JsonDocument doc;
++  if (!PersistableStoreBase::readDocFromFile(INDEX_PATH, doc)) return order;
++  for (const JsonVariantConst hash : doc["lru"].as<JsonArrayConst>()) {
++    const char* value = hash | "";
++    if (value[0] != '\0') order.emplace_back(value);
++  }
++  return order;
++}
++
++void saveOrder(const std::vector<std::string>& order) {
++  JsonDocument doc;
++  JsonArray lru = doc["lru"].to<JsonArray>();
++  for (const auto& hash : order) lru.add(hash);
++  if (!PersistableStoreBase::writeDocToFile(INDEX_PATH, doc)) LOG_ERR("RDS", "Failed to save Readest copy list");
++}
++
++void deleteFiles(const std::string& readestHash) {
++  const std::string path = pathFor(readestHash);
++  if (Storage.exists(path.c_str())) Storage.remove(path.c_str());
++  const std::string cache = Epub::cachePathForFilePath(path, "/.crosspoint");
++  if (Storage.exists(cache.c_str())) Storage.removeDir(cache.c_str());
++}
++}  // namespace
++
++std::string pathFor(const std::string& readestHash) { return "/.crosspoint/readest_copy_" + readestHash + ".epub"; }
++
++void markUsed(const std::string& readestHash) {
++  std::vector<std::string> order = loadOrder();
++  order.erase(std::remove(order.begin(), order.end(), readestHash), order.end());
++  order.push_back(readestHash);  // most recent last
++  while (order.size() > MAX_COPIES) {
++    LOG_INF("RDS", "Evicting Readest copy %s", order.front().c_str());
++    deleteFiles(order.front());
++    order.erase(order.begin());
++  }
++  saveOrder(order);
++}
++
++void remove(const std::string& readestHash) {
++  deleteFiles(readestHash);
++  std::vector<std::string> order = loadOrder();
++  order.erase(std::remove(order.begin(), order.end(), readestHash), order.end());
++  saveOrder(order);
++}
++
++void clearAll() {
++  for (const auto& hash : loadOrder()) deleteFiles(hash);
++  if (Storage.exists(INDEX_PATH)) Storage.remove(INDEX_PATH);
++}
++}  // namespace ReadestCopies
++
 +namespace ReadestLinks {
 +namespace {
 +std::string linksPath(const std::string& localHash) { return "/.crosspoint/readest_links_" + localHash + ".json"; }
@@ -2858,10 +2911,10 @@ index 00000000..d298635b
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
 new file mode 100644
-index 00000000..b9197bb6
+index 00000000..d04060b6
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,54 @@
 +#pragma once
 +
 +#include <string>
@@ -2892,6 +2945,22 @@ index 00000000..b9197bb6
 + * propagate (without it every difference looks like an addition).
 + * Stored in /.crosspoint/readest_links_<localHash>.json.
 + */
++/**
++ * Text-only copies of Readest's books kept on the SD card for the most
++ * recently synced books, so re-syncing the books being read needs no
++ * download. At most MAX_COPIES are kept; syncing another book evicts the
++ * least recently synced copy (file + CrossInk's metadata cache for it).
++ * Order stored in /.crosspoint/readest_copies.json.
++ */
++namespace ReadestCopies {
++constexpr size_t MAX_COPIES = 10;
++std::string pathFor(const std::string& readestHash);
++// Mark a copy as just used and evict the oldest ones beyond MAX_COPIES.
++void markUsed(const std::string& readestHash);
++void remove(const std::string& readestHash);
++void clearAll();
++}  // namespace ReadestCopies
++
 +namespace ReadestLinks {
 +struct Link {
 +  std::string id;
