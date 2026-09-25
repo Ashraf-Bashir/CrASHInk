@@ -1,14 +1,17 @@
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a589c5a..ec0baf17 100644
+index 3a589c5a..b83fcb7d 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -845,3 +845,38 @@ STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
+@@ -845,3 +845,41 @@ STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
  STR_DOUBLE_TAP_HOME_SHORTCUT: "Double Tap Home"
  STR_CUSTOM_BOOTSCREEN: "Custom Boot Screen"
  STR_TAP_HIDE_STATUS_BAR: "Tap to Hide Status Bar"
 +STR_READEST_SYNC: "Readest Sync"
 +STR_READEST_SYNC_BOOK: "Sync Readest"
 +STR_READEST_SYNCING_POSITION: "Syncing reading position..."
++STR_READEST_DOWNLOADING_BOOK: "Downloading Readest's copy of the book..."
++STR_READEST_REMOVED_FORMAT: "%d deleted highlights synced"
++STR_READEST_COPY_MISSING: "Readest's copy is not in its cloud; locations may be off"
 +STR_READEST_SYNC_DONE: "Synced with Readest"
 +STR_READEST_SYNC_COUNTS_FORMAT: "%d clippings pulled, %d pushed"
 +STR_READEST_POS_FROM_READEST_FORMAT: "Moved to Readest position (%d%%)"
@@ -42,7 +45,7 @@ index 3a589c5a..ec0baf17 100644
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 9f66ac0d..efdd16fc 100644
+index 9f66ac0d..68dd690a 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
 @@ -8,12 +8,15 @@
@@ -61,7 +64,7 @@ index 9f66ac0d..efdd16fc 100644
  namespace {
  std::string stripPrefix(const XML_Char* name) {
    if (!name) {
-@@ -680,3 +683,478 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
+@@ -680,3 +683,842 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
    }
    return resolver.getXPath();
  }
@@ -121,6 +124,24 @@ index 9f66ac0d..efdd16fc 100644
 +
 +// JS string offsets (what Readest resolves against) count UTF-16 code units.
 +size_t utf16Units(const uint32_t cp) { return cp > 0xFFFF ? 2 : 1; }
++
++void appendUtf8(std::string& out, const uint32_t cp) {
++  if (cp < 0x80) {
++    out += static_cast<char>(cp);
++  } else if (cp < 0x800) {
++    out += static_cast<char>(0xC0 | (cp >> 6));
++    out += static_cast<char>(0x80 | (cp & 0x3F));
++  } else if (cp < 0x10000) {
++    out += static_cast<char>(0xE0 | (cp >> 12));
++    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
++    out += static_cast<char>(0x80 | (cp & 0x3F));
++  } else {
++    out += static_cast<char>(0xF0 | (cp >> 18));
++    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
++    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
++    out += static_cast<char>(0x80 | (cp & 0x3F));
++  }
++}
 +
 +std::vector<uint32_t> matchCodepoints(const std::string& text, const MatchMode mode) {
 +  std::vector<uint32_t> out;
@@ -493,55 +514,401 @@ index 9f66ac0d..efdd16fc 100644
 +  return false;
 +}
 +
-+bool ChapterXPathResolver::findXPathRangeForText(const std::shared_ptr<Epub>& epub, const int spineIndex,
-+                                                 const std::string& text, const float positionHint,
-+                                                 XPathTextRange& out) {
++bool ChapterXPathResolver::rangeForLocation(const std::shared_ptr<Epub>& epub, const int spineIndex,
++                                            const XPathTextLocation& location, XPathTextRange& out) {
 +  out = XPathTextRange{};
-+  XPathTextLocation location;
-+  if (!locateText(epub, spineIndex, text, positionHint, location)) {
-+    return false;
-+  }
-+
++  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return false;
 +  const auto href = epub->getSpineItem(spineIndex).href;
 +  XPathPointResolver resolver(spineIndex, location.loose ? MatchMode::Loose : MatchMode::Strict, location.start,
 +                              location.end);
 +  if (!resolver.ok() || !epub->readItemContentsToStream(href, resolver, 1024) || !resolver.finish() ||
 +      !resolver.complete()) {
-+    LOG_DBG("KOX", "Could not resolve clipping range in spine %d", spineIndex);
++    LOG_DBG("KOX", "Could not resolve text range in spine %d", spineIndex);
 +    return false;
 +  }
-+
 +  out.start = resolver.startXPath;
 +  out.end = resolver.endXPath;
-+  LOG_DBG("KOX", "Resolved clipping in spine %d -> %s .. %s", spineIndex, out.start.c_str(), out.end.c_str());
 +  return true;
++}
++
++bool ChapterXPathResolver::findXPathRangeForText(const std::shared_ptr<Epub>& epub, const int spineIndex,
++                                                 const std::string& text, const float positionHint,
++                                                 XPathTextRange& out) {
++  out = XPathTextRange{};
++  XPathTextLocation location;
++  return locateText(epub, spineIndex, text, positionHint, location) &&
++         rangeForLocation(epub, spineIndex, location, out);
 +}
 +
 +std::string ChapterXPathResolver::looseTextKey(const std::string& text) {
 +  const std::vector<uint32_t> codepoints = matchCodepoints(text, MatchMode::Loose);
 +  std::string key;
 +  key.reserve(codepoints.size());
-+  for (const uint32_t cp : codepoints) {
-+    if (cp < 0x80) {
-+      key += static_cast<char>(cp);
-+    } else if (cp < 0x800) {
-+      key += static_cast<char>(0xC0 | (cp >> 6));
-+      key += static_cast<char>(0x80 | (cp & 0x3F));
-+    } else if (cp < 0x10000) {
-+      key += static_cast<char>(0xE0 | (cp >> 12));
-+      key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-+      key += static_cast<char>(0x80 | (cp & 0x3F));
-+    } else {
-+      key += static_cast<char>(0xF0 | (cp >> 18));
-+      key += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-+      key += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-+      key += static_cast<char>(0x80 | (cp & 0x3F));
-+    }
-+  }
++  for (const uint32_t cp : codepoints) appendUtf8(key, cp);
 +  return key;
 +}
++
++namespace {
++// Collects the chapter text between two match positions, the way the reader
++// shows it: whitespace runs (and block boundaries) become one space, soft
++// hyphens vanish, entities are expanded.
++class TextSpanExtractor final : public ExpatTextStream {
++ public:
++  TextSpanExtractor(const MatchMode mode, const uint32_t startPos, const uint32_t endPos)
++      : mode(mode), startPos(startPos), endPos(endPos) {}
++
++  bool done = false;
++  std::string text;
++
++ protected:
++  void onStartElement(const std::string& name) override {
++    if (!insideBody) {
++      if (name == "body") {
++        insideBody = true;
++        bodyDepth = depth;
++      }
++      depth++;
++      return;
++    }
++    if (isBlockTag(name) || name == "br") pendingSpace = true;
++    if (isNonVisibleTextTag(name)) nonVisibleDepth++;
++    depth++;
++  }
++
++  void onEndElement(const std::string& name) override {
++    depth--;
++    if (!insideBody) return;
++    if (depth == bodyDepth && name == "body") {
++      insideBody = false;
++      return;
++    }
++    if (isBlockTag(name)) pendingSpace = true;
++    if (isNonVisibleTextTag(name) && nonVisibleDepth > 0) nonVisibleDepth--;
++  }
++
++  void onCharacterData(const XML_Char* data, const int len) override {
++    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped) return;
++    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
++    const unsigned char* end = ptr + len;
++    while (ptr < end) {
++      const uint32_t cp = utf8NextCodepoint(&ptr);
++      uint32_t folded = 0;
++      const bool participates = matchChar(cp, mode, folded);
++      if (trailing) {
++        // Keep punctuation glued to the end of the match ("all." or "all,").
++        if (participates || isWhitespaceOrSoftHyphen(cp)) {
++          stop();
++          return;
++        }
++        appendUtf8(text, cp);
++        continue;
++      }
++      if (participates && position == startPos) {
++        capturing = true;
++        pendingSpace = false;
++      }
++      if (capturing) {
++        if (isWhitespaceOrSoftHyphen(cp)) {
++          if (cp != 0xAD) pendingSpace = true;
++        } else {
++          if (pendingSpace && !text.empty()) text += ' ';
++          pendingSpace = false;
++          appendUtf8(text, cp);
++        }
++      }
++      if (participates) {
++        if (position == endPos) {
++          done = true;
++          trailing = true;
++        }
++        position++;
++      }
++    }
++  }
++
++ private:
++  const MatchMode mode;
++  const uint32_t startPos;
++  const uint32_t endPos;
++  uint32_t position = 0;
++  bool trailing = false;
++  bool capturing = false;
++  bool pendingSpace = false;
++  bool insideBody = false;
++  int depth = 0;
++  int bodyDepth = -1;
++  int nonVisibleDepth = 0;
++};
++
++// Target of a KOReader/Readest xpointer: element path below <body>, the kept
++// text child (0 = element start) and the collapsed offset inside it.
++struct XPathTarget {
++  std::vector<PathSegment> path;
++  int textNode = 0;
++  size_t offset = 0;
++};
++
++bool parseXPathTarget(const std::string& xpath, int& spineIndex, XPathTarget& out) {
++  static constexpr char kFragment[] = "/body/DocFragment";
++  if (xpath.rfind(kFragment, 0) != 0) return false;
++  size_t pos = sizeof(kFragment) - 1;
++  spineIndex = 0;
++  if (pos < xpath.size() && xpath[pos] == '[') {
++    spineIndex = std::atoi(xpath.c_str() + pos + 1) - 1;
++    pos = xpath.find(']', pos);
++    if (pos == std::string::npos) return false;
++    pos++;
++  }
++  static constexpr char kBody[] = "/body";
++  if (xpath.compare(pos, sizeof(kBody) - 1, kBody) != 0) return false;
++  pos += sizeof(kBody) - 1;
++
++  out = XPathTarget{};
++  while (pos < xpath.size() && xpath[pos] == '/') {
++    const size_t next = xpath.find('/', pos + 1);
++    std::string step = xpath.substr(pos + 1, next == std::string::npos ? std::string::npos : next - pos - 1);
++    pos = next == std::string::npos ? xpath.size() : next;
++    if (step.rfind("text()", 0) == 0) {
++      // text().N or text()[K].N
++      out.textNode = 1;
++      size_t cursor = 6;
++      if (cursor < step.size() && step[cursor] == '[') {
++        out.textNode = std::max(1, std::atoi(step.c_str() + cursor + 1));
++        cursor = step.find(']', cursor);
++        if (cursor == std::string::npos) return false;
++        cursor++;
++      }
++      if (cursor < step.size() && step[cursor] == '.')
++        out.offset = std::strtoul(step.c_str() + cursor + 1, nullptr, 10);
++      break;
++    }
++    // name, name[idx], or name[idx].N (offset on the element: treated as its start)
++    const size_t dot = step.find('.');
++    if (dot != std::string::npos) step.resize(dot);
++    int index = 1;
++    const size_t bracket = step.find('[');
++    if (bracket != std::string::npos) {
++      index = std::max(1, std::atoi(step.c_str() + bracket + 1));
++      step.resize(bracket);
++    }
++    if (step.empty()) return false;
++    out.path.push_back({step, index});
++  }
++  return spineIndex >= 0;
++}
++
++bool samePath(const std::vector<PathSegment>& a, const std::vector<PathSegment>& b) {
++  if (a.size() != b.size()) return false;
++  for (size_t i = 0; i < a.size(); ++i) {
++    if (a[i].index != b[i].index || a[i].name != b[i].name) return false;
++  }
++  return true;
++}
++
++// Reads up to maxChars of text starting at an xpointer (same text()[K] and
++// offset rules as XPathPointResolver).
++class XPathTextReader final : public ExpatTextStream {
++ public:
++  XPathTextReader(XPathTarget target, const size_t maxChars) : target(std::move(target)), maxChars(maxChars) {}
++
++  std::string text;
++  bool started() const { return capturing; }
++
++ protected:
++  void onStartElement(const std::string& name) override {
++    if (!insideBody) {
++      if (name == "body") {
++        insideBody = true;
++        bodyDepth = depth;
++        frames.clear();
++        frames.emplace_back();
++        frames.back().block = true;
++        if (target.path.empty() && target.textNode == 0) capturing = true;
++      }
++      depth++;
++      return;
++    }
++
++    inTextNode = false;
++    if (capturing && (isBlockTag(name) || name == "br")) pendingSpace = true;
++    Frame frame;
++    frame.block = isBlockTag(name);
++    frame.pre = frames.back().pre || isPreTag(name);
++    frames.back().childNodes++;
++    const int siblingIndex = frames.back().children.nextIndex(name);
++    path.push_back({name, siblingIndex});
++    frames.push_back(std::move(frame));
++    if (isNonVisibleTextTag(name)) nonVisibleDepth++;
++    if (!capturing && target.textNode == 0 && samePath(path, target.path)) capturing = true;
++    depth++;
++  }
++
++  void onEndElement(const std::string& name) override {
++    depth--;
++    if (!insideBody) return;
++    inTextNode = false;
++    if (capturing && isBlockTag(name)) pendingSpace = true;
++    if (depth == bodyDepth && name == "body") {
++      insideBody = false;
++      frames.clear();
++      path.clear();
++      return;
++    }
++    if (isNonVisibleTextTag(name) && nonVisibleDepth > 0) nonVisibleDepth--;
++    if (!path.empty()) path.pop_back();
++    if (frames.size() > 1) frames.pop_back();
++  }
++
++  void onCharacterData(const XML_Char* data, const int len) override {
++    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped || frames.empty()) return;
++    Frame& frame = frames.back();
++    if (!inTextNode) {
++      inTextNode = true;
++      textCounted = false;
++      nodeOffset = 0;
++      prevSpace = false;
++      firstChild = frame.childNodes == 0;
++      frame.childNodes++;
++    }
++
++    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
++    const unsigned char* end = ptr + len;
++    while (ptr < end) {
++      const uint32_t cp = utf8NextCodepoint(&ptr);
++      const bool space = isCollapsibleSpace(cp);
++      if (!textCounted && (!space || frame.pre || !(firstChild && frame.block))) {
++        textCounted = true;
++        frame.textNodes++;
++      }
++      if (!capturing && target.textNode > 0 && textCounted && frame.textNodes == target.textNode &&
++          nodeOffset >= target.offset && samePath(path, target.path)) {
++        capturing = true;
++      }
++      if (capturing) {
++        if (isWhitespaceOrSoftHyphen(cp)) {
++          if (cp != 0xAD) pendingSpace = true;
++        } else {
++          if (pendingSpace && !text.empty()) text += ' ';
++          pendingSpace = false;
++          appendUtf8(text, cp);
++          if (++captured >= maxChars) {
++            stop();
++            return;
++          }
++        }
++      }
++      if (!(space && prevSpace && !frame.pre)) nodeOffset += utf16Units(cp);
++      prevSpace = space;
++    }
++  }
++
++ private:
++  struct Frame {
++    ParentState children;
++    int childNodes = 0;
++    int textNodes = 0;
++    bool block = false;
++    bool pre = false;
++  };
++
++  const XPathTarget target;
++  const size_t maxChars;
++  size_t captured = 0;
++  std::vector<Frame> frames;
++  std::vector<PathSegment> path;
++  size_t nodeOffset = 0;
++  bool capturing = false;
++  bool pendingSpace = false;
++  bool inTextNode = false;
++  bool textCounted = false;
++  bool firstChild = false;
++  bool prevSpace = false;
++  bool insideBody = false;
++  int depth = 0;
++  int bodyDepth = -1;
++  int nonVisibleDepth = 0;
++};
++
++size_t spineStartSize(const std::shared_ptr<Epub>& epub, const int spineIndex) {
++  return spineIndex > 0 ? epub->getCumulativeSpineItemSize(spineIndex - 1) : 0;
++}
++}  // namespace
++
++bool ChapterXPathResolver::extractText(const std::shared_ptr<Epub>& epub, const int spineIndex,
++                                       const XPathTextLocation& location, std::string& out) {
++  out.clear();
++  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return false;
++  const auto href = epub->getSpineItem(spineIndex).href;
++  TextSpanExtractor extractor(location.loose ? MatchMode::Loose : MatchMode::Strict, location.start, location.end);
++  if (!extractor.ok() || !epub->readItemContentsToStream(href, extractor, 1024) || !extractor.finish() ||
++      !extractor.done) {
++    return false;
++  }
++  out = std::move(extractor.text);
++  return !out.empty();
++}
++
++bool ChapterXPathResolver::textAtXPath(const std::shared_ptr<Epub>& epub, const std::string& xpath,
++                                       const size_t maxChars, std::string& out, int& spineIndex) {
++  out.clear();
++  XPathTarget target;
++  if (!epub || !parseXPathTarget(xpath, spineIndex, target) || spineIndex >= epub->getSpineItemsCount()) {
++    return false;
++  }
++  const auto href = epub->getSpineItem(spineIndex).href;
++  XPathTextReader reader(std::move(target), maxChars);
++  if (!reader.ok() || !epub->readItemContentsToStream(href, reader, 1024)) return false;
++  reader.finish();
++  out = std::move(reader.text);
++  return !out.empty();
++}
++
++float ChapterXPathResolver::bookFraction(const std::shared_ptr<Epub>& epub, const int spineIndex,
++                                         const float intraFraction) {
++  const size_t total = epub ? epub->getBookSize() : 0;
++  if (total == 0 || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return 0.0f;
++  const size_t start = spineStartSize(epub, spineIndex);
++  const size_t size = epub->getCumulativeSpineItemSize(spineIndex) - start;
++  const float clamped = std::max(0.0f, std::min(1.0f, intraFraction));
++  return (static_cast<float>(start) + clamped * static_cast<float>(size)) / static_cast<float>(total);
++}
++
++bool ChapterXPathResolver::findTextInBook(const std::shared_ptr<Epub>& epub, const std::string& text,
++                                          const float bookFractionHint, const int maxSpineDistance, int& spineOut,
++                                          XPathTextLocation& out) {
++  spineOut = -1;
++  const int count = epub ? epub->getSpineItemsCount() : 0;
++  if (count <= 0) return false;
++
++  // Start where the same relative spot of the book is, then widen outwards.
++  int estimate = 0;
++  float intra = -1.0f;
++  const size_t total = epub->getBookSize();
++  if (total > 0 && bookFractionHint >= 0.0f) {
++    const size_t target = static_cast<size_t>(std::min(1.0f, bookFractionHint) * static_cast<float>(total));
++    while (estimate < count - 1 && epub->getCumulativeSpineItemSize(estimate) <= target) estimate++;
++    const size_t start = spineStartSize(epub, estimate);
++    const size_t size = epub->getCumulativeSpineItemSize(estimate) - start;
++    if (size > 0) intra = static_cast<float>(target - std::min(target, start)) / static_cast<float>(size);
++  }
++
++  const int limit = maxSpineDistance < 0 ? count : maxSpineDistance;
++  for (int distance = 0; distance <= limit; ++distance) {
++    for (const int sign : {1, -1}) {
++      if (distance == 0 && sign < 0) continue;
++      const int spine = estimate + sign * distance;
++      if (spine < 0 || spine >= count) continue;
++      if (locateText(epub, spine, text, distance == 0 ? intra : -1.0f, out)) {
++        spineOut = spine;
++        return true;
++      }
++    }
++    if (estimate - distance < 0 && estimate + distance >= count) break;
++  }
++  return false;
++}
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.h b/lib/KOReaderSync/ChapterXPathResolver.h
-index 6f18700c..b02de58c 100644
+index 6f18700c..67cf8e6b 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.h
 +++ b/lib/KOReaderSync/ChapterXPathResolver.h
 @@ -6,6 +6,20 @@
@@ -565,7 +932,7 @@ index 6f18700c..b02de58c 100644
  class ChapterXPathResolver {
   public:
    /**
-@@ -39,4 +53,29 @@ class ChapterXPathResolver {
+@@ -39,4 +53,51 @@ class ChapterXPathResolver {
    // page position stored in CrossInk's section cache, independent of layout.
    static std::string findXPathForVisibleTextOffset(const std::shared_ptr<Epub>& epub, int spineIndex,
                                                     uint32_t visibleTextOffset);
@@ -588,6 +955,28 @@ index 6f18700c..b02de58c 100644
 +   * rules (whitespace runs collapsed, 0-based within the text node) so
 +   * Readest/KOReader resolve them to the same characters.
 +   */
++  // Xpointers for an already located range.
++  static bool rangeForLocation(const std::shared_ptr<Epub>& epub, int spineIndex, const XPathTextLocation& location,
++                               XPathTextRange& out);
++
++  // The chapter's own wording for a located range (whitespace collapsed,
++  // soft hyphens removed), i.e. exactly what the reader displays.
++  static bool extractText(const std::shared_ptr<Epub>& epub, int spineIndex, const XPathTextLocation& location,
++                          std::string& out);
++
++  // Up to maxChars of visible text starting at an xpointer in this EPUB.
++  static bool textAtXPath(const std::shared_ptr<Epub>& epub, const std::string& xpath, size_t maxChars,
++                          std::string& out, int& spineIndex);
++
++  // 0..1 position of a spot in the book, weighted by chapter sizes.
++  static float bookFraction(const std::shared_ptr<Epub>& epub, int spineIndex, float intraFraction);
++
++  // Search the book for `text`, starting at the chapter holding
++  // `bookFractionHint` and widening outwards up to maxSpineDistance chapters
++  // (-1 = whole book).
++  static bool findTextInBook(const std::shared_ptr<Epub>& epub, const std::string& text, float bookFractionHint,
++                             int maxSpineDistance, int& spineOut, XPathTextLocation& out);
++
 +  // Text reduced to what loose matching compares (letters and digits, case
 +  // folded), for "is this the same highlight?" checks across readers.
 +  static std::string looseTextKey(const std::string& text);
@@ -836,14 +1225,15 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..cedee49e
+index 00000000..6485c169
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,805 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
 +#include <GfxRenderer.h>
++#include <HalStorage.h>
 +#include <I18n.h>
 +#include <Logging.h>
 +#include <MD5Builder.h>
@@ -890,6 +1280,8 @@ index 00000000..cedee49e
 +// Position differences below this fraction count as "already in sync".
 +constexpr float POSITION_EPSILON = 0.002f;
 +constexpr unsigned long AUTO_RETURN_DELAY_MS = 2000;
++// Text taken at a reading position to find the same spot in the other copy.
++constexpr size_t POSITION_SNIPPET_CHARS = 64;
 +
 +void wifiOff() {
 +  WiFi.disconnect(false);
@@ -950,16 +1342,16 @@ index 00000000..cedee49e
 +
 +int percentOf(const float fraction) { return static_cast<int>(fraction * 100.0f + 0.5f); }
 +
-+// Spine index in *this* EPUB for a Readest note, via its xpointer or CFI
-+// (both use the original/source spine numbering). -1 if unusable.
-+int currentSpineForNote(const std::shared_ptr<Epub>& epub, const ReadestNote& note) {
-+  const int sourceSpine = spineIndexFromNote(note);
-+  if (sourceSpine < 0) return -1;
-+  std::string xpath = note.xpointer0.rfind("/body/DocFragment[", 0) == 0
-+                          ? note.xpointer0
-+                          : "/body/DocFragment[" + std::to_string(sourceSpine + 1) + "]";
-+  int spine = -1;
-+  return ProgressMapper::sourceXPathToCurrent(epub, xpath, spine) ? spine : -1;
++// Short, stable identity for a highlight's text (loose: case, spacing and
++// punctuation ignored), stored in the links file instead of the full text.
++std::string keyHashFor(const std::string& text) {
++  const std::string key = ChapterXPathResolver::looseTextKey(text);
++  if (key.empty()) return "";
++  MD5Builder md5;
++  md5.begin();
++  md5.add(key.c_str());
++  md5.calculate();
++  return std::string(md5.toString().c_str()).substr(0, 16);
 +}
 +}  // namespace
 +
@@ -1126,37 +1518,61 @@ index 00000000..cedee49e
 +  requestUpdate(true);
 +}
 +
++bool ReadestSyncActivity::openReadestCopy(const ReadestBook& book) {
++  readestCopyMissing = false;
++  if (!localHash.empty() && localHash == book.hash) {
++    readestEpub = epub;  // byte-identical file
++    return true;
++  }
++
++  const std::string path = "/.crosspoint/readest_" + book.hash + ".epub";
++  if (!Storage.exists(path.c_str())) {
++    setStatus(tr(STR_READEST_DOWNLOADING_BOOK));
++    const auto result = client.downloadBook(book, path);
++    if (result != ReadestClient::OK) {
++      LOG_ERR("RDS", "Readest copy unavailable (%d); matching against the device copy", static_cast<int>(result));
++      readestEpub = epub;
++      readestCopyMissing = true;
++      return true;
++    }
++  }
++
++  auto copy = std::make_shared<Epub>(path, "/.crosspoint");
++  copy->setupCacheDir();
++  // Spine/TOC only: the copy is never rendered, just streamed for text.
++  if (!copy->load(true, true, Epub::XLocationLoadMode::Skip, true)) {
++    LOG_ERR("RDS", "Cannot open Readest copy %s; re-downloading next time", path.c_str());
++    Storage.remove(path.c_str());
++    readestEpub = epub;
++    readestCopyMissing = true;
++    return true;
++  }
++  readestEpub = std::move(copy);
++  return true;
++}
++
 +void ReadestSyncActivity::syncWithBook(const ReadestBook& book) {
 +  if (!CLIPPINGS.loadForBook(epubPath, epub->getTitle(), epub->getAuthor(), "epub")) {
 +    fail(tr(STR_READEST_OPEN_BOOK_FAILED));
 +    return;
 +  }
++  openReadestCopy(book);
 +
-+  setStatus(tr(STR_READEST_PULLING));
-+  std::vector<ReadestNote> remote;
-+  const auto pulled = client.pullNotes(book, remote);
-+  if (pulled != ReadestClient::OK) {
-+    fail(ReadestClient::errorString(pulled));
-+    return;
-+  }
-+
-+  int added = 0;
-+  int pushed = 0;
-+  int skipped = 0;
-+  if (!pullClippings(remote, added, skipped)) return;
-+
-+  setStatus(tr(STR_READEST_PUSHING));
-+  if (!pushClippings(book, remote, pushed, skipped)) return;
-+  remote.clear();
-+  remote.shrink_to_fit();
++  HighlightCounts counts;
++  if (!syncHighlights(book, counts)) return;
 +
 +  setStatus(tr(STR_READEST_SYNCING_POSITION));
 +  const std::string position = syncPosition(book);
 +
-+  LOG_INF("RDS", "Sync done: %d pulled, %d pushed, %d skipped", added, pushed, skipped);
-+  std::string detail = formatCounts(tr(STR_READEST_SYNC_COUNTS_FORMAT), added, pushed);
-+  if (skipped > 0) detail += "\n" + formatCount(tr(STR_READEST_SKIPPED_FORMAT), skipped);
++  LOG_INF("RDS", "Sync done: pulled=%d pushed=%d removedHere=%d removedThere=%d skipped=%d", counts.pulled,
++          counts.pushed, counts.removedHere, counts.removedThere, counts.skipped);
++  std::string detail = formatCounts(tr(STR_READEST_SYNC_COUNTS_FORMAT), counts.pulled, counts.pushed);
++  if (counts.removedHere + counts.removedThere > 0) {
++    detail += "\n" + formatCount(tr(STR_READEST_REMOVED_FORMAT), counts.removedHere + counts.removedThere);
++  }
++  if (counts.skipped > 0) detail += "\n" + formatCount(tr(STR_READEST_SKIPPED_FORMAT), counts.skipped);
 +  if (!position.empty()) detail += "\n" + position;
++  if (readestCopyMissing) detail += "\n" + std::string(tr(STR_READEST_COPY_MISSING));
 +  {
 +    RenderLock lock(*this);
 +    state = DONE;
@@ -1167,148 +1583,213 @@ index 00000000..cedee49e
 +  requestUpdate(true);
 +}
 +
-+bool ReadestSyncActivity::pullClippings(const std::vector<ReadestNote>& remote, int& added, int& skipped) {
-+  // What the device already has, so repeated syncs (and our own pushed
-+  // highlights coming back) don't create duplicates.
-+  std::vector<std::string> existing;
-+  existing.reserve(CLIPPINGS.clippingCount() + remote.size());
-+  {
-+    std::string text;
-+    for (size_t i = 0; i < CLIPPINGS.clippingCount(); ++i) {
-+      const Clipping* clipping = CLIPPINGS.clippingAt(i);
-+      text.clear();
-+      if (clipping && CLIPPINGS.readClippingText(i, text)) existing.push_back(ChapterXPathResolver::looseTextKey(text));
++bool ReadestSyncActivity::addPulledClipping(const ReadestNote& note, int& skipped) {
++  // Find Readest's text in the device copy, starting at the same relative
++  // spot of the book as in Readest's copy and widening to the whole book.
++  float hint = -1.0f;
++  if (readestEpub) {
++    const int sourceSpine = spineIndexFromNote(note);
++    if (sourceSpine >= 0 && sourceSpine < readestEpub->getSpineItemsCount()) {
++      hint = ChapterXPathResolver::bookFraction(readestEpub, sourceSpine, 0.5f);
 +    }
 +  }
++  int spine = -1;
++  XPathTextLocation location;
++  if (!ChapterXPathResolver::findTextInBook(epub, note.text, hint, -1, spine, location)) {
++    LOG_DBG("RDS", "Readest note %s not found in the device copy", note.id.c_str());
++    skipped++;
++    return true;
++  }
 +
-+  const int spineCount = epub->getSpineItemsCount();
-+  for (const ReadestNote& note : remote) {
-+    if (note.deleted) continue;
-+    int spine = currentSpineForNote(epub, note);
-+    if (spine < 0 || spine >= spineCount) {
-+      skipped++;
-+      continue;
-+    }
++  // Store the device's own wording so the reader's highlighter matches it.
++  std::string deviceText;
++  if (!ChapterXPathResolver::extractText(epub, spine, location, deviceText)) deviceText = note.text;
 +
-+    const std::string key = ChapterXPathResolver::looseTextKey(note.text);
-+    bool duplicate = false;
-+    for (const auto& item : existing) {
-+      if (item == key) {
-+        duplicate = true;
-+        break;
-+      }
-+    }
-+    if (duplicate) continue;
++  const uint16_t page =
++      location.total > 0
++          ? static_cast<uint16_t>(static_cast<uint64_t>(location.start) * (VIRTUAL_PAGE_COUNT - 1) / location.total)
++          : 0;
++  const int tocIndex = epub->getTocIndexForSpineIndex(spine);
++  const std::string chapterTitle = tocIndex >= 0 ? epub->getTocItem(tocIndex).title : "";
 +
-+    // Chapter numbering can differ slightly between readers (non-linear
-+    // spine items), so look in the neighbouring chapters too.
-+    XPathTextLocation location;
-+    int foundSpine = -1;
-+    for (const int delta : {0, 1, -1, 2, -2}) {
-+      const int candidate = spine + delta;
-+      if (candidate < 0 || candidate >= spineCount) continue;
-+      if (ChapterXPathResolver::locateText(epub, candidate, note.text, -1.0f, location)) {
-+        foundSpine = candidate;
-+        break;
-+      }
-+    }
-+    if (foundSpine < 0) {
-+      LOG_DBG("RDS", "Readest note %s not located near spine %d", note.id.c_str(), spine);
-+      skipped++;
-+      continue;
-+    }
-+    spine = foundSpine;
-+
-+    const uint16_t page =
-+        location.total > 0
-+            ? static_cast<uint16_t>(static_cast<uint64_t>(location.start) * (VIRTUAL_PAGE_COUNT - 1) / location.total)
-+            : 0;
-+    const int tocIndex = epub->getTocIndexForSpineIndex(spine);
-+    const std::string chapterTitle = tocIndex >= 0 ? epub->getTocItem(tocIndex).title : "";
-+
-+    // layoutSignature 0 marks the range as layout-less: the reader matches
-+    // the saved text on each page instead of trusting word indices.
-+    const auto addResult =
-+        CLIPPINGS.addClipping(static_cast<uint16_t>(spine), page, page, VIRTUAL_PAGE_COUNT, 0, 0, countWords(note.text),
-+                              chapterTitle.c_str(), UINT16_MAX, note.text, UINT16_MAX, 0);
-+    if (addResult == ClippingStore::AddResult::LimitReached) {
-+      LOG_ERR("RDS", "Clipping limit reached while pulling");
-+      break;
-+    }
-+    if (addResult == ClippingStore::AddResult::SaveFailed) {
-+      fail(tr(STR_READEST_SAVE_FAILED));
-+      return false;
-+    }
-+    existing.push_back(key);
-+    added++;
++  // layoutSignature 0 marks the range as layout-less: the reader matches the
++  // saved text on each page instead of trusting word indices.
++  const auto addResult =
++      CLIPPINGS.addClipping(static_cast<uint16_t>(spine), page, page, VIRTUAL_PAGE_COUNT, 0, 0, countWords(deviceText),
++                            chapterTitle.c_str(), UINT16_MAX, deviceText, UINT16_MAX, 0);
++  if (addResult == ClippingStore::AddResult::LimitReached) {
++    LOG_ERR("RDS", "Clipping limit reached while pulling");
++    skipped++;
++    return true;
++  }
++  if (addResult == ClippingStore::AddResult::SaveFailed) {
++    fail(tr(STR_READEST_SAVE_FAILED));
++    return false;
 +  }
 +  return true;
 +}
 +
-+bool ReadestSyncActivity::pushClippings(const ReadestBook& book, const std::vector<ReadestNote>& remote, int& pushed,
-+                                        int& skipped) {
-+  if (!CLIPPINGS.hasClippings()) return true;
++bool ReadestSyncActivity::syncHighlights(const ReadestBook& book, HighlightCounts& counts) {
++  setStatus(tr(STR_READEST_PULLING));
++  std::vector<ReadestNote> remote;
++  const auto pulled = client.pullNotes(book, remote);
++  if (pulled != ReadestClient::OK) {
++    fail(ReadestClient::errorString(pulled));
++    return false;
++  }
 +
-+  // Text Readest already has (live or deleted there) is never sent again: that
-+  // covers clippings just pulled and highlights removed on purpose in Readest.
++  std::vector<ReadestLinks::Link> links;
++  const bool hadLinks = ReadestLinks::load(localHash, links);
++
++  // Snapshot of the device clippings, identified by their loose text.
++  struct LocalClip {
++    std::string keyHash;
++    bool claimed = false;
++    bool remove = false;
++  };
++  std::vector<LocalClip> local(CLIPPINGS.clippingCount());
++  {
++    std::string text;
++    for (size_t i = 0; i < local.size(); ++i) {
++      text.clear();
++      if (CLIPPINGS.readClippingText(i, text)) local[i].keyHash = keyHashFor(text);
++    }
++  }
 +  std::vector<std::string> remoteKeys;
 +  remoteKeys.reserve(remote.size());
-+  for (const ReadestNote& note : remote) remoteKeys.push_back(ChapterXPathResolver::looseTextKey(note.text));
++  for (const auto& note : remote) remoteKeys.push_back(keyHashFor(note.text));
++
++  const auto findRemote = [&](const std::string& id) -> int {
++    for (size_t i = 0; i < remote.size(); ++i) {
++      if (remote[i].id == id) return static_cast<int>(i);
++    }
++    return -1;
++  };
++  const auto claimLocal = [&](const std::string& keyHash) -> int {
++    if (keyHash.empty()) return -1;
++    for (size_t i = 0; i < local.size(); ++i) {
++      if (!local[i].claimed && !local[i].remove && local[i].keyHash == keyHash) return static_cast<int>(i);
++    }
++    return -1;
++  };
++
++  std::vector<bool> remoteHandled(remote.size(), false);
++  std::vector<size_t> toPull;       // remote notes to add on the device
++  std::vector<size_t> toTombstone;  // remote notes to delete in Readest
++  std::vector<ReadestLinks::Link> nextLinks;
++  nextLinks.reserve(links.size() + remote.size() + local.size());
++
++  // 1. What was in sync last time: detect deletions and edits on each side.
++  for (const auto& link : links) {
++    const int ri = findRemote(link.id);
++    const int li = claimLocal(link.keyHash);
++    if (ri < 0 || remote[static_cast<size_t>(ri)].deleted) {
++      if (li >= 0) local[static_cast<size_t>(li)].remove = true;  // deleted in Readest
++      if (ri >= 0) remoteHandled[static_cast<size_t>(ri)] = true;
++      continue;
++    }
++    const size_t r = static_cast<size_t>(ri);
++    remoteHandled[r] = true;
++    if (remoteKeys[r] != link.keyHash) {  // edited in Readest: replace the device copy
++      if (li >= 0) local[static_cast<size_t>(li)].remove = true;
++      toPull.push_back(r);
++      continue;
++    }
++    if (li < 0) {  // deleted on the device
++      toTombstone.push_back(r);
++      continue;
++    }
++    local[static_cast<size_t>(li)].claimed = true;
++    nextLinks.push_back(link);
++  }
++
++  // 2. Readest highlights not seen before.
++  for (size_t r = 0; r < remote.size(); ++r) {
++    if (remoteHandled[r] || remote[r].deleted) continue;
++    const int li = claimLocal(remoteKeys[r]);
++    if (li >= 0) {
++      // First sync after the text-matching fix: grey highlights we pushed
++      // before were placed by layout, not text. Re-place them once.
++      if (!hadLinks && !readestCopyMissing && remote[r].color == HIGHLIGHT_COLOR) {
++        toTombstone.push_back(r);
++        continue;  // the device clipping stays unclaimed and is pushed again
++      }
++      local[static_cast<size_t>(li)].claimed = true;
++      nextLinks.push_back({remote[r].id, remoteKeys[r]});
++      continue;
++    }
++    toPull.push_back(r);
++  }
 +
 +  const time_t now = time(nullptr);
 +  const int64_t nowMs = now > 1600000000 ? static_cast<int64_t>(now) * 1000 : 0;
 +
++  // 3. Push device clippings Readest doesn't have, located by text in
++  //    Readest's own copy.
++  setStatus(tr(STR_READEST_PUSHING));
 +  JsonDocument batch;
 +  JsonArray notes = batch.to<JsonArray>();
 +  size_t batchCount = 0;
-+  std::string text;
-+  text.reserve(CLIPPING_TEXT_MAX);
-+
-+  const auto flush = [&]() -> ReadestClient::Error {
-+    if (batchCount == 0) return ReadestClient::OK;
++  const auto flush = [&]() -> bool {
++    if (batchCount == 0) return true;
 +    std::string json;
 +    serializeJson(batch, json);
 +    const auto result = client.pushNotes(json);
-+    if (result == ReadestClient::OK) pushed += static_cast<int>(batchCount);
 +    batch.clear();
 +    notes = batch.to<JsonArray>();
 +    batchCount = 0;
-+    return result;
++    if (result != ReadestClient::OK) {
++      fail(ReadestClient::errorString(result));
++      return false;
++    }
++    return true;
 +  };
 +
-+  const size_t count = CLIPPINGS.clippingCount();
-+  for (size_t i = 0; i < count; ++i) {
++  std::string text;
++  text.reserve(CLIPPING_TEXT_MAX);
++  for (size_t i = 0; i < local.size(); ++i) {
++    if (local[i].claimed || local[i].remove || local[i].keyHash.empty()) continue;
 +    const Clipping* clipping = CLIPPINGS.clippingAt(i);
 +    text.clear();
-+    if (!clipping || !CLIPPINGS.readClippingText(i, text) || text.empty()) continue;
++    if (!clipping || !CLIPPINGS.readClippingText(i, text)) continue;
 +
-+    const std::string key = ChapterXPathResolver::looseTextKey(text);
-+    bool known = false;
-+    for (const auto& remoteKey : remoteKeys) {
-+      if (remoteKey == key) {
-+        known = true;
++    // Where the clipping sits in the device copy picks the starting chapter
++    // and breaks ties between repeated passages; the match itself is text.
++    const float intra =
++        clipping->pageCount > 1 ? (static_cast<float>(clipping->startPage) + 0.5f) / clipping->pageCount : 0.5f;
++    const float hint = ChapterXPathResolver::bookFraction(epub, clipping->spineIndex, intra);
++    int spine = -1;
++    XPathTextLocation location;
++    XPathTextRange range;
++    if (!ChapterXPathResolver::findTextInBook(readestEpub, text, hint, -1, spine, location) ||
++        !ChapterXPathResolver::rangeForLocation(readestEpub, spine, location, range)) {
++      LOG_DBG("RDS", "Clipping %u not found in Readest's copy", static_cast<unsigned>(i));
++      counts.skipped++;
++      continue;
++    }
++    if (readestEpub == epub && readestCopyMissing) {
++      // Fallback: device copy standing in for Readest's; map optimizer splits.
++      ProgressMapper::currentXPathToSource(epub, spine, range.start);
++      ProgressMapper::currentXPathToSource(epub, spine, range.end);
++    }
++
++    const std::string id = noteIdFor(book.hash, range);
++    // A re-placed highlight that landed on its old id is simply kept.
++    bool reused = false;
++    for (auto it = toTombstone.begin(); it != toTombstone.end(); ++it) {
++      if (remote[*it].id == id) {
++        toTombstone.erase(it);
++        reused = true;
 +        break;
 +      }
 +    }
-+    if (known) continue;
-+
-+    // Where in the chapter the clipping was made; only used to choose between
-+    // repeated occurrences of the same text.
-+    const float positionHint =
-+        clipping->pageCount > 1 ? (static_cast<float>(clipping->startPage) + 0.5f) / clipping->pageCount : -1.0f;
-+    XPathTextRange range;
-+    if (!ChapterXPathResolver::findXPathRangeForText(epub, clipping->spineIndex, text, positionHint, range) ||
-+        !ProgressMapper::currentXPathToSource(epub, clipping->spineIndex, range.start) ||
-+        !ProgressMapper::currentXPathToSource(epub, clipping->spineIndex, range.end)) {
-+      LOG_DBG("RDS", "Clipping %u not located in spine %u", static_cast<unsigned>(i), clipping->spineIndex);
-+      skipped++;
-+      continue;
-+    }
++    nextLinks.push_back({id, local[i].keyHash});
++    if (reused) continue;
 +
 +    JsonObject note = notes.add<JsonObject>();
 +    note["bookHash"] = book.hash;
 +    if (!book.metaHash.empty()) note["metaHash"] = book.metaHash;
-+    note["id"] = noteIdFor(book.hash, range);
++    note["id"] = id;
 +    note["type"] = "annotation";
 +    note["cfi"] = "";
 +    note["xpointer0"] = range.start;
@@ -1323,21 +1804,59 @@ index 00000000..cedee49e
 +    // New rows get a fresh updated_at from the server on insert.
 +    note["updatedAt"] = 1;
 +    batchCount++;
++    counts.pushed++;
++    if (batchCount >= PUSH_BATCH && !flush()) return false;
++  }
 +
-+    if (batchCount >= PUSH_BATCH) {
-+      const auto result = flush();
-+      if (result != ReadestClient::OK) {
-+        fail(ReadestClient::errorString(result));
-+        return false;
-+      }
++  // 4. Deletions made on the device (or re-placed highlights) go to Readest
++  //    as tombstones. They need a real clock to win last-writer-wins.
++  if (nowMs > 0) {
++    for (const size_t r : toTombstone) {
++      const ReadestNote& gone = remote[r];
++      JsonObject note = notes.add<JsonObject>();
++      note["bookHash"] = book.hash;
++      if (!book.metaHash.empty()) note["metaHash"] = book.metaHash;
++      note["id"] = gone.id;
++      note["type"] = "annotation";
++      note["cfi"] = gone.cfi;
++      if (!gone.xpointer0.empty()) note["xpointer0"] = gone.xpointer0;
++      note["text"] = gone.text;
++      note["note"] = "";
++      note["deletedAt"] = nowMs;
++      note["updatedAt"] = nowMs;
++      batchCount++;
++      if (remote[r].color != HIGHLIGHT_COLOR || hadLinks) counts.removedThere++;
++      if (batchCount >= PUSH_BATCH && !flush()) return false;
++    }
++  } else if (!toTombstone.empty()) {
++    LOG_ERR("RDS", "No wall-clock time; %u Readest deletions postponed", static_cast<unsigned>(toTombstone.size()));
++    // Keep the links so the next sync retries instead of pulling them back.
++    for (const size_t r : toTombstone) nextLinks.push_back({remote[r].id, remoteKeys[r]});
++  }
++  if (!flush()) return false;
++
++  // 5. Deletions/edits made in Readest: drop device clippings (highest index
++  //    first so earlier indices stay valid).
++  for (size_t i = local.size(); i-- > 0;) {
++    if (!local[i].remove) continue;
++    if (CLIPPINGS.removeClippingAt(i)) {
++      counts.removedHere++;
++    } else {
++      LOG_ERR("RDS", "Failed to remove clipping %u", static_cast<unsigned>(i));
 +    }
 +  }
 +
-+  const auto result = flush();
-+  if (result != ReadestClient::OK) {
-+    fail(ReadestClient::errorString(result));
-+    return false;
++  // 6. Readest highlights new to the device.
++  for (const size_t r : toPull) {
++    const size_t before = CLIPPINGS.clippingCount();
++    if (!addPulledClipping(remote[r], counts.skipped)) return false;
++    if (CLIPPINGS.clippingCount() > before) {
++      counts.pulled++;
++      nextLinks.push_back({remote[r].id, remoteKeys[r]});
++    }
 +  }
++
++  ReadestLinks::save(localHash, nextLinks);
 +  return true;
 +}
 +
@@ -1351,8 +1870,7 @@ index 00000000..cedee49e
 +    local.visibleTextOffset = progress.visibleTextOffset;
 +    local.hasVisibleTextOffset = true;
 +  }
-+  // Readest has the original EPUB, so positions travel in source coordinates.
-+  const KOReaderPosition localKo = ProgressMapper::toKOReader(epub, local, PositionCoordinateSpace::SourceDocument);
++  const KOReaderPosition localKo = ProgressMapper::toKOReader(epub, local);
 +
 +  ReadestProgress remote;
 +  const auto pulled = client.pullProgress(book, remote);
@@ -1361,20 +1879,39 @@ index 00000000..cedee49e
 +    return tr(STR_READEST_POS_UNAVAILABLE);
 +  }
 +
-+  // Map Readest's position into this layout and onto the same percentage
-+  // scale as the local one before comparing.
++  // Readest -> device: read a snippet at Readest's position in Readest's copy
++  // and find that text in the device copy.
 +  bool remoteMapped = false;
 +  float remotePct = -1.0f;
 +  CrossPointPosition remotePos{};
-+  if (remote.found && (!remote.xpointer.empty() || remote.fraction >= 0.0f)) {
-+    KOReaderPosition ko;
-+    ko.xpath = remote.xpointer;
-+    ko.percentage = remote.fraction >= 0.0f ? remote.fraction : 0.0f;
-+    remotePos = ProgressMapper::toCrossPoint(epub, ko, local.spineIndex, local.totalPages,
-+                                             PositionCoordinateSpace::SourceDocument);
-+    if (remotePos.valid && remotePos.spineIndex >= 0 && remotePos.spineIndex < epub->getSpineItemsCount()) {
-+      remoteMapped = true;
-+      remotePct = ProgressMapper::toKOReader(epub, remotePos).percentage;
++  if (remote.found && !remote.xpointer.empty()) {
++    std::string deviceXPath;
++    if (readestEpub == epub && !readestCopyMissing) {
++      deviceXPath = remote.xpointer;  // identical files
++    } else {
++      std::string snippet;
++      int remoteSpine = -1;
++      int spine = -1;
++      XPathTextLocation location;
++      XPathTextRange range;
++      if (ChapterXPathResolver::textAtXPath(readestEpub, remote.xpointer, POSITION_SNIPPET_CHARS, snippet,
++                                            remoteSpine) &&
++          ChapterXPathResolver::findTextInBook(epub, snippet, remote.fraction, -1, spine, location) &&
++          ChapterXPathResolver::rangeForLocation(epub, spine, location, range)) {
++        deviceXPath = range.start;
++      } else {
++        LOG_ERR("RDS", "Readest position text not found in the device copy");
++      }
++    }
++    if (!deviceXPath.empty()) {
++      KOReaderPosition ko;
++      ko.xpath = deviceXPath;
++      ko.percentage = remote.fraction >= 0.0f ? remote.fraction : 0.0f;
++      remotePos = ProgressMapper::toCrossPoint(epub, ko, local.spineIndex, local.totalPages);
++      if (remotePos.valid && remotePos.spineIndex >= 0 && remotePos.spineIndex < epub->getSpineItemsCount()) {
++        remoteMapped = true;
++        remotePct = ProgressMapper::toKOReader(epub, remotePos).percentage;
++      }
 +    }
 +  }
 +
@@ -1391,8 +1928,31 @@ index 00000000..cedee49e
 +    return formatCount(tr(STR_READEST_POS_FROM_READEST_FORMAT), percentOf(remotePct));
 +  }
 +
-+  if (localKo.valid && !localKo.xpath.empty() && (!remoteMapped || localKo.percentage > remotePct + POSITION_EPSILON)) {
-+    const auto pushed = client.pushProgress(book, localKo.xpath, localKo.percentage);
++  const bool deviceAhead = !remoteMapped || localKo.percentage > remotePct + POSITION_EPSILON;
++  if (localKo.valid && !localKo.xpath.empty() && deviceAhead) {
++    // Device -> Readest: the text at the device position, found in Readest's copy.
++    std::string readestXPath;
++    if (readestEpub == epub && !readestCopyMissing) {
++      readestXPath = localKo.xpath;
++    } else if (readestCopyMissing) {
++      readestXPath = ProgressMapper::toKOReader(epub, local, PositionCoordinateSpace::SourceDocument).xpath;
++    } else {
++      std::string snippet;
++      int localSpine = -1;
++      int spine = -1;
++      XPathTextLocation location;
++      XPathTextRange range;
++      if (ChapterXPathResolver::textAtXPath(epub, localKo.xpath, POSITION_SNIPPET_CHARS, snippet, localSpine) &&
++          ChapterXPathResolver::findTextInBook(readestEpub, snippet, localKo.percentage, -1, spine, location) &&
++          ChapterXPathResolver::rangeForLocation(readestEpub, spine, location, range)) {
++        readestXPath = range.start;
++      }
++    }
++    if (readestXPath.empty()) {
++      LOG_ERR("RDS", "Device position text not found in Readest's copy");
++      return tr(STR_READEST_POS_UNAVAILABLE);
++    }
++    const auto pushed = client.pushProgress(book, readestXPath, localKo.percentage);
 +    if (pushed != ReadestClient::OK) {
 +      LOG_ERR("RDS", "Position push failed: %d", static_cast<int>(pushed));
 +      return tr(STR_READEST_POS_UNAVAILABLE);
@@ -1476,10 +2036,10 @@ index 00000000..cedee49e
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 00000000..1b36ef34
+index 00000000..f33ba45a
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,107 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -1501,12 +2061,16 @@ index 00000000..1b36ef34
 + *
 + *  1. Match the book: a remembered match (ReadestBookMap), else a confident
 + *     title/file match, else the user picks from the top 3 candidates.
-+ *  2. Pull: Readest highlights not on the device become clippings. They carry
-+ *     no layout signature, so the reader finds them by text.
-+ *  3. Push: device clippings Readest doesn't have yet become grey Readest
-+ *     highlights, located in the chapter XHTML as KOReader xpointers.
-+ *  4. Position: furthest wins. The device jumps forward to Readest's
-+ *     position, or sends its own position when it is ahead.
++ *  2. Get Readest's own copy of the book (cached on the SD card) unless the
++ *     device file is byte-identical. Everything below is matched by TEXT
++ *     between the two copies, so differing files (optimizer splits, Calibre
++ *     conversions, other editions) still line up.
++ *  3. Highlights, reconciled against the links remembered from the last sync
++ *     (ReadestLinks): additions, deletions and edits on either side are
++ *     applied to the other. Pulled clippings store the device's own wording
++ *     so the reader always finds them.
++ *  4. Position: furthest wins, anchored on a text snippet at the reading
++ *     position and found in the other copy.
 + *
 + * Like KOReader sync, the reader first hands off to a tiny instance that
 + * reboots into the lean network mode (freeing the reader's heap before
@@ -1540,6 +2104,10 @@ index 00000000..1b36ef34
 +  enum State { WIFI_SELECTION, WORKING, CHOOSING, DONE, FAILED };
 +
 +  std::shared_ptr<Epub> epub;
++  // Readest's copy of the book; the same object as `epub` when the files are
++  // identical, or (fallback) when Readest's copy could not be downloaded.
++  std::shared_ptr<Epub> readestEpub;
++  bool readestCopyMissing = false;
 +  std::string epubPath;
 +  uint8_t readerOrientation = CrossPointSettings::ORIENTATION_COUNT;
 +  bool restartBeforeNetwork = false;
@@ -1565,9 +2133,17 @@ index 00000000..1b36ef34
 +  void runSync();
 +  void showChooser();
 +  void syncWithBook(const ReadestBook& book);
-+  // Each step returns false after reporting a fatal error via fail().
-+  bool pullClippings(const std::vector<ReadestNote>& remote, int& added, int& skipped);
-+  bool pushClippings(const ReadestBook& book, const std::vector<ReadestNote>& remote, int& pushed, int& skipped);
++  bool openReadestCopy(const ReadestBook& book);
++  struct HighlightCounts {
++    int pulled = 0;
++    int pushed = 0;
++    int removedHere = 0;
++    int removedThere = 0;
++    int skipped = 0;
++  };
++  // Returns false after reporting a fatal error via fail().
++  bool syncHighlights(const ReadestBook& book, HighlightCounts& counts);
++  bool addPulledClipping(const ReadestNote& note, int& skipped);
 +  std::string syncPosition(const ReadestBook& book);
 +  void returnToReader();
 +};
@@ -2125,10 +2701,10 @@ index cd01e87c..2b7e2178 100644
          if (fontsActivity) {
 diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
 new file mode 100644
-index 00000000..ad946984
+index 00000000..5dc9cd5d
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.cpp
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,85 @@
 +#include "ReadestBookMap.h"
 +
 +#include <ArduinoJson.h>
@@ -2154,6 +2730,7 @@ index 00000000..ad946984
 +  out.metaHash = entry["m"] | "";
 +  out.title = entry["t"] | "";
 +  out.author = entry["a"] | "";
++  out.format = entry["f"] | "";
 +  return true;
 +}
 +
@@ -2167,6 +2744,7 @@ index 00000000..ad946984
 +  entry["m"] = book.metaHash;
 +  entry["t"] = book.title;
 +  entry["a"] = book.author;
++  entry["f"] = book.format;
 +  if (!PersistableStoreBase::writeDocToFile(MAP_PATH, doc)) {
 +    LOG_ERR("RDS", "Failed to save Readest book match");
 +    return false;
@@ -2181,15 +2759,47 @@ index 00000000..ad946984
 +}
 +
 +}  // namespace ReadestBookMap
++
++namespace ReadestLinks {
++namespace {
++std::string linksPath(const std::string& localHash) { return "/.crosspoint/readest_links_" + localHash + ".json"; }
++}  // namespace
++
++bool load(const std::string& localHash, std::vector<Link>& out) {
++  out.clear();
++  if (localHash.empty()) return false;
++  JsonDocument doc;
++  if (!PersistableStoreBase::readDocFromFile(linksPath(localHash).c_str(), doc)) return false;
++  const JsonObjectConst ids = doc["ids"].as<JsonObjectConst>();
++  out.reserve(ids.size());
++  for (const JsonPairConst pair : ids) {
++    out.push_back({pair.key().c_str(), pair.value() | ""});
++  }
++  return true;
++}
++
++bool save(const std::string& localHash, const std::vector<Link>& links) {
++  if (localHash.empty()) return false;
++  JsonDocument doc;
++  JsonObject ids = doc["ids"].to<JsonObject>();
++  for (const auto& link : links) ids[link.id] = link.keyHash;
++  if (!PersistableStoreBase::writeDocToFile(linksPath(localHash).c_str(), doc)) {
++    LOG_ERR("RDS", "Failed to save Readest highlight links");
++    return false;
++  }
++  return true;
++}
++}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
 new file mode 100644
-index 00000000..853ad4ad
+index 00000000..3990337e
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,36 @@
 +#pragma once
 +
 +#include <string>
++#include <vector>
 +
 +#include "ReadestClient.h"
 +
@@ -2206,18 +2816,36 @@ index 00000000..853ad4ad
 +bool remember(const std::string& localHash, const ReadestBook& book);
 +void clearAll();
 +}  // namespace ReadestBookMap
++
++/**
++ * Which Readest highlight each device clipping was last synced with, per
++ * book: Readest note id -> hash of the highlight's loose text. Comparing it
++ * with the current state on both sides is what lets deletions and edits
++ * propagate (without it every difference looks like an addition).
++ * Stored in /.crosspoint/readest_links_<localHash>.json.
++ */
++namespace ReadestLinks {
++struct Link {
++  std::string id;
++  std::string keyHash;
++};
++bool load(const std::string& localHash, std::vector<Link>& out);
++bool save(const std::string& localHash, const std::vector<Link>& links);
++}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
 new file mode 100644
-index 00000000..c858b18f
+index 00000000..c82f2423
 --- /dev/null
 +++ b/src/readest/ReadestClient.cpp
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,594 @@
 +#include "ReadestClient.h"
 +
 +#include <ArduinoJson.h>
++#include <HalStorage.h>
 +#include <I18n.h>
 +#include <Logging.h>
 +#include <SecureHttpClient.h>
++#include <strings.h>
 +
 +#include <algorithm>
 +#include <cctype>
@@ -2233,6 +2861,7 @@ index 00000000..c858b18f
 +namespace {
 +constexpr char SUPABASE_AUTH_URL[] = "https://readest.supabase.co/auth/v1/token?grant_type=";
 +constexpr char SYNC_URL[] = "https://web.readest.com/api/sync";
++constexpr char STORAGE_DOWNLOAD_URL[] = "https://web.readest.com/api/storage/download?fileKey=";
 +// Readest's public Supabase anon key (the same one shipped in readest.koplugin).
 +constexpr char SUPABASE_ANON_KEY[] =
 +    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZic3l4ZnVzampxZHhranFseXNjIiwicm9sZSI6"
@@ -2473,6 +3102,7 @@ index 00000000..c858b18f
 +  rowFilter["title"] = true;
 +  rowFilter["source_title"] = true;
 +  rowFilter["author"] = true;
++  rowFilter["format"] = true;
 +  rowFilter["deleted_at"] = true;
 +  rowFilter["synced_at"] = true;
 +
@@ -2521,6 +3151,7 @@ index 00000000..c858b18f
 +      book.metaHash = row["meta_hash"] | "";
 +      book.title = rowTitle;
 +      book.author = rowAuthor;
++      book.format = row["format"] | "";
 +      book.score = score;
 +      offerCandidate(out, std::move(book));
 +    }
@@ -2565,6 +3196,84 @@ index 00000000..c858b18f
 +  body += notesJson;
 +  body += ",\"configs\":[]}";
 +  return postSync(body);
++}
++
++ReadestClient::Error ReadestClient::downloadBook(const ReadestBook& book, const std::string& destPath) {
++  const Error session = ensureSession();
++  if (session != OK) return session;
++  if (insufficientHeap()) return LOW_MEMORY;
++  const std::string& userId = READEST_STORE.getUserId();
++  if (userId.empty() || book.hash.empty() || (!book.format.empty() && strcasecmp(book.format.c_str(), "EPUB") != 0)) {
++    return BOOK_NOT_FOUND;
++  }
++
++  // Same key shape as readest.koplugin; the server resolves the stored name.
++  const std::string fileKey = userId + "/Readest/Books/" + book.hash + "/" + book.hash + ".epub";
++  std::string downloadUrl;
++  {
++    freeink::SecureHttpClient http;
++    const int code = sendJson(http, "GET", std::string(STORAGE_DOWNLOAD_URL) + fileKey, accessToken, false, "", true);
++    if (code != 200) {
++      LOG_ERR("RDS", "Download URL request failed: %d", code);
++      http.end();
++      return code == 404 ? BOOK_NOT_FOUND : errorForStatus(code);
++    }
++    JsonDocument filter;
++    filter["downloadUrl"] = true;
++    JsonDocument doc;
++    const DeserializationError error = deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
++    http.end();
++    if (error || !doc["downloadUrl"].is<const char*>()) {
++      LOG_ERR("RDS", "Download URL response unusable");
++      return JSON_ERROR;
++    }
++    downloadUrl = doc["downloadUrl"].as<const char*>();
++  }
++
++  const std::string partPath = destPath + ".part";
++  HalFile file;
++  if (!Storage.openFileForWrite("RDS", partPath, file)) {
++    LOG_ERR("RDS", "Cannot create %s", partPath.c_str());
++    return SERVER_ERROR;
++  }
++  size_t written = 0;
++  bool writeFailed = false;
++  int code = 0;
++  bool complete = false;
++  {
++    freeink::SecureHttpClient http;
++    http.setInsecure();
++    http.setTimeout(REQUEST_TIMEOUT_MS);
++    http.setUserAgent(USER_AGENT);
++    http.setFollowRedirects(3);
++    if (http.begin(downloadUrl)) {
++      // Streamed chunk by chunk to the SD card; nothing is buffered in RAM.
++      code = http.GET([&](const uint8_t* data, const size_t len) {
++        if (file.write(data, len) != len) {
++          writeFailed = true;
++          return false;
++        }
++        written += len;
++        return true;
++      });
++      complete = http.responseComplete();
++    }
++    http.end();
++  }
++  file.close();
++  if (code != 200 || !complete || writeFailed || written == 0) {
++    LOG_ERR("RDS", "Book download failed: code=%d complete=%d written=%u", code, complete ? 1 : 0,
++            static_cast<unsigned>(written));
++    Storage.remove(partPath.c_str());
++    return code <= 0 ? NETWORK_ERROR : (code == 404 ? BOOK_NOT_FOUND : SERVER_ERROR);
++  }
++  Storage.remove(destPath.c_str());
++  if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
++    LOG_ERR("RDS", "Cannot move downloaded book into place");
++    return SERVER_ERROR;
++  }
++  LOG_INF("RDS", "Downloaded Readest copy (%u bytes)", static_cast<unsigned>(written));
++  return OK;
 +}
 +
 +ReadestClient::Error ReadestClient::pullProgress(const ReadestBook& book, ReadestProgress& out) {
@@ -2662,6 +3371,7 @@ index 00000000..c858b18f
 +  noteFilter["cfi"] = true;
 +  noteFilter["xpointer0"] = true;
 +  noteFilter["text"] = true;
++  noteFilter["color"] = true;
 +  noteFilter["deleted_at"] = true;
 +
 +  JsonDocument doc;
@@ -2693,6 +3403,7 @@ index 00000000..c858b18f
 +    item.cfi = note["cfi"] | "";
 +    item.xpointer0 = note["xpointer0"] | "";
 +    item.text = text;
++    item.color = note["color"] | "";
 +    item.deleted = !note["deleted_at"].isNull();
 +    out.push_back(std::move(item));
 +  }
@@ -2723,10 +3434,10 @@ index 00000000..c858b18f
 +}
 diff --git a/src/readest/ReadestClient.h b/src/readest/ReadestClient.h
 new file mode 100644
-index 00000000..98b1b0c5
+index 00000000..a9245f0c
 --- /dev/null
 +++ b/src/readest/ReadestClient.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,96 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -2739,7 +3450,8 @@ index 00000000..98b1b0c5
 +  std::string metaHash;  // Readest meta_hash (title/author/identifier fingerprint)
 +  std::string title;
 +  std::string author;
-+  int score = 0;  // similarity to the local book, higher is closer (transient)
++  std::string format;  // Readest format column, e.g. "EPUB"
++  int score = 0;       // similarity to the local book, higher is closer (transient)
 +};
 +
 +// A highlight pulled from Readest.
@@ -2748,6 +3460,7 @@ index 00000000..98b1b0c5
 +  std::string cfi;
 +  std::string xpointer0;
 +  std::string text;
++  std::string color;
 +  bool deleted = false;  // tombstone: deleted in Readest
 +};
 +
@@ -2804,6 +3517,10 @@ index 00000000..98b1b0c5
 +
 +  // All highlight/excerpt notes Readest has for the book, tombstones included.
 +  Error pullNotes(const ReadestBook& book, std::vector<ReadestNote>& out);
++
++  // Download Readest's own copy of the book (EPUB only) from Readest cloud
++  // storage to `destPath`, streaming straight to the SD card.
++  Error downloadBook(const ReadestBook& book, const std::string& destPath);
 +
 +  // Reading position for exactly this Readest book (same book_hash).
 +  Error pullProgress(const ReadestBook& book, ReadestProgress& out);
@@ -2888,10 +3605,10 @@ index 00000000..c44719f0
 +}
 diff --git a/src/readest/ReadestStore.h b/src/readest/ReadestStore.h
 new file mode 100644
-index 00000000..3c2cb149
+index 00000000..fa7f3025
 --- /dev/null
 +++ b/src/readest/ReadestStore.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,65 @@
 +#pragma once
 +#include <ArduinoJson.h>
 +#include <PersistableStore.h>
@@ -2939,6 +3656,10 @@ index 00000000..3c2cb149
 +  // Session state from the last successful sign-in or token refresh.
 +  void setSession(const std::string& newUserId, const std::string& newRefreshToken);
 +  void clearSession();
++  const std::string& getUserId() const {
++    ensureLoaded();
++    return userId;
++  }
 +  const std::string& getRefreshToken() const {
 +    ensureLoaded();
 +    return refreshToken;
