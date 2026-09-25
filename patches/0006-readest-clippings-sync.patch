@@ -1,12 +1,20 @@
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a589c5a..22e22bd9 100644
+index 3a589c5a..ec0baf17 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -845,3 +845,33 @@ STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
+@@ -845,3 +845,38 @@ STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
  STR_DOUBLE_TAP_HOME_SHORTCUT: "Double Tap Home"
  STR_CUSTOM_BOOTSCREEN: "Custom Boot Screen"
  STR_TAP_HIDE_STATUS_BAR: "Tap to Hide Status Bar"
 +STR_READEST_SYNC: "Readest Sync"
++STR_READEST_SYNC_BOOK: "Sync Readest"
++STR_READEST_SYNCING_POSITION: "Syncing reading position..."
++STR_READEST_SYNC_DONE: "Synced with Readest"
++STR_READEST_SYNC_COUNTS_FORMAT: "%d clippings pulled, %d pushed"
++STR_READEST_POS_FROM_READEST_FORMAT: "Moved to Readest position (%d%%)"
++STR_READEST_POS_TO_READEST_FORMAT: "Sent reading position to Readest (%d%%)"
++STR_READEST_POS_IN_SYNC: "Reading position already in sync"
++STR_READEST_POS_UNAVAILABLE: "Reading position not synced"
 +STR_READEST_ACCOUNT: "Account"
 +STR_READEST_CONNECT: "Connect"
 +STR_READEST_DISCONNECT: "Disconnect"
@@ -17,15 +25,10 @@ index 3a589c5a..22e22bd9 100644
 +STR_READEST_SIGNING_IN: "Signing in to Readest..."
 +STR_READEST_SIGNED_IN: "Connected to Readest"
 +STR_READEST_SIGN_IN_FAILED: "Readest sign-in failed"
-+STR_READEST_PUSH_CLIPPINGS: "Push Clippings to Readest"
-+STR_READEST_PULL_CLIPPINGS: "Pull Clippings from Readest"
 +STR_READEST_FINDING_BOOK: "Finding book in Readest..."
 +STR_READEST_PUSHING: "Pushing clippings..."
 +STR_READEST_PULLING: "Pulling clippings..."
-+STR_READEST_PUSH_DONE_FORMAT: "%d clippings pushed to Readest"
-+STR_READEST_PULL_DONE_FORMAT: "%d new clippings pulled from Readest"
 +STR_READEST_SKIPPED_FORMAT: "%d could not be matched in the book"
-+STR_READEST_NO_CLIPPINGS: "This book has no clippings"
 +STR_READEST_SYNC_FAILED: "Readest sync failed"
 +STR_READEST_OPEN_BOOK_FAILED: "Could not open the book"
 +STR_READEST_SAVE_FAILED: "Could not save clippings"
@@ -33,9 +36,11 @@ index 3a589c5a..22e22bd9 100644
 +STR_READEST_ERR_AUTH: "Wrong Readest email or password"
 +STR_READEST_ERR_SERVER: "Readest server error"
 +STR_READEST_ERR_JSON: "Unexpected response from Readest"
-+STR_READEST_ERR_BOOK: "Book not found in your Readest library"
++STR_READEST_ERR_BOOK: "No similar book in your Readest library"
 +STR_READEST_ERR_MEMORY: "Not enough memory"
 +STR_READEST_ERR_NO_CREDENTIALS: "Connect Readest in Settings first"
++STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
++STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
 index 9f66ac0d..913c36a5 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
@@ -509,6 +514,46 @@ index 6f18700c..00c409f8 100644
 +  static bool findXPathRangeForText(const std::shared_ptr<Epub>& epub, int spineIndex, const std::string& text,
 +                                    uint16_t paragraphHint, XPathTextRange& out);
  };
+diff --git a/lib/KOReaderSync/ProgressMapper.cpp b/lib/KOReaderSync/ProgressMapper.cpp
+index 3cfee453..62f7aad2 100644
+--- a/lib/KOReaderSync/ProgressMapper.cpp
++++ b/lib/KOReaderSync/ProgressMapper.cpp
+@@ -1016,3 +1016,16 @@ std::string ProgressMapper::generateXPath(const std::shared_ptr<Epub>& epub, int
+   const int p = s.paragraphCount();
+   return (p > 0) ? base + "/p[" + std::to_string(p) + "]" : base;
+ }
++
++bool ProgressMapper::currentXPathToSource(const std::shared_ptr<Epub>& epub, const int currentSpineIndex,
++                                          std::string& xpath) {
++  return epub && mapCurrentXPathToSource(epub, currentSpineIndex, xpath);
++}
++
++bool ProgressMapper::sourceXPathToCurrent(const std::shared_ptr<Epub>& epub, std::string& xpath,
++                                          int& currentSpineIndex) {
++  if (!epub) return false;
++  // Unoptimized EPUBs keep the source spine numbering.
++  currentSpineIndex = parseIndex(xpath, "/body/DocFragment[") - 1;
++  return mapSourceXPathToCurrent(epub, xpath, currentSpineIndex) && currentSpineIndex >= 0;
++}
+diff --git a/lib/KOReaderSync/ProgressMapper.h b/lib/KOReaderSync/ProgressMapper.h
+index 49a82a11..0502ed06 100644
+--- a/lib/KOReaderSync/ProgressMapper.h
++++ b/lib/KOReaderSync/ProgressMapper.h
+@@ -92,6 +92,14 @@ class ProgressMapper {
+   static std::optional<CrossPointPosition> fromRichPosition(const std::shared_ptr<Epub>& epub,
+                                                             const KOReaderRichPosition& rich, GfxRenderer& renderer);
+ 
++  /**
++   * Rewrite an xpointer between this (possibly optimized/split) EPUB and the
++   * original source EPUB other readers such as Readest have. Identity for
++   * EPUBs that were never optimized. Return false when no mapping exists.
++   */
++  static bool currentXPathToSource(const std::shared_ptr<Epub>& epub, int currentSpineIndex, std::string& xpath);
++  static bool sourceXPathToCurrent(const std::shared_ptr<Epub>& epub, std::string& xpath, int& currentSpineIndex);
++
+  private:
+   /**
+    * Generate a fallback XPath by streaming the spine item's XHTML and resolving
 diff --git a/src/SettingsList.h b/src/SettingsList.h
 index c5a9d23c..79e3a4ea 100644
 --- a/src/SettingsList.h
@@ -562,7 +607,7 @@ index 73ba26bf..9a177d9e 100644
  
  void silentRestart();                                            // home screen
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 85902c3e..10f2e07a 100644
+index 85902c3e..8e46390f 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -28,6 +28,7 @@
@@ -589,12 +634,11 @@ index 85902c3e..10f2e07a 100644
  #if CROSSINK_APP_CAP_TOUCH
  #include "components/TouchHeaderBackButton.h"
  #endif
-@@ -3918,6 +3921,42 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction
+@@ -3918,6 +3921,38 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction
        }
        break;
      }
-+    case EpubReaderMenuActivity::MenuAction::READEST_PUSH_CLIPPINGS:
-+    case EpubReaderMenuActivity::MenuAction::READEST_PULL_CLIPPINGS: {
++    case EpubReaderMenuActivity::MenuAction::READEST_SYNC: {
 +      if (!READEST_STORE.hasCredentials()) {
 +        pauseReadingPaceTimer("readest_settings");
 +        startActivityForResult(std::make_unique<ReadestSettingsActivity>(renderer, mappedInput),
@@ -614,10 +658,7 @@ index 85902c3e..10f2e07a 100644
 +        return;
 +      }
 +
-+      const auto mode = action == EpubReaderMenuActivity::MenuAction::READEST_PUSH_CLIPPINGS
-+                            ? ReadestSyncActivity::Mode::PUSH
-+                            : ReadestSyncActivity::Mode::PULL;
-+      auto restartActivity = makeUniqueNoThrow<ReadestSyncActivity>(renderer, mappedInput, mode, SETTINGS.orientation);
++      auto restartActivity = makeUniqueNoThrow<ReadestSyncActivity>(renderer, mappedInput, SETTINGS.orientation);
 +      if (!restartActivity) {
 +        LOG_ERR("RDS", "OOM: restart handoff (free=%u maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 +        drawToast(renderer, tr(STR_READEST_ERR_MEMORY));
@@ -633,7 +674,7 @@ index 85902c3e..10f2e07a 100644
        const int currentPage = section ? section->currentPage : nextPageNumber;
        const int totalPages = section ? section->estimatedTotalPages() : std::max(1, cachedChapterTotalPageCount);
 diff --git a/src/activities/reader/EpubReaderMenuActivity.cpp b/src/activities/reader/EpubReaderMenuActivity.cpp
-index 35af2e47..ada2cb54 100644
+index 35af2e47..6c0635cb 100644
 --- a/src/activities/reader/EpubReaderMenuActivity.cpp
 +++ b/src/activities/reader/EpubReaderMenuActivity.cpp
 @@ -240,7 +240,7 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
@@ -641,93 +682,83 @@ index 35af2e47..ada2cb54 100644
  
    mainItems.reserve(9 + (hasFootnotes ? 1u : 0u) + (hasDictionary ? 2u : 0u));
 -  bookmarkItems.reserve(9 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
-+  bookmarkItems.reserve(11 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
++  bookmarkItems.reserve(10 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
    settingsItems.reserve(6);
  
    if (hasFootnotes) {
-@@ -269,6 +269,8 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
+@@ -269,6 +269,7 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
      bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
    }
    bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-+  bookmarkItems.push_back({MenuAction::READEST_PUSH_CLIPPINGS, StrId::STR_READEST_PUSH_CLIPPINGS});
-+  bookmarkItems.push_back({MenuAction::READEST_PULL_CLIPPINGS, StrId::STR_READEST_PULL_CLIPPINGS});
++  bookmarkItems.push_back({MenuAction::READEST_SYNC, StrId::STR_READEST_SYNC_BOOK});
    bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
    bookmarkItems.push_back({MenuAction::SEND_NEARBY_BOOK, StrId::STR_SEND_NEARBY_BOOK});
    bookmarkItems.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
 diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
-index c9b3e28c..cff06b81 100644
+index c9b3e28c..37015251 100644
 --- a/src/activities/reader/EpubReaderMenuModel.h
 +++ b/src/activities/reader/EpubReaderMenuModel.h
-@@ -33,6 +33,8 @@ enum class EpubReaderMenuAction : uint8_t {
+@@ -33,6 +33,7 @@ enum class EpubReaderMenuAction : uint8_t {
    LOOKUP_HISTORY,
    SET_BOOK_DICTIONARY,
    STATUS_BAR_SETTINGS,
-+  READEST_PUSH_CLIPPINGS,
-+  READEST_PULL_CLIPPINGS,
++  READEST_SYNC,
  };
  
  enum class ReaderDrawerTab : uint8_t { Font = 0, Layout = 1, More = 2, Location = 3, Settings = 4, Count };
-@@ -99,6 +101,8 @@ enum class ReaderDrawerCatalogItem : uint8_t {
+@@ -99,6 +100,7 @@ enum class ReaderDrawerCatalogItem : uint8_t {
    FontSize,
    DictionaryFontFamily,
    DictionaryFontSize,
-+  ReadestPushClippings,
-+  ReadestPullClippings,
++  ReadestSync,
  };
  
  struct ReaderDrawerAvailability {
-@@ -159,6 +163,8 @@ constexpr ReaderDrawerCatalog makeReaderDrawerCatalog(const ReaderDrawerAvailabi
+@@ -159,6 +161,7 @@ constexpr ReaderDrawerCatalog makeReaderDrawerCatalog(const ReaderDrawerAvailabi
    }
    location.add(ReaderDrawerCatalogItem::SaveClipping);
    if (available.hasClippings) location.add(ReaderDrawerCatalogItem::ViewClippings);
-+  location.add(ReaderDrawerCatalogItem::ReadestPushClippings);
-+  location.add(ReaderDrawerCatalogItem::ReadestPullClippings);
++  location.add(ReaderDrawerCatalogItem::ReadestSync);
    location.add(ReaderDrawerCatalogItem::Screenshot);
    location.add(ReaderDrawerCatalogItem::DisplayQr);
  
 diff --git a/src/activities/reader/EpubReaderTouchMenuActivity.cpp b/src/activities/reader/EpubReaderTouchMenuActivity.cpp
-index 96014ce6..b7b37577 100644
+index 96014ce6..37e9a2a0 100644
 --- a/src/activities/reader/EpubReaderTouchMenuActivity.cpp
 +++ b/src/activities/reader/EpubReaderTouchMenuActivity.cpp
-@@ -1348,6 +1348,12 @@ void EpubReaderTouchMenuActivity::activateRow(const RowId row) {
+@@ -1348,6 +1348,9 @@ void EpubReaderTouchMenuActivity::activateRow(const RowId row) {
      case RowId::ViewClippings:
        action = EpubReaderMenuAction::VIEW_CLIPPINGS;
        break;
-+    case RowId::ReadestPushClippings:
-+      action = EpubReaderMenuAction::READEST_PUSH_CLIPPINGS;
-+      break;
-+    case RowId::ReadestPullClippings:
-+      action = EpubReaderMenuAction::READEST_PULL_CLIPPINGS;
++    case RowId::ReadestSync:
++      action = EpubReaderMenuAction::READEST_SYNC;
 +      break;
      case RowId::ResetReadingPace:
        action = EpubReaderMenuAction::RESET_READING_PACE;
        break;
-@@ -2106,6 +2112,10 @@ const char* EpubReaderTouchMenuActivity::rowLabel(const RowId row) const {
+@@ -2106,6 +2109,8 @@ const char* EpubReaderTouchMenuActivity::rowLabel(const RowId row) const {
        return tr(STR_SAVE_CLIPPING);
      case RowId::ViewClippings:
        return tr(STR_VIEW_CLIPPINGS);
-+    case RowId::ReadestPushClippings:
-+      return tr(STR_READEST_PUSH_CLIPPINGS);
-+    case RowId::ReadestPullClippings:
-+      return tr(STR_READEST_PULL_CLIPPINGS);
++    case RowId::ReadestSync:
++      return tr(STR_READEST_SYNC_BOOK);
      case RowId::DeleteBookmarks:
        return tr(STR_DELETE_BOOKMARKS);
      case RowId::StatusBar:
-@@ -2219,6 +2229,8 @@ bool EpubReaderTouchMenuActivity::rowShowsNavigationCaret(const RowId row) const
+@@ -2219,6 +2224,7 @@ bool EpubReaderTouchMenuActivity::rowShowsNavigationCaret(const RowId row) const
      case RowId::DisplayQr:
      case RowId::Lookup:
      case RowId::SaveClipping:
-+    case RowId::ReadestPushClippings:
-+    case RowId::ReadestPullClippings:
++    case RowId::ReadestSync:
      case RowId::ResetReadingPace:
      case RowId::DeleteBookmarks:
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..f87e6d33
+index 00000000..65dc4db3
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,639 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -737,26 +768,32 @@ index 00000000..f87e6d33
 +#include <MD5Builder.h>
 +#include <WiFi.h>
 +
++#include <algorithm>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <ctime>
++#include <optional>
 +#include <utility>
 +#include <vector>
 +
 +#include "ChapterXPathResolver.h"
 +#include "ClippingStore.h"
++#include "EpubReaderUtils.h"
 +#include "HalClock.h"
 +#include "KOReaderDocumentId.h"
 +#include "MappedInputManager.h"
++#include "ProgressMapper.h"
 +#include "ReaderUtils.h"
 +#include "SdCardFontSystem.h"
 +#include "SilentRestart.h"
 +#include "activities/ActivityManager.h"
++#include "activities/home/RecentBookProgress.h"
 +#include "activities/network/WifiSelectionActivity.h"
 +#include "components/TouchHeaderBackButton.h"
 +#include "components/UITheme.h"
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
++#include "readest/ReadestBookMap.h"
 +#include "readest/ReadestStore.h"
 +
 +namespace {
@@ -769,7 +806,9 @@ index 00000000..f87e6d33
 +// Pulled clippings have no real page layout; they store a position within a
 +// virtual 1000-page chapter so "jump to clipping" lands near the right page.
 +constexpr uint16_t VIRTUAL_PAGE_COUNT = 1000;
-+constexpr uint32_t PAYLOAD_PULL_FLAG = 0x100;
++// Position differences below this fraction count as "already in sync".
++constexpr float POSITION_EPSILON = 0.002f;
++constexpr unsigned long AUTO_RETURN_DELAY_MS = 2000;
 +
 +void wifiOff() {
 +  WiFi.disconnect(false);
@@ -840,16 +879,30 @@ index 00000000..f87e6d33
 +  snprintf(buffer, sizeof(buffer), format, count);
 +  return buffer;
 +}
-+}  // namespace
 +
-+uint32_t ReadestSyncActivity::encodeBootPayload(const Mode mode, const uint8_t orientation) {
-+  const uint32_t orientationBits =
-+      orientation < CrossPointSettings::ORIENTATION_COUNT ? static_cast<uint32_t>(orientation) + 1 : 0;
-+  return orientationBits | (mode == Mode::PULL ? PAYLOAD_PULL_FLAG : 0);
++std::string formatCounts(const char* format, const int first, const int second) {
++  char buffer[96];
++  snprintf(buffer, sizeof(buffer), format, first, second);
++  return buffer;
 +}
 +
-+ReadestSyncActivity::Mode ReadestSyncActivity::decodeBootMode(const uint32_t payload) {
-+  return (payload & PAYLOAD_PULL_FLAG) != 0 ? Mode::PULL : Mode::PUSH;
++int percentOf(const float fraction) { return static_cast<int>(fraction * 100.0f + 0.5f); }
++
++// Spine index in *this* EPUB for a Readest note, via its xpointer or CFI
++// (both use the original/source spine numbering). -1 if unusable.
++int currentSpineForNote(const std::shared_ptr<Epub>& epub, const ReadestNote& note) {
++  const int sourceSpine = spineIndexFromNote(note);
++  if (sourceSpine < 0) return -1;
++  std::string xpath = note.xpointer0.rfind("/body/DocFragment[", 0) == 0
++                          ? note.xpointer0
++                          : "/body/DocFragment[" + std::to_string(sourceSpine + 1) + "]";
++  int spine = -1;
++  return ProgressMapper::sourceXPathToCurrent(epub, xpath, spine) ? spine : -1;
++}
++}  // namespace
++
++uint32_t ReadestSyncActivity::encodeBootPayload(const uint8_t orientation) {
++  return orientation < CrossPointSettings::ORIENTATION_COUNT ? static_cast<uint32_t>(orientation) + 1 : 0;
 +}
 +
 +uint8_t ReadestSyncActivity::decodeBootOrientation(const uint32_t payload) {
@@ -864,7 +917,7 @@ index 00000000..f87e6d33
 +  const bool hasReaderOrientation = readerOrientation < CrossPointSettings::ORIENTATION_COUNT;
 +  if (restartBeforeNetwork) {
 +    if (hasReaderOrientation) ReaderUtils::applyOrientation(renderer, readerOrientation);
-+    silentRestartToNetwork(NetworkBootTarget::READEST_SYNC, encodeBootPayload(mode, readerOrientation));
++    silentRestartToNetwork(NetworkBootTarget::READEST_SYNC, encodeBootPayload(readerOrientation));
 +    return;
 +  }
 +
@@ -872,7 +925,7 @@ index 00000000..f87e6d33
 +  ReaderUtils::applyOrientation(renderer, hasReaderOrientation ? readerOrientation : SETTINGS.orientation);
 +
 +  if (!READEST_STORE.hasCredentials()) {
-+    finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), tr(STR_READEST_ERR_NO_CREDENTIALS));
++    fail(tr(STR_READEST_ERR_NO_CREDENTIALS));
 +    return;
 +  }
 +
@@ -918,9 +971,9 @@ index 00000000..f87e6d33
 +    requestUpdate(true);
 +  }
 +
-+  // Real wall-clock time for note timestamps.
++  // Real wall-clock time for note and position timestamps.
 +  if (!halClock.syncSystemTimeFromNTP()) {
-+    LOG_DBG("RDS", "NTP sync unavailable; Readest will stamp notes itself");
++    LOG_DBG("RDS", "NTP sync unavailable; Readest will stamp records itself");
 +  }
 +
 +  runSync();
@@ -936,11 +989,11 @@ index 00000000..f87e6d33
 +  }
 +}
 +
-+void ReadestSyncActivity::finishWith(const State finalState, std::string message, std::string detail) {
++void ReadestSyncActivity::fail(std::string detail) {
 +  {
 +    RenderLock lock(*this);
-+    state = finalState;
-+    statusMessage = std::move(message);
++    state = FAILED;
++    statusMessage = tr(STR_READEST_SYNC_FAILED);
 +    detailMessage = std::move(detail);
 +  }
 +  requestUpdate(true);
@@ -953,129 +1006,107 @@ index 00000000..f87e6d33
 +  if (!epub->load(false, true, Epub::XLocationLoadMode::Immediate, true)) {
 +    LOG_ERR("RDS", "Failed to load epub %s", epubPath.c_str());
 +    epub.reset();
-+    finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), tr(STR_READEST_OPEN_BOOK_FAILED));
++    fail(tr(STR_READEST_OPEN_BOOK_FAILED));
 +    return;
 +  }
 +
-+  const std::string localHash = KOReaderDocumentId::calculate(epubPath);
++  localHash = KOReaderDocumentId::calculate(epubPath);
 +  ReadestBook book;
-+  const auto found = client.findBookByTitle(epub->getTitle(), localHash, book);
++  if (ReadestBookMap::lookup(localHash, book)) {
++    LOG_INF("RDS", "Using saved match \"%s\" (%s)", book.title.c_str(), book.hash.c_str());
++    syncWithBook(book);
++    return;
++  }
++
++  const auto found = client.findCandidates(epub->getTitle(), epub->getAuthor(), localHash, candidates);
 +  if (found != ReadestClient::OK) {
 +    std::string detail = ReadestClient::errorString(found);
 +    if (found == ReadestClient::BOOK_NOT_FOUND) detail += ": " + epub->getTitle();
-+    finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), std::move(detail));
++    fail(std::move(detail));
 +    return;
 +  }
 +
-+  if (!CLIPPINGS.loadForBook(epubPath, epub->getTitle(), epub->getAuthor(), "epub")) {
-+    finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), tr(STR_READEST_OPEN_BOOK_FAILED));
++  // Only ask when in doubt: an identical file, or a word-for-word title match
++  // clearly ahead of the runner-up, is taken (and remembered) straight away.
++  const int runnerUp = candidates.size() > 1 ? candidates[1].score : 0;
++  const int bestScore = candidates.front().score;
++  if (bestScore >= ReadestClient::SCORE_SAME_FILE ||
++      (bestScore >= ReadestClient::SCORE_CONFIDENT && bestScore - runnerUp >= ReadestClient::SCORE_CLEAR_LEAD)) {
++    book = candidates.front();
++    candidates.clear();
++    LOG_INF("RDS", "Auto-matched \"%s\" (score %d, runner-up %d)", book.title.c_str(), bestScore, runnerUp);
++    ReadestBookMap::remember(localHash, book);
++    syncWithBook(book);
 +    return;
 +  }
-+
-+  if (mode == Mode::PUSH) {
-+    pushClippings(book);
-+  } else {
-+    pullClippings(book);
-+  }
++  showChooser();
 +}
 +
-+void ReadestSyncActivity::pushClippings(const ReadestBook& book) {
-+  if (!CLIPPINGS.hasClippings()) {
-+    finishWith(DONE, tr(STR_READEST_NO_CLIPPINGS));
++void ReadestSyncActivity::showChooser() {
++  std::vector<std::string> labels;
++  labels.reserve(candidates.size());
++  for (const auto& candidate : candidates) {
++    std::string label = candidate.title.empty() ? candidate.hash : candidate.title;
++    if (!candidate.author.empty()) label += " - " + candidate.author;
++    labels.push_back(std::move(label));
++  }
++
++  {
++    RenderLock lock(*this);
++    state = CHOOSING;
++    statusMessage = tr(STR_READEST_CHOOSE_BOOK);
++    detailMessage = epub->getTitle();
++    chosenIndex = -1;
++    choiceCancelled = false;
++    chooser.show(tr(STR_READEST_CHOOSE_BOOK), labels, 0, [this](const int index) { chosenIndex = index; });
++    chooser.setCancelCallback([this] { choiceCancelled = true; });
++  }
++  requestUpdate(true);
++}
++
++void ReadestSyncActivity::syncWithBook(const ReadestBook& book) {
++  if (!CLIPPINGS.loadForBook(epubPath, epub->getTitle(), epub->getAuthor(), "epub")) {
++    fail(tr(STR_READEST_OPEN_BOOK_FAILED));
 +    return;
 +  }
-+  setStatus(tr(STR_READEST_PUSHING));
 +
-+  const time_t now = time(nullptr);
-+  const int64_t nowMs = now > 1600000000 ? static_cast<int64_t>(now) * 1000 : 0;
++  setStatus(tr(STR_READEST_PULLING));
++  std::vector<ReadestNote> remote;
++  const auto pulled = client.pullNotes(book, remote);
++  if (pulled != ReadestClient::OK) {
++    fail(ReadestClient::errorString(pulled));
++    return;
++  }
 +
++  int added = 0;
 +  int pushed = 0;
 +  int skipped = 0;
-+  JsonDocument batch;
-+  JsonArray notes = batch.to<JsonArray>();
-+  size_t batchCount = 0;
-+  std::string text;
-+  text.reserve(CLIPPING_TEXT_MAX);
++  if (!pullClippings(remote, added, skipped)) return;
 +
-+  const auto flush = [&]() -> ReadestClient::Error {
-+    if (batchCount == 0) return ReadestClient::OK;
-+    std::string json;
-+    serializeJson(batch, json);
-+    const auto result = client.pushNotes(json);
-+    if (result == ReadestClient::OK) pushed += static_cast<int>(batchCount);
-+    batch.clear();
-+    notes = batch.to<JsonArray>();
-+    batchCount = 0;
-+    return result;
-+  };
++  setStatus(tr(STR_READEST_PUSHING));
++  if (!pushClippings(book, remote, pushed, skipped)) return;
++  remote.clear();
++  remote.shrink_to_fit();
 +
-+  const size_t count = CLIPPINGS.clippingCount();
-+  for (size_t i = 0; i < count; ++i) {
-+    const Clipping* clipping = CLIPPINGS.clippingAt(i);
-+    text.clear();
-+    if (!clipping || !CLIPPINGS.readClippingText(i, text) || text.empty()) {
-+      skipped++;
-+      continue;
-+    }
++  setStatus(tr(STR_READEST_SYNCING_POSITION));
++  const std::string position = syncPosition(book);
 +
-+    XPathTextRange range;
-+    if (!ChapterXPathResolver::findXPathRangeForText(epub, clipping->spineIndex, text, clipping->paragraphIndex,
-+                                                     range)) {
-+      LOG_DBG("RDS", "Clipping %u not located in spine %u", static_cast<unsigned>(i), clipping->spineIndex);
-+      skipped++;
-+      continue;
-+    }
-+
-+    JsonObject note = notes.add<JsonObject>();
-+    note["bookHash"] = book.hash;
-+    if (!book.metaHash.empty()) note["metaHash"] = book.metaHash;
-+    note["id"] = noteIdFor(book.hash, range);
-+    note["type"] = "annotation";
-+    note["cfi"] = "";
-+    note["xpointer0"] = range.start;
-+    note["xpointer1"] = range.end;
-+    note["text"] = text;
-+    note["note"] = "";
-+    note["style"] = "highlight";
-+    note["color"] = HIGHLIGHT_COLOR;
-+    if (nowMs > 0) note["createdAt"] = nowMs;
-+    // Deliberately ancient: Readest's last-writer-wins then never lets a
-+    // re-push overwrite (or resurrect) a highlight edited/deleted in Readest.
-+    // New rows get a fresh updated_at from the server on insert.
-+    note["updatedAt"] = 1;
-+    batchCount++;
-+
-+    if (batchCount >= PUSH_BATCH) {
-+      const auto result = flush();
-+      if (result != ReadestClient::OK) {
-+        finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), ReadestClient::errorString(result));
-+        return;
-+      }
-+    }
++  LOG_INF("RDS", "Sync done: %d pulled, %d pushed, %d skipped", added, pushed, skipped);
++  std::string detail = formatCounts(tr(STR_READEST_SYNC_COUNTS_FORMAT), added, pushed);
++  if (skipped > 0) detail += "\n" + formatCount(tr(STR_READEST_SKIPPED_FORMAT), skipped);
++  if (!position.empty()) detail += "\n" + position;
++  {
++    RenderLock lock(*this);
++    state = DONE;
++    statusMessage = tr(STR_READEST_SYNC_DONE);
++    detailMessage = std::move(detail);
++    autoReturnAt = millis() + AUTO_RETURN_DELAY_MS;
 +  }
-+
-+  const auto result = flush();
-+  if (result != ReadestClient::OK) {
-+    finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), ReadestClient::errorString(result));
-+    return;
-+  }
-+
-+  LOG_INF("RDS", "Pushed %d clippings, %d skipped", pushed, skipped);
-+  finishWith(DONE, formatCount(tr(STR_READEST_PUSH_DONE_FORMAT), pushed),
-+             skipped > 0 ? formatCount(tr(STR_READEST_SKIPPED_FORMAT), skipped) : "");
++  requestUpdate(true);
 +}
 +
-+void ReadestSyncActivity::pullClippings(const ReadestBook& book) {
-+  setStatus(tr(STR_READEST_PULLING));
-+
-+  std::vector<ReadestNote> remote;
-+  const auto result = client.pullNotes(book, remote);
-+  if (result != ReadestClient::OK) {
-+    finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), ReadestClient::errorString(result));
-+    return;
-+  }
-+
-+  // What the device already has, so repeated pulls (and our own pushed
++bool ReadestSyncActivity::pullClippings(const std::vector<ReadestNote>& remote, int& added, int& skipped) {
++  // What the device already has, so repeated syncs (and our own pushed
 +  // highlights coming back) don't create duplicates.
 +  std::vector<std::pair<uint16_t, std::string>> existing;
 +  existing.reserve(CLIPPINGS.clippingCount() + remote.size());
@@ -1089,11 +1120,10 @@ index 00000000..f87e6d33
 +    }
 +  }
 +
-+  int added = 0;
-+  int skipped = 0;
 +  const int spineCount = epub->getSpineItemsCount();
 +  for (const ReadestNote& note : remote) {
-+    const int spine = spineIndexFromNote(note);
++    if (note.deleted) continue;
++    const int spine = currentSpineForNote(epub, note);
 +    if (spine < 0 || spine >= spineCount) {
 +      skipped++;
 +      continue;
@@ -1133,16 +1163,168 @@ index 00000000..f87e6d33
 +      break;
 +    }
 +    if (addResult == ClippingStore::AddResult::SaveFailed) {
-+      finishWith(FAILED, tr(STR_READEST_SYNC_FAILED), tr(STR_READEST_SAVE_FAILED));
-+      return;
++      fail(tr(STR_READEST_SAVE_FAILED));
++      return false;
 +    }
 +    existing.emplace_back(static_cast<uint16_t>(spine), key);
 +    added++;
 +  }
++  return true;
++}
 +
-+  LOG_INF("RDS", "Pulled %d clippings, %d skipped", added, skipped);
-+  finishWith(DONE, formatCount(tr(STR_READEST_PULL_DONE_FORMAT), added),
-+             skipped > 0 ? formatCount(tr(STR_READEST_SKIPPED_FORMAT), skipped) : "");
++bool ReadestSyncActivity::pushClippings(const ReadestBook& book, const std::vector<ReadestNote>& remote, int& pushed,
++                                        int& skipped) {
++  if (!CLIPPINGS.hasClippings()) return true;
++
++  // Text Readest already has (live or deleted there) is never sent again: that
++  // covers clippings just pulled and highlights removed on purpose in Readest.
++  std::vector<std::string> remoteKeys;
++  remoteKeys.reserve(remote.size());
++  for (const ReadestNote& note : remote) remoteKeys.push_back(compareKey(note.text));
++
++  const time_t now = time(nullptr);
++  const int64_t nowMs = now > 1600000000 ? static_cast<int64_t>(now) * 1000 : 0;
++
++  JsonDocument batch;
++  JsonArray notes = batch.to<JsonArray>();
++  size_t batchCount = 0;
++  std::string text;
++  text.reserve(CLIPPING_TEXT_MAX);
++
++  const auto flush = [&]() -> ReadestClient::Error {
++    if (batchCount == 0) return ReadestClient::OK;
++    std::string json;
++    serializeJson(batch, json);
++    const auto result = client.pushNotes(json);
++    if (result == ReadestClient::OK) pushed += static_cast<int>(batchCount);
++    batch.clear();
++    notes = batch.to<JsonArray>();
++    batchCount = 0;
++    return result;
++  };
++
++  const size_t count = CLIPPINGS.clippingCount();
++  for (size_t i = 0; i < count; ++i) {
++    const Clipping* clipping = CLIPPINGS.clippingAt(i);
++    text.clear();
++    if (!clipping || !CLIPPINGS.readClippingText(i, text) || text.empty()) continue;
++
++    const std::string key = compareKey(text);
++    bool known = false;
++    for (const auto& remoteKey : remoteKeys) {
++      if (remoteKey == key) {
++        known = true;
++        break;
++      }
++    }
++    if (known) continue;
++
++    XPathTextRange range;
++    if (!ChapterXPathResolver::findXPathRangeForText(epub, clipping->spineIndex, text, clipping->paragraphIndex,
++                                                     range) ||
++        !ProgressMapper::currentXPathToSource(epub, clipping->spineIndex, range.start) ||
++        !ProgressMapper::currentXPathToSource(epub, clipping->spineIndex, range.end)) {
++      LOG_DBG("RDS", "Clipping %u not located in spine %u", static_cast<unsigned>(i), clipping->spineIndex);
++      skipped++;
++      continue;
++    }
++
++    JsonObject note = notes.add<JsonObject>();
++    note["bookHash"] = book.hash;
++    if (!book.metaHash.empty()) note["metaHash"] = book.metaHash;
++    note["id"] = noteIdFor(book.hash, range);
++    note["type"] = "annotation";
++    note["cfi"] = "";
++    note["xpointer0"] = range.start;
++    note["xpointer1"] = range.end;
++    note["text"] = text;
++    note["note"] = "";
++    note["style"] = "highlight";
++    note["color"] = HIGHLIGHT_COLOR;
++    if (nowMs > 0) note["createdAt"] = nowMs;
++    // Deliberately ancient: Readest's last-writer-wins then never lets a
++    // re-push overwrite (or resurrect) a highlight edited/deleted in Readest.
++    // New rows get a fresh updated_at from the server on insert.
++    note["updatedAt"] = 1;
++    batchCount++;
++
++    if (batchCount >= PUSH_BATCH) {
++      const auto result = flush();
++      if (result != ReadestClient::OK) {
++        fail(ReadestClient::errorString(result));
++        return false;
++      }
++    }
++  }
++
++  const auto result = flush();
++  if (result != ReadestClient::OK) {
++    fail(ReadestClient::errorString(result));
++    return false;
++  }
++  return true;
++}
++
++std::string ReadestSyncActivity::syncPosition(const ReadestBook& book) {
++  EpubReaderUtils::Progress progress;
++  EpubReaderUtils::loadProgress(*epub, progress, "RDS");
++  if (progress.spineIndex < 0 || progress.spineIndex >= epub->getSpineItemsCount()) progress.spineIndex = 0;
++  CrossPointPosition local = {progress.spineIndex, progress.pageNumber,
++                              progress.hasPageCount ? std::max(1, progress.pageCount) : 1};
++  if (progress.hasVisibleTextOffset) {
++    local.visibleTextOffset = progress.visibleTextOffset;
++    local.hasVisibleTextOffset = true;
++  }
++  // Readest has the original EPUB, so positions travel in source coordinates.
++  const KOReaderPosition localKo = ProgressMapper::toKOReader(epub, local, PositionCoordinateSpace::SourceDocument);
++
++  ReadestProgress remote;
++  const auto pulled = client.pullProgress(book, remote);
++  if (pulled != ReadestClient::OK) {
++    LOG_ERR("RDS", "Position pull failed: %d", static_cast<int>(pulled));
++    return tr(STR_READEST_POS_UNAVAILABLE);
++  }
++
++  // Map Readest's position into this layout and onto the same percentage
++  // scale as the local one before comparing.
++  bool remoteMapped = false;
++  float remotePct = -1.0f;
++  CrossPointPosition remotePos{};
++  if (remote.found && (!remote.xpointer.empty() || remote.fraction >= 0.0f)) {
++    KOReaderPosition ko;
++    ko.xpath = remote.xpointer;
++    ko.percentage = remote.fraction >= 0.0f ? remote.fraction : 0.0f;
++    remotePos = ProgressMapper::toCrossPoint(epub, ko, local.spineIndex, local.totalPages,
++                                             PositionCoordinateSpace::SourceDocument);
++    if (remotePos.valid && remotePos.spineIndex >= 0 && remotePos.spineIndex < epub->getSpineItemsCount()) {
++      remoteMapped = true;
++      remotePct = ProgressMapper::toKOReader(epub, remotePos).percentage;
++    }
++  }
++
++  if (remoteMapped && remotePct > localKo.percentage + POSITION_EPSILON) {
++    const int pageCount = std::max(remotePos.totalPages, remotePos.pageNumber + 1);
++    const std::optional<uint32_t> visibleTextOffset =
++        remotePos.hasVisibleTextOffset ? std::optional<uint32_t>(remotePos.visibleTextOffset) : std::nullopt;
++    if (!EpubReaderUtils::saveProgress(*epub, remotePos.spineIndex, remotePos.pageNumber, pageCount,
++                                       visibleTextOffset)) {
++      LOG_ERR("RDS", "Failed to save Readest position");
++      return tr(STR_READEST_POS_UNAVAILABLE);
++    }
++    RecentBookProgress::saveCachedEpubPercent(*epub, remotePos.spineIndex, remotePos.pageNumber, pageCount);
++    return formatCount(tr(STR_READEST_POS_FROM_READEST_FORMAT), percentOf(remotePct));
++  }
++
++  if (localKo.valid && !localKo.xpath.empty() && (!remoteMapped || localKo.percentage > remotePct + POSITION_EPSILON)) {
++    const auto pushed = client.pushProgress(book, localKo.xpath, localKo.percentage);
++    if (pushed != ReadestClient::OK) {
++      LOG_ERR("RDS", "Position push failed: %d", static_cast<int>(pushed));
++      return tr(STR_READEST_POS_UNAVAILABLE);
++    }
++    return formatCount(tr(STR_READEST_POS_TO_READEST_FORMAT), percentOf(localKo.percentage));
++  }
++
++  return remoteMapped ? tr(STR_READEST_POS_IN_SYNC) : tr(STR_READEST_POS_UNAVAILABLE);
 +}
 +
 +void ReadestSyncActivity::returnToReader() { activityManager.goToReader(epubPath, false, false, true); }
@@ -1154,24 +1336,27 @@ index 00000000..f87e6d33
 +  const Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
 +  const Rect header{screen.x, screen.y + metrics.topPadding, screen.width,
 +                    TouchHeaderBackButton::height(metrics, mappedInput)};
-+  const char* title = mode == Mode::PUSH ? tr(STR_READEST_PUSH_CLIPPINGS) : tr(STR_READEST_PULL_CLIPPINGS);
-+  if ((state == DONE || state == FAILED) && mappedInput.hasTouchHardware()) {
++  const char* title = tr(STR_READEST_SYNC_BOOK);
++  const bool finished = state == DONE || state == FAILED;
++  if (finished && mappedInput.hasTouchHardware()) {
 +    TouchHeaderBackButton::draw(renderer, header, title, false);
 +  } else {
 +    GUI.drawHeader(renderer, header, title);
 +  }
 +
 +  const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
-+  const int top = screen.y + (screen.height - lineHeight) / 2;
++  const int top = screen.y + (screen.height - lineHeight * 4) / 2;
 +  const Rect textArea{screen.x + metrics.contentSidePadding, screen.y, screen.width - metrics.contentSidePadding * 2,
 +                      screen.height};
-+  const bool finished = state == DONE || state == FAILED;
 +  UITheme::drawCenteredWrappedText(renderer, textArea, UI_10_FONT_ID, top, statusMessage.c_str(), 2, true,
 +                                   finished ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR, 4);
 +  if (!detailMessage.empty()) {
 +    UITheme::drawCenteredWrappedText(renderer, textArea, UI_10_FONT_ID, top + lineHeight * 2 + 10,
-+                                     detailMessage.c_str(), 3, true, EpdFontFamily::REGULAR, 4);
++                                     detailMessage.c_str(), 5, true, EpdFontFamily::REGULAR, 4);
 +  }
++
++  // The chooser draws its own button hints and pushes the frame itself.
++  if (chooser.processRender(renderer, mappedInput)) return;
 +
 +  const auto labels = mappedInput.mapLabels(
 +      finished ? mappedInput.withBackArrow(tr(STR_BACK)) : MappedInputManager::Label(""), "", "", "");
@@ -1180,7 +1365,29 @@ index 00000000..f87e6d33
 +}
 +
 +void ReadestSyncActivity::loop() {
++  if (state == CHOOSING) {
++    chooser.handleInput(mappedInput, [this] { requestUpdate(); });
++    if (chosenIndex >= 0 && chosenIndex < static_cast<int>(candidates.size())) {
++      const ReadestBook book = candidates[static_cast<size_t>(chosenIndex)];
++      candidates.clear();
++      ReadestBookMap::remember(localHash, book);
++      {
++        RenderLock lock(*this);
++        state = WORKING;
++        detailMessage.clear();
++      }
++      syncWithBook(book);
++    } else if (choiceCancelled || !chooser.isActive()) {
++      returnToReader();
++    }
++    return;
++  }
 +  if (state != DONE && state != FAILED) return;
++
++  if (autoReturnAt != 0 && static_cast<long>(millis() - autoReturnAt) >= 0) {
++    returnToReader();
++    return;
++  }
 +
 +  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
 +  int x = 0;
@@ -1193,10 +1400,10 @@ index 00000000..f87e6d33
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 00000000..0af4e2dc
+index 00000000..1b36ef34
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,91 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -1204,63 +1411,60 @@ index 00000000..0af4e2dc
 +#include <memory>
 +#include <string>
 +#include <utility>
++#include <vector>
 +
 +#include "CrossPointSettings.h"
 +#include "activities/Activity.h"
 +#include "activities/ScreenTransitionRefresh.h"
++#include "components/OptionPopup.h"
 +#include "readest/ReadestClient.h"
 +
 +/**
-+ * Two-way clipping sync between this book and the same book (matched by
-+ * title) in the user's Readest library.
++ * "Sync Readest": one pass that keeps this book and the same book in the
++ * user's Readest library in step.
 + *
-+ * PUSH: every clipping is located in the chapter XHTML, converted to
-+ *       KOReader xpointers and sent as a grey Readest highlight. Readest turns
-+ *       the xpointers into its own CFI the next time the book is opened there.
-+ * PULL: Readest highlights not already on the device are added as clippings.
-+ *       They carry no layout signature, so the reader finds them by text on
-+ *       whatever layout is active.
++ *  1. Match the book: a remembered match (ReadestBookMap), else a confident
++ *     title/file match, else the user picks from the top 3 candidates.
++ *  2. Pull: Readest highlights not on the device become clippings. They carry
++ *     no layout signature, so the reader finds them by text.
++ *  3. Push: device clippings Readest doesn't have yet become grey Readest
++ *     highlights, located in the chapter XHTML as KOReader xpointers.
++ *  4. Position: furthest wins. The device jumps forward to Readest's
++ *     position, or sends its own position when it is ahead.
 + *
-+ * Like KOReader sync, the reader first hands off to a tiny instance of this
-+ * activity that reboots into the lean network mode (freeing the reader's
-+ * heap before Wi-Fi/TLS), then the real instance runs and reboots back into
-+ * the reader on exit.
++ * Like KOReader sync, the reader first hands off to a tiny instance that
++ * reboots into the lean network mode (freeing the reader's heap before
++ * Wi-Fi/TLS); the real instance reboots back into the reader on exit.
 + */
 +class ReadestSyncActivity final : public Activity {
 + public:
-+  enum class Mode : uint8_t { PUSH = 0, PULL = 1 };
-+
 +  // Reader-side handoff: reboots into network mode on enter.
-+  ReadestSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Mode mode, uint8_t readerOrientation)
++  ReadestSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, uint8_t readerOrientation)
 +      : Activity("ReadestSync", renderer, mappedInput),
-+        mode(mode),
 +        readerOrientation(readerOrientation),
 +        restartBeforeNetwork(true) {}
 +
 +  // Network boot: performs the sync for `epubPath`.
-+  ReadestSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string epubPath, Mode mode,
++  ReadestSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string epubPath,
 +                      uint8_t readerOrientation)
 +      : Activity("ReadestSync", renderer, mappedInput),
 +        epubPath(std::move(epubPath)),
-+        mode(mode),
 +        readerOrientation(readerOrientation) {}
 +
-+  static uint32_t encodeBootPayload(Mode mode, uint8_t orientation);
-+  static Mode decodeBootMode(uint32_t payload);
++  static uint32_t encodeBootPayload(uint8_t orientation);
 +  static uint8_t decodeBootOrientation(uint32_t payload);
 +
 +  void onEnter() override;
 +  void onExit() override;
 +  void loop() override;
 +  void render(RenderLock&&) override;
-+  bool preventAutoSleep() override { return state == WORKING; }
++  bool preventAutoSleep() override { return state == WORKING || state == CHOOSING; }
 +
 + private:
-+  enum State { WIFI_SELECTION, WORKING, DONE, FAILED };
++  enum State { WIFI_SELECTION, WORKING, CHOOSING, DONE, FAILED };
 +
 +  std::shared_ptr<Epub> epub;
 +  std::string epubPath;
-+  Mode mode;
 +  uint8_t readerOrientation = CrossPointSettings::ORIENTATION_COUNT;
 +  bool restartBeforeNetwork = false;
 +  bool wifiActivated = false;
@@ -1269,22 +1473,34 @@ index 00000000..0af4e2dc
 +  ScreenTransitionRefresh screenTransitionRefresh;
 +  std::string statusMessage;
 +  std::string detailMessage;
++  unsigned long autoReturnAt = 0;  // success screens close themselves
 +  ReadestClient client;
++  std::string localHash;
++
++  // Book chooser (first sync of a book only, and only when in doubt).
++  OptionPopup chooser;
++  std::vector<ReadestBook> candidates;
++  int chosenIndex = -1;
++  bool choiceCancelled = false;
 +
 +  void onWifiSelectionComplete(bool success);
 +  void setStatus(const char* message);
-+  void finishWith(State finalState, std::string message, std::string detail = "");
++  void fail(std::string detail);
 +  void runSync();
-+  void pushClippings(const ReadestBook& book);
-+  void pullClippings(const ReadestBook& book);
++  void showChooser();
++  void syncWithBook(const ReadestBook& book);
++  // Each step returns false after reporting a fatal error via fail().
++  bool pullClippings(const std::vector<ReadestNote>& remote, int& added, int& skipped);
++  bool pushClippings(const ReadestBook& book, const std::vector<ReadestNote>& remote, int& pushed, int& skipped);
++  std::string syncPosition(const ReadestBook& book);
 +  void returnToReader();
 +};
 diff --git a/src/activities/settings/ReadestAuthActivity.cpp b/src/activities/settings/ReadestAuthActivity.cpp
 new file mode 100644
-index 00000000..3e28a8f4
+index 00000000..9a73e41f
 --- /dev/null
 +++ b/src/activities/settings/ReadestAuthActivity.cpp
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,132 @@
 +#include "ReadestAuthActivity.h"
 +
 +#include <GfxRenderer.h>
@@ -1330,6 +1546,7 @@ index 00000000..3e28a8f4
 +    RenderLock lock(*this);
 +    if (result == ReadestClient::OK) {
 +      state = SUCCESS;
++      autoFinishAt = millis() + 1500;
 +    } else {
 +      state = FAILED;
 +      errorMessage = ReadestClient::errorString(result);
@@ -1397,6 +1614,10 @@ index 00000000..3e28a8f4
 +}
 +
 +void ReadestAuthActivity::loop() {
++  if (state == SUCCESS && autoFinishAt != 0 && static_cast<long>(millis() - autoFinishAt) >= 0) {
++    finish();
++    return;
++  }
 +  if (state == SUCCESS || state == FAILED) {
 +    const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
 +    if (TouchHeaderBackButton::wasTapped(mappedInput, header) ||
@@ -1414,10 +1635,10 @@ index 00000000..3e28a8f4
 +}
 diff --git a/src/activities/settings/ReadestAuthActivity.h b/src/activities/settings/ReadestAuthActivity.h
 new file mode 100644
-index 00000000..474cc8dc
+index 00000000..44b8c0c7
 --- /dev/null
 +++ b/src/activities/settings/ReadestAuthActivity.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +#pragma once
 +
 +#include <string>
@@ -1447,15 +1668,16 @@ index 00000000..474cc8dc
 +  State state = WIFI_SELECTION;
 +  ScreenTransitionRefresh screenTransitionRefresh;
 +  std::string errorMessage;
++  unsigned long autoFinishAt = 0;  // "Connected" closes itself
 +
 +  void onWifiSelectionComplete(bool success);
 +};
 diff --git a/src/activities/settings/ReadestSettingsActivity.cpp b/src/activities/settings/ReadestSettingsActivity.cpp
 new file mode 100644
-index 00000000..053a3437
+index 00000000..25d2b452
 --- /dev/null
 +++ b/src/activities/settings/ReadestSettingsActivity.cpp
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,220 @@
 +#include "ReadestSettingsActivity.h"
 +
 +#include <GfxRenderer.h>
@@ -1472,18 +1694,20 @@ index 00000000..053a3437
 +#include "components/UIThemeTokens.h"
 +#include "components/UiAppHelpers.h"
 +#include "fontIds.h"
++#include "readest/ReadestBookMap.h"
 +#include "readest/ReadestStore.h"
 +#include "util/InputReleaseGuard.h"
 +
 +namespace fui = freeink::ui;
 +
 +namespace {
-+constexpr int MENU_ITEMS = 3;
++constexpr int MENU_ITEMS = 4;
 +constexpr int ROW_ACCOUNT = 0;
 +constexpr int ROW_CONNECT = 1;
-+constexpr int ROW_DISCONNECT = 2;
++constexpr int ROW_RESET_MATCHES = 2;
++constexpr int ROW_DISCONNECT = 3;
 +const StrId menuNames[MENU_ITEMS] = {StrId::STR_READEST_ACCOUNT, StrId::STR_READEST_CONNECT,
-+                                     StrId::STR_READEST_DISCONNECT};
++                                     StrId::STR_READEST_RESET_MATCHES, StrId::STR_READEST_DISCONNECT};
 +constexpr fui::ActionId ACTION_ROW = 1;
 +}  // namespace
 +
@@ -1601,9 +1825,15 @@ index 00000000..053a3437
 +    } else {
 +      askEmail();
 +    }
++  } else if (selectedIndex == ROW_RESET_MATCHES) {
++    // Next sync of each book asks again which Readest book it is.
++    ReadestBookMap::clearAll();
++    requestUpdate();
 +  } else if (selectedIndex == ROW_DISCONNECT) {
 +    READEST_STORE.clear();
 +    READEST_STORE.saveToFile();
++    // Matches point at the old account's library.
++    ReadestBookMap::clearAll();
 +    requestUpdate();
 +  }
 +}
@@ -1763,7 +1993,7 @@ index fd39d85c..68a3e8a5 100644
    DisplaySleepScreen,
    DisplayFrontlight,
 diff --git a/src/main.cpp b/src/main.cpp
-index cd01e87c..ebfc4eb7 100644
+index cd01e87c..2b7e2178 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -93,12 +93,14 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
@@ -1802,9 +2032,9 @@ index cd01e87c..ebfc4eb7 100644
 +          LOG_ERR("MAIN", "Readest sync boot without an open EPUB");
 +          break;
 +        }
-+        auto syncActivity = makeUniqueNoThrow<ReadestSyncActivity>(
-+            renderer, mappedInputManager, std::move(epubPath), ReadestSyncActivity::decodeBootMode(snapshotPayload),
-+            ReadestSyncActivity::decodeBootOrientation(snapshotPayload));
++        auto syncActivity =
++            makeUniqueNoThrow<ReadestSyncActivity>(renderer, mappedInputManager, std::move(epubPath),
++                                                   ReadestSyncActivity::decodeBootOrientation(snapshotPayload));
 +        if (syncActivity) {
 +          activityManager.replaceActivity(std::move(syncActivity));
 +          launched = true;
@@ -1817,25 +2047,110 @@ index cd01e87c..ebfc4eb7 100644
        case NetworkBootTarget::MANAGE_FONTS: {
          auto fontsActivity = makeUniqueNoThrow<FontDownloadActivity>(renderer, mappedInputManager);
          if (fontsActivity) {
+diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
+new file mode 100644
+index 00000000..ad946984
+--- /dev/null
++++ b/src/readest/ReadestBookMap.cpp
+@@ -0,0 +1,52 @@
++#include "ReadestBookMap.h"
++
++#include <ArduinoJson.h>
++#include <HalStorage.h>
++#include <Logging.h>
++#include <PersistableStore.h>
++
++namespace {
++constexpr char MAP_PATH[] = "/.crosspoint/readest_books.json";
++}  // namespace
++
++namespace ReadestBookMap {
++
++bool lookup(const std::string& localHash, ReadestBook& out) {
++  if (localHash.empty()) return false;
++  JsonDocument doc;
++  if (!PersistableStoreBase::readDocFromFile(MAP_PATH, doc)) return false;
++  const JsonObjectConst entry = doc[localHash].as<JsonObjectConst>();
++  if (entry.isNull()) return false;
++  const char* hash = entry["h"] | "";
++  if (hash[0] == '\0') return false;
++  out.hash = hash;
++  out.metaHash = entry["m"] | "";
++  out.title = entry["t"] | "";
++  out.author = entry["a"] | "";
++  return true;
++}
++
++bool remember(const std::string& localHash, const ReadestBook& book) {
++  if (localHash.empty() || book.hash.empty()) return false;
++  JsonDocument doc;
++  PersistableStoreBase::readDocFromFile(MAP_PATH, doc);  // missing file = empty map
++  if (!doc.is<JsonObject>()) doc.to<JsonObject>();
++  JsonObject entry = doc[localHash].to<JsonObject>();
++  entry["h"] = book.hash;
++  entry["m"] = book.metaHash;
++  entry["t"] = book.title;
++  entry["a"] = book.author;
++  if (!PersistableStoreBase::writeDocToFile(MAP_PATH, doc)) {
++    LOG_ERR("RDS", "Failed to save Readest book match");
++    return false;
++  }
++  return true;
++}
++
++void clearAll() {
++  if (Storage.exists(MAP_PATH) && !Storage.remove(MAP_PATH)) {
++    LOG_ERR("RDS", "Failed to remove %s", MAP_PATH);
++  }
++}
++
++}  // namespace ReadestBookMap
+diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
+new file mode 100644
+index 00000000..853ad4ad
+--- /dev/null
++++ b/src/readest/ReadestBookMap.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <string>
++
++#include "ReadestClient.h"
++
++/**
++ * Remembers which Readest library book the user picked for a local EPUB, so
++ * the library scan and chooser only happen on the first sync of each book.
++ *
++ * Keyed by the local file's KOReader-style partial MD5, which survives moves
++ * and renames. Stored as a small JSON object in /.crosspoint/readest_books.json
++ * that is read/written only around a sync (never kept in RAM).
++ */
++namespace ReadestBookMap {
++bool lookup(const std::string& localHash, ReadestBook& out);
++bool remember(const std::string& localHash, const ReadestBook& book);
++void clearAll();
++}  // namespace ReadestBookMap
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
 new file mode 100644
-index 00000000..bd5147ac
+index 00000000..c858b18f
 --- /dev/null
 +++ b/src/readest/ReadestClient.cpp
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,509 @@
 +#include "ReadestClient.h"
 +
 +#include <ArduinoJson.h>
 +#include <I18n.h>
 +#include <Logging.h>
 +#include <SecureHttpClient.h>
-+#include <strings.h>
 +
 +#include <algorithm>
 +#include <cctype>
 +#include <cstdio>
 +#include <cstring>
++#include <ctime>
 +#include <string>
++#include <utility>
++#include <vector>
 +
 +#include "ReadestStore.h"
 +
@@ -1920,36 +2235,76 @@ index 00000000..bd5147ac
 +  return ((days * 24 + h) * 60 + mi) * 60000LL + s * 1000LL + ms;
 +}
 +
-+// Lowercase ASCII letters/digits only; non-ASCII bytes are kept verbatim so
-+// non-Latin titles still compare exactly.
-+std::string normalizeTitle(const std::string& title) {
-+  std::string out;
-+  out.reserve(title.size());
-+  for (const char ch : title) {
++bool isStopWord(const std::string& word) {
++  return word == "the" || word == "a" || word == "an" || word == "of" || word == "and";
++}
++
++// Lowercased words: runs of ASCII letters/digits, with non-ASCII bytes kept
++// verbatim so non-Latin titles still compare. Stop words are dropped unless
++// that would leave nothing.
++std::vector<std::string> titleWords(const std::string& text) {
++  std::vector<std::string> all;
++  std::string current;
++  for (const char ch : text) {
 +    const auto c = static_cast<unsigned char>(ch);
 +    if (c >= 0x80) {
-+      out += ch;
++      current += ch;
 +    } else if (std::isalnum(c)) {
-+      out += static_cast<char>(std::tolower(c));
++      current += static_cast<char>(std::tolower(c));
++    } else if (!current.empty()) {
++      all.push_back(std::move(current));
++      current.clear();
 +    }
 +  }
-+  return out;
++  if (!current.empty()) all.push_back(std::move(current));
++
++  std::vector<std::string> kept;
++  kept.reserve(all.size());
++  for (auto& word : all) {
++    if (!isStopWord(word)) kept.push_back(word);
++  }
++  return kept.empty() ? all : kept;
 +}
 +
-+// Title without a subtitle: "Dune: Deluxe Edition" -> "Dune".
-+std::string mainTitle(const std::string& title) {
-+  const size_t cut = title.find_first_of(":([");
-+  return normalizeTitle(cut == std::string::npos ? title : title.substr(0, cut));
++// 0..100 word-overlap similarity. Identical word lists score 100; a title
++// fully contained in the other ("Dune" vs "Dune: Deluxe Edition") scores at
++// least 60; otherwise the Dice coefficient of the two word lists.
++int wordSimilarity(const std::vector<std::string>& a, const std::vector<std::string>& b) {
++  if (a.empty() || b.empty()) return 0;
++  size_t common = 0;
++  for (const auto& word : a) {
++    if (std::find(b.begin(), b.end(), word) != b.end()) common++;
++  }
++  if (common == 0) return 0;
++  if (common == a.size() && a.size() == b.size()) return 100;
++  const size_t shorter = std::min(a.size(), b.size());
++  const size_t longer = std::max(a.size(), b.size());
++  int score = static_cast<int>(200 * common / (a.size() + b.size()));
++  if (common >= shorter) score = std::max(score, 60 + static_cast<int>(40 * shorter / longer));
++  return std::min(score, 99);
 +}
 +
-+int titleScore(const std::string& wantedFull, const std::string& wantedMain, const char* candidate) {
-+  if (!candidate || candidate[0] == '\0') return 0;
-+  const std::string cand = candidate;
-+  const std::string full = normalizeTitle(cand);
-+  if (!full.empty() && full == wantedFull) return 2;
-+  const std::string main = mainTitle(cand);
-+  if (!main.empty() && (main == wantedMain || main == wantedFull || full == wantedMain)) return 1;
-+  return 0;
++// Keep the best MAX_CANDIDATES books, one entry per Readest hash, sorted.
++void offerCandidate(std::vector<ReadestBook>& top, ReadestBook&& book) {
++  bool changed = false;
++  for (auto& existing : top) {
++    if (existing.hash == book.hash) {
++      if (book.score <= existing.score) return;
++      existing = std::move(book);
++      changed = true;
++      break;
++    }
++  }
++  if (!changed) {
++    if (top.size() < ReadestClient::MAX_CANDIDATES) {
++      top.push_back(std::move(book));
++    } else if (book.score > top.back().score) {
++      top.back() = std::move(book);
++    } else {
++      return;
++    }
++  }
++  std::sort(top.begin(), top.end(), [](const ReadestBook& l, const ReadestBook& r) { return l.score > r.score; });
 +}
 +
 +bool isDummyHash(const char* hash) { return hash && std::strcmp(hash, "00000000000000000000000000000000") == 0; }
@@ -2026,14 +2381,14 @@ index 00000000..bd5147ac
 +  return signIn();
 +}
 +
-+ReadestClient::Error ReadestClient::findBookByTitle(const std::string& title, const std::string& localHash,
-+                                                    ReadestBook& out) {
++ReadestClient::Error ReadestClient::findCandidates(const std::string& title, const std::string& author,
++                                                   const std::string& localHash, std::vector<ReadestBook>& out) {
++  out.clear();
 +  const Error session = ensureSession();
 +  if (session != OK) return session;
 +
-+  const std::string wantedFull = normalizeTitle(title);
-+  const std::string wantedMain = mainTitle(title);
-+  if (wantedFull.empty()) return BOOK_NOT_FOUND;
++  const std::vector<std::string> wantedTitle = titleWords(title);
++  const std::vector<std::string> wantedAuthor = titleWords(author);
 +
 +  JsonDocument filter;
 +  JsonObject rowFilter = filter["books"][0].to<JsonObject>();
@@ -2041,11 +2396,11 @@ index 00000000..bd5147ac
 +  rowFilter["meta_hash"] = true;
 +  rowFilter["title"] = true;
 +  rowFilter["source_title"] = true;
-+  rowFilter["format"] = true;
++  rowFilter["author"] = true;
 +  rowFilter["deleted_at"] = true;
 +  rowFilter["synced_at"] = true;
 +
-+  int bestScore = 0;
++  out.reserve(MAX_CANDIDATES);
 +  int64_t since = 0;
 +  std::string previousLast;
 +  for (int page = 0; page < BOOKS_MAX_PAGES; ++page) {
@@ -2077,21 +2432,23 @@ index 00000000..bd5147ac
 +      const char* hash = row["book_hash"] | "";
 +      if (hash[0] == '\0' || isDummyHash(hash) || !row["deleted_at"].isNull()) continue;
 +
-+      const int match = std::max(titleScore(wantedFull, wantedMain, row["title"] | ""),
-+                                 titleScore(wantedFull, wantedMain, row["source_title"] | ""));
-+      if (match == 0) continue;
-+      const char* format = row["format"] | "";
-+      const int score = match * 4 + (localHash == hash ? 2 : 0) + (strcasecmp(format, "EPUB") == 0 ? 1 : 0);
-+      if (score > bestScore) {
-+        bestScore = score;
-+        out.hash = hash;
-+        out.metaHash = row["meta_hash"] | "";
-+        out.title = row["title"] | "";
-+      }
++      const char* rowTitle = row["title"] | "";
++      const char* rowAuthor = row["author"] | "";
++      int score = std::max(wordSimilarity(wantedTitle, titleWords(rowTitle)),
++                           wordSimilarity(wantedTitle, titleWords(row["source_title"] | "")));
++      if (score > 0 && wordSimilarity(wantedAuthor, titleWords(rowAuthor)) > 0) score += 15;
++      if (localHash == hash) score = SCORE_SAME_FILE;  // Readest imported this very file
++      if (score <= 0) continue;
++
++      ReadestBook book;
++      book.hash = hash;
++      book.metaHash = row["meta_hash"] | "";
++      book.title = rowTitle;
++      book.author = rowAuthor;
++      book.score = score;
++      offerCandidate(out, std::move(book));
 +    }
 +
-+    // Exact title on the very same file cannot be beaten.
-+    if (bestScore >= 2 * 4 + 2) break;
 +    if (rows.size() < static_cast<size_t>(BOOKS_PAGE_SIZE)) break;
 +
 +    int64_t next = parseIsoMs(pageLast.c_str());
@@ -2102,31 +2459,115 @@ index 00000000..bd5147ac
 +    since = next;
 +  }
 +
-+  if (bestScore == 0) {
-+    LOG_INF("RDS", "No Readest book titled \"%s\"", title.c_str());
++  if (out.empty()) {
++    LOG_INF("RDS", "No Readest book resembles \"%s\"", title.c_str());
 +    return BOOK_NOT_FOUND;
 +  }
-+  LOG_INF("RDS", "Matched \"%s\" -> %s", out.title.c_str(), out.hash.c_str());
++  for (const auto& book : out) {
++    LOG_INF("RDS", "Candidate %d: \"%s\" (%s)", book.score, book.title.c_str(), book.hash.c_str());
++  }
 +  return OK;
 +}
 +
-+ReadestClient::Error ReadestClient::pushNotes(const std::string& notesJson) {
++ReadestClient::Error ReadestClient::postSync(const std::string& body) {
 +  const Error session = ensureSession();
 +  if (session != OK) return session;
 +  if (insufficientHeap()) return LOW_MEMORY;
 +
++  freeink::SecureHttpClient http;
++  const int code = sendJson(http, "POST", SYNC_URL, accessToken, false, body, false);
++  http.end();
++  LOG_DBG("RDS", "Sync POST response: %d (%u bytes sent)", code, static_cast<unsigned>(body.size()));
++  if (code >= 200 && code < 300) return OK;
++  return errorForStatus(code);
++}
++
++ReadestClient::Error ReadestClient::pushNotes(const std::string& notesJson) {
 +  std::string body;
 +  body.reserve(notesJson.size() + 40);
 +  body += "{\"books\":[],\"notes\":";
 +  body += notesJson;
 +  body += ",\"configs\":[]}";
++  return postSync(body);
++}
 +
-+  freeink::SecureHttpClient http;
-+  const int code = sendJson(http, "POST", SYNC_URL, accessToken, false, body, false);
-+  http.end();
-+  LOG_DBG("RDS", "Push response: %d (%u bytes sent)", code, static_cast<unsigned>(body.size()));
-+  if (code >= 200 && code < 300) return OK;
-+  return errorForStatus(code);
++ReadestClient::Error ReadestClient::pullProgress(const ReadestBook& book, ReadestProgress& out) {
++  out = ReadestProgress{};
++  const Error session = ensureSession();
++  if (session != OK) return session;
++  if (insufficientHeap()) return LOW_MEMORY;
++
++  const std::string url =
++      std::string(SYNC_URL) + "?since=0&type=configs&book=" + book.hash + "&meta_hash=" + book.metaHash;
++
++  JsonDocument filter;
++  JsonObject configFilter = filter["configs"][0].to<JsonObject>();
++  configFilter["book_hash"] = true;
++  configFilter["xpointer"] = true;
++  configFilter["progress"] = true;
++  configFilter["deleted_at"] = true;
++
++  JsonDocument doc;
++  {
++    freeink::SecureHttpClient http;
++    const int code = sendJson(http, "GET", url, accessToken, false, "", true);
++    if (code != 200) {
++      LOG_ERR("RDS", "Progress pull failed: %d", code);
++      http.end();
++      return errorForStatus(code);
++    }
++    const DeserializationError error = deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
++    http.end();
++    if (error) {
++      LOG_ERR("RDS", "Progress JSON parse failed: %s", error.c_str());
++      return JSON_ERROR;
++    }
++  }
++
++  // Siblings (same meta_hash, other files) are skipped: their positions refer
++  // to a different file's structure, which Readest itself also refuses to trust.
++  for (const JsonObjectConst config : doc["configs"].as<JsonArrayConst>()) {
++    if (book.hash != (config["book_hash"] | "") || !config["deleted_at"].isNull()) continue;
++    out.found = true;
++    out.xpointer = config["xpointer"] | "";
++    // progress is stored as a JSON string "[current,total]" (or an array).
++    int current = 0;
++    int total = 0;
++    const JsonVariantConst progress = config["progress"];
++    if (progress.is<JsonArrayConst>()) {
++      current = progress[0] | 0;
++      total = progress[1] | 0;
++    } else if (progress.is<const char*>()) {
++      std::sscanf(progress.as<const char*>(), "[%d,%d]", &current, &total);
++    }
++    if (total > 0 && current >= 0) out.fraction = std::min(1.0f, static_cast<float>(current) / total);
++    break;
++  }
++  LOG_INF("RDS", "Readest progress: found=%d frac=%.3f xp=%s", out.found ? 1 : 0, out.fraction, out.xpointer.c_str());
++  return OK;
++}
++
++ReadestClient::Error ReadestClient::pushProgress(const ReadestBook& book, const std::string& xpointer,
++                                                 const float fraction) {
++  JsonDocument doc;
++  doc["books"].to<JsonArray>();
++  doc["notes"].to<JsonArray>();
++  JsonObject config = doc["configs"].to<JsonArray>().add<JsonObject>();
++  config["bookHash"] = book.hash;
++  if (!book.metaHash.empty()) config["metaHash"] = book.metaHash;
++  config["xpointer"] = xpointer;
++  // Readest reads progress as [current, total]; a per-mille fraction keeps the
++  // sibling-fraction comparison meaningful without inventing page numbers.
++  JsonArray progress = config["progress"].to<JsonArray>();
++  const float clamped = std::max(0.0f, std::min(1.0f, fraction));
++  progress.add(static_cast<int>(clamped * 1000.0f + 0.5f));
++  progress.add(1000);
++  const time_t now = time(nullptr);
++  if (now > 1600000000) config["updatedAt"] = static_cast<int64_t>(now) * 1000;
++
++  std::string body;
++  serializeJson(doc, body);
++  return postSync(body);
 +}
 +
 +ReadestClient::Error ReadestClient::pullNotes(const ReadestBook& book, std::vector<ReadestNote>& out) {
@@ -2167,7 +2608,6 @@ index 00000000..bd5147ac
 +  const JsonArrayConst notes = doc["notes"].as<JsonArrayConst>();
 +  out.reserve(notes.size());
 +  for (const JsonObjectConst note : notes) {
-+    if (!note["deleted_at"].isNull()) continue;
 +    const char* type = note["type"] | "";
 +    if (std::strcmp(type, "annotation") != 0 && std::strcmp(type, "excerpt") != 0) continue;
 +    const char* text = note["text"] | "";
@@ -2177,6 +2617,7 @@ index 00000000..bd5147ac
 +    item.cfi = note["cfi"] | "";
 +    item.xpointer0 = note["xpointer0"] | "";
 +    item.text = text;
++    item.deleted = !note["deleted_at"].isNull();
 +    out.push_back(std::move(item));
 +  }
 +  LOG_INF("RDS", "Pulled %u highlights", static_cast<unsigned>(out.size()));
@@ -2206,10 +2647,10 @@ index 00000000..bd5147ac
 +}
 diff --git a/src/readest/ReadestClient.h b/src/readest/ReadestClient.h
 new file mode 100644
-index 00000000..4bc0a9de
+index 00000000..98b1b0c5
 --- /dev/null
 +++ b/src/readest/ReadestClient.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,90 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -2221,6 +2662,8 @@ index 00000000..4bc0a9de
 +  std::string hash;      // Readest book_hash (KOReader-style partial MD5 of the file Readest imported)
 +  std::string metaHash;  // Readest meta_hash (title/author/identifier fingerprint)
 +  std::string title;
++  std::string author;
++  int score = 0;  // similarity to the local book, higher is closer (transient)
 +};
 +
 +// A highlight pulled from Readest.
@@ -2229,6 +2672,14 @@ index 00000000..4bc0a9de
 +  std::string cfi;
 +  std::string xpointer0;
 +  std::string text;
++  bool deleted = false;  // tombstone: deleted in Readest
++};
++
++// Reading position Readest stores for a book (book_configs row).
++struct ReadestProgress {
++  bool found = false;
++  std::string xpointer;    // KOReader xpointer, may be empty
++  float fraction = -1.0f;  // progress[0] / progress[1], -1 when unknown
 +};
 +
 +/**
@@ -2259,15 +2710,28 @@ index 00000000..4bc0a9de
 +  // Get an access token for this session: refresh token first, then password.
 +  Error ensureSession();
 +
-+  // Find the Readest library book whose title matches `title` (case,
-+  // punctuation and subtitle insensitive). `localHash` breaks ties.
-+  Error findBookByTitle(const std::string& title, const std::string& localHash, ReadestBook& out);
++  // Scan the Readest library and return up to MAX_CANDIDATES books ranked by
++  // title (and author) similarity. A book imported from the identical file
++  // (`localHash`) always ranks first. BOOK_NOT_FOUND if nothing is similar.
++  static constexpr size_t MAX_CANDIDATES = 3;
++  // Candidate scores: word-overlap similarity 0..100 (+15 when the author
++  // matches too); an identical file is SCORE_SAME_FILE. A match is taken
++  // without asking when it reaches SCORE_CONFIDENT with a clear lead.
++  static constexpr int SCORE_SAME_FILE = 1000;
++  static constexpr int SCORE_CONFIDENT = 100;
++  static constexpr int SCORE_CLEAR_LEAD = 15;
++  Error findCandidates(const std::string& title, const std::string& author, const std::string& localHash,
++                       std::vector<ReadestBook>& out);
 +
 +  // POST {"books":[],"notes":[...],"configs":[]}; `notesJson` is the notes array.
 +  Error pushNotes(const std::string& notesJson);
 +
-+  // All live highlight/excerpt notes Readest has for the book.
++  // All highlight/excerpt notes Readest has for the book, tombstones included.
 +  Error pullNotes(const ReadestBook& book, std::vector<ReadestNote>& out);
++
++  // Reading position for exactly this Readest book (same book_hash).
++  Error pullProgress(const ReadestBook& book, ReadestProgress& out);
++  Error pushProgress(const ReadestBook& book, const std::string& xpointer, float fraction);
 +
 +  static const char* errorString(Error error);
 +
@@ -2275,6 +2739,7 @@ index 00000000..4bc0a9de
 +  std::string accessToken;
 +
 +  Error requestToken(const char* grantType, const std::string& body);
++  Error postSync(const std::string& body);
 +};
 diff --git a/src/readest/ReadestStore.cpp b/src/readest/ReadestStore.cpp
 new file mode 100644

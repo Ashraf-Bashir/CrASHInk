@@ -20,16 +20,17 @@ This package contains two git patches and comprehensive documentation for extend
    - Modifies `src/activities/reader/EpubReaderClippingListActivity.cpp`
 
 3. **`0006-readest-clippings-sync.patch`**
-   - Two-way clipping sync with [Readest](https://readest.com) (X4 Pro)
+   - Two-way sync with [Readest](https://readest.com) (X4 Pro)
    - Settings → System → Readest Sync: enter Readest email + password once; they are saved (password
-     obfuscated with the device MAC) and reused for every later sync
-   - Reader menu → "Push Clippings to Readest" / "Pull Clippings from Readest"
-   - The book is matched **by title** against your Readest library (subtitle/case/punctuation insensitive)
-   - Push: each clipping is located in the chapter XHTML and sent as a **grey** Readest highlight with
-     KOReader xpointers; Readest converts them to its own positions when the book is next opened there.
-     Re-pushing is idempotent and never overwrites or resurrects highlights edited/deleted in Readest
-   - Pull: Readest highlights not already on the device are added as clippings (found by text on the
-     current layout)
+     obfuscated with the device MAC). Also "Reset Book Matches" and "Disconnect"
+   - Reader menu → **Sync Readest** does everything in one pass:
+     - finds the book in your Readest library by title similarity; a confident match (same file, or a
+       word-for-word title clearly ahead of the rest) is used directly, otherwise you pick from the top 3.
+       The choice is remembered per book
+     - pulls Readest highlights the device doesn't have as clippings
+     - pushes device clippings Readest doesn't have as **grey** highlights (KOReader xpointers)
+     - syncs reading position, furthest wins (jumps forward, or sends the device position to Readest)
+   - Success screens close by themselves after ~2 s; errors stay until dismissed
    - Runs after a clean network reboot like KOReader sync, pushes in batches of 10, and parses Readest
      responses through JSON filters to keep heap use low
 
