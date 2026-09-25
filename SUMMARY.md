@@ -19,6 +19,20 @@ This package contains two git patches and comprehensive documentation for extend
    - Reuses existing `FileBrowserActionActivity` modal pattern for consistency
    - Modifies `src/activities/reader/EpubReaderClippingListActivity.cpp`
 
+3. **`0006-readest-clippings-sync.patch`**
+   - Two-way clipping sync with [Readest](https://readest.com) (X4 Pro)
+   - Settings → System → Readest Sync: enter Readest email + password once; they are saved (password
+     obfuscated with the device MAC) and reused for every later sync
+   - Reader menu → "Push Clippings to Readest" / "Pull Clippings from Readest"
+   - The book is matched **by title** against your Readest library (subtitle/case/punctuation insensitive)
+   - Push: each clipping is located in the chapter XHTML and sent as a **grey** Readest highlight with
+     KOReader xpointers; Readest converts them to its own positions when the book is next opened there.
+     Re-pushing is idempotent and never overwrites or resurrects highlights edited/deleted in Readest
+   - Pull: Readest highlights not already on the device are added as clippings (found by text on the
+     current layout)
+   - Runs after a clean network reboot like KOReader sync, pushes in batches of 10, and parses Readest
+     responses through JSON filters to keep heap use low
+
 ### Documentation
 
 1. **`patch-application-guide.md`** (260 lines)
