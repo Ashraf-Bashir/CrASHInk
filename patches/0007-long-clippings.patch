@@ -1,0 +1,138 @@
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+index bc2c9cae..206842f5 100644
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -7,9 +7,12 @@
+ 
+ inline constexpr size_t CLIPPING_CHAPTER_TITLE_MAX = 48;
+ // Clipping text lives on the SD card rather than in every in-memory clipping
+-// record. Match the reader's bounded selection-text budget so previews retain
+-// a complete multi-paragraph selection without growing the saved-item index.
+-inline constexpr size_t CLIPPING_TEXT_MAX = 4U * 1024U;
++// record. The on-disk length field is 16 bits, so 60 KB (~10,000 words) is the
++// largest clipping the format can hold without a version change.
++inline constexpr size_t CLIPPING_TEXT_MAX = 60U * 1024U;
++// Initial capacity for buffers that read clipping text; they grow on demand
++// for long clippings instead of reserving the maximum on every page render.
++inline constexpr size_t CLIPPING_TEXT_RESERVE = 4U * 1024U;
+ inline constexpr uint16_t CLIPPING_MAX_PER_BOOK = 65535;
+ inline constexpr uint16_t CLIPPING_MAX_PAGE_MATCHES = 16;
+ inline constexpr uint32_t CLIPPING_WORD_LAYOUT_VERSION = 2;
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index d949e9ed..23f46353 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -4370,8 +4370,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+       }
+     }
+     const int lineHeight = renderer.getLineHeight(readerFontId);
+-    const int pagesToLoad = std::min(3, section->pageCount - startPage);
+-    static constexpr size_t MAX_CLIP_SELECTION_WORDS = 240;
++    // Clippings may run to the end of the chapter (capped at 30 pages and
++    // ~10,000 words, about what the 60 KB clipping text limit holds); dictionary
++    // lookups only need the nearby words, so they keep a short window.
++    static constexpr int MAX_CLIP_SELECTION_PAGES = 30;
++    static constexpr int DICTIONARY_SELECTION_PAGES = 3;
++    const int pagesToLoad = std::min(dictionaryRequest ? DICTIONARY_SELECTION_PAGES : MAX_CLIP_SELECTION_PAGES,
++                                     section->pageCount - startPage);
++    static constexpr size_t MAX_CLIP_SELECTION_WORDS = 10000;
+     static constexpr uint32_t CLIP_SELECTION_WORD_RESERVE_HEADROOM = 16U * 1024U;
+     static constexpr size_t CLIP_SELECTION_INITIAL_TEXT_RESERVE = 4U * 1024U;
+     // Page density varies with font size and layout. Keep the fixed memory cap,
+@@ -4379,7 +4385,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+     const size_t maxSelectableWords = pagesToLoad > 0 ? MAX_CLIP_SELECTION_WORDS : 0;
+     const uint32_t wordReserveBytes = static_cast<uint32_t>(maxSelectableWords * sizeof(WordRef));
+     const auto heapBeforeWords = MemoryBudget::snapshot();
+-    if (heapBeforeWords.maxAllocHeap < wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM) {
++    // The word list is large enough to be placed in PSRAM where the board has
++    // it; only fail when neither internal RAM nor PSRAM can hold it.
++    const bool fitsInPsram = MemoryBudget::psramSnapshot().maxAllocHeap >= wordReserveBytes;
++    if (!fitsInPsram && heapBeforeWords.maxAllocHeap < wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM) {
+       LOG_ERR("CLIP", "Low heap for clipping selection (%u free, %u max alloc, need block %u); skipping",
+               heapBeforeWords.freeHeap, heapBeforeWords.maxAllocHeap,
+               wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM);
+@@ -6098,7 +6107,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+         const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
+         const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
+         std::string clippingText;
+-        clippingText.reserve(CLIPPING_TEXT_MAX);
++        clippingText.reserve(CLIPPING_TEXT_RESERVE);
+         if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
+         section->currentPage =
+             clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
+@@ -6147,7 +6156,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+         const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
+         const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
+         std::string clippingText;
+-        clippingText.reserve(CLIPPING_TEXT_MAX);
++        clippingText.reserve(CLIPPING_TEXT_RESERVE);
+         if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
+         section->currentPage =
+             clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
+@@ -7314,7 +7323,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+   const uint16_t currentPageCount = canUseStoredRanges ? static_cast<uint16_t>(section->pageCount) : 0;
+   const uint32_t currentClippingLayoutSignature = clippingWordLayoutSignature(activeSectionLayoutSignature);
+   std::string clippingText;
+-  clippingText.reserve(CLIPPING_TEXT_MAX);
++  clippingText.reserve(CLIPPING_TEXT_RESERVE);
+   const auto& clippings = CLIPPINGS.getClippings();
+   for (size_t clippingIndex = 0; clippingIndex < clippings.size(); ++clippingIndex) {
+     const Clipping& clipping = clippings[clippingIndex];
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
+index 4297e7aa..9635c104 100644
+--- a/src/activities/reader/EpubReaderClippingListActivity.cpp
++++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
+@@ -160,7 +160,7 @@ void EpubReaderClippingListActivity::onEnter() {
+   applySharedUiTheme(app, uiTarget);
+   app.on(ACTION_ROW, &EpubReaderClippingListActivity::onRowEvent, this);
+   app.setScreen(&EpubReaderClippingListActivity::listScreen, this);
+-  detailText.reserve(CLIPPING_TEXT_MAX);
++  detailText.reserve(CLIPPING_TEXT_RESERVE);
+   detailLines.reserve(32);
+   uiItems.resize(CLIPPINGS.clippingCount());
+   // At most 20 reusable 259-byte previews, instead of full text plus a copy per row.
+@@ -221,7 +221,7 @@ void EpubReaderClippingListActivity::openSelectedDetail() {
+   if (selectedIndex < 0 || selectedIndex >= static_cast<int>(CLIPPINGS.clippingCount())) return;
+ 
+   std::string text;
+-  text.reserve(CLIPPING_TEXT_MAX);
++  text.reserve(CLIPPING_TEXT_RESERVE);
+   if (!CLIPPINGS.readClippingText(static_cast<size_t>(selectedIndex), text)) {
+     text.clear();
+   }
+diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
+index f1aa231e..5615346e 100644
+--- a/src/activities/reader/ReadestSyncActivity.cpp
++++ b/src/activities/reader/ReadestSyncActivity.cpp
+@@ -559,7 +559,7 @@ bool ReadestSyncActivity::syncHighlights(const ReadestBook& book, HighlightCount
+   };
+ 
+   std::string text;
+-  text.reserve(CLIPPING_TEXT_MAX);
++  text.reserve(CLIPPING_TEXT_RESERVE);
+   for (size_t i = 0; i < local.size(); ++i) {
+     if (local[i].claimed || local[i].remove || local[i].keyHash.empty()) continue;
+     const Clipping* clipping = CLIPPINGS.clippingAt(i);
+diff --git a/src/clippings/ClippingsManager.cpp b/src/clippings/ClippingsManager.cpp
+index 8f087382..12b14fb1 100644
+--- a/src/clippings/ClippingsManager.cpp
++++ b/src/clippings/ClippingsManager.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <cstdio>
+ 
++#include "ClippingStore.h"
+ #include "CrossPointSettings.h"
+ 
+ namespace {
+@@ -130,8 +131,8 @@ bool ClippingsManager::saveClipping(const std::string& bookTitle, const std::str
+   }
+   location += "\n";
+ 
+-  static constexpr size_t MAX_TEXT_BYTES = 2000;
+-  const size_t textLen = std::min(selectedText.size(), MAX_TEXT_BYTES);
++  // Export the whole clipping (bounded by the clipping store's own limit).
++  const size_t textLen = std::min(selectedText.size(), CLIPPING_TEXT_MAX);
+   static constexpr char separator[] = "\n==========\n";
+ 
+   std::string buffer;
