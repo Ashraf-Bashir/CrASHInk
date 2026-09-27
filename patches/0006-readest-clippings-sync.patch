@@ -45,13 +45,16 @@ index 3a589c5a..78835a60 100644
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 9f66ac0d..68dd690a 100644
+index 9f66ac0d..cdb269ff 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
-@@ -8,12 +8,15 @@
+@@ -7,13 +7,18 @@
+ #include <expat.h>
  
  #include <algorithm>
++#include <climits>
  #include <cmath>
++#include <cstdint>
 +#include <cstdlib>
  #include <cstring>
  #include <string>
@@ -64,7 +67,7 @@ index 9f66ac0d..68dd690a 100644
  namespace {
  std::string stripPrefix(const XML_Char* name) {
    if (!name) {
-@@ -680,3 +683,842 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
+@@ -680,3 +685,1084 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
    }
    return resolver.getXPath();
  }
@@ -87,17 +90,59 @@ index 9f66ac0d..68dd690a 100644
 +         (cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F);
 +}
 +
-+// Returns false when `cp` does not take part in matching; otherwise writes the
-+// comparison form of the character.
-+bool matchChar(const uint32_t cp, const MatchMode mode, uint32_t& out) {
-+  if (isWhitespaceOrSoftHyphen(cp)) return false;
-+  if (mode == MatchMode::Loose) {
-+    if (isPunctuationOrSymbol(cp)) return false;
-+    out = (cp >= 'A' && cp <= 'Z') ? cp + ('a' - 'A') : cp;
-+    return true;
++// Latin-1 Supplement and Latin Extended-A letters (U+00C0..U+017F) folded to
++// plain lowercase ASCII for loose matching: "é" -> "e", "ß" -> "ss".
++const char* const kLatinFold[0x180 - 0xC0] = {
++    "a", "a", "a",  "a", "a", "a", "ae", "c",  "e", "e", "e",  "e",  "i", "i", "i",  "i",  "d", "n", "o",  "o",
++    "o", "o", "o",  "",  "o", "u", "u",  "u",  "u", "y", "th", "ss", "a", "a", "a",  "a",  "a", "a", "ae", "c",
++    "e", "e", "e",  "e", "i", "i", "i",  "i",  "d", "n", "o",  "o",  "o", "o", "o",  "",   "o", "u", "u",  "u",
++    "u", "y", "th", "y", "a", "a", "a",  "a",  "a", "a", "c",  "c",  "c", "c", "c",  "c",  "c", "c", "d",  "d",
++    "d", "d", "e",  "e", "e", "e", "e",  "e",  "e", "e", "e",  "e",  "g", "g", "g",  "g",  "g", "g", "g",  "g",
++    "h", "h", "h",  "h", "i", "i", "i",  "i",  "i", "i", "i",  "i",  "i", "i", "ij", "ij", "j", "j", "k",  "k",
++    "k", "l", "l",  "l", "l", "l", "l",  "l",  "l", "l", "l",  "n",  "n", "n", "n",  "n",  "n", "n", "n",  "n",
++    "o", "o", "o",  "o", "o", "o", "oe", "oe", "r", "r", "r",  "r",  "r", "r", "s",  "s",  "s", "s", "s",  "s",
++    "s", "s", "t",  "t", "t", "t", "t",  "t",  "u", "u", "u",  "u",  "u", "u", "u",  "u",  "u", "u", "u",  "u",
++    "w", "w", "y",  "y", "y", "z", "z",  "z",  "z", "z", "z",  "s",
++};
++
++// Comparison form of `cp` for `mode`, written to out[] (0..3 characters;
++// 0 = the character does not take part in matching).
++//  Both modes: whitespace and soft hyphens vanish; ligature characters
++//  (U+FB00..U+FB06) expand to their letters, so "\uFB01" equals "fi".
++//  Loose also drops punctuation, symbols and combining accents, folds case
++//  and strips accents from Latin letters.
++size_t foldChar(const uint32_t cp, const MatchMode mode, uint32_t out[3]) {
++  if (isWhitespaceOrSoftHyphen(cp)) return 0;
++  if (cp >= 0xFB00 && cp <= 0xFB06) {
++    static const char* const kLigatures[] = {"ff", "fi", "fl", "ffi", "ffl", "st", "st"};
++    size_t count = 0;
++    for (const char* c = kLigatures[cp - 0xFB00]; *c; ++c) out[count++] = static_cast<uint32_t>(*c);
++    return count;
 +  }
-+  out = cp;
-+  return true;
++  if (mode == MatchMode::Strict) {
++    out[0] = cp;
++    return 1;
++  }
++  if (isPunctuationOrSymbol(cp) || (cp >= 0x0300 && cp <= 0x036F)) return 0;
++  if (cp >= 'A' && cp <= 'Z') {
++    out[0] = cp + ('a' - 'A');
++    return 1;
++  }
++  if (cp >= 0xC0 && cp < 0x180) {
++    size_t count = 0;
++    for (const char* c = kLatinFold[cp - 0xC0]; *c; ++c) out[count++] = static_cast<uint32_t>(*c);
++    return count;
++  }
++  if (cp >= 0x410 && cp <= 0x42F) {  // Cyrillic capitals
++    out[0] = cp + 0x20;
++    return 1;
++  }
++  if (cp >= 0x400 && cp <= 0x40F) {
++    out[0] = cp + 0x50;
++    return 1;
++  }
++  out[0] = cp;
++  return 1;
 +}
 +
 +// crengine collapses only ASCII whitespace runs when counting xpointer offsets.
@@ -148,9 +193,10 @@ index 9f66ac0d..68dd690a 100644
 +  out.reserve(text.size());
 +  const unsigned char* ptr = reinterpret_cast<const unsigned char*>(text.c_str());
 +  const unsigned char* end = ptr + text.size();
++  uint32_t folded[3];
 +  while (ptr < end) {
-+    uint32_t folded = 0;
-+    if (matchChar(utf8NextCodepoint(&ptr), mode, folded)) out.push_back(folded);
++    const size_t count = foldChar(utf8NextCodepoint(&ptr), mode, folded);
++    out.insert(out.end(), folded, folded + count);
 +  }
 +  return out;
 +}
@@ -311,18 +357,21 @@ index 9f66ac0d..68dd690a 100644
 +    const size_t n = needle.size();
 +    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
 +    const unsigned char* end = ptr + len;
++    uint32_t folded[3];
 +    while (ptr < end) {
-+      uint32_t cp = 0;
-+      if (!matchChar(utf8NextCodepoint(&ptr), mode, cp)) continue;
-+      while (matched > 0 && cp != needle[matched]) matched = failure[matched - 1];
-+      if (cp == needle[matched]) matched++;
-+      if (matched == n) {
-+        if (matches.size() < MAX_MATCHES) {
-+          matches.push_back({position + 1 - static_cast<uint32_t>(n), position});
++      const size_t count = foldChar(utf8NextCodepoint(&ptr), mode, folded);
++      for (size_t f = 0; f < count; ++f) {
++        const uint32_t cp = folded[f];
++        while (matched > 0 && cp != needle[matched]) matched = failure[matched - 1];
++        if (cp == needle[matched]) matched++;
++        if (matched == n) {
++          if (matches.size() < MAX_MATCHES) {
++            matches.push_back({position + 1 - static_cast<uint32_t>(n), position});
++          }
++          matched = failure[matched - 1];
 +        }
-+        matched = failure[matched - 1];
++        position++;
 +      }
-+      position++;
 +    }
 +  }
 +
@@ -416,15 +465,17 @@ index 9f66ac0d..68dd690a 100644
 +        textCounted = true;
 +        frame.textNodes++;
 +      }
-+      uint32_t folded = 0;
-+      if (matchChar(cp, mode, folded)) {
-+        if (position == startPos) {
++      uint32_t folded[3];
++      const size_t count = foldChar(cp, mode, folded);
++      if (count > 0) {
++        // A ligature covers several match positions; any of them selects it.
++        if (startXPath.empty() && startPos >= position && startPos < position + count) {
 +          startXPath = buildTextPointXPath(spineIndex, path, frame.textNodes, nodeOffset);
 +        }
-+        if (position == endPos) {
++        if (endPos >= position && endPos < position + count) {
 +          endXPath = buildTextPointXPath(spineIndex, path, frame.textNodes, nodeOffset + utf16Units(cp));
 +        }
-+        position++;
++        position += static_cast<uint32_t>(count);
 +        if (complete()) {
 +          stop();
 +          return;
@@ -492,25 +543,211 @@ index 9f66ac0d..68dd690a 100644
 +  out.loose = mode == MatchMode::Loose;
 +  return true;
 +}
++
++// --- Tier 3: tolerant ("fuzzy") matching ------------------------------------
++// When neither strict nor loose matching finds the text, accept the passage
++// with the fewest character edits (insert / delete / substitute), so small
++// differences between two copies of a book still line up: accented letters
++// stored differently, ligatures, footnote markers, OCR typos, edition fixes.
++
++// Edits tolerated for a needle of `m` loose characters.
++int allowedEdits(const size_t m) {
++  if (m < 8) return 0;  // too short to tell a near-miss from a different word
++  if (m < 20) return 1;
++  return static_cast<int>(std::min<size_t>(30, std::max<size_t>(2, m / 12)));
++}
++
++// Collects a chapter's loose comparison characters (what Loose mode matches).
++class LooseTextCollector final : public ExpatTextStream {
++ public:
++  std::vector<uint32_t> text;
++
++ protected:
++  void onStartElement(const std::string& name) override {
++    if (!insideBody) {
++      if (name == "body") {
++        insideBody = true;
++        bodyDepth = depth;
++      }
++      depth++;
++      return;
++    }
++    if (isNonVisibleTextTag(name)) nonVisibleDepth++;
++    depth++;
++  }
++
++  void onEndElement(const std::string& name) override {
++    depth--;
++    if (!insideBody) return;
++    if (depth == bodyDepth && name == "body") {
++      insideBody = false;
++      return;
++    }
++    if (isNonVisibleTextTag(name) && nonVisibleDepth > 0) nonVisibleDepth--;
++  }
++
++  void onCharacterData(const XML_Char* data, const int len) override {
++    if (!insideBody || nonVisibleDepth > 0 || len <= 0) return;
++    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
++    const unsigned char* end = ptr + len;
++    uint32_t folded[3];
++    while (ptr < end) {
++      const size_t count = foldChar(utf8NextCodepoint(&ptr), MatchMode::Loose, folded);
++      text.insert(text.end(), folded, folded + count);
++    }
++  }
++
++ private:
++  bool insideBody = false;
++  int depth = 0;
++  int bodyDepth = -1;
++  int nonVisibleDepth = 0;
++};
++
++struct ApproxMatch {
++  int edits = INT32_MAX;
++  uint32_t start = 0;
++  uint32_t end = 0;  // inclusive
++};
++
++// Semi-global edit distance (Sellers): best placement of the whole needle
++// anywhere inside hay[windowStart, windowEnd). O(m) memory, O(m * window) time.
++ApproxMatch bestPlacement(const std::vector<uint32_t>& needle, const std::vector<uint32_t>& hay,
++                          const size_t windowStart, const size_t windowEnd) {
++  const size_t m = needle.size();
++  std::vector<int> cost(m + 1);
++  std::vector<int> next(m + 1);
++  std::vector<uint32_t> origin(m + 1);
++  std::vector<uint32_t> nextOrigin(m + 1);
++  for (size_t i = 0; i <= m; ++i) {
++    cost[i] = static_cast<int>(i);
++    origin[i] = static_cast<uint32_t>(windowStart);
++  }
++  ApproxMatch best;
++  for (size_t j = windowStart; j < windowEnd; ++j) {
++    const uint32_t c = hay[j];
++    next[0] = 0;
++    nextOrigin[0] = static_cast<uint32_t>(j + 1);  // a match starting after this char
++    for (size_t i = 1; i <= m; ++i) {
++      int value = cost[i - 1] + (needle[i - 1] == c ? 0 : 1);  // match / substitute
++      uint32_t from = origin[i - 1];
++      if (cost[i] + 1 < value) {  // extra character in the text
++        value = cost[i] + 1;
++        from = origin[i];
++      }
++      if (next[i - 1] + 1 < value) {  // character missing from the text
++        value = next[i - 1] + 1;
++        from = nextOrigin[i - 1];
++      }
++      next[i] = value;
++      nextOrigin[i] = from;
++    }
++    if (next[m] < best.edits) {
++      best.edits = next[m];
++      best.start = nextOrigin[m];
++      best.end = static_cast<uint32_t>(j);
++    }
++    cost.swap(next);
++    origin.swap(nextOrigin);
++  }
++  return best;
++}
++
++bool locateTextFuzzy(const std::shared_ptr<Epub>& epub, const std::string& href, const std::string& text,
++                     const float positionHint, XPathTextLocation& out) {
++  const std::vector<uint32_t> needle = matchCodepoints(text, MatchMode::Loose);
++  const int maxEdits = allowedEdits(needle.size());
++  if (maxEdits <= 0) return false;
++
++  LooseTextCollector collector;
++  if (!collector.ok() || !epub->readItemContentsToStream(href, collector, 1024) || !collector.finish()) return false;
++  const std::vector<uint32_t>& hay = collector.text;
++  const size_t n = hay.size();
++  const size_t m = needle.size();
++  if (n == 0 || n + static_cast<size_t>(maxEdits) < m) return false;
++
++  // Candidate windows: the whole chapter for short needles; for long ones,
++  // wherever one of several exact 16-character anchors from the needle occurs
++  // (a few edits cannot destroy all of them).
++  std::vector<size_t> starts;
++  constexpr size_t SHORT_NEEDLE = 32;
++  constexpr size_t ANCHOR = 16;
++  constexpr size_t ANCHORS = 8;
++  constexpr size_t MAX_CANDIDATES = 12;
++  if (m >= SHORT_NEEDLE) {
++    for (size_t a = 0; a < ANCHORS && starts.size() < MAX_CANDIDATES; ++a) {
++      const size_t offset = a * (m - ANCHOR) / (ANCHORS - 1);
++      for (size_t j = 0; j + ANCHOR <= n && starts.size() < MAX_CANDIDATES; ++j) {
++        if (!std::equal(needle.begin() + offset, needle.begin() + offset + ANCHOR, hay.begin() + j)) continue;
++        const size_t candidate = j >= offset ? j - offset : 0;
++        bool known = false;
++        for (const size_t s : starts) {
++          if ((s > candidate ? s - candidate : candidate - s) <= static_cast<size_t>(maxEdits)) {
++            known = true;
++            break;
++          }
++        }
++        if (!known) starts.push_back(candidate);
++      }
++    }
++    if (starts.empty()) return false;
++  }
++
++  ApproxMatch best;
++  float bestDistance = 2.0f;
++  const auto consider = [&](const ApproxMatch& match) {
++    if (match.edits > maxEdits || match.end < match.start) return;
++    const float distance =
++        positionHint >= 0.0f ? std::fabs(static_cast<float>(match.start) / static_cast<float>(n) - positionHint) : 0.0f;
++    if (match.edits < best.edits || (match.edits == best.edits && distance < bestDistance)) {
++      best = match;
++      bestDistance = distance;
++    }
++  };
++  if (starts.empty()) {
++    consider(bestPlacement(needle, hay, 0, n));
++  } else {
++    for (const size_t candidate : starts) {
++      const size_t windowStart = candidate > static_cast<size_t>(maxEdits) ? candidate - maxEdits : 0;
++      const size_t windowEnd = std::min(n, candidate + m + static_cast<size_t>(maxEdits));
++      consider(bestPlacement(needle, hay, windowStart, windowEnd));
++    }
++  }
++  if (best.edits > maxEdits) return false;
++
++  LOG_DBG("KOX", "Fuzzy match with %d edit(s) (allowed %d)", best.edits, maxEdits);
++  out.start = best.start;
++  out.end = best.end;
++  out.total = static_cast<uint32_t>(n);
++  out.loose = true;  // positions are in loose-character space
++  return true;
++}
++
++// All tiers for one spine item; fuzzy only when `allowFuzzy`.
++bool locateTextTiers(const std::shared_ptr<Epub>& epub, const int spineIndex, const std::string& text,
++                     const float positionHint, const bool allowFuzzy, XPathTextLocation& out) {
++  out = XPathTextLocation{};
++  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return false;
++  const auto href = epub->getSpineItem(spineIndex).href;
++  if (href.empty()) return false;
++  if (locateTextWithMode(epub, href, text, positionHint, MatchMode::Strict, out)) return true;
++  if (locateTextWithMode(epub, href, text, positionHint, MatchMode::Loose, out)) return true;
++  return allowFuzzy && locateTextFuzzy(epub, href, text, positionHint, out);
++}
++
++bool locateTextFuzzyOnly(const std::shared_ptr<Epub>& epub, const int spineIndex, const std::string& text,
++                         const float positionHint, XPathTextLocation& out) {
++  out = XPathTextLocation{};
++  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return false;
++  const auto href = epub->getSpineItem(spineIndex).href;
++  return !href.empty() && locateTextFuzzy(epub, href, text, positionHint, out);
++}
 +}  // namespace
 +
 +bool ChapterXPathResolver::locateText(const std::shared_ptr<Epub>& epub, const int spineIndex, const std::string& text,
 +                                      const float positionHint, XPathTextLocation& out) {
-+  out = XPathTextLocation{};
-+  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) {
-+    return false;
-+  }
-+  const auto href = epub->getSpineItem(spineIndex).href;
-+  if (href.empty()) {
-+    return false;
-+  }
-+
-+  if (locateTextWithMode(epub, href, text, positionHint, MatchMode::Strict, out)) return true;
-+  if (locateTextWithMode(epub, href, text, positionHint, MatchMode::Loose, out)) {
-+    LOG_DBG("KOX", "Clipping text matched loosely in spine %d", spineIndex);
-+    return true;
-+  }
-+  LOG_DBG("KOX", "Clipping text not found in spine %d", spineIndex);
++  if (locateTextTiers(epub, spineIndex, text, positionHint, true, out)) return true;
++  LOG_DBG("KOX", "Text not found in spine %d", spineIndex);
 +  return false;
 +}
 +
@@ -592,8 +829,9 @@ index 9f66ac0d..68dd690a 100644
 +    const unsigned char* end = ptr + len;
 +    while (ptr < end) {
 +      const uint32_t cp = utf8NextCodepoint(&ptr);
-+      uint32_t folded = 0;
-+      const bool participates = matchChar(cp, mode, folded);
++      uint32_t folded[3];
++      const size_t count = foldChar(cp, mode, folded);
++      const bool participates = count > 0;
 +      if (trailing) {
 +        // Keep punctuation glued to the end of the match ("all." or "all,").
 +        if (participates || isWhitespaceOrSoftHyphen(cp)) {
@@ -603,7 +841,7 @@ index 9f66ac0d..68dd690a 100644
 +        appendUtf8(text, cp);
 +        continue;
 +      }
-+      if (participates && position == startPos) {
++      if (participates && !capturing && startPos >= position && startPos < position + count) {
 +        capturing = true;
 +        pendingSpace = false;
 +      }
@@ -617,11 +855,11 @@ index 9f66ac0d..68dd690a 100644
 +        }
 +      }
 +      if (participates) {
-+        if (position == endPos) {
++        if (endPos >= position && endPos < position + count) {
 +          done = true;
 +          trailing = true;
 +        }
-+        position++;
++        position += static_cast<uint32_t>(count);
 +      }
 +    }
 +  }
@@ -892,23 +1130,30 @@ index 9f66ac0d..68dd690a 100644
 +    if (size > 0) intra = static_cast<float>(target - std::min(target, start)) / static_cast<float>(size);
 +  }
 +
++  // Exact tiers across the whole book first, then tolerant matching, so a
++  // near-miss nearby never beats the real passage a few chapters away.
 +  const int limit = maxSpineDistance < 0 ? count : maxSpineDistance;
-+  for (int distance = 0; distance <= limit; ++distance) {
-+    for (const int sign : {1, -1}) {
-+      if (distance == 0 && sign < 0) continue;
-+      const int spine = estimate + sign * distance;
-+      if (spine < 0 || spine >= count) continue;
-+      if (locateText(epub, spine, text, distance == 0 ? intra : -1.0f, out)) {
-+        spineOut = spine;
-+        return true;
++  for (const bool fuzzy : {false, true}) {
++    for (int distance = 0; distance <= limit; ++distance) {
++      for (const int sign : {1, -1}) {
++        if (distance == 0 && sign < 0) continue;
++        const int spine = estimate + sign * distance;
++        if (spine < 0 || spine >= count) continue;
++        const float hint = distance == 0 ? intra : -1.0f;
++        const bool found = fuzzy ? locateTextFuzzyOnly(epub, spine, text, hint, out)
++                                 : locateTextTiers(epub, spine, text, hint, false, out);
++        if (found) {
++          spineOut = spine;
++          return true;
++        }
 +      }
++      if (estimate - distance < 0 && estimate + distance >= count) break;
 +    }
-+    if (estimate - distance < 0 && estimate + distance >= count) break;
 +  }
 +  return false;
 +}
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.h b/lib/KOReaderSync/ChapterXPathResolver.h
-index 6f18700c..67cf8e6b 100644
+index 6f18700c..53db8b4f 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.h
 +++ b/lib/KOReaderSync/ChapterXPathResolver.h
 @@ -6,6 +6,20 @@
@@ -932,7 +1177,7 @@ index 6f18700c..67cf8e6b 100644
  class ChapterXPathResolver {
   public:
    /**
-@@ -39,4 +53,51 @@ class ChapterXPathResolver {
+@@ -39,4 +53,54 @@ class ChapterXPathResolver {
    // page position stored in CrossInk's section cache, independent of layout.
    static std::string findXPathForVisibleTextOffset(const std::shared_ptr<Epub>& epub, int spineIndex,
                                                     uint32_t visibleTextOffset);
@@ -940,11 +1185,13 @@ index 6f18700c..67cf8e6b 100644
 +  /**
 +   * Find `text` inside a spine item purely by text.
 +   *
-+   * Tries a strict match (whitespace and soft hyphens ignored) and then a
-+   * loose one (also case and punctuation ignored). HTML entities are expanded
-+   * like the reader does. When the text occurs more than once, the
-+   * occurrence nearest `positionHint` (0..1 through the chapter, <0 = none)
-+   * wins.
++   * Tries, in order: a strict match (whitespace and soft hyphens ignored), a
++   * loose one (also case and punctuation ignored), and a tolerant one that
++   * accepts a few character edits (1 for short text, about 1 per 12
++   * characters for longer text, at most 30; exact only under 8 characters).
++   * HTML entities are expanded like the reader does. When several places
++   * qualify, the closest match wins, then the one nearest `positionHint`
++   * (0..1 through the chapter, <0 = none).
 +   */
 +  static bool locateText(const std::shared_ptr<Epub>& epub, int spineIndex, const std::string& text, float positionHint,
 +                         XPathTextLocation& out);
@@ -973,7 +1220,8 @@ index 6f18700c..67cf8e6b 100644
 +
 +  // Search the book for `text`, starting at the chapter holding
 +  // `bookFractionHint` and widening outwards up to maxSpineDistance chapters
-+  // (-1 = whole book).
++  // (-1 = whole book). Exact tiers are tried across the book before tolerant
++  // matching.
 +  static bool findTextInBook(const std::shared_ptr<Epub>& epub, const std::string& text, float bookFractionHint,
 +                             int maxSpineDistance, int& spineOut, XPathTextLocation& out);
 +
@@ -1225,10 +1473,10 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..7f204a49
+index 00000000..77c421bd
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,844 @@
+@@ -0,0 +1,859 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1667,7 +1915,8 @@ index 00000000..7f204a49
 +  }
 +
 +  std::vector<ReadestLinks::Link> links;
-+  const bool hadLinks = ReadestLinks::load(localHash, links);
++  int linksVersion = ReadestLinks::KEY_VERSION;
++  const bool hadLinks = ReadestLinks::load(localHash, links, linksVersion);
 +
 +  // Snapshot of the device clippings, identified by their loose text.
 +  struct LocalClip {
@@ -1686,6 +1935,20 @@ index 00000000..7f204a49
 +  std::vector<std::string> remoteKeys;
 +  remoteKeys.reserve(remote.size());
 +  for (const auto& note : remote) remoteKeys.push_back(keyHashFor(note.text));
++
++  // Links saved with an older text fingerprint: refresh them from Readest's
++  // current text (assumed unchanged since the last sync) instead of treating
++  // every highlight as edited.
++  if (hadLinks && linksVersion < ReadestLinks::KEY_VERSION) {
++    for (auto& link : links) {
++      for (size_t r = 0; r < remote.size(); ++r) {
++        if (remote[r].id == link.id) {
++          link.keyHash = remoteKeys[r];
++          break;
++        }
++      }
++    }
++  }
 +
 +  const auto findRemote = [&](const std::string& id) -> int {
 +    for (size_t i = 0; i < remote.size(); ++i) {
@@ -2749,10 +3012,10 @@ index cd01e87c..2b7e2178 100644
          if (fontsActivity) {
 diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
 new file mode 100644
-index 00000000..05d4ba55
+index 00000000..5fa373b4
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.cpp
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,159 @@
 +#include "ReadestBookMap.h"
 +
 +#include <ArduinoJson.h>
@@ -2884,11 +3147,13 @@ index 00000000..05d4ba55
 +std::string linksPath(const std::string& localHash) { return "/.crosspoint/readest_links_" + localHash + ".json"; }
 +}  // namespace
 +
-+bool load(const std::string& localHash, std::vector<Link>& out) {
++bool load(const std::string& localHash, std::vector<Link>& out, int& version) {
 +  out.clear();
++  version = KEY_VERSION;
 +  if (localHash.empty()) return false;
 +  JsonDocument doc;
 +  if (!PersistableStoreBase::readDocFromFile(linksPath(localHash).c_str(), doc)) return false;
++  version = doc["v"] | 1;
 +  const JsonObjectConst ids = doc["ids"].as<JsonObjectConst>();
 +  out.reserve(ids.size());
 +  for (const JsonPairConst pair : ids) {
@@ -2900,6 +3165,7 @@ index 00000000..05d4ba55
 +bool save(const std::string& localHash, const std::vector<Link>& links) {
 +  if (localHash.empty()) return false;
 +  JsonDocument doc;
++  doc["v"] = KEY_VERSION;
 +  JsonObject ids = doc["ids"].to<JsonObject>();
 +  for (const auto& link : links) ids[link.id] = link.keyHash;
 +  if (!PersistableStoreBase::writeDocToFile(linksPath(localHash).c_str(), doc)) {
@@ -2911,10 +3177,10 @@ index 00000000..05d4ba55
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
 new file mode 100644
-index 00000000..d04060b6
+index 00000000..2df91993
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,57 @@
 +#pragma once
 +
 +#include <string>
@@ -2966,7 +3232,10 @@ index 00000000..d04060b6
 +  std::string id;
 +  std::string keyHash;
 +};
-+bool load(const std::string& localHash, std::vector<Link>& out);
++// Bumped when the text fingerprint changes (2: accents/ligatures folded).
++constexpr int KEY_VERSION = 2;
++// `version` receives the fingerprint version the links were saved with.
++bool load(const std::string& localHash, std::vector<Link>& out, int& version);
 +bool save(const std::string& localHash, const std::vector<Link>& links);
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
