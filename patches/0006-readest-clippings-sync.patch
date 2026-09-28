@@ -45,13 +45,14 @@ index 3a589c5a..78835a60 100644
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 9f66ac0d..521dc036 100644
+index 9f66ac0d..0ca913f9 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
-@@ -7,13 +7,18 @@
+@@ -7,13 +7,19 @@
  #include <expat.h>
  
  #include <algorithm>
++#include <cctype>
 +#include <climits>
  #include <cmath>
 +#include <cstdint>
@@ -67,7 +68,7 @@ index 9f66ac0d..521dc036 100644
  namespace {
  std::string stripPrefix(const XML_Char* name) {
    if (!name) {
-@@ -680,3 +685,1092 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
+@@ -680,3 +686,1157 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
    }
    return resolver.getXPath();
  }
@@ -275,14 +276,61 @@ index 9f66ac0d..521dc036 100644
 +
 +  bool stopped = false;
 +
++  // Inside an element the reader hides (see isHiddenElement()).
++  bool textHidden() const { return hiddenDepth_ > 0; }
++
 + private:
-+  static void XMLCALL startElement(void* userData, const XML_Char* name, const XML_Char**) {
-+    static_cast<ExpatTextStream*>(userData)->onStartElement(stripPrefix(name));
++  static void XMLCALL startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
++    auto* self = static_cast<ExpatTextStream*>(userData);
++    if (self->hiddenDepth_ > 0 || isHiddenElement(atts)) self->hiddenDepth_++;
++    self->onStartElement(stripPrefix(name));
 +  }
 +
 +  static void XMLCALL endElement(void* userData, const XML_Char* name) {
-+    static_cast<ExpatTextStream*>(userData)->onEndElement(stripPrefix(name));
++    auto* self = static_cast<ExpatTextStream*>(userData);
++    self->onEndElement(stripPrefix(name));
++    if (self->hiddenDepth_ > 0) self->hiddenDepth_--;
 +  }
++
++  static const char* attribute(const XML_Char** atts, const char* name) {
++    for (int i = 0; atts && atts[i]; i += 2) {
++      if (std::strcmp(atts[i], name) == 0) return atts[i + 1];
++    }
++    return nullptr;
++  }
++
++  static bool containsToken(const char* value, const char* token) {
++    if (!value) return false;
++    const size_t tokenLen = std::strlen(token);
++    for (const char* p = value; *p;) {
++      while (*p == ' ' || *p == '\t') ++p;
++      const char* end = p;
++      while (*end && *end != ' ' && *end != '\t') ++end;
++      if (static_cast<size_t>(end - p) == tokenLen && std::strncmp(p, token, tokenLen) == 0) return true;
++      p = end;
++    }
++    return false;
++  }
++
++  // Elements CrossInk's reader never shows (ChapterHtmlSlimParser skips them,
++  // text included): `hidden`, publisher page-break markers, and an inline
++  // display:none. Their text must not be matched, extracted or counted.
++  static bool isHiddenElement(const XML_Char** atts) {
++    if (attribute(atts, "hidden")) return true;
++    if (containsToken(attribute(atts, "epub:type"), "pagebreak") ||
++        containsToken(attribute(atts, "role"), "doc-pagebreak")) {
++      return true;
++    }
++    const char* style = attribute(atts, "style");
++    if (!style) return false;
++    std::string compact;
++    for (const char* c = style; *c; ++c) {
++      if (*c != ' ' && *c != '\t') compact += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
++    }
++    return compact.find("display:none") != std::string::npos;
++  }
++
++  int hiddenDepth_ = 0;
 +
 +  static void XMLCALL characterData(void* userData, const XML_Char* data, const int len) {
 +    static_cast<ExpatTextStream*>(userData)->onCharacterData(data, len);
@@ -353,7 +401,7 @@ index 9f66ac0d..521dc036 100644
 +  }
 +
 +  void onCharacterData(const XML_Char* data, const int len) override {
-+    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped || needle.empty()) return;
++    if (!insideBody || nonVisibleDepth > 0 || textHidden() || len <= 0 || stopped || needle.empty()) return;
 +    const size_t n = needle.size();
 +    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
 +    const unsigned char* end = ptr + len;
@@ -443,7 +491,7 @@ index 9f66ac0d..521dc036 100644
 +  }
 +
 +  void onCharacterData(const XML_Char* data, const int len) override {
-+    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped || frames.empty()) return;
++    if (!insideBody || nonVisibleDepth > 0 || textHidden() || len <= 0 || stopped || frames.empty()) return;
 +    Frame& frame = frames.back();
 +    if (!inTextNode) {
 +      inTextNode = true;
@@ -587,7 +635,7 @@ index 9f66ac0d..521dc036 100644
 +  }
 +
 +  void onCharacterData(const XML_Char* data, const int len) override {
-+    if (!insideBody || nonVisibleDepth > 0 || len <= 0) return;
++    if (!insideBody || nonVisibleDepth > 0 || textHidden() || len <= 0) return;
 +    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
 +    const unsigned char* end = ptr + len;
 +    uint32_t folded[3];
@@ -789,6 +837,18 @@ index 9f66ac0d..521dc036 100644
 +}
 +
 +namespace {
++// How CrossInk's reader treats a character when it builds page words
++// (ChapterHtmlSlimParser): words break only at ASCII whitespace and at
++// (narrow) no-break spaces; soft hyphens and the BOM never appear; every other
++// character, invisible ones included, stays inside its word. Extracted text
++// must follow the same rules or the reader's byte-exact highlighter misses it.
++enum class ReaderChar : uint8_t { Word, Space, Dropped };
++ReaderChar readerCharKind(const uint32_t cp) {
++  if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == 0xA0 || cp == 0x202F) return ReaderChar::Space;
++  if (cp == 0xAD || cp == 0xFEFF) return ReaderChar::Dropped;
++  return ReaderChar::Word;
++}
++
 +// Collects the chapter text between two match positions, the way the reader
 +// shows it: whitespace runs (and block boundaries) become one space, soft
 +// hyphens vanish, entities are expanded.
@@ -827,7 +887,7 @@ index 9f66ac0d..521dc036 100644
 +  }
 +
 +  void onCharacterData(const XML_Char* data, const int len) override {
-+    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped) return;
++    if (!insideBody || nonVisibleDepth > 0 || textHidden() || len <= 0 || stopped) return;
 +    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data);
 +    const unsigned char* end = ptr + len;
 +    while (ptr < end) {
@@ -849,8 +909,11 @@ index 9f66ac0d..521dc036 100644
 +        pendingSpace = false;
 +      }
 +      if (capturing) {
-+        if (isWhitespaceOrSoftHyphen(cp)) {
-+          if (cp != 0xAD) pendingSpace = true;
++        const ReaderChar kind = readerCharKind(cp);
++        if (kind == ReaderChar::Dropped) {
++          // Not part of any rendered word.
++        } else if (kind == ReaderChar::Space) {
++          pendingSpace = true;
 +        } else {
 +          if (pendingSpace && !text.empty()) text += ' ';
 +          pendingSpace = false;
@@ -1001,7 +1064,7 @@ index 9f66ac0d..521dc036 100644
 +  }
 +
 +  void onCharacterData(const XML_Char* data, const int len) override {
-+    if (!insideBody || nonVisibleDepth > 0 || len <= 0 || stopped || frames.empty()) return;
++    if (!insideBody || nonVisibleDepth > 0 || textHidden() || len <= 0 || stopped || frames.empty()) return;
 +    Frame& frame = frames.back();
 +    if (!inTextNode) {
 +      inTextNode = true;
@@ -1026,8 +1089,11 @@ index 9f66ac0d..521dc036 100644
 +        capturing = true;
 +      }
 +      if (capturing) {
-+        if (isWhitespaceOrSoftHyphen(cp)) {
-+          if (cp != 0xAD) pendingSpace = true;
++        const ReaderChar kind = readerCharKind(cp);
++        if (kind == ReaderChar::Dropped) {
++          // Not part of any rendered word.
++        } else if (kind == ReaderChar::Space) {
++          pendingSpace = true;
 +        } else {
 +          if (pendingSpace && !text.empty()) text += ' ';
 +          pendingSpace = false;
@@ -1481,10 +1547,10 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteCache:
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..f1aa231e
+index 00000000..7c0915fe
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,918 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1868,7 +1934,7 @@ index 00000000..f1aa231e
 +  requestUpdate(true);
 +}
 +
-+bool ReadestSyncActivity::addPulledClipping(const ReadestNote& note, int& skipped) {
++bool ReadestSyncActivity::locatePulledText(const ReadestNote& note, PulledText& out) {
 +  // Find Readest's text in the device copy, starting at the same relative
 +  // spot of the book as in Readest's copy and widening to the whole book.
 +  float hint = -1.0f;
@@ -1878,40 +1944,36 @@ index 00000000..f1aa231e
 +      hint = ChapterXPathResolver::bookFraction(readestEpub, sourceSpine, 0.5f);
 +    }
 +  }
-+  int spine = -1;
-+  XPathTextLocation location;
-+  if (!ChapterXPathResolver::findTextInBook(epub, note.text, hint, -1, spine, location)) {
++  if (!ChapterXPathResolver::findTextInBook(epub, note.text, hint, -1, out.spine, out.location)) {
 +    LOG_DBG("RDS", "Readest note %s not found in the device copy", note.id.c_str());
-+    skipped++;
-+    return true;
++    return false;
 +  }
++  // Store the device's own wording (hidden page markers dropped, words split
++  // like the reader splits them) so the reader's highlighter matches it.
++  if (!ChapterXPathResolver::extractText(epub, out.spine, out.location, out.text)) out.text = note.text;
++  out.keyHash = keyHashFor(out.text);
++  return !out.keyHash.empty();
++}
 +
-+  // Store the device's own wording so the reader's highlighter matches it.
-+  std::string deviceText;
-+  if (!ChapterXPathResolver::extractText(epub, spine, location, deviceText)) deviceText = note.text;
-+
-+  const uint16_t page =
-+      location.total > 0
-+          ? static_cast<uint16_t>(static_cast<uint64_t>(location.start) * (VIRTUAL_PAGE_COUNT - 1) / location.total)
-+          : 0;
-+  const int tocIndex = epub->getTocIndexForSpineIndex(spine);
++bool ReadestSyncActivity::addPulledClipping(const PulledText& pulled) {
++  const uint16_t page = pulled.location.total > 0
++                            ? static_cast<uint16_t>(static_cast<uint64_t>(pulled.location.start) *
++                                                    (VIRTUAL_PAGE_COUNT - 1) / pulled.location.total)
++                            : 0;
++  const int tocIndex = epub->getTocIndexForSpineIndex(pulled.spine);
 +  const std::string chapterTitle = tocIndex >= 0 ? epub->getTocItem(tocIndex).title : "";
 +
-+  // layoutSignature 0 marks the range as layout-less: the reader matches the
-+  // saved text on each page instead of trusting word indices.
++  // layoutSignature 0 (and the virtual page count) mark a pulled, layout-less
++  // clipping: the reader matches the saved text on each page.
 +  const auto addResult =
-+      CLIPPINGS.addClipping(static_cast<uint16_t>(spine), page, page, VIRTUAL_PAGE_COUNT, 0, 0, countWords(deviceText),
-+                            chapterTitle.c_str(), UINT16_MAX, deviceText, UINT16_MAX, 0);
-+  if (addResult == ClippingStore::AddResult::LimitReached) {
-+    LOG_ERR("RDS", "Clipping limit reached while pulling");
-+    skipped++;
-+    return true;
-+  }
++      CLIPPINGS.addClipping(static_cast<uint16_t>(pulled.spine), page, page, VIRTUAL_PAGE_COUNT, 0, 0,
++                            countWords(pulled.text), chapterTitle.c_str(), UINT16_MAX, pulled.text, UINT16_MAX, 0);
 +  if (addResult == ClippingStore::AddResult::SaveFailed) {
 +    fail(tr(STR_READEST_SAVE_FAILED));
 +    return false;
 +  }
-+  return true;
++  if (addResult == ClippingStore::AddResult::LimitReached) LOG_ERR("RDS", "Clipping limit reached while pulling");
++  return addResult == ClippingStore::AddResult::Added;
 +}
 +
 +bool ReadestSyncActivity::syncHighlights(const ReadestBook& book, HighlightCounts& counts) {
@@ -1930,8 +1992,10 @@ index 00000000..f1aa231e
 +  // Snapshot of the device clippings, identified by their loose text.
 +  struct LocalClip {
 +    std::string keyHash;
++    bool pulledStyle = false;  // added by an earlier pull (layout-less record)
 +    bool claimed = false;
 +    bool remove = false;
++    bool silent = false;  // removal is a repair, not a user deletion
 +  };
 +  std::vector<LocalClip> local(CLIPPINGS.clippingCount());
 +  {
@@ -1939,20 +2003,22 @@ index 00000000..f1aa231e
 +    for (size_t i = 0; i < local.size(); ++i) {
 +      text.clear();
 +      if (CLIPPINGS.readClippingText(i, text)) local[i].keyHash = keyHashFor(text);
++      const Clipping* clipping = CLIPPINGS.clippingAt(i);
++      local[i].pulledStyle = clipping && clipping->layoutSignature == 0 && clipping->pageCount == VIRTUAL_PAGE_COUNT;
 +    }
 +  }
 +  std::vector<std::string> remoteKeys;
 +  remoteKeys.reserve(remote.size());
 +  for (const auto& note : remote) remoteKeys.push_back(keyHashFor(note.text));
 +
-+  // Links saved with an older text fingerprint: refresh them from Readest's
-+  // current text (assumed unchanged since the last sync) instead of treating
-+  // every highlight as edited.
-+  if (hadLinks && linksVersion < ReadestLinks::KEY_VERSION) {
++  // Links saved before the fingerprint was folded (v1): refresh them from
++  // Readest's current text instead of treating every highlight as edited.
++  if (hadLinks && linksVersion < 2) {
 +    for (auto& link : links) {
 +      for (size_t r = 0; r < remote.size(); ++r) {
 +        if (remote[r].id == link.id) {
 +          link.keyHash = remoteKeys[r];
++          link.localHash = remoteKeys[r];
 +          break;
 +        }
 +      }
@@ -1976,13 +2042,19 @@ index 00000000..f1aa231e
 +  std::vector<bool> remoteHandled(remote.size(), false);
 +  std::vector<size_t> toPull;       // remote notes to add on the device
 +  std::vector<size_t> toTombstone;  // remote notes to delete in Readest
++  struct Replacement {
++    size_t remote;
++    PulledText pulled;
++  };
++  std::vector<Replacement> replacements;  // pulled clippings re-extracted (repair)
 +  std::vector<ReadestLinks::Link> nextLinks;
 +  nextLinks.reserve(links.size() + remote.size() + local.size());
 +
 +  // 1. What was in sync last time: detect deletions and edits on each side.
-+  for (const auto& link : links) {
++  for (auto link : links) {
++    if (link.localHash.empty()) link.localHash = link.keyHash;
 +    const int ri = findRemote(link.id);
-+    const int li = claimLocal(link.keyHash);
++    const int li = claimLocal(link.localHash);
 +    if (ri < 0 || remote[static_cast<size_t>(ri)].deleted) {
 +      if (li >= 0) local[static_cast<size_t>(li)].remove = true;  // deleted in Readest
 +      if (ri >= 0) remoteHandled[static_cast<size_t>(ri)] = true;
@@ -2000,6 +2072,18 @@ index 00000000..f1aa231e
 +      continue;
 +    }
 +    local[static_cast<size_t>(li)].claimed = true;
++    // One-time repair: clippings pulled by builds before v3 may contain text
++    // the reader never shows (hidden page numbers), so its highlighter missed
++    // parts of them. Re-extract and replace only when the text changes.
++    if (linksVersion < 3 && local[static_cast<size_t>(li)].pulledStyle) {
++      PulledText fresh;
++      if (locatePulledText(remote[r], fresh) && fresh.keyHash != link.localHash) {
++        local[static_cast<size_t>(li)].remove = true;
++        local[static_cast<size_t>(li)].silent = true;
++        replacements.push_back({r, std::move(fresh)});
++        continue;
++      }
++    }
 +    nextLinks.push_back(link);
 +  }
 +
@@ -2015,10 +2099,33 @@ index 00000000..f1aa231e
 +        continue;  // the device clipping stays unclaimed and is pushed again
 +      }
 +      local[static_cast<size_t>(li)].claimed = true;
-+      nextLinks.push_back({remote[r].id, remoteKeys[r]});
++      nextLinks.push_back({remote[r].id, remoteKeys[r], remoteKeys[r]});
 +      continue;
 +    }
 +    toPull.push_back(r);
++  }
++
++  // Resolve those Readest highlights to the device's wording now, so a device
++  // clipping with that wording is linked here instead of being pushed as new.
++  struct PendingPull {
++    size_t remote;
++    PulledText pulled;
++  };
++  std::vector<PendingPull> pendingPulls;
++  pendingPulls.reserve(toPull.size());
++  for (const size_t r : toPull) {
++    PulledText pulledText;
++    if (!locatePulledText(remote[r], pulledText)) {
++      counts.skipped++;
++      continue;
++    }
++    const int li = claimLocal(pulledText.keyHash);
++    if (li >= 0) {
++      local[static_cast<size_t>(li)].claimed = true;
++      nextLinks.push_back({remote[r].id, remoteKeys[r], pulledText.keyHash});
++      continue;
++    }
++    pendingPulls.push_back({r, std::move(pulledText)});
 +  }
 +
 +  const time_t now = time(nullptr);
@@ -2083,7 +2190,7 @@ index 00000000..f1aa231e
 +        break;
 +      }
 +    }
-+    nextLinks.push_back({id, local[i].keyHash});
++    nextLinks.push_back({id, local[i].keyHash, local[i].keyHash});
 +    if (reused) continue;
 +
 +    JsonObject note = notes.add<JsonObject>();
@@ -2135,24 +2242,41 @@ index 00000000..f1aa231e
 +  }
 +  if (!flush()) return false;
 +
-+  // 5. Deletions/edits made in Readest: drop device clippings (highest index
-+  //    first so earlier indices stay valid).
++  // 5. Deletions/edits made in Readest (and repairs): drop device clippings,
++  //    highest index first so earlier indices stay valid.
 +  for (size_t i = local.size(); i-- > 0;) {
 +    if (!local[i].remove) continue;
 +    if (CLIPPINGS.removeClippingAt(i)) {
-+      counts.removedHere++;
++      if (!local[i].silent) counts.removedHere++;
 +    } else {
 +      LOG_ERR("RDS", "Failed to remove clipping %u", static_cast<unsigned>(i));
 +    }
 +  }
 +
-+  // 6. Readest highlights new to the device.
-+  for (const size_t r : toPull) {
-+    const size_t before = CLIPPINGS.clippingCount();
-+    if (!addPulledClipping(remote[r], counts.skipped)) return false;
-+    if (CLIPPINGS.clippingCount() > before) {
-+      counts.pulled++;
-+      nextLinks.push_back({remote[r].id, remoteKeys[r]});
++  // 6. Repaired clippings go back with the corrected text.
++  for (const auto& replacement : replacements) {
++    if (addPulledClipping(replacement.pulled)) {
++      nextLinks.push_back({remote[replacement.remote].id, remoteKeys[replacement.remote], replacement.pulled.keyHash});
++    } else if (state == FAILED) {
++      return false;
++    }
++  }
++
++  // 7. Readest highlights new to the device.
++  std::vector<std::string> addedKeys;
++  for (const auto& pending : pendingPulls) {
++    const auto& key = pending.pulled.keyHash;
++    const bool duplicate = std::find(addedKeys.begin(), addedKeys.end(), key) != addedKeys.end();
++    if (duplicate || addPulledClipping(pending.pulled)) {
++      if (!duplicate) {
++        counts.pulled++;
++        addedKeys.push_back(key);
++      }
++      nextLinks.push_back({remote[pending.remote].id, remoteKeys[pending.remote], key});
++    } else if (state == FAILED) {
++      return false;
++    } else {
++      counts.skipped++;
 +    }
 +  }
 +
@@ -2347,10 +2471,10 @@ index 00000000..f1aa231e
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 00000000..96f83bdf
+index 00000000..e9292743
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,119 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -2360,6 +2484,7 @@ index 00000000..96f83bdf
 +#include <utility>
 +#include <vector>
 +
++#include "ChapterXPathResolver.h"
 +#include "CrossPointSettings.h"
 +#include "activities/Activity.h"
 +#include "activities/ScreenTransitionRefresh.h"
@@ -2455,7 +2580,17 @@ index 00000000..96f83bdf
 +  };
 +  // Returns false after reporting a fatal error via fail().
 +  bool syncHighlights(const ReadestBook& book, HighlightCounts& counts);
-+  bool addPulledClipping(const ReadestNote& note, int& skipped);
++  // Readest highlight located in the device copy, with the device's wording.
++  struct PulledText {
++    int spine = -1;
++    XPathTextLocation location;
++    std::string text;
++    std::string keyHash;
++  };
++  bool locatePulledText(const ReadestNote& note, PulledText& out);
++  // Adds a pulled clipping; false if not added (fail() already called when
++  // saving failed, i.e. state == FAILED).
++  bool addPulledClipping(const PulledText& pulled);
 +  std::string syncPosition(const ReadestBook& book);
 +  void returnToReader();
 +};
@@ -3021,10 +3156,10 @@ index cd01e87c..2b7e2178 100644
          if (fontsActivity) {
 diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
 new file mode 100644
-index 00000000..5fa373b4
+index 00000000..f1916ebd
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.cpp
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,172 @@
 +#include "ReadestBookMap.h"
 +
 +#include <ArduinoJson.h>
@@ -3166,7 +3301,16 @@ index 00000000..5fa373b4
 +  const JsonObjectConst ids = doc["ids"].as<JsonObjectConst>();
 +  out.reserve(ids.size());
 +  for (const JsonPairConst pair : ids) {
-+    out.push_back({pair.key().c_str(), pair.value() | ""});
++    Link link;
++    link.id = pair.key().c_str();
++    if (pair.value().is<const char*>()) {  // before v3: one shared fingerprint
++      link.keyHash = pair.value().as<const char*>();
++      link.localHash = link.keyHash;
++    } else {
++      link.keyHash = pair.value()["r"] | "";
++      link.localHash = pair.value()["l"] | "";
++    }
++    out.push_back(std::move(link));
 +  }
 +  return true;
 +}
@@ -3176,7 +3320,11 @@ index 00000000..5fa373b4
 +  JsonDocument doc;
 +  doc["v"] = KEY_VERSION;
 +  JsonObject ids = doc["ids"].to<JsonObject>();
-+  for (const auto& link : links) ids[link.id] = link.keyHash;
++  for (const auto& link : links) {
++    JsonObject entry = ids[link.id].to<JsonObject>();
++    entry["r"] = link.keyHash;
++    entry["l"] = link.localHash;
++  }
 +  if (!PersistableStoreBase::writeDocToFile(linksPath(localHash).c_str(), doc)) {
 +    LOG_ERR("RDS", "Failed to save Readest highlight links");
 +    return false;
@@ -3186,10 +3334,10 @@ index 00000000..5fa373b4
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
 new file mode 100644
-index 00000000..2df91993
+index 00000000..00149749
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,60 @@
 +#pragma once
 +
 +#include <string>
@@ -3239,10 +3387,13 @@ index 00000000..2df91993
 +namespace ReadestLinks {
 +struct Link {
 +  std::string id;
-+  std::string keyHash;
++  std::string keyHash;    // fingerprint of Readest's text for the highlight
++  std::string localHash;  // fingerprint of the device clipping's text
 +};
-+// Bumped when the text fingerprint changes (2: accents/ligatures folded).
-+constexpr int KEY_VERSION = 2;
++// Bumped when fingerprints change: 2 = accents/ligatures folded, 3 = separate
++// Readest/device fingerprints (their wording may differ, e.g. hidden page
++// numbers that only Readest's text contains).
++constexpr int KEY_VERSION = 3;
 +// `version` receives the fingerprint version the links were saved with.
 +bool load(const std::string& localHash, std::vector<Link>& out, int& version);
 +bool save(const std::string& localHash, const std::vector<Link>& links);
