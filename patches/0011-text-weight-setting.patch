@@ -162,7 +162,7 @@ index f038969..0e41be0 100644
    uint8_t touchReaderControls = TOUCH_READER_ON;
    // Page-turn gestures remain independently configurable while touch reader controls stay enabled.
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index 7e71166..45ae8de 100644
+index 7e71166..2fe451b 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
 @@ -666,6 +666,10 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
@@ -176,11 +176,74 @@ index 7e71166..45ae8de 100644
      add(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                            {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
                            "imageRendering", StrId::STR_CAT_READER));
+@@ -1138,7 +1142,7 @@ inline std::vector<SettingInfo> buildBookReaderSettingsParentList(const std::vec
+ 
+ inline std::vector<SettingInfo> buildReaderFontSettingsList(const std::vector<SettingInfo>& allSettings) {
+   std::vector<SettingInfo> settings;
+-  settings.reserve(10);
++  settings.reserve(11);
+   addSettingByName(settings, allSettings, StrId::STR_FONT_FAMILY);
+   addSettingByName(settings, allSettings, StrId::STR_FONT_SIZE);
+   addSettingByName(settings, allSettings, StrId::STR_DICTIONARY_FONT);
+@@ -1146,6 +1150,7 @@ inline std::vector<SettingInfo> buildReaderFontSettingsList(const std::vector<Se
+   addSettingByName(settings, allSettings, StrId::STR_LINE_SPACING);
+   addSettingByName(settings, allSettings, StrId::STR_WORD_SPACING);
+   addSettingByName(settings, allSettings, StrId::STR_TEXT_AA);
++  addSettingByName(settings, allSettings, StrId::STR_TEXT_WEIGHT);
+   settings.push_back(SettingInfo::Action(StrId::STR_DOWNLOAD_FONTS, SettingAction::DownloadFonts));
+   addSettingByName(settings, allSettings, StrId::STR_SD_FONT_SIZE_RANGE);
+   return settings;
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index ce126e8..71b9f58 100644
+index 61c4479..d4cd8f2 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -7008,6 +7008,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -1120,6 +1120,7 @@ void captureReaderSettings(EpubReaderActivity::ReaderSettingsSnapshot& out) {
+   out.embeddedStyle = SETTINGS.embeddedStyle;
+   out.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+   out.textAntiAliasing = SETTINGS.textAntiAliasing;
++  out.textWeight = SETTINGS.textWeight;
+   out.imageRendering = SETTINGS.imageRendering;
+   out.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+   out.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+@@ -1159,6 +1160,7 @@ void applyReaderSettings(const EpubReaderActivity::ReaderSettingsSnapshot& in) {
+   SETTINGS.embeddedStyle = in.embeddedStyle ? 1 : 0;
+   SETTINGS.hyphenationEnabled = in.hyphenationEnabled ? 1 : 0;
+   SETTINGS.textAntiAliasing = in.textAntiAliasing ? 1 : 0;
++  SETTINGS.textWeight = in.textWeight < CrossPointSettings::TEXT_WEIGHT_COUNT ? in.textWeight : CrossPointSettings::WEIGHT_NORMAL;
+   SETTINGS.imageRendering =
+       in.imageRendering < CrossPointSettings::IMAGE_RENDERING_COUNT ? in.imageRendering : SETTINGS.imageRendering;
+   SETTINGS.extraParagraphSpacing = in.extraParagraphSpacing ? 1 : 0;
+@@ -1276,6 +1278,9 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
+   // Version 2 books inherit the current global indexing method instead of
+   // silently changing modes when their older custom settings are loaded.
+   snapshot.indexingMethod = data.readerSettings.indexingMethod;
++  // Text weight is a trailing byte added after this format shipped: files written
++  // before it simply end early and the book keeps the global weight.
++  snapshot.textWeight = data.readerSettings.textWeight;
+   bool ok = readU8(file, flags) && readU16(file, seconds);
+   if (ok) {
+     ok = readU8(file, renderMode);
+@@ -1292,6 +1297,10 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
+   if (ok && version >= PRE_SPLIT_SCREEN_MARGIN_READER_SETTINGS_FILE_VERSION) {
+     ok = readU8(file, data.dictionaryFontPointSize);
+   }
++  if (ok) {
++    uint8_t storedTextWeight = 0;
++    if (readU8(file, storedTextWeight)) snapshot.textWeight = storedTextWeight;
++  }
+   file.close();
+   if (!ok) {
+     LOG_ERR("ERS", "Reader settings file is truncated, using defaults");
+@@ -1344,7 +1353,7 @@ bool saveBookReaderSettingsFile(const std::string& cachePath, const BookReaderSe
+                   writeU16(file, clampedSeconds) && writeU8(file, normalizeRenderModeRaw(data.renderMode)) &&
+                   writeReaderSettingsSnapshot(file, normalizedReaderSettings) &&
+                   writeExact(file, data.dictionarySdFontFamilyName, sizeof(data.dictionarySdFontFamilyName)) &&
+-                  writeU8(file, data.dictionaryFontPointSize);
++                  writeU8(file, data.dictionaryFontPointSize) && writeU8(file, normalizedReaderSettings.textWeight);
+   file.close();
+   if (!ok) {
+     LOG_ERR("ERS", "Short write saving reader settings");
+@@ -7009,6 +7018,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    };
  
    const auto composePageBuffer = [&]() {
@@ -188,7 +251,7 @@ index ce126e8..71b9f58 100644
      if (deferImageLoading) {
        page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
                                          /*renderCachedImages=*/false);
-@@ -7018,6 +7019,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7019,6 +7029,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    };
  
    const auto composeGrayscaleBuffer = [&]() {
@@ -196,7 +259,7 @@ index ce126e8..71b9f58 100644
      if (needsTextGrayscale) {
        page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
      } else {
-@@ -7026,6 +7028,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7027,6 +7038,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      finalizeBufferComposition();
    };
    if (updatePanel && pageHasImagesNeedingDecode) {
@@ -204,3 +267,164 @@ index ce126e8..71b9f58 100644
      page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
      finalizeBufferComposition();
      renderStatusBar();
+diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+index ad15a9e..dc88852 100644
+--- a/src/activities/reader/EpubReaderActivity.h
++++ b/src/activities/reader/EpubReaderActivity.h
+@@ -51,6 +51,7 @@ class EpubReaderActivity final : public Activity {
+     uint8_t embeddedStyle = 1;
+     uint8_t hyphenationEnabled = 0;
+     uint8_t textAntiAliasing = 1;
++    uint8_t textWeight = CrossPointSettings::WEIGHT_NORMAL;
+     uint8_t imageRendering = 0;
+     uint8_t extraParagraphSpacing = 1;
+     uint8_t forceParagraphIndents = 0;
+diff --git a/src/activities/reader/EpubReaderMenuActivity.cpp b/src/activities/reader/EpubReaderMenuActivity.cpp
+index 6c0635c..9d92c01 100644
+--- a/src/activities/reader/EpubReaderMenuActivity.cpp
++++ b/src/activities/reader/EpubReaderMenuActivity.cpp
+@@ -78,6 +78,7 @@ struct ReaderLayoutSettingsSnapshot {
+   uint8_t embeddedStyle;
+   uint8_t hyphenationEnabled;
+   uint8_t textAntiAliasing;
++  uint8_t textWeight;
+   uint8_t imageRendering;
+   uint8_t extraParagraphSpacing;
+   uint8_t forceParagraphIndents;
+@@ -103,6 +104,7 @@ ReaderLayoutSettingsSnapshot captureReaderLayoutSettings() {
+       SETTINGS.embeddedStyle,
+       SETTINGS.hyphenationEnabled,
+       SETTINGS.textAntiAliasing,
++      SETTINGS.textWeight,
+       SETTINGS.imageRendering,
+       SETTINGS.extraParagraphSpacing,
+       SETTINGS.forceParagraphIndents,
+@@ -119,7 +121,7 @@ ReaderSettingsChangeMask classifyReaderSettingsChange(const ReaderLayoutSettings
+                                                       const ReaderLayoutSettingsSnapshot& after) {
+   ReaderSettingsChangeMask changeMask = ReaderSettingsChangeMask::None;
+ 
+-  if (before.textAntiAliasing != after.textAntiAliasing) {
++  if (before.textAntiAliasing != after.textAntiAliasing || before.textWeight != after.textWeight) {
+     changeMask = changeMask | ReaderSettingsChangeMask::NonLayout;
+   }
+   if (before.orientation != after.orientation) {
+diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
+index 3701525..011b166 100644
+--- a/src/activities/reader/EpubReaderMenuModel.h
++++ b/src/activities/reader/EpubReaderMenuModel.h
+@@ -101,6 +101,7 @@ enum class ReaderDrawerCatalogItem : uint8_t {
+   DictionaryFontFamily,
+   DictionaryFontSize,
+   ReadestSync,
++  TextWeight,
+ };
+ 
+ struct ReaderDrawerAvailability {
+@@ -128,6 +129,7 @@ constexpr ReaderDrawerCatalog makeReaderDrawerCatalog(const ReaderDrawerAvailabi
+   font.add(ReaderDrawerCatalogItem::DictionaryFont);
+   font.add(ReaderDrawerCatalogItem::Spacing);
+   font.add(ReaderDrawerCatalogItem::TextAa);
++  font.add(ReaderDrawerCatalogItem::TextWeight);
+   font.add(ReaderDrawerCatalogItem::Focus);
+   font.add(ReaderDrawerCatalogItem::GuideDots);
+ 
+@@ -251,6 +253,7 @@ struct ReaderSettingsDraft {
+   uint8_t orientation = 0;
+   uint8_t paragraphAlignment = 0;
+   uint8_t textAntiAliasing = 0;
++  uint8_t textWeight = 0;
+   uint8_t focusReadingEnabled = 0;
+   uint8_t guideReadingEnabled = 0;
+   uint8_t hyphenationEnabled = 0;
+diff --git a/src/activities/reader/EpubReaderTouchMenuActivity.cpp b/src/activities/reader/EpubReaderTouchMenuActivity.cpp
+index 37e9a2a..49a214f 100644
+--- a/src/activities/reader/EpubReaderTouchMenuActivity.cpp
++++ b/src/activities/reader/EpubReaderTouchMenuActivity.cpp
+@@ -450,6 +450,7 @@ ReaderSettingsDraft EpubReaderTouchMenuActivity::captureSettings() {
+   value.orientation = SETTINGS.orientation;
+   value.paragraphAlignment = SETTINGS.paragraphAlignment;
+   value.textAntiAliasing = SETTINGS.textAntiAliasing;
++  value.textWeight = SETTINGS.textWeight;
+   value.focusReadingEnabled = SETTINGS.focusReadingEnabled;
+   value.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+   value.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+@@ -475,6 +476,7 @@ void EpubReaderTouchMenuActivity::applySettings(const ReaderSettingsDraft& value
+   SETTINGS.orientation = value.orientation;
+   SETTINGS.paragraphAlignment = value.paragraphAlignment;
+   SETTINGS.textAntiAliasing = value.textAntiAliasing;
++  SETTINGS.textWeight = value.textWeight;
+   SETTINGS.focusReadingEnabled = value.focusReadingEnabled;
+   SETTINGS.guideReadingEnabled = value.guideReadingEnabled;
+   SETTINGS.hyphenationEnabled = value.hyphenationEnabled;
+@@ -1238,6 +1240,7 @@ void EpubReaderTouchMenuActivity::activateRow(const RowId row) {
+     case RowId::Alignment:
+     case RowId::Images:
+     case RowId::RenderMode:
++    case RowId::TextWeight:
+       showEnumOptions(row);
+       return;
+     case RowId::IndexingMethod:
+@@ -1445,6 +1448,13 @@ void EpubReaderTouchMenuActivity::showEnumOptions(const RowId row) {
+       raw = {0, 1, 2, 3, 4};
+       currentRaw = draft.paragraphAlignment;
+       break;
++    case RowId::TextWeight:
++      title = StrId::STR_TEXT_WEIGHT;
++      labels = {tr(STR_WEIGHT_LIGHTEST), tr(STR_WEIGHT_LIGHTER), tr(STR_WEIGHT_NORMAL), tr(STR_WEIGHT_BOLDER),
++                tr(STR_WEIGHT_BOLDEST)};
++      raw = {0, 1, 2, 3, 4};
++      currentRaw = draft.textWeight;
++      break;
+     case RowId::Images:
+       title = StrId::STR_IMAGES;
+       labels = {tr(STR_IMAGES_DISPLAY), tr(STR_IMAGES_PLACEHOLDER), tr(STR_IMAGES_SUPPRESS)};
+@@ -1572,6 +1582,10 @@ void EpubReaderTouchMenuActivity::selectEnumOption(const int index) {
+       previewedEnumOptionIndex = -1;
+       markSettingChanged(ReaderSettingsChangeMask::Preview | ReaderSettingsChangeMask::Relayout);
+       break;
++    case RowId::TextWeight:
++      draft.textWeight = value;
++      markSettingChanged(ReaderSettingsChangeMask::NonLayout);
++      break;
+     case RowId::Images:
+       draft.imageRendering = value;
+       markSettingChanged(ReaderSettingsChangeMask::NonLayout);
+@@ -2063,6 +2077,8 @@ const char* EpubReaderTouchMenuActivity::rowLabel(const RowId row) const {
+       return tr(STR_SPACING);
+     case RowId::TextAa:
+       return tr(STR_TEXT_AA);
++    case RowId::TextWeight:
++      return tr(STR_TEXT_WEIGHT);
+     case RowId::Focus:
+       return tr(STR_FOCUS_READING);
+     case RowId::GuideDots:
+@@ -2165,6 +2181,12 @@ const char* EpubReaderTouchMenuActivity::rowValue(const RowId row, char* buffer,
+                                                   StrId::STR_ALIGN_RIGHT, StrId::STR_BOOK_S_STYLE};
+       return I18N.get(labels[std::min<size_t>(draft.paragraphAlignment, labels.size() - 1)]);
+     }
++    case RowId::TextWeight: {
++      static const std::array<StrId, 5> labels = {StrId::STR_WEIGHT_LIGHTEST, StrId::STR_WEIGHT_LIGHTER,
++                                                  StrId::STR_WEIGHT_NORMAL, StrId::STR_WEIGHT_BOLDER,
++                                                  StrId::STR_WEIGHT_BOLDEST};
++      return I18N.get(labels[std::min<size_t>(draft.textWeight, labels.size() - 1)]);
++    }
+     case RowId::Images: {
+       static const std::array<StrId, 3> labels = {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER,
+                                                   StrId::STR_IMAGES_SUPPRESS};
+diff --git a/test/reader_drawer_model/ReaderDrawerModelTest.cpp b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
+index f6cfc8e..b826402 100644
+--- a/test/reader_drawer_model/ReaderDrawerModelTest.cpp
++++ b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
+@@ -60,9 +60,10 @@ TEST(ReaderDrawerModel, ResumeRestoresScrollToTheActiveRootOrPane) {
+ TEST(ReaderDrawerModel, CatalogOrderAndConditionalRowsMatchTouchDesign) {
+   const ReaderDrawerCatalog minimal = makeReaderDrawerCatalog({});
+   const auto& font = minimal[static_cast<size_t>(ReaderDrawerTab::Font)];
+-  EXPECT_EQ(font.count, 6);
++  EXPECT_EQ(font.count, 7);
+   EXPECT_EQ(font.items[0], ReaderDrawerCatalogItem::ReaderFont);
+-  EXPECT_EQ(font.items[5], ReaderDrawerCatalogItem::GuideDots);
++  EXPECT_EQ(font.items[4], ReaderDrawerCatalogItem::TextWeight);
++  EXPECT_EQ(font.items[6], ReaderDrawerCatalogItem::GuideDots);
+ 
+   const auto& layout = minimal[static_cast<size_t>(ReaderDrawerTab::Layout)];
+   EXPECT_EQ(layout.count, 9);
