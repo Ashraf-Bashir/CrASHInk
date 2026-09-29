@@ -1,0 +1,453 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -127,6 +127,14 @@ STR_CAT_DISPLAY: "Display"
+ STR_CAT_READER: "Reader"
+ STR_CAT_CONTROLS: "Controls"
+ STR_CAT_SYSTEM: "System"
++STR_CAT_CRASHINK: "CrASHink"
++STR_STATUS_BAR_ICONS: "Status Bar Icons"
++STR_ICON_FRONTLIGHT: "Frontlight shortcut"
++STR_ICON_TOUCHSCREEN: "Touchscreen toggle"
++STR_ICON_READEST: "Readest sync (R)"
++STR_ICON_HIGHLIGHTER: "Highlighter"
++STR_MOVE_UP: "Move up"
++STR_MOVE_DOWN: "Move down"
+ STR_SLEEP_SCREEN: "Sleep Screen"
+ STR_SLEEP_SCREEN_WALLPAPER: "Wallpaper"
+ STR_QUICK_RESUME_TIMEOUT: "Quick Resume on Timeout"
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include "I18nKeys.h"
+ #include "QuickActions.h"
++#include "StatusIconRow.h"
+ #include "SettingsList.h"
+ #include "fontIds.h"
+ #include "util/FrontlightSchedule.h"
+@@ -477,6 +478,11 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
+     quickActionSlotsJson.add(action);
+   }
+   doc["quickActionsTrigger"] = quickActionsTrigger;
++  JsonArray statusIconOrderJson = doc["statusIconOrder"].to<JsonArray>();
++  for (const uint8_t slot : statusIconOrder) {
++    statusIconOrderJson.add(slot);
++  }
++  doc["statusIconHidden"] = statusIconHidden;
+   doc["language"] = (language < getLanguageCount()) ? LANGUAGE_CODES[language] : "EN";
+   if (keyboardLayouts != 0) doc["keyboardLayouts"] = keyboardLayouts;
+   doc["tiltPageTurnDirectionSchema"] = TILT_DIRECTION_SCHEMA_CURRENT;
+@@ -737,6 +743,36 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
+       }
+     }
+   }
++  {
++    const JsonArrayConst statusIconOrderJson = doc["statusIconOrder"].as<JsonArrayConst>();
++    uint8_t loadedOrder[StatusIconRow::Count];
++    StatusIconRow::resetOrder(loadedOrder);
++    if (!statusIconOrderJson.isNull() && statusIconOrderJson.size() <= StatusIconRow::Count) {
++      // A saved order from before an icon existed lists fewer slots: keep that
++      // order and put the newer icons after it.
++      uint8_t seen = 0;
++      uint8_t n = 0;
++      bool ok = true;
++      for (JsonVariantConst v : statusIconOrderJson) {
++        const uint8_t slot = v | static_cast<uint8_t>(0xFF);
++        if (slot >= StatusIconRow::Count || (seen & (1u << slot))) {
++          ok = false;
++          break;
++        }
++        seen |= static_cast<uint8_t>(1u << slot);
++        loadedOrder[n++] = slot;
++      }
++      if (ok) {
++        for (uint8_t s = 0; s < StatusIconRow::Count; ++s) {
++          if (!(seen & (1u << s))) loadedOrder[n++] = s;
++        }
++      } else {
++        StatusIconRow::resetOrder(loadedOrder);
++      }
++    }
++    std::copy(loadedOrder, loadedOrder + StatusIconRow::Count, statusIconOrder);
++    statusIconHidden = (doc["statusIconHidden"] | static_cast<uint8_t>(0)) & StatusIconRow::kAllMask;
++  }
+   const uint8_t persistedQuickActionsTrigger =
+       doc["quickActionsTrigger"] | static_cast<uint8_t>(QuickActions::Trigger::None);
+   const bool unavailableHomeTrigger =
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -601,6 +601,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   // adjacent so old settings files simply retain their default-initialized tail.
+   uint8_t quickActionSlots[5] = {IGNORE, IGNORE, IGNORE, IGNORE, IGNORE};
+   uint8_t quickActionsTrigger = 0;
++  // Status bar icons (see StatusIconRow.h): left to right order, and which are switched off
++  // (stored inverted so an icon added later starts out shown).
++  uint8_t statusIconOrder[4] = {0, 1, 2, 3};
++  uint8_t statusIconHidden = 0;
+   // Tilt-based page turning on devices with a supported IMU (X3 and Sticky).
+   uint8_t tiltPageTurn = TILT_OFF;
+   uint8_t tiltPageTurnDirection = TILT_LEFT_RIGHT;
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1125,6 +1125,14 @@ inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<
+   return readerSettings;
+ }
+ 
++// The CrASHink tab: options that belong to this firmware fork rather
++// than to upstream CrossInk. New fork-only settings go here.
++inline std::vector<SettingInfo> buildCrashinkSettingsList() {
++  std::vector<SettingInfo> settings;
++  settings.push_back(SettingInfo::Action(StrId::STR_STATUS_BAR_ICONS, SettingAction::StatusIcons));
++  return settings;
++}
++
+ inline std::vector<SettingInfo> buildBookReaderSettingsParentList(const std::vector<SettingInfo>& allSettings) {
+   auto settings = buildReaderSettingsParentList(allSettings);
+   settings.erase(
+diff --git a/src/StatusIconRow.h b/src/StatusIconRow.h
+new file mode 100644
+--- /dev/null
++++ b/src/StatusIconRow.h
+@@ -0,0 +1,113 @@
++#pragma once
++
++#include <cstdint>
++
++// Layout of the small icons at the left of the reader's top status bar
++// (frontlight shortcut, touchscreen toggle, Readest sync, highlighter, and
++// whatever gets added later). Pure arithmetic with no hardware access, so the
++// drawing code and the tap tests always agree on where each icon is.
++//
++// Icons are placed left to right in the order the user chose in
++// CrASHink > Status Bar Icons. An icon takes room only while it is shown: one
++// the user turned off, or one the device cannot use right now, is skipped and
++// the icons after it close up. Nothing keeps a blank slot.
++//
++// To add an icon: append a Slot before Count, give it a name string in
++// StatusIconsActivity, and draw it at Layout::x(slot) when Layout::visible(slot).
++// Saved orders that lack the new slot are repaired automatically, and the new
++// icon starts enabled at the end of the row.
++namespace StatusIconRow {
++
++enum Slot : uint8_t { Lamp = 0, Touch = 1, Readest = 2, Highlighter = 3, Count = 4 };
++
++constexpr int kIconSize = 20;
++constexpr int kGap = 8;
++// Extra room in front of icons drawn with no built-in blank margin (the R box
++// and the highlighter), so gaps look even next to the bitmap icons.
++constexpr int kVisualPad = 6;
++// How far past the last icon a tap still counts as a tap on it.
++constexpr int kEdgeTap = 24;
++constexpr uint8_t kAllMask = static_cast<uint8_t>((1u << Count) - 1u);
++
++inline bool needsVisualPad(const uint8_t slot) { return slot == Readest || slot == Highlighter; }
++
++// True when order holds every slot exactly once.
++inline bool isValidOrder(const uint8_t* order) {
++  uint8_t seen = 0;
++  for (uint8_t i = 0; i < Count; ++i) {
++    if (order[i] >= Count || (seen & (1u << order[i]))) return false;
++    seen |= static_cast<uint8_t>(1u << order[i]);
++  }
++  return seen == kAllMask;
++}
++
++inline void resetOrder(uint8_t* order) {
++  for (uint8_t i = 0; i < Count; ++i) order[i] = i;
++}
++
++// Makes any stored order usable: an invalid one becomes the default order.
++inline void sanitizeOrder(uint8_t* order) {
++  if (!isValidOrder(order)) resetOrder(order);
++}
++
++struct Layout {
++  uint8_t order[Count] = {0, 1, 2, 3};
++  uint8_t enabledMask = kAllMask;    // what the user switched on
++  uint8_t availableMask = kAllMask;  // what the device can show right now
++  int leftX = 0;
++
++  bool visible(const uint8_t slot) const {
++    return slot < Count && (enabledMask & availableMask & (1u << slot)) != 0;
++  }
++
++  // Left edge of the slot's icon, or -1 when it is not shown.
++  int x(const uint8_t slot) const {
++    if (!visible(slot)) return -1;
++    int cursor = leftX;
++    bool first = true;
++    for (uint8_t i = 0; i < Count; ++i) {
++      const uint8_t s = order[i];
++      if (!visible(s)) continue;
++      if (!first && needsVisualPad(s)) cursor += kVisualPad;
++      if (s == slot) return cursor;
++      cursor += kIconSize + kGap;
++      first = false;
++    }
++    return -1;
++  }
++
++  // Horizontal tap zone of a shown icon. The zones of neighbouring icons meet
++  // in the middle of the gap between them, the first starts at the screen edge
++  // and the last reaches kEdgeTap past its icon, so they never overlap.
++  // Returns false when the icon is not shown.
++  bool hitRange(const uint8_t slot, int& left, int& right) const {
++    if (!visible(slot)) return false;
++    int prevRight = -1;
++    int nextLeft = -1;
++    bool seenSelf = false;
++    for (uint8_t i = 0; i < Count; ++i) {
++      const uint8_t s = order[i];
++      if (!visible(s)) continue;
++      if (s == slot) {
++        seenSelf = true;
++      } else if (!seenSelf) {
++        prevRight = x(s) + kIconSize;
++      } else if (nextLeft < 0) {
++        nextLeft = x(s);
++      }
++    }
++    const int self = x(slot);
++    left = prevRight < 0 ? 0 : prevRight + (self - prevRight) / 2;
++    const int selfRight = self + kIconSize;
++    right = nextLeft < 0 ? selfRight + kEdgeTap : selfRight + (nextLeft - selfRight) / 2;
++    return true;
++  }
++
++  bool hits(const uint8_t slot, const int touchX) const {
++    int left = 0;
++    int right = 0;
++    return hitRange(slot, left, right) && touchX >= left && touchX < right;
++  }
++};
++
++}  // namespace StatusIconRow
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -29,6 +29,7 @@
+ #include "OpdsServerListActivity.h"
+ #include "QuickActions.h"
+ #include "QuickActionsActivity.h"
++#include "StatusIconsActivity.h"
+ #include "SdCardFontSystem.h"
+ #include "SdFirmwareUpdateActivity.h"
+ #include "SettingsList.h"
+@@ -59,7 +60,8 @@ constexpr int16_t TOUCH_TAB_BAR_HEIGHT = 50;
+ }  // namespace
+ 
+ const StrId SettingsActivity::categoryNames[categoryCount] = {StrId::STR_CAT_DISPLAY, StrId::STR_CAT_READER,
+-                                                              StrId::STR_CAT_CONTROLS, StrId::STR_CAT_SYSTEM};
++                                                              StrId::STR_CAT_CONTROLS, StrId::STR_CAT_SYSTEM,
++                                                              StrId::STR_CAT_CRASHINK};
+ 
+ namespace {
+ constexpr int systemVersionFooterSideMargin = 20;
+@@ -282,6 +284,7 @@ void SettingsActivity::rebuildSettingsLists() {
+   controlsTapsGesturesSettings.clear();
+   controlsTwoFingerSwipeSettings.clear();
+   systemSettings.clear();
++  crashinkSettings.clear();
+   systemDeviceSettings.clear();
+   systemFilesCacheSettings.clear();
+   fileBrowserSettings.clear();
+@@ -322,6 +325,7 @@ void SettingsActivity::rebuildSettingsLists() {
+   systemFilesCacheSettings = buildSystemFilesCacheSettingsList(allSettings);
+   systemReadingStatsSettings = buildSystemReadingStatsSettingsList(allSettings);
+   systemGlobalStatsSettings = buildSystemGlobalStatsSettingsList(allSettings);
++  crashinkSettings = buildCrashinkSettingsList();
+   controlsSettings = buildControlsSettingsParentList(allSettings);
+   controlsPowerSettings = buildControlsPowerSettingsList(allSettings);
+   controlsHomeButtonSettings = buildControlsHomeButtonSettingsList(allSettings);
+@@ -445,6 +449,9 @@ void SettingsActivity::setCurrentSettingsForCategory() {
+           break;
+       }
+       break;
++    case 4:
++      currentSettings = &crashinkSettings;
++      break;
+   }
+   settingsCount = static_cast<int>(currentSettings->size());
+ }
+@@ -1122,6 +1129,9 @@ void SettingsActivity::toggleCurrentSetting() {
+       case SettingAction::QuickActions:
+         startActivityForResult(std::make_unique<QuickActionsActivity>(renderer, mappedInput), resultHandler);
+         break;
++      case SettingAction::StatusIcons:
++        startActivityForResult(std::make_unique<StatusIconsActivity>(renderer, mappedInput), resultHandler);
++        break;
+       case SettingAction::ReaderFontOptions:
+       case SettingAction::ReaderPageLayout:
+       case SettingAction::ControlsPowerButton:
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -30,6 +30,7 @@ enum class SettingAction {
+   ReaderPageLayout,
+   ScreenMargin,
+   QuickActions,
++  StatusIcons,
+   ControlsPowerButton,
+   ControlsHomeButton,
+   ControlsFrontButtons,
+@@ -217,7 +218,8 @@ inline std::string settingEnumOptionLabel(const SettingInfo& setting, const uint
+ 
+ inline bool settingShowsNavigationCaret(const SettingInfo& setting) {
+   return setting.type == SettingType::SUBMENU || setting.action == SettingAction::CustomiseStatusBar ||
+-         setting.action == SettingAction::QuickActions;
++         setting.action == SettingAction::QuickActions ||
++         setting.action == SettingAction::StatusIcons;
+ }
+ 
+ class SettingsActivity final : public Activity {
+@@ -247,6 +249,7 @@ class SettingsActivity final : public Activity {
+   std::vector<SettingInfo> controlsTapsGesturesSettings;
+   std::vector<SettingInfo> controlsTwoFingerSwipeSettings;
+   std::vector<SettingInfo> systemSettings;
++  std::vector<SettingInfo> crashinkSettings;
+   std::vector<SettingInfo> systemDeviceSettings;
+   std::vector<SettingInfo> systemFilesCacheSettings;
+   std::vector<SettingInfo> fileBrowserSettings;
+@@ -272,7 +275,7 @@ class SettingsActivity final : public Activity {
+ 
+   OptionPopup optionPopup;
+ 
+-  static constexpr int categoryCount = 4;
++  static constexpr int categoryCount = 5;
+   static const StrId categoryNames[categoryCount];
+ 
+   // FreeInkApp hosts the tab bar + settings list (themed, touch-routed); the
+diff --git a/src/activities/settings/StatusIconsActivity.cpp b/src/activities/settings/StatusIconsActivity.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/activities/settings/StatusIconsActivity.cpp
+@@ -0,0 +1,95 @@
++#include "StatusIconsActivity.h"
++
++#include <I18n.h>
++
++#include <algorithm>
++#include <string>
++#include <vector>
++
++#include "CrossPointSettings.h"
++
++namespace {
++constexpr StrId slotLabels[StatusIconRow::Count] = {StrId::STR_ICON_FRONTLIGHT, StrId::STR_ICON_TOUCHSCREEN,
++                                                    StrId::STR_ICON_READEST, StrId::STR_ICON_HIGHLIGHTER};
++}  // namespace
++
++void StatusIconsActivity::onEnter() {
++  Activity::onEnter();
++  popup.setDismissOnOutsideTouchDown(true);
++  std::copy_n(SETTINGS.statusIconOrder, draftOrder.size(), draftOrder.begin());
++  StatusIconRow::sanitizeOrder(draftOrder.data());
++  draftHidden = SETTINGS.statusIconHidden;
++  showOverview(0);
++}
++
++void StatusIconsActivity::showOverview(const int selectedRow) {
++  std::vector<std::string> rows;
++  rows.reserve(StatusIconRow::Count);
++  for (uint8_t i = 0; i < StatusIconRow::Count; ++i) {
++    const uint8_t slot = draftOrder[i];
++    const bool shown = (draftHidden & (1u << slot)) == 0;
++    rows.emplace_back(std::to_string(i + 1) + ". " + I18N.get(slotLabels[slot]) + ": " +
++                      I18N.get(shown ? StrId::STR_ON : StrId::STR_OFF));
++  }
++  popup.showConfirmed(
++      StrId::STR_STATUS_BAR_ICONS, rows, selectedRow, [this](int selected) { editRow(selected); },
++      [this] { saveDraft(); }, [this] { finish(); });
++  requestUpdate();
++}
++
++void StatusIconsActivity::editRow(const int row) {
++  if (row < 0 || row >= StatusIconRow::Count) return;
++  const uint8_t slot = draftOrder[row];
++  const bool shown = (draftHidden & (1u << slot)) == 0;
++  enum Choice : uint8_t { Toggle, Up, Down };
++  std::vector<std::string> labels;
++  std::vector<Choice> choices;
++  labels.emplace_back(I18N.get(shown ? StrId::STR_HIDE : StrId::STR_SHOW));
++  choices.push_back(Toggle);
++  if (row > 0) {
++    labels.emplace_back(I18N.get(StrId::STR_MOVE_UP));
++    choices.push_back(Up);
++  }
++  if (row + 1 < StatusIconRow::Count) {
++    labels.emplace_back(I18N.get(StrId::STR_MOVE_DOWN));
++    choices.push_back(Down);
++  }
++  popup.show(slotLabels[slot], labels, 0, [this, row, slot, choices](int selected) {
++    if (selected < 0 || static_cast<size_t>(selected) >= choices.size()) return;
++    int newRow = row;
++    switch (choices[selected]) {
++      case Toggle:
++        draftHidden ^= static_cast<uint8_t>(1u << slot);
++        break;
++      case Up:
++        std::swap(draftOrder[row], draftOrder[row - 1]);
++        newRow = row - 1;
++        break;
++      case Down:
++        std::swap(draftOrder[row], draftOrder[row + 1]);
++        newRow = row + 1;
++        break;
++    }
++    showOverview(newRow);
++  });
++  popup.setCancelCallback([this, row] { showOverview(row); });
++}
++
++void StatusIconsActivity::saveDraft() {
++  std::copy(draftOrder.begin(), draftOrder.end(), SETTINGS.statusIconOrder);
++  SETTINGS.statusIconHidden = draftHidden;
++  SETTINGS.saveToFile();
++  finish();
++}
++
++void StatusIconsActivity::loop() {
++  if (popup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
++    finish();
++  }
++}
++
++void StatusIconsActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  popup.processRender(renderer, mappedInput);
++}
+diff --git a/src/activities/settings/StatusIconsActivity.h b/src/activities/settings/StatusIconsActivity.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/settings/StatusIconsActivity.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <array>
++
++#include "StatusIconRow.h"
++#include "activities/Activity.h"
++#include "components/OptionPopup.h"
++
++// CrASHink > Status Bar Icons: switch each small icon at the left of
++// the reader's top status bar on or off, and choose their left-to-right order.
++class StatusIconsActivity final : public Activity {
++  OptionPopup popup;
++  std::array<uint8_t, StatusIconRow::Count> draftOrder{};
++  uint8_t draftHidden = 0;
++  void showOverview(int selectedRow);
++  void editRow(int row);
++  void saveDraft();
++
++ public:
++  StatusIconsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
++      : Activity("StatusIcons", renderer, mappedInput) {}
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++};
