@@ -4559,3 +4559,250 @@ index 00000000..0ca19c37
 +namespace ReadestTextEpub {
 +bool download(const std::string& url, const std::string& destPath);
 +}  // namespace ReadestTextEpub
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 23f46353..4f433c43 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -514,6 +514,12 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+                               const uint16_t startClipToken, const uint16_t minPartialMatch,
+                               const uint8_t expectedTableColumn, ClippingPageMatch& match,
+                               const bool allowShortBoundary = false) {
++  // A run that starts inside the clipping can only be the continuation of a
++  // clipping that began on an earlier page, so it has to start at the first
++  // word of this page. A tail that merely repeats mid-page is a coincidence.
++  if (!ClippingTextMatcher::startsWhereAClipCanContinue(startClipToken, startPageWord)) {
++    return false;
++  }
+   const char* cursor = nullptr;
+   const char* token = nullptr;
+   size_t tokenLen = 0;
+@@ -600,6 +606,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+   const bool tableColumnOnly = expectedTableColumn != UINT8_MAX;
+ 
+   ClippingMatchTracker matches;
++  bool bestIsComplete = false;
+ 
+   forEachVisiblePageWord(
+       page, [&](const uint16_t wordIndex, const PageTextLine& line, const TextBlock& block, const size_t i) {
+@@ -622,10 +629,16 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+                                        candidate, allowShortBoundary) &&
+               (requiredBoundary == UINT16_MAX ||
+                (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
+-            if (matches.record(candidate.startWord, candidate.endWord)) {
++            const bool candidateComplete = candidate.startsAtClipStart && candidate.reachesClipEnd;
++            // The first hit is kept, unless a later one covers the whole
++            // clipping: a full match always beats a partial run.
++            if (matches.record(candidate.startWord, candidate.endWord) || (candidateComplete && !bestIsComplete)) {
+               match = candidate;
++              bestIsComplete = candidateComplete;
+             }
+-            if (!uniqueMatch || !matches.unique()) {
++            // Keep scanning until a whole-clipping match is in hand, so a
++            // partial run found earlier on the page cannot hide it.
++            if (bestIsComplete && (!uniqueMatch || !matches.unique())) {
+               return false;
+             }
+           }
+diff --git a/src/clippings/ClippingTextMatcher.h b/src/clippings/ClippingTextMatcher.h
+index 45e9a3bc..44b5d966 100644
+--- a/src/clippings/ClippingTextMatcher.h
++++ b/src/clippings/ClippingTextMatcher.h
+@@ -20,10 +20,93 @@ struct TokenFragmentResult {
+ // A complete clipping can be short. A partial run needs enough words to avoid
+ // highlighting a coincidental first/last word at a page boundary after relayout.
+ // Short fragments need an exact saved range or verification across adjacent pages.
++//
++// A partial run that starts inside the clipping (startClipToken > 0) is a
++// continuation from the previous page, so it must begin at the very first word
++// of the page. Anything else is a coincidental repeat of the clipping's tail
++// (e.g. "it is good." inside a longer sentence) and is never a match.
++constexpr uint16_t RELIABLE_PARTIAL_TOKENS = 8;
++
++inline bool startsWhereAClipCanContinue(const uint16_t startClipToken, const uint16_t startPageWord) {
++  return startClipToken == 0 || startPageWord == 0;
++}
++
+ inline bool isReliableRun(const uint16_t startClipToken, const bool reachedClipEnd, const uint16_t matchedTokens,
+                           const uint16_t minPartialMatch) {
+   if (matchedTokens == 0) return false;
+-  return (startClipToken == 0 && reachedClipEnd) || matchedTokens >= minPartialMatch;
++  if (startClipToken == 0 && reachedClipEnd) return true;
++  const uint16_t needed = minPartialMatch > RELIABLE_PARTIAL_TOKENS ? minPartialMatch : RELIABLE_PARTIAL_TOKENS;
++  return matchedTokens >= needed;
++}
++
++// UTF-8 decode of one code point; malformed bytes decode as themselves.
++inline uint32_t nextCodepoint(const char* text, const size_t length, size_t& offset) {
++  const auto b0 = static_cast<unsigned char>(text[offset]);
++  size_t extra = 0;
++  uint32_t cp = b0;
++  if (b0 >= 0xF0) {
++    extra = 3;
++    cp = b0 & 0x07;
++  } else if (b0 >= 0xE0) {
++    extra = 2;
++    cp = b0 & 0x0F;
++  } else if (b0 >= 0xC0) {
++    extra = 1;
++    cp = b0 & 0x1F;
++  }
++  if (offset + extra >= length) {  // truncated sequence
++    offset++;
++    return b0;
++  }
++  for (size_t i = 1; i <= extra; ++i) {
++    const auto b = static_cast<unsigned char>(text[offset + i]);
++    if ((b & 0xC0) != 0x80) {
++      offset++;
++      return b0;
++    }
++    cp = (cp << 6) | (b & 0x3F);
++  }
++  offset += extra + 1;
++  return cp;
++}
++
++// Comparison form of a code point. The reader shows text after CSS
++// text-transform / small-caps (so "He" can render as "HE") and books mix
++// curly and straight quotes, so highlight matching ignores case and treats
++// every quote or dash variant as its plain ASCII counterpart.
++inline uint32_t foldForMatch(const uint32_t cp) {
++  if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
++  if (cp < 0x80) return cp;
++  switch (cp) {
++    case 0x2018:  // left single quote
++    case 0x2019:  // right single quote / apostrophe
++    case 0x201A:
++    case 0x201B:
++    case 0x2032:  // prime
++    case 0x02BC:  // modifier letter apostrophe
++      return '\'';
++    case 0x201C:  // left double quote
++    case 0x201D:  // right double quote
++    case 0x201E:
++    case 0x201F:
++    case 0x2033:
++      return '"';
++    case 0x2010:  // hyphen
++    case 0x2011:  // non-breaking hyphen
++    case 0x2012:
++    case 0x2013:
++    case 0x2014:
++    case 0x2015:
++    case 0x2212:
++      return '-';
++    default:
++      break;
++  }
++  if ((cp >= 0xC0 && cp <= 0xDE && cp != 0xD7)) return cp + 0x20;  // Latin-1 capitals
++  if (cp >= 0x410 && cp <= 0x42F) return cp + 0x20;               // Cyrillic capitals
++  if (cp >= 0x400 && cp <= 0x40F) return cp + 0x50;
++  if (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2) return cp + 0x20;  // Greek capitals
++  return cp;
+ }
+ 
+ inline bool isNonBreakingSpace(const char* text, const size_t length, const size_t offset) {
+@@ -54,24 +137,30 @@ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const
+ 
+   size_t wordOffset = 0;
+   size_t matchedTokenBytes = 0;
+-  while (wordOffset < wordLen && tokenOffset + matchedTokenBytes < tokenLen) {
+-    if (isNonBreakingSpace(word, wordLen, wordOffset) && token[tokenOffset + matchedTokenBytes] == ' ') {
++  const size_t tokenAvailable = tokenLen - tokenOffset;
++  const char* tokenFrom = token + tokenOffset;
++  while (wordOffset < wordLen && matchedTokenBytes < tokenAvailable) {
++    if (isNonBreakingSpace(word, wordLen, wordOffset) && tokenFrom[matchedTokenBytes] == ' ') {
+       wordOffset += 2;
+       matchedTokenBytes++;
+       continue;
+     }
+-    if (word[wordOffset] != token[tokenOffset + matchedTokenBytes]) {
++    size_t nextWord = wordOffset;
++    size_t nextToken = matchedTokenBytes;
++    const uint32_t wordCp = nextCodepoint(word, wordLen, nextWord);
++    const uint32_t tokenCp = nextCodepoint(tokenFrom, tokenAvailable, nextToken);
++    if (foldForMatch(wordCp) != foldForMatch(tokenCp)) {
+       return {};
+     }
+-    wordOffset++;
+-    matchedTokenBytes++;
++    wordOffset = nextWord;
++    matchedTokenBytes = nextToken;
+   }
+ 
+   if (wordOffset != wordLen) {
+     return {};
+   }
+ 
+-  const bool completesToken = tokenOffset + matchedTokenBytes == tokenLen;
++  const bool completesToken = matchedTokenBytes == tokenAvailable;
+   if (completesToken && endsWithInsertedHyphen) {
+     return {};
+   }
+diff --git a/test/clip_word_store/ClipWordStoreTest.cpp b/test/clip_word_store/ClipWordStoreTest.cpp
+index a7da7074..0d2cbf05 100644
+--- a/test/clip_word_store/ClipWordStoreTest.cpp
++++ b/test/clip_word_store/ClipWordStoreTest.cpp
+@@ -456,8 +456,59 @@ TEST(ClippingTextMatcher, RejectsCoincidentalShortPageBoundaryRuns) {
+ TEST(ClippingTextMatcher, PreservesCompleteShortClippingsAndLongerRelayoutRuns) {
+   EXPECT_TRUE(ClippingTextMatcher::isReliableRun(0, true, 1, 1));
+   EXPECT_TRUE(ClippingTextMatcher::isReliableRun(0, true, 2, 2));
+-  EXPECT_TRUE(ClippingTextMatcher::isReliableRun(0, false, 3, 3));
+-  EXPECT_TRUE(ClippingTextMatcher::isReliableRun(4, true, 3, 3));
+-  EXPECT_TRUE(ClippingTextMatcher::isReliableRun(4, false, 3, 3));
++  EXPECT_FALSE(ClippingTextMatcher::isReliableRun(0, false, 3, 3));
++  EXPECT_TRUE(ClippingTextMatcher::isReliableRun(0, false, 8, 3));
++  EXPECT_FALSE(ClippingTextMatcher::isReliableRun(4, true, 3, 3));
++  EXPECT_FALSE(ClippingTextMatcher::isReliableRun(4, false, 3, 3));
++  EXPECT_TRUE(ClippingTextMatcher::isReliableRun(4, true, 8, 3));
+   EXPECT_FALSE(ClippingTextMatcher::isReliableRun(0, false, 0, 3));
+ }
++
++TEST(ClippingTextMatcher, IgnoresCaseSoSmallCapsWordsMatch) {
++  const char token[] = "\xE2\x80\x98He";  // ‘He
++  const auto result = ClippingTextMatcher::matchTokenFragmentWithLength("\xE2\x80\x98HE", false, token,
++                                                                       sizeof(token) - 1, 0);
++  EXPECT_EQ(result.match, ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++  EXPECT_EQ(result.tokenBytes, sizeof(token) - 1);
++}
++
++TEST(ClippingTextMatcher, TreatsCurlyAndStraightQuotesAsEqual) {
++  const char curly[] = "don\xE2\x80\x99t";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragment("don't", false, curly, sizeof(curly) - 1, 0),
++            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++  const char straight[] = "'HE";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragment("\xE2\x80\x98He", false, straight, sizeof(straight) - 1, 0),
++            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++  const char doubleCurly[] = "\xE2\x80\x9Cgood?\xE2\x80\x9D";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragment("\"good?\"", false, doubleCurly, sizeof(doubleCurly) - 1, 0),
++            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++}
++
++TEST(ClippingTextMatcher, QuoteWidthDifferenceKeepsTokenByteCountInTokenBytes) {
++  // Word has a 1-byte quote, token a 3-byte quote: fragments must still chain.
++  const char token[] = "'Even\xE2\x80\x99";
++  const auto first = ClippingTextMatcher::matchTokenFragmentWithLength("'Ev", false, token, sizeof(token) - 1, 0);
++  EXPECT_EQ(first.match, ClippingTextMatcher::TokenFragmentMatch::CONTINUES_TOKEN);
++  EXPECT_EQ(first.tokenBytes, 3u);
++  const auto second =
++      ClippingTextMatcher::matchTokenFragmentWithLength("en'", false, token, sizeof(token) - 1, first.tokenBytes);
++  EXPECT_EQ(second.match, ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++}
++
++TEST(ClippingTextMatcher, StillRejectsDifferentWords) {
++  const char token[] = "good.";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragment("goods.", false, token, sizeof(token) - 1, 0),
++            ClippingTextMatcher::TokenFragmentMatch::MISMATCH);
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragment("good?", false, token, sizeof(token) - 1, 0),
++            ClippingTextMatcher::TokenFragmentMatch::MISMATCH);
++}
++
++TEST(ClippingTextMatcher, MidPageTailOfAClippingIsNeverAContinuation) {
++  // "it is good." at the top of a page can continue a clipping from the page
++  // before; the same three words in the middle of a page cannot.
++  EXPECT_TRUE(ClippingTextMatcher::startsWhereAClipCanContinue(0, 17));
++  EXPECT_TRUE(ClippingTextMatcher::startsWhereAClipCanContinue(12, 0));
++  EXPECT_FALSE(ClippingTextMatcher::startsWhereAClipCanContinue(12, 17));
++  // Three matching words are no longer enough to trust a partial run.
++  EXPECT_FALSE(ClippingTextMatcher::isReliableRun(12, true, 3, 3));
++}
