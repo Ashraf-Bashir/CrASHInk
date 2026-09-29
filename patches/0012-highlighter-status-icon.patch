@@ -1,0 +1,120 @@
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 31b0b09..6ae3005 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -2677,6 +2677,13 @@ void EpubReaderActivity::loop() {
+     requestUpdate();
+     return;
+   }
++  // Highlighter status bar button: start highlight mode, same as Create Clipping.
++  // Checked before the R and hand icons, whose hit zones would otherwise reach over it.
++  if (touch.tapped && GUI.isHighlightIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding, touch.x,
++                                                   touch.y)) {
++    executeReaderQuickAction(CrossPointSettings::LONG_MENU_CREATE_CLIPPING);
++    return;
++  }
+   // "R" status bar button: sync with Readest, same as the reader menu's Sync Readest
+   // entry (which asks for the account first if none is set up). Checked before the
+   // hand icon, whose hit zone would otherwise reach over it.
+@@ -7624,6 +7631,8 @@ void EpubReaderActivity::renderStatusBar() const {
+                             ReaderUtils::readerDarkModeEnabled());
+   GUI.drawReadestIndicator(renderer, UITheme::getInstance().getMetrics().topPadding,
+                            ReaderUtils::readerDarkModeEnabled());
++  GUI.drawHighlightIndicator(renderer, UITheme::getInstance().getMetrics().topPadding,
++                             ReaderUtils::readerDarkModeEnabled());
+ }
+ 
+ void EpubReaderActivity::refreshChapterGroupEstimate(const uint16_t viewportWidth, const uint16_t viewportHeight) {
+diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
+index b8d7bad..4ead8c8 100644
+--- a/src/components/themes/BaseTheme.cpp
++++ b/src/components/themes/BaseTheme.cpp
+@@ -1330,6 +1330,72 @@ bool BaseTheme::isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int
+   return touchX >= hitLeft && touchX < hitRight && touchY >= baseTopY && touchY < baseTopY + statusBarHeight;
+ }
+ 
++void BaseTheme::drawHighlightIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int iconY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
++  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
++  const int handX = lampX + frontlightStatusIconSize + statusIndicatorGap;
++  const int rX = handX + touchStatusIconSize + statusIndicatorGap + statusIndicatorVisualPad;
++  const int iconX = rX + touchStatusIconSize + statusIndicatorGap + statusIndicatorVisualPad;
++
++  // A highlighter pen laid over the stroke it just marked, drawn from shapes
++  // (not a packed bitmap) so it stays upright in every orientation.
++  const bool ink = !darkMode;
++  renderer.drawLine(iconX + 15, iconY + 2, iconX + 9, iconY + 8, 4, ink);  // barrel
++  const int nibX[3] = {iconX + 6, iconX + 11, iconX + 4};
++  const int nibY[3] = {iconY + 7, iconY + 11, iconY + 14};
++  renderer.fillPolygon(nibX, nibY, 3, ink);                                 // chisel tip
++  renderer.fillRect(iconX + 2, iconY + 17, 16, 2, ink);                     // the highlight stroke
++}
++
++bool BaseTheme::isHighlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
++  const int handX = lampX + frontlightStatusIconSize + statusIndicatorGap;
++  const int rX = handX + touchStatusIconSize + statusIndicatorGap + statusIndicatorVisualPad;
++  const int iconX = rX + touchStatusIconSize + statusIndicatorGap + statusIndicatorVisualPad;
++
++  // Starts midway between the R box and this icon, runs generously past it. The
++  // reader checks this before the R and hand tests, so their wider zones never
++  // steal taps aimed here.
++  constexpr int tapPaddingRight = 24;
++  const int hitLeft = rX + touchStatusIconSize + (statusIndicatorGap + statusIndicatorVisualPad) / 2;
++  const int hitRight = iconX + touchStatusIconSize + tapPaddingRight;
++  return touchX >= hitLeft && touchX < hitRight && touchY >= baseTopY && touchY < baseTopY + statusBarHeight;
++}
++
+ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, const char* previewTime,
+                                       const bool readerContext, const int textYOffset, const bool darkMode,
+                                       const bool forceVisible) const {
+diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
+index 5c16c6a..090257a 100644
+--- a/src/components/themes/BaseTheme.h
++++ b/src/components/themes/BaseTheme.h
+@@ -296,6 +296,11 @@ class BaseTheme {
+   // drawTopStatusBarClock(), so it never shows outside reading mode.
+   void drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
+   bool isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // Highlighter button, drawn right of the R (Readest sync) button in the
++  // reader's top status bar only. Tapping it starts highlight mode, exactly
++  // like Create Clipping. Same visibility rules as the R button.
++  void drawHighlightIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  bool isHighlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
+   // Button hint labels use three states: non-empty labels draw an active hint,
+   // an empty string clears an inactive slot, and nullptr preserves the existing
+   // background without drawing or registering a target.
