@@ -4560,10 +4560,26 @@ index 00000000..0ca19c37
 +bool download(const std::string& url, const std::string& destPath);
 +}  // namespace ReadestTextEpub
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 23f46353..4f433c43 100644
+index d949e9ed..ea378f44 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -514,6 +514,12 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -468,11 +468,13 @@ bool advanceClipCursorToToken(const std::string& text, const uint16_t targetInde
+ 
+ ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
+                                                               const char* token, const size_t tokenLen,
+-                                                              const size_t tokenOffset = 0) {
++                                                              const size_t tokenOffset = 0,
++                                                              const bool clipStart = false,
++                                                              const bool clipEnd = false) {
+   const char* word = block.wordText(wordIndex);
+   const char* visibleWord = word + (hasEmSpacePrefix(word) ? 3 : 0);
+   return ClippingTextMatcher::matchTokenFragmentWithLength(visibleWord, block.wordEndsWithInsertedHyphen(wordIndex),
+-                                                           token, tokenLen, tokenOffset);
++                                                           token, tokenLen, tokenOffset, clipStart, clipEnd);
+ }
+ 
+ template <typename Pages, typename Callback>
+@@ -514,6 +516,12 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
                                const uint16_t startClipToken, const uint16_t minPartialMatch,
                                const uint8_t expectedTableColumn, ClippingPageMatch& match,
                                const bool allowShortBoundary = false) {
@@ -4576,7 +4592,27 @@ index 23f46353..4f433c43 100644
    const char* cursor = nullptr;
    const char* token = nullptr;
    size_t tokenLen = 0;
-@@ -600,6 +606,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+@@ -521,6 +529,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+     return false;
+   }
+ 
++  const uint16_t clipTokenCount = countClipTokens(clippingText);
+   uint16_t matchedTokens = 0;
+   uint16_t lastWord = startPageWord;
+   size_t tokenOffset = 0;
+@@ -546,7 +555,10 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+           return true;
+         }
+ 
+-        const auto fragmentResult = matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset);
++        const uint16_t clipTokenIndex = static_cast<uint16_t>(startClipToken + matchedTokens);
++        const auto fragmentResult =
++            matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset, clipTokenIndex == 0,
++                                 clipTokenIndex + 1 == clipTokenCount);
+         if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::MISMATCH) {
+           stoppedByMismatch = true;
+           return false;
+@@ -600,6 +612,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
    const bool tableColumnOnly = expectedTableColumn != UINT8_MAX;
  
    ClippingMatchTracker matches;
@@ -4584,7 +4620,16 @@ index 23f46353..4f433c43 100644
  
    forEachVisiblePageWord(
        page, [&](const uint16_t wordIndex, const PageTextLine& line, const TextBlock& block, const size_t i) {
-@@ -622,10 +629,16 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+@@ -616,16 +629,24 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+             break;
+           }
+           ClippingPageMatch candidate;
+-          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen).match !=
++          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, 0, tokenIndex == 0,
++                                   tokenIndex + 1 == tokenCount)
++                  .match !=
+                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
+               matchClipRunFromPageWord(page, clippingText, wordIndex, tokenIndex, minPartialMatch, expectedTableColumn,
                                         candidate, allowShortBoundary) &&
                (requiredBoundary == UINT16_MAX ||
                 (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
@@ -4604,10 +4649,10 @@ index 23f46353..4f433c43 100644
              }
            }
 diff --git a/src/clippings/ClippingTextMatcher.h b/src/clippings/ClippingTextMatcher.h
-index 45e9a3bc..44b5d966 100644
+index 45e9a3bc..16c16956 100644
 --- a/src/clippings/ClippingTextMatcher.h
 +++ b/src/clippings/ClippingTextMatcher.h
-@@ -20,10 +20,93 @@ struct TokenFragmentResult {
+@@ -20,10 +20,101 @@ struct TokenFragmentResult {
  // A complete clipping can be short. A partial run needs enough words to avoid
  // highlighting a coincidental first/last word at a page boundary after relayout.
  // Short fragments need an exact saved range or verification across adjacent pages.
@@ -4699,10 +4744,37 @@ index 45e9a3bc..44b5d966 100644
 +  if (cp >= 0x400 && cp <= 0x40F) return cp + 0x50;
 +  if (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2) return cp + 0x20;  // Greek capitals
 +  return cp;
++}
++
++// Punctuation, quotes and symbols that hug the edge of a word ("God.", "\xE2\x80\x98Ur,",
++// "good?\xE2\x80\x99"). Readest highlights often stop just inside them.
++inline bool isEdgePunctuation(const uint32_t cp) {
++  if (cp < 0x80) return !((cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z'));
++  return (cp >= 0xA1 && cp <= 0xBF) || cp == 0xD7 || cp == 0xF7 || (cp >= 0x2010 && cp <= 0x206F) ||
++         (cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F);
  }
  
  inline bool isNonBreakingSpace(const char* text, const size_t length, const size_t offset) {
-@@ -54,24 +137,30 @@ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const
+@@ -37,9 +128,17 @@ inline bool isNonBreakingSpace(const char* text, const size_t length, const size
+ // before the next display fragment is equivalent to the ordinary space stored
+ // in the clipping. An inserted hyphen is omitted from the saved token before
+ // matching its fragment.
++//
++// A highlight made in another reader can start just after, or stop just
++// before, punctuation that belongs to the printed word (a quote, a full stop,
++// "?'"). So the first token of a clipping may skip punctuation in front of the
++// page word (clipStart) and the last token may leave punctuation behind it
++// (clipEnd). Letters and digits are never skipped, so different words still
++// do not match.
+ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const bool endsWithInsertedHyphen,
+                                                         const char* token, const size_t tokenLen,
+-                                                        const size_t tokenOffset) {
++                                                        const size_t tokenOffset, const bool clipStart = false,
++                                                        const bool clipEnd = false) {
+   if (!word || !token || tokenLen == 0 || tokenOffset >= tokenLen) {
+     return {};
+   }
+@@ -54,24 +153,55 @@ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const
  
    size_t wordOffset = 0;
    size_t matchedTokenBytes = 0;
@@ -4710,6 +4782,18 @@ index 45e9a3bc..44b5d966 100644
 -    if (isNonBreakingSpace(word, wordLen, wordOffset) && token[tokenOffset + matchedTokenBytes] == ' ') {
 +  const size_t tokenAvailable = tokenLen - tokenOffset;
 +  const char* tokenFrom = token + tokenOffset;
++
++  if (clipStart && tokenOffset == 0) {
++    // Skip punctuation the saved text left out in front of the word.
++    size_t firstToken = 0;
++    const uint32_t tokenFirstCp = foldForMatch(nextCodepoint(tokenFrom, tokenAvailable, firstToken));
++    while (wordOffset < wordLen) {
++      size_t next = wordOffset;
++      const uint32_t wordCp = nextCodepoint(word, wordLen, next);
++      if (!isEdgePunctuation(wordCp) || foldForMatch(wordCp) == tokenFirstCp) break;
++      wordOffset = next;
++    }
++  }
 +  while (wordOffset < wordLen && matchedTokenBytes < tokenAvailable) {
 +    if (isNonBreakingSpace(word, wordLen, wordOffset) && tokenFrom[matchedTokenBytes] == ' ') {
        wordOffset += 2;
@@ -4728,6 +4812,19 @@ index 45e9a3bc..44b5d966 100644
 -    matchedTokenBytes++;
 +    wordOffset = nextWord;
 +    matchedTokenBytes = nextToken;
++  }
++
++  if (wordOffset != wordLen && clipEnd && !endsWithInsertedHyphen && matchedTokenBytes == tokenAvailable) {
++    // The saved text ends before trailing punctuation of this word.
++    size_t rest = wordOffset;
++    bool onlyPunctuation = true;
++    while (rest < wordLen) {
++      if (!isEdgePunctuation(nextCodepoint(word, wordLen, rest))) {
++        onlyPunctuation = false;
++        break;
++      }
++    }
++    if (onlyPunctuation) wordOffset = wordLen;
    }
  
    if (wordOffset != wordLen) {
@@ -4740,10 +4837,10 @@ index 45e9a3bc..44b5d966 100644
      return {};
    }
 diff --git a/test/clip_word_store/ClipWordStoreTest.cpp b/test/clip_word_store/ClipWordStoreTest.cpp
-index a7da7074..0d2cbf05 100644
+index a7da7074..43ad1295 100644
 --- a/test/clip_word_store/ClipWordStoreTest.cpp
 +++ b/test/clip_word_store/ClipWordStoreTest.cpp
-@@ -456,8 +456,59 @@ TEST(ClippingTextMatcher, RejectsCoincidentalShortPageBoundaryRuns) {
+@@ -456,8 +456,98 @@ TEST(ClippingTextMatcher, RejectsCoincidentalShortPageBoundaryRuns) {
  TEST(ClippingTextMatcher, PreservesCompleteShortClippingsAndLongerRelayoutRuns) {
    EXPECT_TRUE(ClippingTextMatcher::isReliableRun(0, true, 1, 1));
    EXPECT_TRUE(ClippingTextMatcher::isReliableRun(0, true, 2, 2));
@@ -4805,4 +4902,43 @@ index a7da7074..0d2cbf05 100644
 +  EXPECT_FALSE(ClippingTextMatcher::startsWhereAClipCanContinue(12, 17));
 +  // Three matching words are no longer enough to trust a partial run.
 +  EXPECT_FALSE(ClippingTextMatcher::isReliableRun(12, true, 3, 3));
++}
++
++TEST(ClippingTextMatcher, LastTokenMayLeaveTrailingPunctuationBehind) {
++  const char token[] = "God";
++  // "of God" saved, page word is "God." (Readest stops before the full stop).
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragment("God.", false, token, sizeof(token) - 1, 0),
++            ClippingTextMatcher::TokenFragmentMatch::MISMATCH);  // not the last token: exact
++  const auto lastToken =
++      ClippingTextMatcher::matchTokenFragmentWithLength("God.", false, token, sizeof(token) - 1, 0, false, true);
++  EXPECT_EQ(lastToken.match, ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++  const char question[] = "good?";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragmentWithLength("good?\xE2\x80\x99", false, question,
++                                                              sizeof(question) - 1, 0, false, true)
++                .match,
++            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++  // Letters are never skipped: "Go" is not "God.".
++  const char shortToken[] = "Go";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragmentWithLength("God.", false, shortToken, sizeof(shortToken) - 1, 0,
++                                                              false, true)
++                .match,
++            ClippingTextMatcher::TokenFragmentMatch::MISMATCH);
++}
++
++TEST(ClippingTextMatcher, FirstTokenMaySkipPunctuationInFrontOfThePageWord) {
++  const char token[] = "Ur,";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragmentWithLength("\xE2\x80\x98Ur,", false, token, sizeof(token) - 1, 0,
++                                                              false, false)
++                .match,
++            ClippingTextMatcher::TokenFragmentMatch::MISMATCH);
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragmentWithLength("\xE2\x80\x98Ur,", false, token, sizeof(token) - 1, 0,
++                                                              true, false)
++                .match,
++            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
++  // A token that itself starts with the quote still matches exactly.
++  const char quoted[] = "\xE2\x80\x98Ur,";
++  EXPECT_EQ(ClippingTextMatcher::matchTokenFragmentWithLength("\xE2\x80\x98Ur,", false, quoted, sizeof(quoted) - 1,
++                                                              0, true, false)
++                .match,
++            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
 +}
