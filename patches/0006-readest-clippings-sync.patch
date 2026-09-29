@@ -746,13 +746,31 @@ index 9f66ac0d..0ca913f9 100644
 +
 +  ApproxMatch best;
 +  float bestDistance = 2.0f;
++  size_t bestSpanDelta = static_cast<size_t>(-1);
 +  const auto consider = [&](const ApproxMatch& match) {
 +    if (match.edits > maxEdits || match.end < match.start) return;
++
++    const size_t span = static_cast<size_t>(match.end - match.start + 1);
++    const size_t editBudget = static_cast<size_t>(maxEdits);
++    const size_t minSpan = m > editBudget ? m - editBudget : 1;
++    const size_t maxSpan = m + editBudget;
++
++    // A fuzzy hit still has to represent the whole Readest highlight.
++    // Otherwise a long highlight can collapse to a short substring.
++    if (span < minSpan || span > maxSpan) return;
++
++    const size_t spanDelta = span > m ? span - m : m - span;
 +    const float distance =
-+        positionHint >= 0.0f ? std::fabs(static_cast<float>(match.start) / static_cast<float>(n) - positionHint) : 0.0f;
-+    if (match.edits < best.edits || (match.edits == best.edits && distance < bestDistance)) {
++        positionHint >= 0.0f
++            ? std::fabs(static_cast<float>(match.start) / static_cast<float>(n) - positionHint)
++            : 0.0f;
++
++    if (match.edits < best.edits ||
++        (match.edits == best.edits && spanDelta < bestSpanDelta) ||
++        (match.edits == best.edits && spanDelta == bestSpanDelta && distance < bestDistance)) {
 +      best = match;
 +      bestDistance = distance;
++      bestSpanDelta = spanDelta;
 +    }
 +  };
 +  if (starts.empty()) {
@@ -765,6 +783,20 @@ index 9f66ac0d..0ca913f9 100644
 +    }
 +  }
 +  if (best.edits > maxEdits) return false;
++
++  const size_t bestSpan =
++      best.end >= best.start
++          ? static_cast<size_t>(best.end - best.start + 1)
++          : 0;
++  const size_t editBudget = static_cast<size_t>(maxEdits);
++  const size_t minSpan = m > editBudget ? m - editBudget : 1;
++  const size_t maxSpan = m + editBudget;
++
++  if (bestSpan < minSpan || bestSpan > maxSpan) {
++    LOG_DBG("KOX", "Rejected fuzzy match: span %zu/%zu, edits %d/%d",
++            bestSpan, m, best.edits, maxEdits);
++    return false;
++  }
 +
 +  LOG_DBG("KOX", "Fuzzy match with %d edit(s) (allowed %d)", best.edits, maxEdits);
 +  out.start = best.start;
