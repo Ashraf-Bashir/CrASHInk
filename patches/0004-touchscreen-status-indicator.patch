@@ -62,14 +62,10 @@ diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseThe
 index d4c36f3b..238414c3 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
-@@ -51,6 +51,33 @@ constexpr uint8_t icon_lightbulb_off_h_bits[] = {
+@@ -72,6 +72,29 @@ constexpr uint8_t icon_lightbulb_off_h_bits[] = {
      0xB3, 0x8F, 0xDF, 0xB3, 0xC7, 0x9F, 0xF3, 0x33, 0x9F, 0xFF, 0x11, 0xFF, 0xFF, 0xC0, 0xFF,
      0xFF, 0xF0, 0x7F, 0xFF, 0xFE, 0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x9F, 0xFF, 0xFF, 0xFF};
  
-+// Breathing room between the lamp icon and the touchscreen indicator that
-+// follows it, so the two don't read as one blob in the thin status-bar row.
-+constexpr int statusIndicatorGap = 8;
-+
 +// Status-bar-sized (20x20) hand glyph, drawn from scratch (not derived from
 +// an existing icon) rather than reusing the settings-menu tablet icon
 +// (icon_device_tablet_24 / icon_device_tablet_off_24, EpubReaderMenuActivity),
@@ -96,30 +92,10 @@ index d4c36f3b..238414c3 100644
  }  // namespace
  
  void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
-@@ -211,12 +238,104 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
-   const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
+@@ -252,6 +275,96 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
+   return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
+ }
  
-   // Generous hit box, not the icon's own tight bounds: the whole top status
--  // bar row's height, and from the screen edge out to well past the icon's
--  // right edge, since a 20px glyph is a hard target to hit precisely with a
--  // finger.
--  constexpr int tapPaddingRight = 24;
-+  // bar row's height, and from the screen edge out to partway into the gap
-+  // before the touchscreen indicator, since a 20px glyph is a hard target to
-+  // hit precisely with a finger. Stops at the midpoint of that gap (rather
-+  // than overshooting well past the icon, as it did before the touchscreen
-+  // indicator existed) so the two icons' hit zones split the row instead of
-+  // overlapping - see isTouchscreenIndicatorTap below, which claims the rest.
-+  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
-   const int hitLeft = 0;
--  const int hitRight = orientedMarginLeft + metrics.statusBarHorizontalMargin + frontlightStatusIconSize + tapPaddingRight;
-+  const int hitRight = lampX + frontlightStatusIconSize + statusIndicatorGap / 2;
-+  const int hitTop = baseTopY;
-+  const int hitBottom = baseTopY + statusBarHeight;
-+
-+  return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
-+}
-+
 +void BaseTheme::drawTouchscreenIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
 +  // Sits immediately to the right of the frontlight lamp icon, in the same
 +  // top status bar row - drawn from drawTopStatusBarClock() right after
@@ -148,8 +124,11 @@ index d4c36f3b..238414c3 100644
 +
 +  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
 +  const int iconY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
-+  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
-+  const int x = lampX + frontlightStatusIconSize + statusIndicatorGap;
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  if (!layout.visible(StatusIconRow::Touch)) {
++    return;
++  }
++  const int x = layout.x(StatusIconRow::Touch);
 +
 +  const uint8_t* bits = SETTINGS.disableReaderTouchscreen ? icon_hand_off_bits : icon_hand_bits;
 +  if (darkMode) {
@@ -193,20 +172,24 @@ index d4c36f3b..238414c3 100644
 +  (void)orientedMarginBottom;
 +
 +  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
-+  const int lampX = orientedMarginLeft + metrics.statusBarHorizontalMargin;
-+  const int x = lampX + frontlightStatusIconSize + statusIndicatorGap;
++  // Zone from the middle of the gap before this icon (or the screen edge) to the
++  // middle of the gap after it, so it follows the user's icon order.
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  int hitLeft = 0;
++  int hitRight = 0;
++  if (!layout.hitRange(StatusIconRow::Touch, hitLeft, hitRight)) {
++    return false;
++  }
++  const int hitTop = baseTopY;
++  const int hitBottom = baseTopY + statusBarHeight;
 +
-+  // Picks up where the lamp's hit box (above) leaves off, at the midpoint of
-+  // the gap between the two icons, then extends generously past this icon's
-+  // own right edge - it's the last thing in the row, so there's nothing to
-+  // share that padding with.
-+  constexpr int tapPaddingRight = 24;
-+  const int hitLeft = lampX + frontlightStatusIconSize + statusIndicatorGap / 2;
-+  const int hitRight = x + touchStatusIconSize + tapPaddingRight;
-   const int hitTop = baseTopY;
-   const int hitBottom = baseTopY + statusBarHeight;
- 
-@@ -1147,10 +1266,12 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
++  return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
++}
++
+ int BaseTheme::homeHeaderClockTextYOffset(const GfxRenderer& renderer) {
+   const auto& metrics = UITheme::getInstance().getMetrics();
+   const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
+@@ -1176,10 +1289,12 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
                                        const bool readerContext, const int textYOffset, const bool darkMode,
                                        const bool forceVisible) const {
    // Deliberately ahead of the clock's own visibility/availability checks
