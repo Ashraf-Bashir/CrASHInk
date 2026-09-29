@@ -1,0 +1,206 @@
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index 52abca4..82b2c72 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -804,6 +804,76 @@ static void renderCharSmallCaps(const GfxRenderer& renderer, GfxRenderer::Render
+   }
+ }
+ 
++// Draws a glyph lighter or bolder than it was built. Works on an "effective level"
++// per pixel (0 black, 1 dark grey, 2 light grey, 3 white - the same scale the
++// unweighted path derives from the bitmap) and then emits it exactly like the
++// unweighted path, so BW and both grayscale passes stay consistent with each other.
++//   +1  ink spreads 1px to the right      +2  ...and 1px down as well
++//   -1  every grey step gets one lighter  -2  two steps lighter (only solid black stays)
++// 1-bit fonts have no grey steps, so lighter erodes instead: -1 drops the right edge
++// of each stroke, -2 the bottom edge too. Advance widths are untouched, so layout,
++// page breaks and highlights are identical whatever the weight.
++static void renderCharWeighted(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
++                               const EpdFontData* fontData, const EpdGlyph* glyph, const int cursorX,
++                               const int cursorY, const bool pixelState, const int weight) {
++  const bool is2Bit = fontData->is2Bit;
++  const int width = glyph->width;
++  const int height = glyph->height;
++  const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
++  if (bitmap == nullptr || width <= 0 || height <= 0) return;
++
++  const int baseX = cursorX + glyph->left;
++  const int baseY = cursorY - glyph->top;
++  const int extraRight = weight >= 1 ? 1 : 0;
++  const int extraDown = weight >= 2 ? 1 : 0;
++
++  if (!renderer.glyphIntersectsStrip(baseX, baseY, baseX + width - 1 + extraRight, baseY + height - 1 + extraDown)) {
++    return;
++  }
++
++  // Source level at glyph coordinates; outside the glyph is white.
++  const auto levelAt = [&](const int gx, const int gy) -> int {
++    if (gx < 0 || gy < 0 || gx >= width || gy >= height) return 3;
++    const int position = gy * width + gx;
++    if (is2Bit) {
++      const uint8_t byte = bitmap[position >> 2];
++      const uint8_t bitIndex = (3 - (position & 3)) * 2;
++      return 3 - ((byte >> bitIndex) & 0x3);
++    }
++    return ((bitmap[position >> 3] >> (7 - (position & 7))) & 1) ? 0 : 3;
++  };
++
++  for (int gy = 0; gy < height + extraDown; gy++) {
++    for (int gx = 0; gx < width + extraRight; gx++) {
++      int level = levelAt(gx, gy);
++      if (weight > 0) {
++        level = std::min(level, levelAt(gx - 1, gy));
++        if (weight >= 2) {
++          level = std::min(level, levelAt(gx, gy - 1));
++          level = std::min(level, levelAt(gx - 1, gy - 1));
++        }
++      } else if (is2Bit) {
++        level = std::min(3, level + (-weight));
++      } else if (level == 0) {
++        // 1-bit erosion: keep a pixel only while its right (and, at -2, lower) neighbour is inked too.
++        if (levelAt(gx + 1, gy) != 0 || (weight <= -2 && levelAt(gx, gy + 1) != 0)) level = 3;
++      }
++      if (level >= 3) continue;
++
++      const int screenX = baseX + gx;
++      const int screenY = baseY + gy;
++      if (!is2Bit || renderMode == GfxRenderer::BW) {
++        // Black (also paints over the greys in BW mode). 1-bit fonts draw in every pass, as unweighted.
++        renderer.drawPixel(screenX, screenY, pixelState);
++      } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (level == 1 || level == 2)) {
++        renderer.drawPixel(screenX, screenY, false);
++      } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && level == 1) {
++        renderer.drawPixel(screenX, screenY, false);
++      }
++    }
++  }
++}
++
+ template <TextRotation rotation = TextRotation::None>
+ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
+                            const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
+@@ -822,6 +892,12 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode
+   const uint8_t height = glyph->height;
+   const int left = glyph->left;
+   const int top = glyph->top;
++  // Weighted drawing is horizontal text only; rotated text (rare, UI) is drawn as built.
++  const int weight = rotation == TextRotation::None ? renderer.getTextWeight() : 0;
++  if (weight != 0) {
++    renderCharWeighted(renderer, renderMode, fontData, glyph, cursorX, cursorY, pixelState, weight);
++    return;
++  }
+ 
+   // Tiled-grayscale band culling: if this glyph's physical y-extent is entirely
+   // outside the active strip, skip it before the expensive bitmap decode. This
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index 13a0bfa..1f59b6e 100644
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -76,6 +76,9 @@ class GfxRenderer {
+   // table cell. Glyph bitmaps and background fills both pass through this
+   // guard, so an emergency oversized codepoint cannot paint into a neighbour.
+   mutable bool textClipActive_ = false;
++  // Glyph weight adjustment, -2 (lightest) .. +2 (boldest), 0 = font as built.
++  // Only set for book text (see TextWeightScope); UI text is always drawn as-is.
++  mutable int8_t textWeight_ = 0;
+   mutable int textClipLeft_ = 0;
+   mutable int textClipTop_ = 0;
+   mutable int textClipRight_ = 0;   // half-open
+@@ -329,6 +332,22 @@ class GfxRenderer {
+   bool supportsDirectGrayscale() const;
+   bool displayDirectGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
+   RenderMode getRenderMode() const { return renderMode; }
++  int8_t getTextWeight() const { return textWeight_; }
++  void setTextWeight(const int8_t weight) const { textWeight_ = weight < -2 ? -2 : (weight > 2 ? 2 : weight); }
++  // Applies a glyph weight for the lifetime of the scope, then restores the old one.
++  class TextWeightScope {
++   public:
++    TextWeightScope(const GfxRenderer& renderer, const int8_t weight) : renderer_(renderer), previous_(renderer.textWeight_) {
++      renderer.setTextWeight(weight);
++    }
++    ~TextWeightScope() { renderer_.setTextWeight(previous_); }
++    TextWeightScope(const TextWeightScope&) = delete;
++    TextWeightScope& operator=(const TextWeightScope&) = delete;
++
++   private:
++    const GfxRenderer& renderer_;
++    int8_t previous_;
++  };
+   // Grayscale preconditioning settle pass (no-op on X4). The rect overload
+   // takes the gray region in LOGICAL screen coordinates and rotates it to the
+   // panel; the no-arg overload settles the full frame. Call after the BW base
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index f6d7810..22b7775 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -339,6 +339,12 @@ STR_NEXT_PREV: "Next/Prev"
+ STR_DISABLED: "Disabled"
+ STR_NEXT_NEXT: "Next/Next"
+ STR_NEXT_NEXT_DOUBLE_PREV: "Next/Next, Double: Prev"
++STR_TEXT_WEIGHT: "Text Weight"
++STR_WEIGHT_LIGHTEST: "Lightest"
++STR_WEIGHT_LIGHTER: "Lighter"
++STR_WEIGHT_NORMAL: "Normal"
++STR_WEIGHT_BOLDER: "Bolder"
++STR_WEIGHT_BOLDEST: "Boldest"
+ STR_LEXEND_DECA: "Lexend Deca"
+ STR_BITTER: "Bitter"
+ STR_CHAREINK: "ChareInk"
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index f038969..0e41be0 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -457,6 +457,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   uint8_t extraParagraphSpacing = 1;
+   uint8_t forceParagraphIndents = 0;
+   uint8_t textAntiAliasing = 1;
++  // Book text weight: 0 lightest .. 2 normal (as the font was built) .. 4 boldest.
++  enum TEXT_WEIGHT { WEIGHT_LIGHTEST = 0, WEIGHT_LIGHTER, WEIGHT_NORMAL, WEIGHT_BOLDER, WEIGHT_BOLDEST, TEXT_WEIGHT_COUNT };
++  uint8_t textWeight = WEIGHT_NORMAL;
++  int8_t textWeightOffset() const { return static_cast<int8_t>(textWeight) - static_cast<int8_t>(WEIGHT_NORMAL); }
+   // Touch screen reader zones/gestures on boards with a touch controller.
+   uint8_t touchReaderControls = TOUCH_READER_ON;
+   // Page-turn gestures remain independently configurable while touch reader controls stay enabled.
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 7e71166..45ae8de 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -666,6 +666,10 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
+                             StrId::STR_CAT_READER));
+     add(SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
+                             StrId::STR_CAT_READER));
++    add(SettingInfo::Enum(StrId::STR_TEXT_WEIGHT, &CrossPointSettings::textWeight,
++                          {StrId::STR_WEIGHT_LIGHTEST, StrId::STR_WEIGHT_LIGHTER, StrId::STR_WEIGHT_NORMAL,
++                           StrId::STR_WEIGHT_BOLDER, StrId::STR_WEIGHT_BOLDEST},
++                          "textWeight", StrId::STR_CAT_READER));
+     add(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
+                           {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
+                           "imageRendering", StrId::STR_CAT_READER));
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index ce126e8..71b9f58 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -7008,6 +7008,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   };
+ 
+   const auto composePageBuffer = [&]() {
++    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+     if (deferImageLoading) {
+       page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
+                                         /*renderCachedImages=*/false);
+@@ -7018,6 +7019,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   };
+ 
+   const auto composeGrayscaleBuffer = [&]() {
++    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+     if (needsTextGrayscale) {
+       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     } else {
+@@ -7026,6 +7028,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+     finalizeBufferComposition();
+   };
+   if (updatePanel && pageHasImagesNeedingDecode) {
++    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+     page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     finalizeBufferComposition();
+     renderStatusBar();
