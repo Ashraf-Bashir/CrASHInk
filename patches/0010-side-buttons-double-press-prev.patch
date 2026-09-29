@@ -1,0 +1,114 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 78835a6..f6d7810 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -338,6 +338,7 @@ STR_PREV_NEXT: "Prev/Next"
+ STR_NEXT_PREV: "Next/Prev"
+ STR_DISABLED: "Disabled"
+ STR_NEXT_NEXT: "Next/Next"
++STR_NEXT_NEXT_DOUBLE_PREV: "Next/Next, Double: Prev"
+ STR_LEXEND_DECA: "Lexend Deca"
+ STR_BITTER: "Bitter"
+ STR_CHAREINK: "ChareInk"
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index 8f83458..f038969 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -143,6 +143,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+     NEXT_PREV = 1,
+     SIDE_BUTTONS_DISABLED = 2,
+     NEXT_NEXT = 3,
++    // Both side buttons turn forward; pressing either one twice quickly turns back.
++    NEXT_NEXT_DOUBLE_PREV = 4,
+     SIDE_BUTTON_LAYOUT_COUNT
+   };
+ 
+diff --git a/src/MappedInputManager.cpp b/src/MappedInputManager.cpp
+index 6daee6e..66ba5a5 100644
+--- a/src/MappedInputManager.cpp
++++ b/src/MappedInputManager.cpp
+@@ -44,6 +44,7 @@ constexpr SideLayoutMap kSideLayouts[] = {
+     {HalGPIO::BTN_DOWN, kNoButton, HalGPIO::BTN_UP, kNoButton},
+     {kNoButton, kNoButton, kNoButton, kNoButton},
+     {kNoButton, kNoButton, HalGPIO::BTN_UP, HalGPIO::BTN_DOWN},
++    {kNoButton, kNoButton, HalGPIO::BTN_UP, HalGPIO::BTN_DOWN},
+ };
+ 
+ bool shouldSwapReaderSideButtons(const bool readerMode) {
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 79e3a4e..7e71166 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -719,10 +719,12 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
+                           twoFingerSwipeActions, "twoFingerSwipeRight", StrId::STR_CAT_CONTROLS)
+             .withEnumRawValues(twoFingerSwipeActionValues));
+     add(SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,
+-                          {StrId::STR_DISABLED, StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_NEXT_NEXT},
++                          {StrId::STR_DISABLED, StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_NEXT_NEXT,
++                           StrId::STR_NEXT_NEXT_DOUBLE_PREV},
+                           "sideButtonLayout", StrId::STR_CAT_CONTROLS)
+             .withEnumRawValues({CrossPointSettings::SIDE_BUTTONS_DISABLED, CrossPointSettings::PREV_NEXT,
+-                                CrossPointSettings::NEXT_PREV, CrossPointSettings::NEXT_NEXT}));
++                                CrossPointSettings::NEXT_PREV, CrossPointSettings::NEXT_NEXT,
++                                CrossPointSettings::NEXT_NEXT_DOUBLE_PREV}));
+     add(SettingInfo::Enum(StrId::STR_ORIENTATION_AWARE, &CrossPointSettings::sideButtonOrientationAware,
+                           {StrId::STR_NO, StrId::STR_YES}, "sideButtonOrientationAware", StrId::STR_CAT_CONTROLS));
+     add(SettingInfo::Enum(StrId::STR_LONG_PRESS_ACTION, &CrossPointSettings::sideButtonLongPress,
+diff --git a/src/activities/reader/ReaderUtils.h b/src/activities/reader/ReaderUtils.h
+index a7bfe46..01a2354 100644
+--- a/src/activities/reader/ReaderUtils.h
++++ b/src/activities/reader/ReaderUtils.h
+@@ -218,10 +218,36 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
+ 
+   const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
+   const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
+-  const bool sidePrev = sideUsePress ? input.wasPressed(MappedInputManager::Button::PageBack)
+-                                     : input.wasReleased(MappedInputManager::Button::PageBack);
+-  const bool sideNext = sideUsePress ? input.wasPressed(MappedInputManager::Button::PageForward)
+-                                     : input.wasReleased(MappedInputManager::Button::PageForward);
++  bool sidePrev = sideUsePress ? input.wasPressed(MappedInputManager::Button::PageBack)
++                               : input.wasReleased(MappedInputManager::Button::PageBack);
++  bool sideNext = sideUsePress ? input.wasPressed(MappedInputManager::Button::PageForward)
++                               : input.wasReleased(MappedInputManager::Button::PageForward);
++
++  if (SETTINGS.sideButtonLayout == CrossPointSettings::NEXT_NEXT_DOUBLE_PREV) {
++    // Next/Next with a double press for Previous, same idea as the X4 Pro home
++    // key's double tap: a single press has to wait out the double-press window
++    // before it is allowed to turn the page forward.
++    constexpr unsigned long DOUBLE_PRESS_MS = 300;
++    constexpr unsigned long STALE_PRESS_MS = 1500;  // reader was left mid-window: drop, don't fire late
++    static bool pendingPress = false;
++    static unsigned long pendingPressAt = 0;
++    const unsigned long now = millis();
++    const bool newPress = sideNext;
++    sideNext = false;
++    if (pendingPress && now - pendingPressAt > DOUBLE_PRESS_MS) {
++      pendingPress = false;
++      sideNext = now - pendingPressAt <= STALE_PRESS_MS;
++    }
++    if (newPress) {
++      if (pendingPress) {
++        pendingPress = false;
++        sidePrev = true;
++      } else {
++        pendingPress = true;
++        pendingPressAt = now;
++      }
++    }
++  }
+ 
+   const bool frontPrev = input.wasReleased(MappedInputManager::Button::Left);
+   const bool powerReleased = input.wasReleased(MappedInputManager::Button::Power);
+diff --git a/src/util/DictionaryActivityUtils.h b/src/util/DictionaryActivityUtils.h
+index 23cf2af..899988e 100644
+--- a/src/util/DictionaryActivityUtils.h
++++ b/src/util/DictionaryActivityUtils.h
+@@ -25,7 +25,7 @@ inline bool dictionaryPageButtonTriggered(MappedInputManager& input, const bool
+   const bool usePress = SETTINGS.sideButtonLongPress == CrossPointSettings::SIDE_LONG_PRESS::SIDE_LONG_OFF;
+   const auto sideLayout = static_cast<CrossPointSettings::SIDE_BUTTON_LAYOUT>(SETTINGS.sideButtonLayout);
+   const MappedInputManager::Button button =
+-      sideLayout == CrossPointSettings::NEXT_NEXT
++      (sideLayout == CrossPointSettings::NEXT_NEXT || sideLayout == CrossPointSettings::NEXT_NEXT_DOUBLE_PREV)
+           ? (previous ? MappedInputManager::Button::Up : MappedInputManager::Button::Down)
+           : (previous ? MappedInputManager::Button::PageBack : MappedInputManager::Button::PageForward);
+   return usePress ? input.wasPressed(button) : input.wasReleased(button);
