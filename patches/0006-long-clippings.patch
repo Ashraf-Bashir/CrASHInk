@@ -18,11 +18,106 @@ index bc2c9cae..206842f5 100644
  inline constexpr uint16_t CLIPPING_MAX_PER_BOOK = 65535;
  inline constexpr uint16_t CLIPPING_MAX_PAGE_MATCHES = 16;
  inline constexpr uint32_t CLIPPING_WORD_LAYOUT_VERSION = 2;
+diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
+index eefe286b..9250bb19 100644
+--- a/src/activities/reader/ClipSelectionActivity.cpp
++++ b/src/activities/reader/ClipSelectionActivity.cpp
+@@ -195,6 +195,7 @@ void ClipSelectionActivity::restoreSavedBuffer() const {
+ 
+ void ClipSelectionActivity::buildReadingOrder() {
+   readingOrderSize = 0;
++  readingOrder.assign(wordStore.words.size(), 0);
+ 
+   int lineStart = 0;
+   const auto& words = wordStore.words;
+@@ -289,24 +290,16 @@ void ClipSelectionActivity::loop() {
+     if (mappedInput.isScreenTouchHeld(touchX, touchY)) {
+       touchDragHasMoved =
+           touchDragHasMoved || ClipSelectionPaging::hasDraggedFrom(touchDragStartX, touchDragStartY, touchX, touchY);
+-      // Keep timing through a small capacitive-touch jitter margin around the
+-      // selected final word, but reset when the finger genuinely drags away.
+-      const bool touchedWord = selectWordAtPoint(touchX, touchY);
+-      // Releasing on the final word finishes there. Holding it for a moment
+-      // is the explicit intent to continue the clipping onto the next page.
++      selectWordAtPoint(touchX, touchY);
++      // Releasing on the final word of a page finishes the highlight there.
++      // Moving the finger on past it, to the right or further down, is the
++      // explicit request to continue onto the next page.
+       const int nextPageStart = ClipSelectionPaging::nextPageStartIndexForTouchDrag(
+           touchDragHasMoved, startMarkIdx, wordStore.words, readingOrder.data(), readingOrderSize, cursorIdx);
+-      if (nextPageStart >= 0 && (touchedWord || isWithinCurrentPageEndDwellSlop(touchX, touchY))) {
+-        const uint32_t now = static_cast<uint32_t>(millis());
+-        if (touchDragPageEndIdx != cursorIdx) {
+-          touchDragPageEndIdx = cursorIdx;
+-          touchDragPageEndHeldSince = now;
+-        } else if (ClipSelectionPaging::hasHeldPageEndLongEnough(now, touchDragPageEndHeldSince)) {
+-          touchDragPageEndIdx = -1;
+-          moveCursor(nextPageStart);
+-        }
+-      } else {
++      if (nextPageStart >= 0 &&
++          ClipSelectionPaging::isPastPageEnd(wordStore.words[readingOrder[cursorIdx]], touchX, touchY)) {
+         touchDragPageEndIdx = -1;
++        moveCursor(nextPageStart);
+       }
+       return;
+     }
+@@ -642,7 +635,7 @@ void ClipSelectionActivity::drawHighlights() {
+ }
+ 
+ int ClipSelectionActivity::lineEndForward(const int orderIdx) const {
+-  const int total = static_cast<int>(readingOrder.size());
++  const int total = static_cast<int>(readingOrderSize);
+   const auto& words = wordStore.words;
+   const WordRef& current = words[readingOrder[orderIdx]];
+   for (int i = orderIdx + 1; i < total; ++i) {
+diff --git a/src/activities/reader/ClipSelectionActivity.h b/src/activities/reader/ClipSelectionActivity.h
+index 54842092..023e508d 100644
+--- a/src/activities/reader/ClipSelectionActivity.h
++++ b/src/activities/reader/ClipSelectionActivity.h
+@@ -42,7 +42,6 @@ class ClipSelectionActivity final : public Activity {
+  private:
+   static constexpr size_t BUFFER_CHUNK_SIZE = 4096;
+   static constexpr size_t MAX_SAVED_BUFFER_CHUNKS = 16;
+-  static constexpr size_t MAX_READING_ORDER_WORDS = 240;
+ 
+   ClipWordStore wordStore;
+   int renderFontId = 0;
+@@ -73,7 +72,8 @@ class ClipSelectionActivity final : public Activity {
+   bool ignoreInitialPowerRelease = false;
+   bool ignoreInitialBackRelease = false;
+   DictionaryClippingRequest dictionaryRequest{};
+-  std::array<uint16_t, MAX_READING_ORDER_WORDS> readingOrder{};
++  // One entry per selectable word, so a highlight can span every loaded page.
++  std::vector<uint16_t> readingOrder;
+   size_t readingOrderSize = 0;
+ 
+   ButtonNavigator buttonNavigator;
+diff --git a/src/activities/reader/ClipSelectionPaging.h b/src/activities/reader/ClipSelectionPaging.h
+index 0247eb58..d5705861 100644
+--- a/src/activities/reader/ClipSelectionPaging.h
++++ b/src/activities/reader/ClipSelectionPaging.h
+@@ -19,6 +19,15 @@ inline bool hasDraggedFrom(const int startX, const int startY, const int x, cons
+          deltaY <= -TOUCH_DRAG_MOVEMENT_PX;
+ }
+ 
++// A drag that ends on the last word of a page only carries on to the next page
++// when the finger goes on past that word, to the right or further down. Simply
++// stopping on the last word (however long) finishes the highlight there.
++constexpr int TOUCH_PAGE_OVERSHOOT_PX = 16;
++
++inline bool isPastPageEnd(const WordRef& word, const int x, const int y) {
++  return x >= word.x + word.w + TOUCH_PAGE_OVERSHOOT_PX || y >= word.y + word.h + TOUCH_PAGE_OVERSHOOT_PX;
++}
++
+ inline bool hasHeldPageEndLongEnough(const uint32_t now, const uint32_t heldSince) {
+   return static_cast<uint32_t>(now - heldSince) >= TOUCH_PAGE_ADVANCE_HOLD_MS;
+ }
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index d949e9ed..23f46353 100644
+index c7b9ea90..899f526f 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -4370,8 +4370,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4772,8 +4772,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
        }
      }
      const int lineHeight = renderer.getLineHeight(readerFontId);
@@ -39,7 +134,7 @@ index d949e9ed..23f46353 100644
      static constexpr uint32_t CLIP_SELECTION_WORD_RESERVE_HEADROOM = 16U * 1024U;
      static constexpr size_t CLIP_SELECTION_INITIAL_TEXT_RESERVE = 4U * 1024U;
      // Page density varies with font size and layout. Keep the fixed memory cap,
-@@ -4379,7 +4385,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4781,7 +4787,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      const size_t maxSelectableWords = pagesToLoad > 0 ? MAX_CLIP_SELECTION_WORDS : 0;
      const uint32_t wordReserveBytes = static_cast<uint32_t>(maxSelectableWords * sizeof(WordRef));
      const auto heapBeforeWords = MemoryBudget::snapshot();
@@ -51,7 +146,7 @@ index d949e9ed..23f46353 100644
        LOG_ERR("CLIP", "Low heap for clipping selection (%u free, %u max alloc, need block %u); skipping",
                heapBeforeWords.freeHeap, heapBeforeWords.maxAllocHeap,
                wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM);
-@@ -6098,7 +6107,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6573,7 +6582,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -60,7 +155,7 @@ index d949e9ed..23f46353 100644
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -6147,7 +6156,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6622,7 +6631,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -69,7 +164,7 @@ index d949e9ed..23f46353 100644
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -7314,7 +7323,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7744,7 +7753,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
    const uint16_t currentPageCount = canUseStoredRanges ? static_cast<uint16_t>(section->pageCount) : 0;
    const uint32_t currentClippingLayoutSignature = clippingWordLayoutSignature(activeSectionLayoutSignature);
    std::string clippingText;
@@ -79,7 +174,7 @@ index d949e9ed..23f46353 100644
    for (size_t clippingIndex = 0; clippingIndex < clippings.size(); ++clippingIndex) {
      const Clipping& clipping = clippings[clippingIndex];
 diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
-index 4297e7aa..9635c104 100644
+index 3b0a4bb3..44ea9d60 100644
 --- a/src/activities/reader/EpubReaderClippingListActivity.cpp
 +++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
 @@ -160,7 +160,7 @@ void EpubReaderClippingListActivity::onEnter() {
@@ -114,10 +209,10 @@ index 7c0915fe..6bf92d88 100644
      if (local[i].claimed || local[i].remove || local[i].keyHash.empty()) continue;
      const Clipping* clipping = CLIPPINGS.clippingAt(i);
 diff --git a/src/clippings/ClippingsManager.cpp b/src/clippings/ClippingsManager.cpp
-index 8f087382..12b14fb1 100644
+index 05d272ce..bc37181f 100644
 --- a/src/clippings/ClippingsManager.cpp
 +++ b/src/clippings/ClippingsManager.cpp
-@@ -8,6 +8,7 @@
+@@ -9,6 +9,7 @@
  #include <algorithm>
  #include <cstdio>
  
@@ -125,113 +220,15 @@ index 8f087382..12b14fb1 100644
  #include "CrossPointSettings.h"
  
  namespace {
-@@ -130,8 +131,8 @@ bool ClippingsManager::saveClipping(const std::string& bookTitle, const std::str
+@@ -131,9 +132,9 @@ bool ClippingsManager::saveClipping(const std::string& bookTitle, const std::str
    }
    location += "\n";
  
 -  static constexpr size_t MAX_TEXT_BYTES = 2000;
--  const size_t textLen = std::min(selectedText.size(), MAX_TEXT_BYTES);
 +  // Export the whole clipping (bounded by the clipping store's own limit).
-+  const size_t textLen = std::min(selectedText.size(), CLIPPING_TEXT_MAX);
+   const size_t textLen = static_cast<size_t>(
+-      utf8SafeTruncateBuffer(selectedText.data(), static_cast<int>(std::min(selectedText.size(), MAX_TEXT_BYTES))));
++      utf8SafeTruncateBuffer(selectedText.data(), static_cast<int>(std::min(selectedText.size(), CLIPPING_TEXT_MAX))));
    static constexpr char separator[] = "\n==========\n";
  
    std::string buffer;
-diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
-index afa11a7..f58b379 100644
---- a/src/activities/reader/ClipSelectionActivity.cpp
-+++ b/src/activities/reader/ClipSelectionActivity.cpp
-@@ -174,6 +174,7 @@ void ClipSelectionActivity::restoreSavedBuffer() const {
- 
- void ClipSelectionActivity::buildReadingOrder() {
-   readingOrderSize = 0;
-+  readingOrder.assign(wordStore.words.size(), 0);
- 
-   int lineStart = 0;
-   const auto& words = wordStore.words;
-@@ -619,7 +620,7 @@ void ClipSelectionActivity::drawHighlights() {
- }
- 
- int ClipSelectionActivity::lineEndForward(const int orderIdx) const {
--  const int total = static_cast<int>(readingOrder.size());
-+  const int total = static_cast<int>(readingOrderSize);
-   const auto& words = wordStore.words;
-   const WordRef& current = words[readingOrder[orderIdx]];
-   for (int i = orderIdx + 1; i < total; ++i) {
-diff --git a/src/activities/reader/ClipSelectionActivity.h b/src/activities/reader/ClipSelectionActivity.h
-index 5484209..023e508 100644
---- a/src/activities/reader/ClipSelectionActivity.h
-+++ b/src/activities/reader/ClipSelectionActivity.h
-@@ -42,7 +42,6 @@ class ClipSelectionActivity final : public Activity {
-  private:
-   static constexpr size_t BUFFER_CHUNK_SIZE = 4096;
-   static constexpr size_t MAX_SAVED_BUFFER_CHUNKS = 16;
--  static constexpr size_t MAX_READING_ORDER_WORDS = 240;
- 
-   ClipWordStore wordStore;
-   int renderFontId = 0;
-@@ -73,7 +72,8 @@ class ClipSelectionActivity final : public Activity {
-   bool ignoreInitialPowerRelease = false;
-   bool ignoreInitialBackRelease = false;
-   DictionaryClippingRequest dictionaryRequest{};
--  std::array<uint16_t, MAX_READING_ORDER_WORDS> readingOrder{};
-+  // One entry per selectable word, so a highlight can span every loaded page.
-+  std::vector<uint16_t> readingOrder;
-   size_t readingOrderSize = 0;
- 
-   ButtonNavigator buttonNavigator;
-diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
-index f58b379..66a821d 100644
---- a/src/activities/reader/ClipSelectionActivity.cpp
-+++ b/src/activities/reader/ClipSelectionActivity.cpp
-@@ -269,24 +269,16 @@ void ClipSelectionActivity::loop() {
-     if (mappedInput.isScreenTouchHeld(touchX, touchY)) {
-       touchDragHasMoved =
-           touchDragHasMoved || ClipSelectionPaging::hasDraggedFrom(touchDragStartX, touchDragStartY, touchX, touchY);
--      // Keep timing through a small capacitive-touch jitter margin around the
--      // selected final word, but reset when the finger genuinely drags away.
--      const bool touchedWord = selectWordAtPoint(touchX, touchY);
--      // Releasing on the final word finishes there. Holding it for a moment
--      // is the explicit intent to continue the clipping onto the next page.
-+      selectWordAtPoint(touchX, touchY);
-+      // Releasing on the final word of a page finishes the highlight there.
-+      // Moving the finger on past it, to the right or further down, is the
-+      // explicit request to continue onto the next page.
-       const int nextPageStart = ClipSelectionPaging::nextPageStartIndexForTouchDrag(
-           touchDragHasMoved, startMarkIdx, wordStore.words, readingOrder.data(), readingOrderSize, cursorIdx);
--      if (nextPageStart >= 0 && (touchedWord || isWithinCurrentPageEndDwellSlop(touchX, touchY))) {
--        const uint32_t now = static_cast<uint32_t>(millis());
--        if (touchDragPageEndIdx != cursorIdx) {
--          touchDragPageEndIdx = cursorIdx;
--          touchDragPageEndHeldSince = now;
--        } else if (ClipSelectionPaging::hasHeldPageEndLongEnough(now, touchDragPageEndHeldSince)) {
--          touchDragPageEndIdx = -1;
--          moveCursor(nextPageStart);
--        }
--      } else {
-+      if (nextPageStart >= 0 &&
-+          ClipSelectionPaging::isPastPageEnd(wordStore.words[readingOrder[cursorIdx]], touchX, touchY)) {
-         touchDragPageEndIdx = -1;
-+        moveCursor(nextPageStart);
-       }
-       return;
-     }
-diff --git a/src/activities/reader/ClipSelectionPaging.h b/src/activities/reader/ClipSelectionPaging.h
-index 0247eb5..d570586 100644
---- a/src/activities/reader/ClipSelectionPaging.h
-+++ b/src/activities/reader/ClipSelectionPaging.h
-@@ -19,6 +19,15 @@ inline bool hasDraggedFrom(const int startX, const int startY, const int x, cons
-          deltaY <= -TOUCH_DRAG_MOVEMENT_PX;
- }
- 
-+// A drag that ends on the last word of a page only carries on to the next page
-+// when the finger goes on past that word, to the right or further down. Simply
-+// stopping on the last word (however long) finishes the highlight there.
-+constexpr int TOUCH_PAGE_OVERSHOOT_PX = 16;
-+
-+inline bool isPastPageEnd(const WordRef& word, const int x, const int y) {
-+  return x >= word.x + word.w + TOUCH_PAGE_OVERSHOOT_PX || y >= word.y + word.h + TOUCH_PAGE_OVERSHOOT_PX;
-+}
-+
- inline bool hasHeldPageEndLongEnough(const uint32_t now, const uint32_t heldSince) {
-   return static_cast<uint32_t>(now - heldSince) >= TOUCH_PAGE_ADVANCE_HOLD_MS;
- }
