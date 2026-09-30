@@ -1,8 +1,8 @@
 diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
-index 96c94986..dda43a13 100644
+index 8e7e437e..40093d03 100644
 --- a/src/activities/home/HomeActivity.cpp
 +++ b/src/activities/home/HomeActivity.cpp
-@@ -1534,6 +1534,15 @@ void HomeActivity::loop() {
+@@ -1455,6 +1455,15 @@ void HomeActivity::loop() {
        requestUpdate();
        return;
      }
@@ -17,17 +17,17 @@ index 96c94986..dda43a13 100644
 +    }
    }
  
-   if (usesMinimalHomeInteraction()) {
+   if (coverGridUi) {
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index a71dc104..0d276a8f 100644
+index a7abc977..6b05422b 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -2653,6 +2653,15 @@ void EpubReaderActivity::loop() {
+@@ -2856,6 +2856,15 @@ void EpubReaderActivity::loop() {
      requestUpdate();
      return;
    }
-+  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
-+                                                     touch.x, touch.y)) {
++  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                     touch.y)) {
 +    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
 +    // hit while the touchscreen is off, so no separate guard is needed here.
 +    SETTINGS.disableReaderTouchscreen = 1;
@@ -35,19 +35,19 @@ index a71dc104..0d276a8f 100644
 +    requestUpdate();
 +    return;
 +  }
-   if (touch.tapped &&
-       ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
-     if (SETTINGS.tapToHideStatusBar) {
+   const int bottomTapHeight =
+       automaticPageTurnActive
+           ? std::max(UITheme::getStatusBarHeight(),
 diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
-index 2b01c3bc..9e66cc40 100644
+index 6e36ef2e..7aaa937b 100644
 --- a/src/activities/reader/TxtReaderActivity.cpp
 +++ b/src/activities/reader/TxtReaderActivity.cpp
-@@ -212,6 +212,15 @@ void TxtReaderActivity::loop() {
+@@ -215,6 +215,15 @@ void TxtReaderActivity::loop() {
      requestUpdate();
      return;
    }
-+  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
-+                                                     touch.x, touch.y)) {
++  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                     touch.y)) {
 +    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
 +    // hit while the touchscreen is off, so no separate guard is needed here.
 +    SETTINGS.disableReaderTouchscreen = 1;
@@ -56,13 +56,13 @@ index 2b01c3bc..9e66cc40 100644
 +    return;
 +  }
    if (touch.tapped &&
-       ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight())) {
-     if (SETTINGS.tapToHideStatusBar) {
+       (ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight()) ||
+        ReaderUtils::isTopStatusBarTap(renderer, touch.y,
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index d4c36f3b..238414c3 100644
+index 79f0b31a..fcde384f 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
-@@ -72,6 +72,29 @@ constexpr uint8_t icon_lightbulb_off_h_bits[] = {
+@@ -83,6 +83,29 @@ constexpr uint8_t icon_lightbulb_off_h_bits[] = {
      0xB3, 0x8F, 0xDF, 0xB3, 0xC7, 0x9F, 0xF3, 0x33, 0x9F, 0xFF, 0x11, 0xFF, 0xFF, 0xC0, 0xFF,
      0xFF, 0xF0, 0x7F, 0xFF, 0xFE, 0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x9F, 0xFF, 0xFF, 0xFF};
  
@@ -92,7 +92,7 @@ index d4c36f3b..238414c3 100644
  }  // namespace
  
  void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
-@@ -252,6 +275,96 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
+@@ -263,6 +286,96 @@ bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY,
    return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
  }
  
@@ -188,28 +188,28 @@ index d4c36f3b..238414c3 100644
 +
  int BaseTheme::homeHeaderClockTextYOffset(const GfxRenderer& renderer) {
    const auto& metrics = UITheme::getInstance().getMetrics();
-   const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
-@@ -1176,10 +1289,12 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
-                                       const bool readerContext, const int textYOffset, const bool darkMode,
-                                       const bool forceVisible) const {
-   // Deliberately ahead of the clock's own visibility/availability checks
--  // below, so the frontlight indicators keep rendering even when the clock
--  // is hidden (no RTC, or the user turned the clock off) - this function is
--  // the one place every screen, reader and non-reader alike, already calls.
-+  // below, so the frontlight and touchscreen indicators keep rendering even
-+  // when the clock is hidden (no RTC, or the user turned the clock off) -
-+  // this function is the one place every screen, reader and non-reader
-+  // alike, already calls.
+   const int statusBarHeight = metrics.statusBarVerticalMargin;
+@@ -1085,6 +1198,7 @@ void BaseTheme::drawReaderStatusBar(GfxRenderer& renderer, const ReaderStatusBar
+     if (iconsRight > iconsLeft) {
+       const int rowTop = edgeY + progressSpace;
+       drawFrontlightStatusIndicator(renderer, rowTop, content.darkMode);
++      drawTouchscreenIndicator(renderer, rowTop, content.darkMode);
+       bookmarkReserve = std::max(0, iconsRight - std::max(marginLeft, StatusBarMetrics::sideInset)) + 4;
+     }
+   }
+@@ -1223,6 +1337,7 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
+   // is hidden (no RTC, or the user turned the clock off) - this function is
+   // the one place every screen, reader and non-reader alike, already calls.
    drawFrontlightStatusIndicator(renderer, topY, darkMode);
 +  drawTouchscreenIndicator(renderer, topY, darkMode);
  
-   if (!forceVisible &&
-       !(readerContext ? SETTINGS.shouldShowClockInReader() : SETTINGS.shouldShowClockOutsideReader())) {
+   if (!forceVisible && !SETTINGS.shouldShowClockOutsideReader()) {
+     return;
 diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 628a4602..569703cd 100644
+index 6770e452..62c15abd 100644
 --- a/src/components/themes/BaseTheme.h
 +++ b/src/components/themes/BaseTheme.h
-@@ -265,6 +265,30 @@ class BaseTheme {
+@@ -290,6 +290,30 @@ class BaseTheme {
    // light or consume the touch itself, since callers differ in what "handle
    // this touch" means for them.
    bool isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
