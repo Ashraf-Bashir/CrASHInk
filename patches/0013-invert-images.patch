@@ -1,0 +1,391 @@
+diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlock.cpp
+index d326dd65..0abb6103 100644
+--- a/lib/Epub/Epub/blocks/ImageBlock.cpp
++++ b/lib/Epub/Epub/blocks/ImageBlock.cpp
+@@ -261,8 +261,10 @@ RetainedPxcEntry* prepareRetainedPxcEntry(const size_t pixelBytes) {
+   return allocateRetainedPxcEntry(*empty, pixelBytes) ? empty : nullptr;
+ }
+ 
++// invertMask is 0 for the image as cached, or 3 to draw its 2-bit grey levels as a negative
++// (3 - v == v ^ 3), so the BW and both grayscale passes all agree.
+ bool renderCachedPixels(GfxRenderer& renderer, const uint8_t* pixels, const uint16_t cachedWidth,
+-                        const uint16_t cachedHeight, const int x, const int y) {
++                        const uint16_t cachedHeight, const int x, const int y, const uint8_t invertMask) {
+   if (!pixels) return false;
+   const auto clip = cachedImageClip(renderer, x, y, cachedWidth, cachedHeight);
+   if (clip.empty()) return true;
+@@ -276,19 +278,20 @@ bool renderCachedPixels(GfxRenderer& renderer, const uint8_t* pixels, const uint
+     for (int col = clip.x0; col < clip.x1; ++col) {
+       const int byteIdx = col >> 2;
+       const int bitShift = 6 - (col & 3) * 2;
+-      pw.writePixel(x + col, (rowBuffer[byteIdx] >> bitShift) & 0x03);
++      pw.writePixel(x + col, ((rowBuffer[byteIdx] >> bitShift) & 0x03) ^ invertMask);
+     }
+   }
+   return true;
+ }
+ 
+ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x, int y, int expectedWidth,
+-                     int expectedHeight) {
++                     int expectedHeight, const uint8_t invertMask) {
+   // Cache generation invalidates retained entries before overwriting a PXC
+   // path, so repeated grayscale strips can avoid storage I/O entirely.
+   if (auto* retained = findRetainedPxcEntry(cachePath, expectedWidth, expectedHeight)) {
+     touchRetainedPxcEntry(*retained);
+-    return renderCachedPixels(renderer, retained->pixels.get(), retained->width, retained->height, x, y);
++    return renderCachedPixels(renderer, retained->pixels.get(), retained->width, retained->height, x, y,
++                              invertMask);
+   }
+ 
+   FsFile cacheFile;
+@@ -327,7 +330,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
+       LOG_INF("EPS", "Retained PXC in PSRAM: bytes=%u total=%u entries=2 dimensions=%ux%u",
+               static_cast<unsigned>(pixelBytes), static_cast<unsigned>(retainedPxcCapacity), cachedWidth, cachedHeight);
+       MemoryBudget::logEpubHeapPools("pxc retained");
+-      return renderCachedPixels(renderer, retained->pixels.get(), cachedWidth, cachedHeight, x, y);
++      return renderCachedPixels(renderer, retained->pixels.get(), cachedWidth, cachedHeight, x, y, invertMask);
+     }
+     // A short read must never leave an entry that could be mistaken for a
+     // complete cache payload. Keep its allocation for a later retry.
+@@ -397,7 +400,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
+     for (int col = clip.x0; col < clip.x1; col++) {
+       const int byteIdx = col >> 2;            // col / 4
+       const int bitShift = 6 - (col & 3) * 2;  // MSB first within byte
+-      uint8_t pixelValue = (rowBuffer[byteIdx] >> bitShift) & 0x03;
++      uint8_t pixelValue = ((rowBuffer[byteIdx] >> bitShift) & 0x03) ^ invertMask;
+ 
+       pw.writePixel(x + col, pixelValue);
+     }
+@@ -511,10 +514,23 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
+     return;
+   }
+ 
++  // Night mode flips the whole frame when it is sent to the panel, so an image normally
++  // pre-flips itself (preserveImagePolarity) to keep its own look. "Inverted" images skip
++  // that in night mode, so the panel's flip turns them into a negative. In day mode there
++  // is no panel flip, so a negative is drawn directly (grey levels flipped, all passes).
++  const bool negativeWanted = renderer.invertImages();
++  const bool nightMode = renderer.isDisplayInverted();
++  const uint8_t invertMask = (negativeWanted && !nightMode) ? 3 : 0;
++  const auto finishImage = [&]() {
++    if (!negativeWanted) {
++      renderer.preserveImagePolarity(x, y, width, height);
++    }
++  };
++
+   // Try to render from cache first
+   std::string cachePath = getCachePath(imagePath);
+-  if (renderFromCache(renderer, cachePath, x, y, width, height)) {
+-    renderer.preserveImagePolarity(x, y, width, height);
++  if (renderFromCache(renderer, cachePath, x, y, width, height, invertMask)) {
++    finishImage();
+     return;  // Successfully rendered from cache
+   }
+ 
+@@ -569,7 +585,11 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
+     return;
+   }
+ 
+-  renderer.preserveImagePolarity(x, y, width, height);
++  // A fresh decode draws the image as cached; flip the BW plane to the negative in day mode.
++  if (invertMask != 0 && renderer.getRenderMode() == GfxRenderer::BW) {
++    renderer.invertRect(x, y, width, height);
++  }
++  finishImage();
+ }
+ 
+ bool ImageBlock::serialize(FsFile& file) {
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index 8e9f5edc..13ea83fc 100644
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -83,6 +83,8 @@ class GfxRenderer {
+   // Glyph weight adjustment, -2 (lightest) .. +2 (boldest), 0 = font as built.
+   // Only set for book text (see TextWeightScope); UI text is always drawn as-is.
+   mutable int8_t textWeight_ = 0;
++  // Reader images drawn as a negative (see setInvertImages). Reader pages only; covers ignore it.
++  mutable bool invertImages_ = false;
+   mutable int textClipLeft_ = 0;
+   mutable int textClipTop_ = 0;
+   mutable int textClipRight_ = 0;   // half-open
+@@ -347,6 +349,12 @@ class GfxRenderer {
+   RenderMode getRenderMode() const { return renderMode; }
+   int8_t getTextWeight() const { return textWeight_; }
+   void setTextWeight(const int8_t weight) const { textWeight_ = weight < -2 ? -2 : (weight > 2 ? 2 : weight); }
++  // True when images inside book pages should look like a photo negative on screen. The reader
++  // sets this before drawing a page; it only affects ImageBlock, never covers or sleep screens.
++  void setInvertImages(const bool invert) const { invertImages_ = invert; }
++  bool invertImages() const { return invertImages_; }
++  // Night mode inverts the whole frame when it is sent to the panel.
++  bool isDisplayInverted() const { return display.isInverted(); }
+   // Applies a glyph weight for the lifetime of the scope, then restores the old one.
+   class TextWeightScope {
+    public:
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 460e7298..3d70829b 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -154,6 +154,7 @@ STR_READER_DARK_MODE: "Dark Mode"
+ STR_NIGHT_MODE: "Dark Mode"
+ STR_IMAGES: "Images"
+ STR_IMAGES_DISPLAY: "Display"
++STR_IMAGES_INVERTED: "Inverted"
+ STR_IMAGES_PLACEHOLDER: "Placeholder"
+ STR_IMAGES_SUPPRESS: "Suppress"
+ STR_TOUCH_READER_CONTROLS: "Touch Reader Controls"
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+index 024843cd..f6a6e442 100644
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -217,6 +217,8 @@ void applyLegacyStatusBarSettings(CrossPointSettings& settings) {
+ }
+ 
+ bool isEnumRawValueAllowed(const SettingInfo& info, const uint8_t value) {
++  // Auto is a valid stored state for Images even though it is not one of the listed options.
++  if (info.key && strcmp(info.key, "imageRendering") == 0 && value == CrossPointSettings::IMAGES_AUTO) return true;
+   if (info.enumRawValues.empty()) return value < settingEnumOptionCount(info);
+   return std::find(info.enumRawValues.begin(), info.enumRawValues.end(), value) != info.enumRawValues.end();
+ }
+@@ -1209,7 +1211,7 @@ ReaderRenderSpec CrossPointSettings::readerRenderSpec(const uint16_t viewportWid
+   spec.viewportHeight = viewportHeight;
+   spec.hyphenationEnabled = hyphenationEnabled != 0;
+   spec.embeddedStyle = embeddedStyle != 0;
+-  spec.imageRendering = imageRendering;
++  spec.imageRendering = layoutImageRendering(imageRendering);
+   spec.focusReadingEnabled = focusReadingEnabled != 0;
+   spec.guideReadingEnabled = guideReadingEnabled != 0;
+   spec.wordSpacing = sanitizeWordSpacing(wordSpacing);
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index f67c6622..5d79e050 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -365,7 +365,32 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   enum RECENT_BOOKS_VIEW { RECENT_BOOKS_LIST = 0, RECENT_BOOKS_GRID = 1, RECENT_BOOKS_VIEW_COUNT };
+ 
+   // Image rendering in EPUB reader
+-  enum IMAGE_RENDERING { IMAGES_DISPLAY = 0, IMAGES_PLACEHOLDER = 1, IMAGES_SUPPRESS = 2, IMAGE_RENDERING_COUNT };
++  // IMAGES_AUTO is the default and what older settings files hold as 0: Display by day, Inverted in
++  // Dark Mode. Picking any entry in the Images list stores an explicit value (Display = IMAGES_DISPLAY).
++  // Placeholder and Suppress keep their old numbers so saved settings and books stay valid.
++  enum IMAGE_RENDERING {
++    IMAGES_AUTO = 0,
++    IMAGES_PLACEHOLDER = 1,
++    IMAGES_SUPPRESS = 2,
++    IMAGES_INVERTED = 3,
++    IMAGES_DISPLAY = 4,
++    IMAGE_RENDERING_COUNT
++  };
++  static uint8_t resolveImageRendering(const uint8_t raw, const bool darkMode) {
++    return raw == IMAGES_AUTO ? static_cast<uint8_t>(darkMode ? IMAGES_INVERTED : IMAGES_DISPLAY) : raw;
++  }
++  // What the reader does with images right now, with Auto resolved from Dark Mode.
++  uint8_t effectiveImageRendering() const { return resolveImageRendering(imageRendering, screenInverted != 0); }
++  bool invertReaderImages() const { return effectiveImageRendering() == IMAGES_INVERTED; }
++  // Same, for a frame whose night-mode state is known (e.g. a sleep screen drawn on a plain panel).
++  bool invertReaderImages(const bool darkMode) const {
++    return resolveImageRendering(imageRendering, darkMode) == IMAGES_INVERTED;
++  }
++  // Layout only cares whether images are shown, hidden or replaced by placeholders; Display, Inverted
++  // and Auto lay out identically, so switching between them never rebuilds the book's pages.
++  static uint8_t layoutImageRendering(const uint8_t raw) {
++    return (raw == IMAGES_PLACEHOLDER || raw == IMAGES_SUPPRESS) ? raw : static_cast<uint8_t>(IMAGES_AUTO);
++  }
+   enum TOUCH_READER_CONTROLS { TOUCH_READER_OFF = 0, TOUCH_READER_ON = 1, TOUCH_READER_CONTROLS_COUNT };
+   enum PAGE_TURN_GESTURE {
+     TAP_AND_SWIPE = 0,
+@@ -655,7 +680,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   // Idle threshold for reading stats, stored in 10-second units to fit uint8_t.
+   uint8_t readingIdleTimeThresholdUnits = 30;
+   // Image rendering mode in EPUB reader
+-  uint8_t imageRendering = IMAGES_DISPLAY;
++  uint8_t imageRendering = IMAGES_AUTO;
+   // Long-press Confirm (menu button) quick action in reader (0 = off)
+   uint8_t longPressMenuAction = LONG_MENU_OFF;
+   // Long-press Back quick action in reader (defaults to the historical file browser shortcut)
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 7cab2fbf..d22f0c86 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -705,8 +705,11 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
+                            StrId::STR_WEIGHT_BOLDER, StrId::STR_WEIGHT_BOLDEST},
+                           "textWeight", StrId::STR_CAT_READER));
+     add(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
+-                          {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
+-                          "imageRendering", StrId::STR_CAT_READER));
++                          {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_INVERTED, StrId::STR_IMAGES_PLACEHOLDER,
++                           StrId::STR_IMAGES_SUPPRESS},
++                          "imageRendering", StrId::STR_CAT_READER)
++            .withEnumRawValues({CrossPointSettings::IMAGES_DISPLAY, CrossPointSettings::IMAGES_INVERTED,
++                                CrossPointSettings::IMAGES_PLACEHOLDER, CrossPointSettings::IMAGES_SUPPRESS}));
+     add(SettingInfo::Toggle(StrId::STR_TOUCH_READER_CONTROLS, &CrossPointSettings::touchReaderControls,
+                             "touchReaderControls", StrId::STR_CAT_READER));
+     add(SettingInfo::Toggle(StrId::STR_DISABLE_TOUCHSCREEN, &CrossPointSettings::disableReaderTouchscreen,
+diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
+index b915374a..a54ccec2 100644
+--- a/src/activities/reader/ClipSelectionActivity.cpp
++++ b/src/activities/reader/ClipSelectionActivity.cpp
+@@ -532,6 +532,7 @@ bool ClipSelectionActivity::switchToPage(const int pageIdx) {
+ 
+   // Book text is drawn with the reader's Font Weight; keep it while selecting.
+   const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
++  renderer.setInvertImages(SETTINGS.invertReaderImages());
+ 
+   // The snapshot is almost a full framebuffer. Release it before SD-font
+   // prewarming so its chunks do not crowd out the contiguous glyph bitmap.
+diff --git a/src/activities/reader/ControlsOptionsActivity.cpp b/src/activities/reader/ControlsOptionsActivity.cpp
+index 8589cd31..c26356e6 100644
+--- a/src/activities/reader/ControlsOptionsActivity.cpp
++++ b/src/activities/reader/ControlsOptionsActivity.cpp
+@@ -23,6 +23,9 @@ uint8_t enumDisplayIndexForRawValue(const SettingInfo& setting, uint8_t rawValue
+   if (setting.enumRawValues.empty()) {
+     return rawValue;
+   }
++  if (setting.valuePtr == &CrossPointSettings::imageRendering) {
++    rawValue = CrossPointSettings::resolveImageRendering(rawValue, SETTINGS.screenInverted != 0);
++  }
+ 
+   auto it = std::find(setting.enumRawValues.begin(), setting.enumRawValues.end(), rawValue);
+   if (it == setting.enumRawValues.end()) {
+diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activities/reader/DictionaryWordSelectActivity.cpp
+index d1f34a2e..de569f3a 100644
+--- a/src/activities/reader/DictionaryWordSelectActivity.cpp
++++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
+@@ -346,6 +346,7 @@ void DictionaryWordSelectActivity::renderDefinitionBackground() {
+   }
+   // The page behind the definition keeps the reader's Font Weight.
+   const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
++  renderer.setInvertImages(SETTINGS.invertReaderImages());
+   const bool foregroundBlack = ReaderUtils::readerForegroundBlack();
+   renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+ 
+@@ -1265,6 +1266,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+   // overflow ring and the page render serializes ~100+ individual SD reads.
+   // Same pattern as EpubReaderActivity::renderContents().
+   const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
++  renderer.setInvertImages(SETTINGS.invertReaderImages());
+   auto* fcm = renderer.getFontCacheManager();
+   auto scope = fcm->createPrewarmScope();
+   page->render(renderer, SETTINGS.getReaderFontId(), marginLeft, marginTop, foregroundBlack);  // scan pass
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index cb0bad1a..c092511c 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -7383,6 +7383,8 @@ void EpubReaderActivity::prepareCurrentSectionForRelayout() {
+ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fontId, const int orientedMarginTop,
+                                         const int orientedMarginRight, const int orientedMarginBottom,
+                                         const int orientedMarginLeft, const bool updatePanel) {
++  // Image polarity follows Dark Mode and the Images setting; every page draw below uses it.
++  renderer.setInvertImages(SETTINGS.invertReaderImages());
+ #if CROSSINK_APP_CAP_TOUCH
+   if (mappedInput.hasTouchHardware()) {
+     if (!touchReaderPreviewAllocationAttempted) {
+@@ -8090,7 +8092,7 @@ void EpubReaderActivity::refreshChapterGroupEstimate(const uint16_t viewportWidt
+   mix(SETTINGS.paragraphAlignment);
+   mix(SETTINGS.hyphenationEnabled);
+   mix(SETTINGS.embeddedStyle);
+-  mix(SETTINGS.imageRendering);
++  mix(CrossPointSettings::layoutImageRendering(SETTINGS.imageRendering));
+   mix(SETTINGS.focusReadingEnabled);
+   mix(SETTINGS.guideReadingEnabled);
+   mix(SETTINGS.wordSpacing);
+@@ -8497,6 +8499,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+     ImageBlock::setExtractor(nullptr, nullptr, nullptr);
+   }
+   renderer.clearScreen(ReaderUtils::readerBackgroundColor());
++  renderer.setInvertImages(SETTINGS.invertReaderImages(renderer.isDisplayInverted()));
+   page->render(renderer, renderFontId, layout.marginLeft, layout.marginTop, ReaderUtils::readerForegroundBlack());
+   drawPublisherPageMarkers(renderer, *page, layout.marginTop, renderer.getScreenHeight() - layout.marginBottom,
+                            ReaderUtils::readerForegroundBlack());
+diff --git a/src/activities/reader/EpubReaderDrawerActivity.cpp b/src/activities/reader/EpubReaderDrawerActivity.cpp
+index 6f1b44ea..0d660559 100644
+--- a/src/activities/reader/EpubReaderDrawerActivity.cpp
++++ b/src/activities/reader/EpubReaderDrawerActivity.cpp
+@@ -1954,9 +1954,11 @@ void EpubReaderDrawerActivity::showEnumOptions(const RowId row) {
+       break;
+     case RowId::Images:
+       title = StrId::STR_IMAGES;
+-      labels = {tr(STR_IMAGES_DISPLAY), tr(STR_IMAGES_PLACEHOLDER), tr(STR_IMAGES_SUPPRESS)};
+-      raw = {0, 1, 2};
+-      currentRaw = draft.imageRendering;
++      labels = {tr(STR_IMAGES_DISPLAY), tr(STR_IMAGES_INVERTED), tr(STR_IMAGES_PLACEHOLDER), tr(STR_IMAGES_SUPPRESS)};
++      raw = {CrossPointSettings::IMAGES_DISPLAY, CrossPointSettings::IMAGES_INVERTED,
++             CrossPointSettings::IMAGES_PLACEHOLDER, CrossPointSettings::IMAGES_SUPPRESS};
++      // Auto shows as whichever entry it currently resolves to (Display by day, Inverted in Dark Mode).
++      currentRaw = CrossPointSettings::resolveImageRendering(draft.imageRendering, SETTINGS.screenInverted != 0);
+       break;
+     case RowId::RenderMode:
+       title = StrId::STR_EPUB_RENDER_MODE;
+@@ -3170,9 +3172,16 @@ const char* EpubReaderDrawerActivity::rowValue(const RowId row, char* buffer, co
+       return I18N.get(labels[std::min<size_t>(draft.textWeight, labels.size() - 1)]);
+     }
+     case RowId::Images: {
+-      static const std::array<StrId, 3> labels = {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER,
+-                                                  StrId::STR_IMAGES_SUPPRESS};
+-      return I18N.get(labels[std::min<size_t>(draft.imageRendering, labels.size() - 1)]);
++      switch (CrossPointSettings::resolveImageRendering(draft.imageRendering, SETTINGS.screenInverted != 0)) {
++        case CrossPointSettings::IMAGES_INVERTED:
++          return I18N.get(StrId::STR_IMAGES_INVERTED);
++        case CrossPointSettings::IMAGES_PLACEHOLDER:
++          return I18N.get(StrId::STR_IMAGES_PLACEHOLDER);
++        case CrossPointSettings::IMAGES_SUPPRESS:
++          return I18N.get(StrId::STR_IMAGES_SUPPRESS);
++        default:
++          return I18N.get(StrId::STR_IMAGES_DISPLAY);
++      }
+     }
+     case RowId::RenderMode: {
+       static const std::array<StrId, 3> labels = {StrId::STR_RENDER_MODE_CROSSINK_DEFAULT,
+diff --git a/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp b/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp
+index d7267967..80f8a577 100644
+--- a/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp
++++ b/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp
+@@ -185,6 +185,7 @@ void EpubReaderFootnoteSelectActivity::render(RenderLock&&) {
+   }
+ 
+   renderer.clearScreen(ReaderUtils::readerBackgroundColor());
++  renderer.setInvertImages(SETTINGS.invertReaderImages());
+   page->render(renderer, fontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
+   drawHighlightWithSnapshot();
+   drawChrome();
+diff --git a/src/activities/reader/ReaderOptionsActivity.cpp b/src/activities/reader/ReaderOptionsActivity.cpp
+index 9f38aea9..b50fb4ef 100644
+--- a/src/activities/reader/ReaderOptionsActivity.cpp
++++ b/src/activities/reader/ReaderOptionsActivity.cpp
+@@ -30,6 +30,9 @@ uint8_t enumDisplayIndexForRawValue(const SettingInfo& setting, uint8_t rawValue
+   if (setting.enumRawValues.empty()) {
+     return rawValue;
+   }
++  if (setting.valuePtr == &CrossPointSettings::imageRendering) {
++    rawValue = CrossPointSettings::resolveImageRendering(rawValue, SETTINGS.screenInverted != 0);
++  }
+ 
+   auto it = std::find(setting.enumRawValues.begin(), setting.enumRawValues.end(), rawValue);
+   if (it == setting.enumRawValues.end()) {
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 07c55d83..213e781a 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -103,6 +103,9 @@ uint8_t enumDisplayIndexForRawValue(const SettingInfo& setting, uint8_t rawValue
+   if (setting.enumRawValues.empty()) {
+     return rawValue;
+   }
++  if (setting.valuePtr == &CrossPointSettings::imageRendering) {
++    rawValue = CrossPointSettings::resolveImageRendering(rawValue, SETTINGS.screenInverted != 0);
++  }
+ 
+   auto it = std::find(setting.enumRawValues.begin(), setting.enumRawValues.end(), rawValue);
+   if (it == setting.enumRawValues.end()) {
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index be042121..67fa4ebd 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -104,6 +104,9 @@ bool isWebEnumOptionAvailable(const SettingInfo& setting, size_t optionIndex) {
+ 
+ uint8_t enumDisplayIndexForWeb(const SettingInfo& setting, uint8_t rawValue) {
+   if (setting.enumRawValues.empty()) return rawValue;
++  if (setting.valuePtr == &CrossPointSettings::imageRendering) {
++    rawValue = CrossPointSettings::resolveImageRendering(rawValue, SETTINGS.screenInverted != 0);
++  }
+ 
+   uint8_t displayIndex = 0;
+   for (size_t optionIndex = 0; optionIndex < setting.enumRawValues.size(); ++optionIndex) {
