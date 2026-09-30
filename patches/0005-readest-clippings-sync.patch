@@ -1,11 +1,11 @@
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a589c5a..78835a60 100644
+index 9aec8252..c70dfbd4 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -845,3 +845,41 @@ STR_LONG_PRESS_HOME_SHORTCUT: "Long-Press Home"
- STR_DOUBLE_TAP_HOME_SHORTCUT: "Double Tap Home"
- STR_CUSTOM_BOOTSCREEN: "Custom Boot Screen"
- STR_TAP_HIDE_STATUS_BAR: "Tap to Hide Status Bar"
+@@ -923,3 +923,41 @@ STR_STATUS_BAR_EMPTY: "Empty"
+ STR_STATUS_BAR_CLOCK: "Clock"
+ STR_STATUS_BAR_BOTH: "Both"
+ STR_CLOCK_OUTSIDE_READER: "Clock Outside Reader"
 +STR_READEST_SYNC: "Readest Sync"
 +STR_READEST_SYNC_BOOK: "Sync Readest"
 +STR_READEST_SYNCING_POSITION: "Syncing reading position..."
@@ -45,7 +45,7 @@ index 3a589c5a..78835a60 100644
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 9f66ac0d..0ca913f9 100644
+index 9f66ac0d..acee16da 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
 @@ -7,13 +7,19 @@
@@ -1379,10 +1379,10 @@ index 49a82a11..0502ed06 100644
    /**
     * Generate a fallback XPath by streaming the spine item's XHTML and resolving
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index c5a9d23c..79e3a4ea 100644
+index 90bce0ed..ad795451 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
-@@ -1364,12 +1364,13 @@ inline std::vector<SettingInfo> buildDisplaySleepSettingsList(const std::vector<
+@@ -1464,12 +1464,13 @@ inline std::vector<SettingInfo> buildDisplaySleepSettingsList(const std::vector<
  
  inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<SettingInfo>& allSettings) {
    std::vector<SettingInfo> systemSettings;
@@ -1431,7 +1431,7 @@ index 73ba26bf..9a177d9e 100644
  
  void silentRestart();                                            // home screen
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 0d276a8f..d949e9ed 100644
+index 6b05422b..c7b9ea90 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -28,6 +28,7 @@
@@ -1440,17 +1440,17 @@ index 0d276a8f..d949e9ed 100644
  #include "../settings/KOReaderSettingsActivity.h"
 +#include "../settings/ReadestSettingsActivity.h"
  #include "BookStatsActivity.h"
+ #include "BookStatsTracking.h"
  #include "ClipSelectionActivity.h"
- #include "ClippingStore.h"
-@@ -56,6 +57,7 @@
- #include "QrDisplayActivity.h"
+@@ -57,6 +58,7 @@
  #include "QuickActions.h"
+ #include "ReaderFontLoading.h"
  #include "ReaderUtils.h"
 +#include "ReadestSyncActivity.h"
  #include "RecentBooksStore.h"
  #include "SdCardFontSystem.h"
  #include "SilentRestart.h"
-@@ -68,6 +70,7 @@
+@@ -71,6 +73,7 @@
  #include "clippings/ClippingTextMatcher.h"
  #include "clippings/ClippingsManager.h"
  #include "components/UITheme.h"
@@ -1458,11 +1458,140 @@ index 0d276a8f..d949e9ed 100644
  #if CROSSINK_APP_CAP_TOUCH
  #include "components/TouchHeaderBackButton.h"
  #endif
-@@ -3924,6 +3927,38 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction
+@@ -474,11 +477,13 @@ bool advanceClipCursorToToken(const std::string& text, const uint16_t targetInde
+ 
+ ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
+                                                               const char* token, const size_t tokenLen,
+-                                                              const size_t tokenOffset = 0) {
++                                                              const size_t tokenOffset = 0,
++                                                              const bool clipStart = false,
++                                                              const bool clipEnd = false) {
+   const char* word = block.wordText(wordIndex);
+   const char* visibleWord = word + (hasEmSpacePrefix(word) ? 3 : 0);
+   return ClippingTextMatcher::matchTokenFragmentWithLength(visibleWord, block.wordEndsWithInsertedHyphen(wordIndex),
+-                                                           token, tokenLen, tokenOffset);
++                                                           token, tokenLen, tokenOffset, clipStart, clipEnd);
+ }
+ 
+ template <typename Pages, typename Callback>
+@@ -520,6 +525,12 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+                               const uint16_t startClipToken, const uint16_t minPartialMatch,
+                               const uint8_t expectedTableColumn, ClippingPageMatch& match,
+                               const bool allowShortBoundary = false) {
++  // A run that starts inside the clipping can only be the continuation of a
++  // clipping that began on an earlier page, so it has to start at the first
++  // word of this page. A tail that merely repeats mid-page is a coincidence.
++  if (!ClippingTextMatcher::startsWhereAClipCanContinue(startClipToken, startPageWord)) {
++    return false;
++  }
+   const char* cursor = nullptr;
+   const char* token = nullptr;
+   size_t tokenLen = 0;
+@@ -527,6 +538,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+     return false;
+   }
+ 
++  const uint16_t clipTokenCount = countClipTokens(clippingText);
+   uint16_t matchedTokens = 0;
+   uint16_t lastWord = startPageWord;
+   size_t tokenOffset = 0;
+@@ -552,7 +564,10 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+           return true;
+         }
+ 
+-        const auto fragmentResult = matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset);
++        const uint16_t clipTokenIndex = static_cast<uint16_t>(startClipToken + matchedTokens);
++        const auto fragmentResult =
++            matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset, clipTokenIndex == 0,
++                                 clipTokenIndex + 1 == clipTokenCount);
+         if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::MISMATCH) {
+           stoppedByMismatch = true;
+           return false;
+@@ -606,6 +621,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+   const bool tableColumnOnly = expectedTableColumn != UINT8_MAX;
+ 
+   ClippingMatchTracker matches;
++  bool bestIsComplete = false;
+ 
+   forEachVisiblePageWord(
+       page, [&](const uint16_t wordIndex, const PageTextLine& line, const TextBlock& block, const size_t i) {
+@@ -622,16 +638,24 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+             break;
+           }
+           ClippingPageMatch candidate;
+-          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen).match !=
++          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, 0, tokenIndex == 0,
++                                   tokenIndex + 1 == tokenCount)
++                  .match !=
+                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
+               matchClipRunFromPageWord(page, clippingText, wordIndex, tokenIndex, minPartialMatch, expectedTableColumn,
+                                        candidate, allowShortBoundary) &&
+               (requiredBoundary == UINT16_MAX ||
+                (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
+-            if (matches.record(candidate.startWord, candidate.endWord)) {
++            const bool candidateComplete = candidate.startsAtClipStart && candidate.reachesClipEnd;
++            // The first hit is kept, unless a later one covers the whole
++            // clipping: a full match always beats a partial run.
++            if (matches.record(candidate.startWord, candidate.endWord) || (candidateComplete && !bestIsComplete)) {
+               match = candidate;
++              bestIsComplete = candidateComplete;
+             }
+-            if (!uniqueMatch || !matches.unique()) {
++            // Keep scanning until a whole-clipping match is in hand, so a
++            // partial run found earlier on the page cannot hide it.
++            if (bestIsComplete && (!uniqueMatch || !matches.unique())) {
+               return false;
+             }
+           }
+@@ -666,9 +690,28 @@ struct AdjacentClippingPages {
+   }
+ };
+ 
+-bool findClippingTextOnPage(Section& section, const Page& page, const std::string& clippingText,
++// Readest sometimes starts a highlight on the full stop that ends the previous
++// sentence (". If you simulate ..."). That stop belongs to the previous page
++// word ("up."), so drop stray punctuation in front of the first letter or digit.
++std::string trimLeadingClipPunctuation(const std::string& text) {
++  size_t i = 0;
++  while (i < text.size()) {
++    const unsigned char c = static_cast<unsigned char>(text[i]);
++    if (c == 0xE2 && i + 2 < text.size() && static_cast<unsigned char>(text[i + 1]) == 0x80) {
++      i += 3;  // general punctuation: curly quotes, dashes, ellipsis
++    } else if (c < 0x80 && !std::isalnum(c)) {
++      i++;
++    } else {
++      break;
++    }
++  }
++  return i < text.size() ? text.substr(i) : text;
++}
++
++bool findClippingTextOnPage(Section& section, const Page& page, const std::string& rawClippingText,
+                             ClippingPageMatch& match, bool* uniqueMatch = nullptr,
+                             const uint8_t expectedTableColumn = UINT8_MAX) {
++  const std::string clippingText = trimLeadingClipPunctuation(rawClippingText);
+   if (findClippingTextInPages(page, clippingText, match, uniqueMatch, expectedTableColumn)) return true;
+ 
+   // Only read a neighbor if this page has an otherwise plausible short fragment.
+@@ -2856,6 +2899,13 @@ void EpubReaderActivity::loop() {
+     requestUpdate();
+     return;
+   }
++  // "R" status bar button: sync with Readest, same as the reader menu's Sync Readest
++  // entry (which asks for the account first if none is set up). Checked before the
++  // hand icon, whose hit zone would otherwise reach over it.
++  if (touch.tapped && GUI.isReadestIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x, touch.y)) {
++    onReaderMenuConfirm(EpubReaderMenuAction::READEST_SYNC, false, nullptr);
++    return;
++  }
+   if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
+                                                      touch.y)) {
+     // Disable-only: isTouchscreenIndicatorTap already refuses to report a
+@@ -4241,6 +4291,38 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
        }
        break;
      }
-+    case EpubReaderMenuActivity::MenuAction::READEST_SYNC: {
++    case EpubReaderMenuAction::READEST_SYNC: {
 +      if (!READEST_STORE.hasCredentials()) {
 +        pauseReadingPaceTimer("readest_settings");
 +        startActivityForResult(std::make_unique<ReadestSettingsActivity>(renderer, mappedInput),
@@ -1494,63 +1623,31 @@ index 0d276a8f..d949e9ed 100644
 +      activityManager.replaceActivity(std::move(restartActivity));
 +      break;
 +    }
-     case EpubReaderMenuActivity::MenuAction::NEARBY_POSITION_SYNC: {
+     case EpubReaderMenuAction::NEARBY_POSITION_SYNC: {
        const int currentPage = section ? section->currentPage : nextPageNumber;
        const int totalPages = section ? section->estimatedTotalPages() : std::max(1, cachedChapterTotalPageCount);
-diff --git a/src/activities/reader/EpubReaderMenuActivity.cpp b/src/activities/reader/EpubReaderMenuActivity.cpp
-index 35af2e47..6c0635cb 100644
---- a/src/activities/reader/EpubReaderMenuActivity.cpp
-+++ b/src/activities/reader/EpubReaderMenuActivity.cpp
-@@ -240,7 +240,7 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
-   auto& settingsItems = items[SETTINGS_TAB_INDEX];
- 
-   mainItems.reserve(9 + (hasFootnotes ? 1u : 0u) + (hasDictionary ? 2u : 0u));
--  bookmarkItems.reserve(9 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
-+  bookmarkItems.reserve(10 + (hasBookmarks ? 2u : 0u) + (hasClippings ? 1u : 0u));
-   settingsItems.reserve(6);
- 
-   if (hasFootnotes) {
-@@ -269,6 +269,7 @@ EpubReaderMenuActivity::TabMenuItems EpubReaderMenuActivity::buildMenuItems(
-     bookmarkItems.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
+@@ -4533,10 +4615,16 @@ bool EpubReaderActivity::handleFrontlightPanelResult(const FrontlightPanelResult
    }
-   bookmarkItems.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-+  bookmarkItems.push_back({MenuAction::READEST_SYNC, StrId::STR_READEST_SYNC_BOOK});
-   bookmarkItems.push_back({MenuAction::NEARBY_POSITION_SYNC, StrId::STR_NEARBY_POSITION_SYNC});
-   bookmarkItems.push_back({MenuAction::SEND_NEARBY_BOOK, StrId::STR_SEND_NEARBY_BOOK});
-   bookmarkItems.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
-diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
-index c9b3e28c..37015251 100644
---- a/src/activities/reader/EpubReaderMenuModel.h
-+++ b/src/activities/reader/EpubReaderMenuModel.h
-@@ -33,6 +33,7 @@ enum class EpubReaderMenuAction : uint8_t {
-   LOOKUP_HISTORY,
-   SET_BOOK_DICTIONARY,
-   STATUS_BAR_SETTINGS,
-+  READEST_SYNC,
- };
- 
- enum class ReaderDrawerTab : uint8_t { Font = 0, Layout = 1, More = 2, Location = 3, Settings = 4, Count };
-@@ -99,6 +100,7 @@ enum class ReaderDrawerCatalogItem : uint8_t {
-   FontSize,
-   DictionaryFontFamily,
-   DictionaryFontSize,
-+  ReadestSync,
- };
- 
- struct ReaderDrawerAvailability {
-@@ -159,6 +161,7 @@ constexpr ReaderDrawerCatalog makeReaderDrawerCatalog(const ReaderDrawerAvailabi
+   if (result.action == FrontlightPanelAction::None) return handled;
+   if (result.action != FrontlightPanelAction::SyncProgress &&
++      result.action != FrontlightPanelAction::ReadestSync &&
+       result.action != FrontlightPanelAction::NearbyPositionSync &&
+       result.action != FrontlightPanelAction::SendNearbyBook) {
+     return false;
    }
-   location.add(ReaderDrawerCatalogItem::SaveClipping);
-   if (available.hasClippings) location.add(ReaderDrawerCatalogItem::ViewClippings);
-+  location.add(ReaderDrawerCatalogItem::ReadestSync);
-   location.add(ReaderDrawerCatalogItem::Screenshot);
-   location.add(ReaderDrawerCatalogItem::DisplayQr);
++  if (result.action == FrontlightPanelAction::ReadestSync) {
++    // Same save-and-handoff path as the reader menu's Sync Readest entry.
++    onReaderMenuConfirm(EpubReaderMenuAction::READEST_SYNC, false, nullptr);
++    return true;
++  }
  
-diff --git a/src/activities/reader/EpubReaderTouchMenuActivity.cpp b/src/activities/reader/EpubReaderTouchMenuActivity.cpp
-index 96014ce6..37e9a2a0 100644
---- a/src/activities/reader/EpubReaderTouchMenuActivity.cpp
-+++ b/src/activities/reader/EpubReaderTouchMenuActivity.cpp
-@@ -1348,6 +1348,9 @@ void EpubReaderTouchMenuActivity::activateRow(const RowId row) {
+   PendingOverlayResume resume;
+   resume.origin = PendingOverlayOrigin::Reader;
+diff --git a/src/activities/reader/EpubReaderDrawerActivity.cpp b/src/activities/reader/EpubReaderDrawerActivity.cpp
+index 68c915b8..14ba7687 100644
+--- a/src/activities/reader/EpubReaderDrawerActivity.cpp
++++ b/src/activities/reader/EpubReaderDrawerActivity.cpp
+@@ -1819,6 +1819,9 @@ void EpubReaderDrawerActivity::activateRow(const RowId row) {
      case RowId::ViewClippings:
        action = EpubReaderMenuAction::VIEW_CLIPPINGS;
        break;
@@ -1560,7 +1657,7 @@ index 96014ce6..37e9a2a0 100644
      case RowId::ResetReadingPace:
        action = EpubReaderMenuAction::RESET_READING_PACE;
        break;
-@@ -2106,6 +2109,8 @@ const char* EpubReaderTouchMenuActivity::rowLabel(const RowId row) const {
+@@ -3002,6 +3005,8 @@ const char* EpubReaderDrawerActivity::rowLabel(const RowId row) const {
        return tr(STR_SAVE_CLIPPING);
      case RowId::ViewClippings:
        return tr(STR_VIEW_CLIPPINGS);
@@ -1569,14 +1666,42 @@ index 96014ce6..37e9a2a0 100644
      case RowId::DeleteBookmarks:
        return tr(STR_DELETE_BOOKMARKS);
      case RowId::StatusBar:
-@@ -2219,6 +2224,7 @@ bool EpubReaderTouchMenuActivity::rowShowsNavigationCaret(const RowId row) const
+@@ -3165,6 +3170,7 @@ bool EpubReaderDrawerActivity::rowShowsNavigationCaret(const RowId row) const {
      case RowId::DisplayQr:
      case RowId::Lookup:
      case RowId::SaveClipping:
 +    case RowId::ReadestSync:
      case RowId::ResetReadingPace:
+     case RowId::ResetBookReaderSettings:
      case RowId::DeleteBookmarks:
-     case RowId::DeleteCache:
+diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
+index d191462c..2ae6797d 100644
+--- a/src/activities/reader/EpubReaderMenuModel.h
++++ b/src/activities/reader/EpubReaderMenuModel.h
+@@ -35,6 +35,7 @@ enum class EpubReaderMenuAction : uint8_t {
+   SET_BOOK_DICTIONARY,
+   STATUS_BAR_SETTINGS,
+   RESET_BOOK_READER_SETTINGS,
++  READEST_SYNC,
+ };
+ 
+ enum class ReaderDrawerTab : uint8_t { Font = 0, Layout = 1, More = 2, Location = 3, Settings = 4, Count };
+@@ -150,6 +151,7 @@ enum class ReaderDrawerCatalogItem : uint8_t {
+   SyncProgress,
+   NearbyPositionSync,
+   SendNearbyBook,
++  ReadestSync,
+ };
+ 
+ struct ReaderDrawerAvailability {
+@@ -215,6 +217,7 @@ constexpr ReaderDrawerCatalog makeReaderDrawerCatalog(const ReaderDrawerAvailabi
+   }
+   location.add(ReaderDrawerCatalogItem::SaveClipping);
+   if (available.hasClippings) location.add(ReaderDrawerCatalogItem::ViewClippings);
++  location.add(ReaderDrawerCatalogItem::ReadestSync);
+   if (available.buttonDevice) {
+     location.add(ReaderDrawerCatalogItem::SyncProgress);
+     location.add(ReaderDrawerCatalogItem::NearbyPositionSync);
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
 index 00000000..7c0915fe
@@ -3098,10 +3223,10 @@ index 00000000..180540a8
 +  void askPassword();
 +};
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
-index 45dcf0f3..d0cfb3ca 100644
+index 65bcf1bb..1dac35ee 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
-@@ -30,6 +30,7 @@
+@@ -34,6 +34,7 @@
  #include "QuickActions.h"
  #include "QuickActionsActivity.h"
  #include "StatusIconsActivity.h"
@@ -3109,7 +3234,7 @@ index 45dcf0f3..d0cfb3ca 100644
  #include "SdCardFontSystem.h"
  #include "SdFirmwareUpdateActivity.h"
  #include "SettingsList.h"
-@@ -1067,6 +1068,9 @@ void SettingsActivity::toggleCurrentSetting() {
+@@ -1135,6 +1136,9 @@ void SettingsActivity::toggleCurrentSetting() {
        case SettingAction::KOReaderSync:
          startActivityForResult(std::make_unique<KOReaderSettingsActivity>(renderer, mappedInput), resultHandler);
          break;
@@ -3120,7 +3245,7 @@ index 45dcf0f3..d0cfb3ca 100644
          startActivityForResult(std::make_unique<OpdsServerListActivity>(renderer, mappedInput), resultHandler);
          break;
 diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
-index fd39d85c..68a3e8a5 100644
+index 8025b168..21b3b2ce 100644
 --- a/src/activities/settings/SettingsActivity.h
 +++ b/src/activities/settings/SettingsActivity.h
 @@ -23,6 +23,7 @@ enum class SettingAction {
@@ -3131,18 +3256,365 @@ index fd39d85c..68a3e8a5 100644
    OPDSBrowser,
    DisplaySleepScreen,
    DisplayFrontlight,
+diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
+index 8d79b453..3b735b4e 100644
+--- a/src/activities/util/FrontlightPanelActivity.cpp
++++ b/src/activities/util/FrontlightPanelActivity.cpp
+@@ -241,12 +241,12 @@ void FrontlightPanelActivity::openGlobalSettings() {
+ }
+ 
+ void FrontlightPanelActivity::openSyncDialog() {
+-  static constexpr std::array<StrId, 3> OPTIONS = {StrId::STR_SYNC_PROGRESS, StrId::STR_NEARBY_POSITION_SYNC,
+-                                                   StrId::STR_SEND_NEARBY_BOOK};
++  static constexpr std::array<StrId, 4> OPTIONS = {StrId::STR_SYNC_PROGRESS, StrId::STR_READEST_SYNC_BOOK,
++                                                   StrId::STR_NEARBY_POSITION_SYNC, StrId::STR_SEND_NEARBY_BOOK};
+   drawerState.syncDialogOpen = true;
+   const bool canSyncBookProgress = context.activeEpub;
+   const bool canSendBook = !context.bookPath.empty();
+-  optionPopup.show(StrId::STR_SYNC_AND_TRANSFER, OPTIONS.data(), OPTIONS.size(), canSyncBookProgress ? 0 : 2,
++  optionPopup.show(StrId::STR_SYNC_AND_TRANSFER, OPTIONS.data(), OPTIONS.size(), canSyncBookProgress ? 0 : 3,
+                    [this](const int index) {
+                      drawerState.syncDialogOpen = false;
+                      FrontlightPanelResult panelResult;
+@@ -254,12 +254,13 @@ void FrontlightPanelActivity::openSyncDialog() {
+                      panelResult.activeEpub = context.activeEpub;
+                      panelResult.bookPath = context.bookPath;
+                      if (index == 0) panelResult.action = FrontlightPanelAction::SyncProgress;
+-                     if (index == 1) panelResult.action = FrontlightPanelAction::NearbyPositionSync;
+-                     if (index == 2) panelResult.action = FrontlightPanelAction::SendNearbyBook;
++                     if (index == 1) panelResult.action = FrontlightPanelAction::ReadestSync;
++                     if (index == 2) panelResult.action = FrontlightPanelAction::NearbyPositionSync;
++                     if (index == 3) panelResult.action = FrontlightPanelAction::SendNearbyBook;
+                      setResult(ActivityResult(std::move(panelResult)));
+                      finish();
+                    });
+-  optionPopup.setDisabledOptions({!canSyncBookProgress, !canSyncBookProgress, !canSendBook});
++  optionPopup.setDisabledOptions({!canSyncBookProgress, !canSyncBookProgress, !canSyncBookProgress, !canSendBook});
+   optionPopup.setCancelCallback([this] { closeSyncDialog(); });
+   requestUpdate();
+ }
+diff --git a/src/activities/util/FrontlightPanelModel.h b/src/activities/util/FrontlightPanelModel.h
+index cc48f2c6..f0bb5c7a 100644
+--- a/src/activities/util/FrontlightPanelModel.h
++++ b/src/activities/util/FrontlightPanelModel.h
+@@ -11,6 +11,7 @@ enum class FrontlightPanelAction : uint8_t {
+   SyncProgress,
+   NearbyPositionSync,
+   SendNearbyBook,
++  ReadestSync,
+ };
+ 
+ enum class FrontlightBookSource : uint8_t { CurrentBook = 0, LastBook, DeviceOnly };
+diff --git a/src/clippings/ClippingTextMatcher.h b/src/clippings/ClippingTextMatcher.h
+index 45e9a3bc..16c16956 100644
+--- a/src/clippings/ClippingTextMatcher.h
++++ b/src/clippings/ClippingTextMatcher.h
+@@ -20,10 +20,101 @@ struct TokenFragmentResult {
+ // A complete clipping can be short. A partial run needs enough words to avoid
+ // highlighting a coincidental first/last word at a page boundary after relayout.
+ // Short fragments need an exact saved range or verification across adjacent pages.
++//
++// A partial run that starts inside the clipping (startClipToken > 0) is a
++// continuation from the previous page, so it must begin at the very first word
++// of the page. Anything else is a coincidental repeat of the clipping's tail
++// (e.g. "it is good." inside a longer sentence) and is never a match.
++constexpr uint16_t RELIABLE_PARTIAL_TOKENS = 8;
++
++inline bool startsWhereAClipCanContinue(const uint16_t startClipToken, const uint16_t startPageWord) {
++  return startClipToken == 0 || startPageWord == 0;
++}
++
+ inline bool isReliableRun(const uint16_t startClipToken, const bool reachedClipEnd, const uint16_t matchedTokens,
+                           const uint16_t minPartialMatch) {
+   if (matchedTokens == 0) return false;
+-  return (startClipToken == 0 && reachedClipEnd) || matchedTokens >= minPartialMatch;
++  if (startClipToken == 0 && reachedClipEnd) return true;
++  const uint16_t needed = minPartialMatch > RELIABLE_PARTIAL_TOKENS ? minPartialMatch : RELIABLE_PARTIAL_TOKENS;
++  return matchedTokens >= needed;
++}
++
++// UTF-8 decode of one code point; malformed bytes decode as themselves.
++inline uint32_t nextCodepoint(const char* text, const size_t length, size_t& offset) {
++  const auto b0 = static_cast<unsigned char>(text[offset]);
++  size_t extra = 0;
++  uint32_t cp = b0;
++  if (b0 >= 0xF0) {
++    extra = 3;
++    cp = b0 & 0x07;
++  } else if (b0 >= 0xE0) {
++    extra = 2;
++    cp = b0 & 0x0F;
++  } else if (b0 >= 0xC0) {
++    extra = 1;
++    cp = b0 & 0x1F;
++  }
++  if (offset + extra >= length) {  // truncated sequence
++    offset++;
++    return b0;
++  }
++  for (size_t i = 1; i <= extra; ++i) {
++    const auto b = static_cast<unsigned char>(text[offset + i]);
++    if ((b & 0xC0) != 0x80) {
++      offset++;
++      return b0;
++    }
++    cp = (cp << 6) | (b & 0x3F);
++  }
++  offset += extra + 1;
++  return cp;
++}
++
++// Comparison form of a code point. The reader shows text after CSS
++// text-transform / small-caps (so "He" can render as "HE") and books mix
++// curly and straight quotes, so highlight matching ignores case and treats
++// every quote or dash variant as its plain ASCII counterpart.
++inline uint32_t foldForMatch(const uint32_t cp) {
++  if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
++  if (cp < 0x80) return cp;
++  switch (cp) {
++    case 0x2018:  // left single quote
++    case 0x2019:  // right single quote / apostrophe
++    case 0x201A:
++    case 0x201B:
++    case 0x2032:  // prime
++    case 0x02BC:  // modifier letter apostrophe
++      return '\'';
++    case 0x201C:  // left double quote
++    case 0x201D:  // right double quote
++    case 0x201E:
++    case 0x201F:
++    case 0x2033:
++      return '"';
++    case 0x2010:  // hyphen
++    case 0x2011:  // non-breaking hyphen
++    case 0x2012:
++    case 0x2013:
++    case 0x2014:
++    case 0x2015:
++    case 0x2212:
++      return '-';
++    default:
++      break;
++  }
++  if ((cp >= 0xC0 && cp <= 0xDE && cp != 0xD7)) return cp + 0x20;  // Latin-1 capitals
++  if (cp >= 0x410 && cp <= 0x42F) return cp + 0x20;               // Cyrillic capitals
++  if (cp >= 0x400 && cp <= 0x40F) return cp + 0x50;
++  if (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2) return cp + 0x20;  // Greek capitals
++  return cp;
++}
++
++// Punctuation, quotes and symbols that hug the edge of a word ("God.", "\xE2\x80\x98Ur,",
++// "good?\xE2\x80\x99"). Readest highlights often stop just inside them.
++inline bool isEdgePunctuation(const uint32_t cp) {
++  if (cp < 0x80) return !((cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z'));
++  return (cp >= 0xA1 && cp <= 0xBF) || cp == 0xD7 || cp == 0xF7 || (cp >= 0x2010 && cp <= 0x206F) ||
++         (cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F);
+ }
+ 
+ inline bool isNonBreakingSpace(const char* text, const size_t length, const size_t offset) {
+@@ -37,9 +128,17 @@ inline bool isNonBreakingSpace(const char* text, const size_t length, const size
+ // before the next display fragment is equivalent to the ordinary space stored
+ // in the clipping. An inserted hyphen is omitted from the saved token before
+ // matching its fragment.
++//
++// A highlight made in another reader can start just after, or stop just
++// before, punctuation that belongs to the printed word (a quote, a full stop,
++// "?'"). So the first token of a clipping may skip punctuation in front of the
++// page word (clipStart) and the last token may leave punctuation behind it
++// (clipEnd). Letters and digits are never skipped, so different words still
++// do not match.
+ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const bool endsWithInsertedHyphen,
+                                                         const char* token, const size_t tokenLen,
+-                                                        const size_t tokenOffset) {
++                                                        const size_t tokenOffset, const bool clipStart = false,
++                                                        const bool clipEnd = false) {
+   if (!word || !token || tokenLen == 0 || tokenOffset >= tokenLen) {
+     return {};
+   }
+@@ -54,24 +153,55 @@ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const
+ 
+   size_t wordOffset = 0;
+   size_t matchedTokenBytes = 0;
+-  while (wordOffset < wordLen && tokenOffset + matchedTokenBytes < tokenLen) {
+-    if (isNonBreakingSpace(word, wordLen, wordOffset) && token[tokenOffset + matchedTokenBytes] == ' ') {
++  const size_t tokenAvailable = tokenLen - tokenOffset;
++  const char* tokenFrom = token + tokenOffset;
++
++  if (clipStart && tokenOffset == 0) {
++    // Skip punctuation the saved text left out in front of the word.
++    size_t firstToken = 0;
++    const uint32_t tokenFirstCp = foldForMatch(nextCodepoint(tokenFrom, tokenAvailable, firstToken));
++    while (wordOffset < wordLen) {
++      size_t next = wordOffset;
++      const uint32_t wordCp = nextCodepoint(word, wordLen, next);
++      if (!isEdgePunctuation(wordCp) || foldForMatch(wordCp) == tokenFirstCp) break;
++      wordOffset = next;
++    }
++  }
++  while (wordOffset < wordLen && matchedTokenBytes < tokenAvailable) {
++    if (isNonBreakingSpace(word, wordLen, wordOffset) && tokenFrom[matchedTokenBytes] == ' ') {
+       wordOffset += 2;
+       matchedTokenBytes++;
+       continue;
+     }
+-    if (word[wordOffset] != token[tokenOffset + matchedTokenBytes]) {
++    size_t nextWord = wordOffset;
++    size_t nextToken = matchedTokenBytes;
++    const uint32_t wordCp = nextCodepoint(word, wordLen, nextWord);
++    const uint32_t tokenCp = nextCodepoint(tokenFrom, tokenAvailable, nextToken);
++    if (foldForMatch(wordCp) != foldForMatch(tokenCp)) {
+       return {};
+     }
+-    wordOffset++;
+-    matchedTokenBytes++;
++    wordOffset = nextWord;
++    matchedTokenBytes = nextToken;
++  }
++
++  if (wordOffset != wordLen && clipEnd && !endsWithInsertedHyphen && matchedTokenBytes == tokenAvailable) {
++    // The saved text ends before trailing punctuation of this word.
++    size_t rest = wordOffset;
++    bool onlyPunctuation = true;
++    while (rest < wordLen) {
++      if (!isEdgePunctuation(nextCodepoint(word, wordLen, rest))) {
++        onlyPunctuation = false;
++        break;
++      }
++    }
++    if (onlyPunctuation) wordOffset = wordLen;
+   }
+ 
+   if (wordOffset != wordLen) {
+     return {};
+   }
+ 
+-  const bool completesToken = tokenOffset + matchedTokenBytes == tokenLen;
++  const bool completesToken = matchedTokenBytes == tokenAvailable;
+   if (completesToken && endsWithInsertedHyphen) {
+     return {};
+   }
+diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
+index fcde384f..1b1228c2 100644
+--- a/src/components/themes/BaseTheme.cpp
++++ b/src/components/themes/BaseTheme.cpp
+@@ -1199,6 +1199,7 @@ void BaseTheme::drawReaderStatusBar(GfxRenderer& renderer, const ReaderStatusBar
+       const int rowTop = edgeY + progressSpace;
+       drawFrontlightStatusIndicator(renderer, rowTop, content.darkMode);
+       drawTouchscreenIndicator(renderer, rowTop, content.darkMode);
++      drawReadestIndicator(renderer, rowTop, content.darkMode);
+       bookmarkReserve = std::max(0, iconsRight - std::max(marginLeft, StatusBarMetrics::sideInset)) + 4;
+     }
+   }
+@@ -1329,6 +1330,70 @@ void BaseTheme::drawReaderStatusBar(GfxRenderer& renderer, const ReaderStatusBar
+   }
+ }
+ 
++void BaseTheme::drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  if (!layout.visible(StatusIconRow::Readest)) {
++    return;
++  }
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int boxY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
++  const int boxX = layout.x(StatusIconRow::Readest);
++
++  // Drawn with text and a rectangle rather than a packed bitmap, so it stays
++  // upright in every orientation without a hand-rotated glyph table.
++  renderer.drawRect(boxX, boxY, touchStatusIconSize, touchStatusIconSize, !darkMode);
++  const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, "R", EpdFontFamily::BOLD);
++  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
++  renderer.drawText(SMALL_FONT_ID, boxX + (touchStatusIconSize - textWidth) / 2,
++                    boxY + (touchStatusIconSize - lineHeight) / 2, "R", !darkMode, EpdFontFamily::BOLD);
++}
++
++bool BaseTheme::isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++
++  // Runs from the middle of the gap before the R box to the middle of the gap
++  // after it (or well past it when it is last), following the user's icon order.
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  int hitLeft = 0;
++  int hitRight = 0;
++  if (!layout.hitRange(StatusIconRow::Readest, hitLeft, hitRight)) {
++    return false;
++  }
++  return touchX >= hitLeft && touchX < hitRight && touchY >= baseTopY && touchY < baseTopY + statusBarHeight;
++}
++
+ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, const char* previewTime,
+                                       const bool readerContext, const int textYOffset, const bool darkMode,
+                                       const bool forceVisible) const {
+@@ -1338,6 +1403,7 @@ void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, con
+   // the one place every screen, reader and non-reader alike, already calls.
+   drawFrontlightStatusIndicator(renderer, topY, darkMode);
+   drawTouchscreenIndicator(renderer, topY, darkMode);
++  drawReadestIndicator(renderer, topY, darkMode);
+ 
+   if (!forceVisible && !SETTINGS.shouldShowClockOutsideReader()) {
+     return;
+diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
+index 62c15abd..5c39ffaf 100644
+--- a/src/components/themes/BaseTheme.h
++++ b/src/components/themes/BaseTheme.h
+@@ -314,6 +314,13 @@ class BaseTheme {
+   // Hit test on the hand icon regardless of the current touchscreen state
+   // (for screens where touch always works, e.g. home).
+   bool isTouchscreenIndicatorHit(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // "R" (Readest sync) button, drawn right of the touchscreen hand in the
++  // reader's top status bar only. Tapping it runs Sync Readest, exactly like
++  // the reader menu entry. Hidden when the touchscreen is off (it could not be
++  // tapped) and on non-touch hardware. Called by the EPUB reader itself, after
++  // drawTopStatusBarClock(), so it never shows outside reading mode.
++  void drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  bool isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
+   // Button hint labels use three states: non-empty labels draw an active hint,
+   // an empty string clears an inactive slot, and nullptr preserves the existing
+   // background without drawing or registering a target.
 diff --git a/src/main.cpp b/src/main.cpp
-index cd01e87c..2b7e2178 100644
+index 62802ca4..904c60aa 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -93,12 +93,14 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+@@ -93,6 +93,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
  #include "activities/boot_sleep/ImageFolderIndex.h"
  #include "activities/home/BookActions.h"
  #include "activities/reader/KOReaderSyncActivity.h"
 +#include "activities/reader/ReadestSyncActivity.h"
+ #include "activities/reader/ReaderUtils.h"
  #include "activities/reader/ReadingStatsUtils.h"
  #include "activities/reader/StatsBackup.h"
- #include "activities/settings/FontDownloadActivity.h"
+@@ -100,6 +101,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
  #include "activities/settings/KOReaderAuthActivity.h"
  #include "activities/settings/KOReaderSettingsActivity.h"
  #include "activities/settings/OtaUpdateActivity.h"
@@ -3150,7 +3622,7 @@ index cd01e87c..2b7e2178 100644
  #include "activities/settings/SdFirmwareUpdateActivity.h"
  #include "components/UITheme.h"
  #include "components/icons/tablerFilledIcons.h"
-@@ -1506,6 +1508,35 @@ void setup() {
+@@ -1503,6 +1505,35 @@ void setup() {
        case NetworkBootTarget::FILE_TRANSFER:
          launched = activityManager.resumeFileTransferFromNetworkBoot(snapshotPayload);
          break;
@@ -4559,283 +5031,6 @@ index 00000000..0ca19c37
 +namespace ReadestTextEpub {
 +bool download(const std::string& url, const std::string& destPath);
 +}  // namespace ReadestTextEpub
-diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index d949e9ed..ea378f44 100644
---- a/src/activities/reader/EpubReaderActivity.cpp
-+++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -468,11 +468,13 @@ bool advanceClipCursorToToken(const std::string& text, const uint16_t targetInde
- 
- ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
-                                                               const char* token, const size_t tokenLen,
--                                                              const size_t tokenOffset = 0) {
-+                                                              const size_t tokenOffset = 0,
-+                                                              const bool clipStart = false,
-+                                                              const bool clipEnd = false) {
-   const char* word = block.wordText(wordIndex);
-   const char* visibleWord = word + (hasEmSpacePrefix(word) ? 3 : 0);
-   return ClippingTextMatcher::matchTokenFragmentWithLength(visibleWord, block.wordEndsWithInsertedHyphen(wordIndex),
--                                                           token, tokenLen, tokenOffset);
-+                                                           token, tokenLen, tokenOffset, clipStart, clipEnd);
- }
- 
- template <typename Pages, typename Callback>
-@@ -514,6 +516,12 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
-                               const uint16_t startClipToken, const uint16_t minPartialMatch,
-                               const uint8_t expectedTableColumn, ClippingPageMatch& match,
-                               const bool allowShortBoundary = false) {
-+  // A run that starts inside the clipping can only be the continuation of a
-+  // clipping that began on an earlier page, so it has to start at the first
-+  // word of this page. A tail that merely repeats mid-page is a coincidence.
-+  if (!ClippingTextMatcher::startsWhereAClipCanContinue(startClipToken, startPageWord)) {
-+    return false;
-+  }
-   const char* cursor = nullptr;
-   const char* token = nullptr;
-   size_t tokenLen = 0;
-@@ -521,6 +529,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
-     return false;
-   }
- 
-+  const uint16_t clipTokenCount = countClipTokens(clippingText);
-   uint16_t matchedTokens = 0;
-   uint16_t lastWord = startPageWord;
-   size_t tokenOffset = 0;
-@@ -546,7 +555,10 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
-           return true;
-         }
- 
--        const auto fragmentResult = matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset);
-+        const uint16_t clipTokenIndex = static_cast<uint16_t>(startClipToken + matchedTokens);
-+        const auto fragmentResult =
-+            matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset, clipTokenIndex == 0,
-+                                 clipTokenIndex + 1 == clipTokenCount);
-         if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::MISMATCH) {
-           stoppedByMismatch = true;
-           return false;
-@@ -600,6 +612,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
-   const bool tableColumnOnly = expectedTableColumn != UINT8_MAX;
- 
-   ClippingMatchTracker matches;
-+  bool bestIsComplete = false;
- 
-   forEachVisiblePageWord(
-       page, [&](const uint16_t wordIndex, const PageTextLine& line, const TextBlock& block, const size_t i) {
-@@ -616,16 +629,24 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
-             break;
-           }
-           ClippingPageMatch candidate;
--          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen).match !=
-+          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, 0, tokenIndex == 0,
-+                                   tokenIndex + 1 == tokenCount)
-+                  .match !=
-                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
-               matchClipRunFromPageWord(page, clippingText, wordIndex, tokenIndex, minPartialMatch, expectedTableColumn,
-                                        candidate, allowShortBoundary) &&
-               (requiredBoundary == UINT16_MAX ||
-                (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
--            if (matches.record(candidate.startWord, candidate.endWord)) {
-+            const bool candidateComplete = candidate.startsAtClipStart && candidate.reachesClipEnd;
-+            // The first hit is kept, unless a later one covers the whole
-+            // clipping: a full match always beats a partial run.
-+            if (matches.record(candidate.startWord, candidate.endWord) || (candidateComplete && !bestIsComplete)) {
-               match = candidate;
-+              bestIsComplete = candidateComplete;
-             }
--            if (!uniqueMatch || !matches.unique()) {
-+            // Keep scanning until a whole-clipping match is in hand, so a
-+            // partial run found earlier on the page cannot hide it.
-+            if (bestIsComplete && (!uniqueMatch || !matches.unique())) {
-               return false;
-             }
-           }
-diff --git a/src/clippings/ClippingTextMatcher.h b/src/clippings/ClippingTextMatcher.h
-index 45e9a3bc..16c16956 100644
---- a/src/clippings/ClippingTextMatcher.h
-+++ b/src/clippings/ClippingTextMatcher.h
-@@ -20,10 +20,101 @@ struct TokenFragmentResult {
- // A complete clipping can be short. A partial run needs enough words to avoid
- // highlighting a coincidental first/last word at a page boundary after relayout.
- // Short fragments need an exact saved range or verification across adjacent pages.
-+//
-+// A partial run that starts inside the clipping (startClipToken > 0) is a
-+// continuation from the previous page, so it must begin at the very first word
-+// of the page. Anything else is a coincidental repeat of the clipping's tail
-+// (e.g. "it is good." inside a longer sentence) and is never a match.
-+constexpr uint16_t RELIABLE_PARTIAL_TOKENS = 8;
-+
-+inline bool startsWhereAClipCanContinue(const uint16_t startClipToken, const uint16_t startPageWord) {
-+  return startClipToken == 0 || startPageWord == 0;
-+}
-+
- inline bool isReliableRun(const uint16_t startClipToken, const bool reachedClipEnd, const uint16_t matchedTokens,
-                           const uint16_t minPartialMatch) {
-   if (matchedTokens == 0) return false;
--  return (startClipToken == 0 && reachedClipEnd) || matchedTokens >= minPartialMatch;
-+  if (startClipToken == 0 && reachedClipEnd) return true;
-+  const uint16_t needed = minPartialMatch > RELIABLE_PARTIAL_TOKENS ? minPartialMatch : RELIABLE_PARTIAL_TOKENS;
-+  return matchedTokens >= needed;
-+}
-+
-+// UTF-8 decode of one code point; malformed bytes decode as themselves.
-+inline uint32_t nextCodepoint(const char* text, const size_t length, size_t& offset) {
-+  const auto b0 = static_cast<unsigned char>(text[offset]);
-+  size_t extra = 0;
-+  uint32_t cp = b0;
-+  if (b0 >= 0xF0) {
-+    extra = 3;
-+    cp = b0 & 0x07;
-+  } else if (b0 >= 0xE0) {
-+    extra = 2;
-+    cp = b0 & 0x0F;
-+  } else if (b0 >= 0xC0) {
-+    extra = 1;
-+    cp = b0 & 0x1F;
-+  }
-+  if (offset + extra >= length) {  // truncated sequence
-+    offset++;
-+    return b0;
-+  }
-+  for (size_t i = 1; i <= extra; ++i) {
-+    const auto b = static_cast<unsigned char>(text[offset + i]);
-+    if ((b & 0xC0) != 0x80) {
-+      offset++;
-+      return b0;
-+    }
-+    cp = (cp << 6) | (b & 0x3F);
-+  }
-+  offset += extra + 1;
-+  return cp;
-+}
-+
-+// Comparison form of a code point. The reader shows text after CSS
-+// text-transform / small-caps (so "He" can render as "HE") and books mix
-+// curly and straight quotes, so highlight matching ignores case and treats
-+// every quote or dash variant as its plain ASCII counterpart.
-+inline uint32_t foldForMatch(const uint32_t cp) {
-+  if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
-+  if (cp < 0x80) return cp;
-+  switch (cp) {
-+    case 0x2018:  // left single quote
-+    case 0x2019:  // right single quote / apostrophe
-+    case 0x201A:
-+    case 0x201B:
-+    case 0x2032:  // prime
-+    case 0x02BC:  // modifier letter apostrophe
-+      return '\'';
-+    case 0x201C:  // left double quote
-+    case 0x201D:  // right double quote
-+    case 0x201E:
-+    case 0x201F:
-+    case 0x2033:
-+      return '"';
-+    case 0x2010:  // hyphen
-+    case 0x2011:  // non-breaking hyphen
-+    case 0x2012:
-+    case 0x2013:
-+    case 0x2014:
-+    case 0x2015:
-+    case 0x2212:
-+      return '-';
-+    default:
-+      break;
-+  }
-+  if ((cp >= 0xC0 && cp <= 0xDE && cp != 0xD7)) return cp + 0x20;  // Latin-1 capitals
-+  if (cp >= 0x410 && cp <= 0x42F) return cp + 0x20;               // Cyrillic capitals
-+  if (cp >= 0x400 && cp <= 0x40F) return cp + 0x50;
-+  if (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2) return cp + 0x20;  // Greek capitals
-+  return cp;
-+}
-+
-+// Punctuation, quotes and symbols that hug the edge of a word ("God.", "\xE2\x80\x98Ur,",
-+// "good?\xE2\x80\x99"). Readest highlights often stop just inside them.
-+inline bool isEdgePunctuation(const uint32_t cp) {
-+  if (cp < 0x80) return !((cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z'));
-+  return (cp >= 0xA1 && cp <= 0xBF) || cp == 0xD7 || cp == 0xF7 || (cp >= 0x2010 && cp <= 0x206F) ||
-+         (cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F);
- }
- 
- inline bool isNonBreakingSpace(const char* text, const size_t length, const size_t offset) {
-@@ -37,9 +128,17 @@ inline bool isNonBreakingSpace(const char* text, const size_t length, const size
- // before the next display fragment is equivalent to the ordinary space stored
- // in the clipping. An inserted hyphen is omitted from the saved token before
- // matching its fragment.
-+//
-+// A highlight made in another reader can start just after, or stop just
-+// before, punctuation that belongs to the printed word (a quote, a full stop,
-+// "?'"). So the first token of a clipping may skip punctuation in front of the
-+// page word (clipStart) and the last token may leave punctuation behind it
-+// (clipEnd). Letters and digits are never skipped, so different words still
-+// do not match.
- inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const bool endsWithInsertedHyphen,
-                                                         const char* token, const size_t tokenLen,
--                                                        const size_t tokenOffset) {
-+                                                        const size_t tokenOffset, const bool clipStart = false,
-+                                                        const bool clipEnd = false) {
-   if (!word || !token || tokenLen == 0 || tokenOffset >= tokenLen) {
-     return {};
-   }
-@@ -54,24 +153,55 @@ inline TokenFragmentResult matchTokenFragmentWithLength(const char* word, const
- 
-   size_t wordOffset = 0;
-   size_t matchedTokenBytes = 0;
--  while (wordOffset < wordLen && tokenOffset + matchedTokenBytes < tokenLen) {
--    if (isNonBreakingSpace(word, wordLen, wordOffset) && token[tokenOffset + matchedTokenBytes] == ' ') {
-+  const size_t tokenAvailable = tokenLen - tokenOffset;
-+  const char* tokenFrom = token + tokenOffset;
-+
-+  if (clipStart && tokenOffset == 0) {
-+    // Skip punctuation the saved text left out in front of the word.
-+    size_t firstToken = 0;
-+    const uint32_t tokenFirstCp = foldForMatch(nextCodepoint(tokenFrom, tokenAvailable, firstToken));
-+    while (wordOffset < wordLen) {
-+      size_t next = wordOffset;
-+      const uint32_t wordCp = nextCodepoint(word, wordLen, next);
-+      if (!isEdgePunctuation(wordCp) || foldForMatch(wordCp) == tokenFirstCp) break;
-+      wordOffset = next;
-+    }
-+  }
-+  while (wordOffset < wordLen && matchedTokenBytes < tokenAvailable) {
-+    if (isNonBreakingSpace(word, wordLen, wordOffset) && tokenFrom[matchedTokenBytes] == ' ') {
-       wordOffset += 2;
-       matchedTokenBytes++;
-       continue;
-     }
--    if (word[wordOffset] != token[tokenOffset + matchedTokenBytes]) {
-+    size_t nextWord = wordOffset;
-+    size_t nextToken = matchedTokenBytes;
-+    const uint32_t wordCp = nextCodepoint(word, wordLen, nextWord);
-+    const uint32_t tokenCp = nextCodepoint(tokenFrom, tokenAvailable, nextToken);
-+    if (foldForMatch(wordCp) != foldForMatch(tokenCp)) {
-       return {};
-     }
--    wordOffset++;
--    matchedTokenBytes++;
-+    wordOffset = nextWord;
-+    matchedTokenBytes = nextToken;
-+  }
-+
-+  if (wordOffset != wordLen && clipEnd && !endsWithInsertedHyphen && matchedTokenBytes == tokenAvailable) {
-+    // The saved text ends before trailing punctuation of this word.
-+    size_t rest = wordOffset;
-+    bool onlyPunctuation = true;
-+    while (rest < wordLen) {
-+      if (!isEdgePunctuation(nextCodepoint(word, wordLen, rest))) {
-+        onlyPunctuation = false;
-+        break;
-+      }
-+    }
-+    if (onlyPunctuation) wordOffset = wordLen;
-   }
- 
-   if (wordOffset != wordLen) {
-     return {};
-   }
- 
--  const bool completesToken = tokenOffset + matchedTokenBytes == tokenLen;
-+  const bool completesToken = matchedTokenBytes == tokenAvailable;
-   if (completesToken && endsWithInsertedHyphen) {
-     return {};
-   }
 diff --git a/test/clip_word_store/ClipWordStoreTest.cpp b/test/clip_word_store/ClipWordStoreTest.cpp
 index a7da7074..43ad1295 100644
 --- a/test/clip_word_store/ClipWordStoreTest.cpp
@@ -4942,224 +5137,3 @@ index a7da7074..43ad1295 100644
 +                .match,
 +            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
 +}
-diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index ea378f4..8428d13 100644
---- a/src/activities/reader/EpubReaderActivity.cpp
-+++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -2677,6 +2677,14 @@ void EpubReaderActivity::loop() {
-     requestUpdate();
-     return;
-   }
-+  // "R" status bar button: sync with Readest, same as the reader menu's Sync Readest
-+  // entry (which asks for the account first if none is set up). Checked before the
-+  // hand icon, whose hit zone would otherwise reach over it.
-+  if (touch.tapped && GUI.isReadestIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding, touch.x,
-+                                                 touch.y)) {
-+    onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::READEST_SYNC, false, nullptr);
-+    return;
-+  }
-   if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding,
-                                                      touch.x, touch.y)) {
-     // Disable-only: isTouchscreenIndicatorTap already refuses to report a
-@@ -4235,10 +4243,16 @@ void EpubReaderActivity::onFrontlightPanelClosed() {
- bool EpubReaderActivity::handleFrontlightPanelResult(const FrontlightPanelResult& result) {
-   if (!epub || result.action == FrontlightPanelAction::None) return false;
-   if (result.action != FrontlightPanelAction::SyncProgress &&
-+      result.action != FrontlightPanelAction::ReadestSync &&
-       result.action != FrontlightPanelAction::NearbyPositionSync &&
-       result.action != FrontlightPanelAction::SendNearbyBook) {
-     return false;
-   }
-+  if (result.action == FrontlightPanelAction::ReadestSync) {
-+    // Same save-and-handoff path as the reader menu's Sync Readest entry.
-+    onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::READEST_SYNC, false, nullptr);
-+    return true;
-+  }
- 
-   PendingOverlayResume resume;
-   resume.origin = PendingOverlayOrigin::Reader;
-@@ -7596,6 +7610,8 @@ void EpubReaderActivity::renderStatusBar() const {
-                     static_cast<int>(referencePageCount), !activeFootnotePreview, pageCountEstimated);
-   GUI.drawTopStatusBarClock(renderer, UITheme::getInstance().getMetrics().topPadding, nullptr, true, 0,
-                             ReaderUtils::readerDarkModeEnabled());
-+  GUI.drawReadestIndicator(renderer, UITheme::getInstance().getMetrics().topPadding,
-+                           ReaderUtils::readerDarkModeEnabled());
- }
- 
- void EpubReaderActivity::refreshChapterGroupEstimate(const uint16_t viewportWidth, const uint16_t viewportHeight) {
-diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
-index 9adea32..9809bb9 100644
---- a/src/activities/util/FrontlightPanelActivity.cpp
-+++ b/src/activities/util/FrontlightPanelActivity.cpp
-@@ -221,12 +221,12 @@ void FrontlightPanelActivity::openGlobalSettings() {
- }
- 
- void FrontlightPanelActivity::openSyncDialog() {
--  static constexpr std::array<StrId, 3> OPTIONS = {StrId::STR_SYNC_PROGRESS, StrId::STR_NEARBY_POSITION_SYNC,
--                                                   StrId::STR_SEND_NEARBY_BOOK};
-+  static constexpr std::array<StrId, 4> OPTIONS = {StrId::STR_SYNC_PROGRESS, StrId::STR_READEST_SYNC_BOOK,
-+                                                   StrId::STR_NEARBY_POSITION_SYNC, StrId::STR_SEND_NEARBY_BOOK};
-   drawerState.syncDialogOpen = true;
-   const bool canSyncBookProgress = context.activeEpub;
-   const bool canSendBook = !context.bookPath.empty();
--  optionPopup.show(StrId::STR_SYNC_AND_TRANSFER, OPTIONS.data(), OPTIONS.size(), canSyncBookProgress ? 0 : 2,
-+  optionPopup.show(StrId::STR_SYNC_AND_TRANSFER, OPTIONS.data(), OPTIONS.size(), canSyncBookProgress ? 0 : 3,
-                    [this](const int index) {
-                      drawerState.syncDialogOpen = false;
-                      FrontlightPanelResult panelResult;
-@@ -234,12 +234,13 @@ void FrontlightPanelActivity::openSyncDialog() {
-                      panelResult.activeEpub = context.activeEpub;
-                      panelResult.bookPath = context.bookPath;
-                      if (index == 0) panelResult.action = FrontlightPanelAction::SyncProgress;
--                     if (index == 1) panelResult.action = FrontlightPanelAction::NearbyPositionSync;
--                     if (index == 2) panelResult.action = FrontlightPanelAction::SendNearbyBook;
-+                     if (index == 1) panelResult.action = FrontlightPanelAction::ReadestSync;
-+                     if (index == 2) panelResult.action = FrontlightPanelAction::NearbyPositionSync;
-+                     if (index == 3) panelResult.action = FrontlightPanelAction::SendNearbyBook;
-                      setResult(ActivityResult(std::move(panelResult)));
-                      finish();
-                    });
--  optionPopup.setDisabledOptions({!canSyncBookProgress, !canSyncBookProgress, !canSendBook});
-+  optionPopup.setDisabledOptions({!canSyncBookProgress, !canSyncBookProgress, !canSyncBookProgress, !canSendBook});
-   optionPopup.setCancelCallback([this] { closeSyncDialog(); });
-   requestUpdate();
- }
-diff --git a/src/activities/util/FrontlightPanelModel.h b/src/activities/util/FrontlightPanelModel.h
-index 2f9ed2b..04589a8 100644
---- a/src/activities/util/FrontlightPanelModel.h
-+++ b/src/activities/util/FrontlightPanelModel.h
-@@ -11,6 +11,7 @@ enum class FrontlightPanelAction : uint8_t {
-   SyncProgress,
-   NearbyPositionSync,
-   SendNearbyBook,
-+  ReadestSync,
- };
- 
- enum class FrontlightBookSource : uint8_t { CurrentBook = 0, LastBook, DeviceOnly };
-diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index 238414c..b8d7bad 100644
---- a/src/components/themes/BaseTheme.cpp
-+++ b/src/components/themes/BaseTheme.cpp
-@@ -1262,6 +1262,70 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
-   }
- }
- 
-+void BaseTheme::drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
-+  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
-+    return;
-+  }
-+
-+  const auto& metrics = UITheme::getInstance().getMetrics();
-+  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
-+  if (statusBarHeight <= 0) {
-+    return;
-+  }
-+
-+  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
-+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
-+                                   &orientedMarginLeft);
-+  (void)orientedMarginRight;
-+  (void)orientedMarginBottom;
-+
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
-+  if (!layout.visible(StatusIconRow::Readest)) {
-+    return;
-+  }
-+  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
-+  const int boxY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
-+  const int boxX = layout.x(StatusIconRow::Readest);
-+
-+  // Drawn with text and a rectangle rather than a packed bitmap, so it stays
-+  // upright in every orientation without a hand-rotated glyph table.
-+  renderer.drawRect(boxX, boxY, touchStatusIconSize, touchStatusIconSize, !darkMode);
-+  const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, "R", EpdFontFamily::BOLD);
-+  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
-+  renderer.drawText(SMALL_FONT_ID, boxX + (touchStatusIconSize - textWidth) / 2,
-+                    boxY + (touchStatusIconSize - lineHeight) / 2, "R", !darkMode, EpdFontFamily::BOLD);
-+}
-+
-+bool BaseTheme::isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
-+  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
-+    return false;
-+  }
-+
-+  const auto& metrics = UITheme::getInstance().getMetrics();
-+  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
-+  if (statusBarHeight <= 0) {
-+    return false;
-+  }
-+
-+  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
-+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
-+                                   &orientedMarginLeft);
-+  (void)orientedMarginRight;
-+  (void)orientedMarginBottom;
-+
-+  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
-+
-+  // Runs from the middle of the gap before the R box to the middle of the gap
-+  // after it (or well past it when it is last), following the user's icon order.
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
-+  int hitLeft = 0;
-+  int hitRight = 0;
-+  if (!layout.hitRange(StatusIconRow::Readest, hitLeft, hitRight)) {
-+    return false;
-+  }
-+  return touchX >= hitLeft && touchX < hitRight && touchY >= baseTopY && touchY < baseTopY + statusBarHeight;
-+}
-+
- void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, const char* previewTime,
-                                       const bool readerContext, const int textYOffset, const bool darkMode,
-                                       const bool forceVisible) const {
-diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 569703c..5c16c6a 100644
---- a/src/components/themes/BaseTheme.h
-+++ b/src/components/themes/BaseTheme.h
-@@ -289,6 +289,13 @@ class BaseTheme {
-   // Hit test on the hand icon regardless of the current touchscreen state
-   // (for screens where touch always works, e.g. home).
-   bool isTouchscreenIndicatorHit(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
-+  // "R" (Readest sync) button, drawn right of the touchscreen hand in the
-+  // reader's top status bar only. Tapping it runs Sync Readest, exactly like
-+  // the reader menu entry. Hidden when the touchscreen is off (it could not be
-+  // tapped) and on non-touch hardware. Called by the EPUB reader itself, after
-+  // drawTopStatusBarClock(), so it never shows outside reading mode.
-+  void drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
-+  bool isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
-   // Button hint labels use three states: non-empty labels draw an active hint,
-   // an empty string clears an inactive slot, and nullptr preserves the existing
-   // background without drawing or registering a target.
-diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 8428d13..106f9b5 100644
---- a/src/activities/reader/EpubReaderActivity.cpp
-+++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -681,9 +681,28 @@ struct AdjacentClippingPages {
-   }
- };
- 
--bool findClippingTextOnPage(Section& section, const Page& page, const std::string& clippingText,
-+// Readest sometimes starts a highlight on the full stop that ends the previous
-+// sentence (". If you simulate ..."). That stop belongs to the previous page
-+// word ("up."), so drop stray punctuation in front of the first letter or digit.
-+std::string trimLeadingClipPunctuation(const std::string& text) {
-+  size_t i = 0;
-+  while (i < text.size()) {
-+    const unsigned char c = static_cast<unsigned char>(text[i]);
-+    if (c == 0xE2 && i + 2 < text.size() && static_cast<unsigned char>(text[i + 1]) == 0x80) {
-+      i += 3;  // general punctuation: curly quotes, dashes, ellipsis
-+    } else if (c < 0x80 && !std::isalnum(c)) {
-+      i++;
-+    } else {
-+      break;
-+    }
-+  }
-+  return i < text.size() ? text.substr(i) : text;
-+}
-+
-+bool findClippingTextOnPage(Section& section, const Page& page, const std::string& rawClippingText,
-                             ClippingPageMatch& match, bool* uniqueMatch = nullptr,
-                             const uint8_t expectedTableColumn = UINT8_MAX) {
-+  const std::string clippingText = trimLeadingClipPunctuation(rawClippingText);
-   if (findClippingTextInPages(page, clippingText, match, uniqueMatch, expectedTableColumn)) return true;
- 
-   // Only read a neighbor if this page has an otherwise plausible short fragment.
