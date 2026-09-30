@@ -179,3 +179,59 @@ index 5484209..023e508 100644
    size_t readingOrderSize = 0;
  
    ButtonNavigator buttonNavigator;
+diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
+index f58b379..66a821d 100644
+--- a/src/activities/reader/ClipSelectionActivity.cpp
++++ b/src/activities/reader/ClipSelectionActivity.cpp
+@@ -269,24 +269,16 @@ void ClipSelectionActivity::loop() {
+     if (mappedInput.isScreenTouchHeld(touchX, touchY)) {
+       touchDragHasMoved =
+           touchDragHasMoved || ClipSelectionPaging::hasDraggedFrom(touchDragStartX, touchDragStartY, touchX, touchY);
+-      // Keep timing through a small capacitive-touch jitter margin around the
+-      // selected final word, but reset when the finger genuinely drags away.
+-      const bool touchedWord = selectWordAtPoint(touchX, touchY);
+-      // Releasing on the final word finishes there. Holding it for a moment
+-      // is the explicit intent to continue the clipping onto the next page.
++      selectWordAtPoint(touchX, touchY);
++      // Releasing on the final word of a page finishes the highlight there.
++      // Moving the finger on past it, to the right or further down, is the
++      // explicit request to continue onto the next page.
+       const int nextPageStart = ClipSelectionPaging::nextPageStartIndexForTouchDrag(
+           touchDragHasMoved, startMarkIdx, wordStore.words, readingOrder.data(), readingOrderSize, cursorIdx);
+-      if (nextPageStart >= 0 && (touchedWord || isWithinCurrentPageEndDwellSlop(touchX, touchY))) {
+-        const uint32_t now = static_cast<uint32_t>(millis());
+-        if (touchDragPageEndIdx != cursorIdx) {
+-          touchDragPageEndIdx = cursorIdx;
+-          touchDragPageEndHeldSince = now;
+-        } else if (ClipSelectionPaging::hasHeldPageEndLongEnough(now, touchDragPageEndHeldSince)) {
+-          touchDragPageEndIdx = -1;
+-          moveCursor(nextPageStart);
+-        }
+-      } else {
++      if (nextPageStart >= 0 &&
++          ClipSelectionPaging::isPastPageEnd(wordStore.words[readingOrder[cursorIdx]], touchX, touchY)) {
+         touchDragPageEndIdx = -1;
++        moveCursor(nextPageStart);
+       }
+       return;
+     }
+diff --git a/src/activities/reader/ClipSelectionPaging.h b/src/activities/reader/ClipSelectionPaging.h
+index 0247eb5..d570586 100644
+--- a/src/activities/reader/ClipSelectionPaging.h
++++ b/src/activities/reader/ClipSelectionPaging.h
+@@ -19,6 +19,15 @@ inline bool hasDraggedFrom(const int startX, const int startY, const int x, cons
+          deltaY <= -TOUCH_DRAG_MOVEMENT_PX;
+ }
+ 
++// A drag that ends on the last word of a page only carries on to the next page
++// when the finger goes on past that word, to the right or further down. Simply
++// stopping on the last word (however long) finishes the highlight there.
++constexpr int TOUCH_PAGE_OVERSHOOT_PX = 16;
++
++inline bool isPastPageEnd(const WordRef& word, const int x, const int y) {
++  return x >= word.x + word.w + TOUCH_PAGE_OVERSHOOT_PX || y >= word.y + word.h + TOUCH_PAGE_OVERSHOOT_PX;
++}
++
+ inline bool hasHeldPageEndLongEnough(const uint32_t now, const uint32_t heldSince) {
+   return static_cast<uint32_t>(now - heldSince) >= TOUCH_PAGE_ADVANCE_HOLD_MS;
+ }
