@@ -1,13 +1,15 @@
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 9aec8252..c70dfbd4 100644
+index 9aec8252..64717167 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -923,3 +923,41 @@ STR_STATUS_BAR_EMPTY: "Empty"
+@@ -923,3 +923,43 @@ STR_STATUS_BAR_EMPTY: "Empty"
  STR_STATUS_BAR_CLOCK: "Clock"
  STR_STATUS_BAR_BOTH: "Both"
  STR_CLOCK_OUTSIDE_READER: "Clock Outside Reader"
 +STR_READEST_SYNC: "Readest Sync"
 +STR_READEST_SYNC_BOOK: "Sync Readest"
++STR_READEST_AUTO_SYNC: "Readest Auto-Sync"
++STR_READEST_SYNCING_BOOK: "Syncing Readest..."
 +STR_READEST_SYNCING_POSITION: "Syncing reading position..."
 +STR_READEST_DOWNLOADING_BOOK: "Downloading the text of Readest's copy..."
 +STR_READEST_REMOVED_FORMAT: "%d deleted highlights synced"
@@ -1378,11 +1380,59 @@ index 49a82a11..0502ed06 100644
   private:
    /**
     * Generate a fallback XPath by streaming the spine item's XHTML and resolving
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index 53665682..7fe6860f 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -438,6 +438,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   // Night mode: inverted output polarity, applied to every activity per render
+   // by ActivityManager. Quick Resume preserves it; other sleep screens remain normal.
+   uint8_t screenInverted = 0;
++  // Readest Auto-Sync: sync the open book with Readest on open, close, wake and sleep.
++  uint8_t readestAutoSync = 0;
+   // Sleep screen cover mode settings
+   uint8_t sleepScreenCoverMode = FIT;
+   // Sleep screen cover filter
+diff --git a/src/GlobalActions.h b/src/GlobalActions.h
+index aa047ce1..d3e11c7e 100644
+--- a/src/GlobalActions.h
++++ b/src/GlobalActions.h
+@@ -60,6 +60,9 @@ inline bool isPowerButtonActionAvailableOutsideReader(const CrossPointSettings::
+ }
+ 
+ void enterDeepSleep(bool fromTimeout = false);
++// Deep sleep straight from the silent Readest sleep-sync boot: nothing is redrawn,
++// the sleep screen drawn before that boot is still on the panel.
++void enterDeepSleepAfterReadestSync();
+ bool handleGlobalPowerButtonAction(CrossPointSettings::SHORT_PWRBTN action,
+                                    QuickLockTrigger quickLockTrigger = QuickLockTrigger::None);
+ bool dispatchShortcutAction(CrossPointSettings::SHORT_PWRBTN action);
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index 90bce0ed..ad795451 100644
+index 90bce0ed..1e488296 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
-@@ -1464,12 +1464,13 @@ inline std::vector<SettingInfo> buildDisplaySleepSettingsList(const std::vector<
+@@ -620,6 +620,8 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
+                                 CrossPointSettings::REFRESH_30, CrossPointSettings::REFRESH_NEVER}));
+     add(SettingInfo::Toggle(StrId::STR_NIGHT_MODE, &CrossPointSettings::screenInverted, "screenInverted",
+                             StrId::STR_CAT_DISPLAY));
++    add(SettingInfo::Toggle(StrId::STR_READEST_AUTO_SYNC, &CrossPointSettings::readestAutoSync, "readestAutoSync",
++                            StrId::STR_CAT_CRASHINK));
+     add(SettingInfo::Enum(StrId::STR_UI_THEME, &CrossPointSettings::uiTheme,
+                           {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_MINIMAL, StrId::STR_THEME_DASHBOARD,
+                            StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED, StrId::STR_THEME_LYRA_CAROUSEL,
+@@ -1198,9 +1200,10 @@ inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<
+ 
+ // The CrASHink tab: options that belong to this firmware fork rather
+ // than to upstream CrossInk. New fork-only settings go here.
+-inline std::vector<SettingInfo> buildCrashinkSettingsList() {
++inline std::vector<SettingInfo> buildCrashinkSettingsList(const std::vector<SettingInfo>& allSettings) {
+   std::vector<SettingInfo> settings;
+   settings.push_back(SettingInfo::Action(StrId::STR_STATUS_BAR_ICONS, SettingAction::StatusIcons));
++  addSettingByName(settings, allSettings, StrId::STR_READEST_AUTO_SYNC);
+   return settings;
+ }
+ 
+@@ -1464,12 +1467,13 @@ inline std::vector<SettingInfo> buildDisplaySleepSettingsList(const std::vector<
  
  inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<SettingInfo>& allSettings) {
    std::vector<SettingInfo> systemSettings;
@@ -1398,38 +1448,133 @@ index 90bce0ed..ad795451 100644
    systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
    systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
 diff --git a/src/SilentRestart.h b/src/SilentRestart.h
-index 73ba26bf..9a177d9e 100644
+index 73ba26bf..657930b2 100644
 --- a/src/SilentRestart.h
 +++ b/src/SilentRestart.h
-@@ -14,6 +14,8 @@ enum class NetworkBootTarget : uint32_t {
+@@ -14,6 +14,9 @@ enum class NetworkBootTarget : uint32_t {
    KOREADER_AUTH = 5,
    FILE_TRANSFER = 6,
    MANAGE_FONTS = 7,
 +  READEST_AUTH = 8,
 +  READEST_SYNC = 9,
++  READEST_SLEEP_SYNC = 10,
  };
  
  constexpr bool isNetworkBootTargetValue(const uint32_t value) {
-@@ -24,6 +26,8 @@ constexpr bool isNetworkBootTargetValue(const uint32_t value) {
+@@ -24,6 +27,9 @@ constexpr bool isNetworkBootTargetValue(const uint32_t value) {
      case NetworkBootTarget::KOREADER_AUTH:
      case NetworkBootTarget::FILE_TRANSFER:
      case NetworkBootTarget::MANAGE_FONTS:
 +    case NetworkBootTarget::READEST_AUTH:
 +    case NetworkBootTarget::READEST_SYNC:
++    case NetworkBootTarget::READEST_SLEEP_SYNC:
        return true;
    }
    return false;
-@@ -34,7 +38,9 @@ static_assert(isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::
+@@ -34,7 +40,10 @@ static_assert(isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::
                    isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::KOREADER_SYNC)) &&
                    isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::KOREADER_AUTH)) &&
                    isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::FILE_TRANSFER)) &&
 -                  isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::MANAGE_FONTS)),
 +                  isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::MANAGE_FONTS)) &&
 +                  isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::READEST_AUTH)) &&
-+                  isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::READEST_SYNC)),
++                  isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::READEST_SYNC)) &&
++                  isNetworkBootTargetValue(static_cast<uint32_t>(NetworkBootTarget::READEST_SLEEP_SYNC)),
                "Every network boot target must pass RTC target validation");
  
  void silentRestart();                                            // home screen
+@@ -43,6 +52,13 @@ void silentRestartToReader(bool cleanImageBaseOnEntry = false);  // currently-op
+ void restartToHomeAfterStorageHandoff();
+ void silentRestartToNetwork(NetworkBootTarget target, uint32_t payload = 0);
+ void silentRestartToManageFonts();
++// "Readest Auto-Sync": syncs a book in the lean network mode when it is opened
++// (then the reader), closed (then Home), when the device wakes up in a book (then
++// the reader) or goes to sleep (silent: the sleep screen stays on the panel, then
++// deep sleep).
++enum class ReadestAutoSync : uint32_t { Sleep = 0, Close = 1, Open = 2, Wake = 3 };
++bool shouldReadestAutoSync(const std::string& epubPath);
++void silentRestartToReadestAutoSync(ReadestAutoSync when, const std::string& epubPath);
+ 
+ void armSilentRestartReaderPageBuild(const std::string& bookPath, uint16_t spineIndex, uint16_t targetPage,
+                                      bool autoPageTurnActive);
+diff --git a/src/activities/Activity.cpp b/src/activities/Activity.cpp
+index 1f214ca7..4d120742 100644
+--- a/src/activities/Activity.cpp
++++ b/src/activities/Activity.cpp
+@@ -1,6 +1,7 @@
+ #include "Activity.h"
+ 
+ #include "ActivityManager.h"
++#include "SilentRestart.h"
+ 
+ void Activity::onEnter() { LOG_DBG("ACT", "Entering activity: %s", name.c_str()); }
+ 
+@@ -12,7 +13,14 @@ RequestUpdateResult Activity::requestUpdateAndWait() { return activityManager.re
+ 
+ void Activity::onGoHome(HomeMenuItem item) { activityManager.goHome(item); }
+ 
+-void Activity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }
++void Activity::onSelectBook(const std::string& path) {
++  // "Readest Auto-Sync" on opening a book: sync first, then the reader opens it.
++  if (shouldReadestAutoSync(path)) {
++    silentRestartToReadestAutoSync(ReadestAutoSync::Open, path);
++    return;
++  }
++  activityManager.goToReader(path);
++}
+ 
+ void Activity::startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) {
+   this->resultHandler = std::move(resultHandler);
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index bdeb013b..941c1192 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -1021,6 +1021,10 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
+ }
+ 
+ void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::RefreshMode initialRefreshMode) {
++  // "Readest Auto-Sync" on closing a book: remember it, sync once Home is up.
++  const std::string closingBook = currentActivity && currentActivity->isEpubReaderActivity()
++                                      ? currentActivity->getCurrentBookPath()
++                                      : std::string();
+   std::string initialBookPath;
+   if (returningHomeThroughSettings) {
+     initialBookPath = std::move(preferredHomeBookPath);
+@@ -1046,6 +1050,10 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::Ref
+   }
+   replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem, initialRefreshMode,
+                                                  std::move(initialBookPath)));
++  if (shouldReadestAutoSync(closingBook)) {
++    loop();  // finish leaving the reader first so its position is saved
++    silentRestartToReadestAutoSync(ReadestAutoSync::Close, closingBook);
++  }
+ }
+ void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
+ 
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index 40093d03..1443dd97 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -39,6 +39,7 @@
+ #include "RecentBookProgress.h"
+ #include "RecentBooksStore.h"
+ #include "SavedItemsHomeActivity.h"
++#include "SilentRestart.h"
+ #include "components/UITheme.h"
+ #include "components/themes/dashboard/DashboardTheme.h"
+ #include "components/themes/lyra/LyraCarouselTheme.h"
+@@ -2383,6 +2384,11 @@ void HomeActivity::onSelectBook(const std::string& path) {
+   if (Storage.exists(CAROUSEL_CACHE_TMP_PATH)) {
+     Storage.remove(CAROUSEL_CACHE_TMP_PATH);
+   }
++  // "Readest Auto-Sync" on opening a book: sync first, then the reader opens it.
++  if (shouldReadestAutoSync(path)) {
++    silentRestartToReadestAutoSync(ReadestAutoSync::Open, path);
++    return;
++  }
+   activityManager.goToReader(path);
+ }
+ 
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
 index 6b05422b..c7b9ea90 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
@@ -1704,10 +1849,10 @@ index d191462c..2ae6797d 100644
      location.add(ReaderDrawerCatalogItem::NearbyPositionSync);
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..7c0915fe
+index 00000000..704b7a52
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,918 @@
+@@ -0,0 +1,1034 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1729,14 +1874,17 @@ index 00000000..7c0915fe
 +
 +#include "ChapterXPathResolver.h"
 +#include "ClippingStore.h"
++#include "CrossPointState.h"
 +#include "EpubReaderUtils.h"
 +#include "HalClock.h"
 +#include "KOReaderDocumentId.h"
 +#include "MappedInputManager.h"
 +#include "ProgressMapper.h"
++#include "GlobalActions.h"
 +#include "ReaderUtils.h"
 +#include "SdCardFontSystem.h"
 +#include "SilentRestart.h"
++#include "WifiCredentialStore.h"
 +#include "activities/ActivityManager.h"
 +#include "activities/home/RecentBookProgress.h"
 +#include "activities/network/WifiSelectionActivity.h"
@@ -1761,6 +1909,8 @@ index 00000000..7c0915fe
 +// Position differences below this fraction count as "already in sync".
 +constexpr float POSITION_EPSILON = 0.002f;
 +constexpr unsigned long AUTO_RETURN_DELAY_MS = 2000;
++// Readest Auto-Sync gives up on a saved network after this long.
++constexpr unsigned long AUTO_SYNC_WIFI_TIMEOUT_MS = 8000;
 +// Text taken at a reading position to find the same spot in the other copy.
 +constexpr size_t POSITION_SNIPPET_CHARS = 64;
 +
@@ -1849,6 +1999,16 @@ index 00000000..7c0915fe
 +void ReadestSyncActivity::onEnter() {
 +  Activity::onEnter();
 +
++  if (sleepMode) {
++    // Silent Readest Auto-Sync boot: no screen, no Wi-Fi picker. The real work
++    // runs from loop() once the activity is up.
++    if (autoSyncWhen == static_cast<uint32_t>(ReadestAutoSync::Wake)) {
++      GUI.drawPopup(renderer, tr(STR_READEST_SYNCING_BOOK));
++    }
++    sdFontSystem.releaseLoadedFont(renderer);
++    return;
++  }
++
 +  const bool hasReaderOrientation = readerOrientation < CrossPointSettings::ORIENTATION_COUNT;
 +  if (restartBeforeNetwork) {
 +    // The network reboot restores the frontlight from the saved setting; make
@@ -1884,7 +2044,7 @@ index 00000000..7c0915fe
 +
 +void ReadestSyncActivity::onExit() {
 +  Activity::onExit();
-+  if (restartBeforeNetwork) return;
++  if (restartBeforeNetwork || sleepMode) return;
 +
 +  CLIPPINGS.unload();
 +  readestEpub.reset();
@@ -1923,6 +2083,7 @@ index 00000000..7c0915fe
 +}
 +
 +void ReadestSyncActivity::setStatus(const char* message) {
++  if (sleepMode) return;
 +  {
 +    RenderLock lock(*this);
 +    statusMessage = message;
@@ -1933,6 +2094,11 @@ index 00000000..7c0915fe
 +}
 +
 +void ReadestSyncActivity::fail(std::string detail) {
++  if (sleepMode) {
++    LOG_ERR("RDS", "Auto-sync failed: %s", detail.c_str());
++    state = FAILED;
++    return;
++  }
 +  {
 +    RenderLock lock(*this);
 +    state = FAILED;
@@ -1980,6 +2146,12 @@ index 00000000..7c0915fe
 +    LOG_INF("RDS", "Auto-matched \"%s\" (score %d, runner-up %d)", book.title.c_str(), bestScore, runnerUp);
 +    ReadestBookMap::remember(localHash, book);
 +    syncWithBook(book);
++    return;
++  }
++  if (sleepMode) {
++    // Nobody is there to pick the book; the manual "Sync Readest" asks once.
++    LOG_INF("RDS", "Auto-sync skipped: needs a book choice");
++    state = FAILED;
 +    return;
 +  }
 +  showChooser();
@@ -2088,7 +2260,7 @@ index 00000000..7c0915fe
 +    detailMessage = std::move(detail);
 +    autoReturnAt = millis() + AUTO_RETURN_DELAY_MS;
 +  }
-+  requestUpdate(true);
++  if (!sleepMode) requestUpdate(true);
 +}
 +
 +bool ReadestSyncActivity::locatePulledText(const ReadestNote& note, PulledText& out) {
@@ -2546,7 +2718,89 @@ index 00000000..7c0915fe
 +
 +void ReadestSyncActivity::returnToReader() { activityManager.goToReader(epubPath, false, false, true); }
 +
++bool ReadestSyncActivity::connectQuietly() {
++  WiFi.persistent(false);
++  if (!WiFi.mode(WIFI_STA)) return false;
++  wifiActivated = true;
++  const auto tryNetwork = [](const WifiCredential& credential) {
++    LOG_INF("RDS", "Auto-sync: joining %s", credential.ssid.c_str());
++    if (credential.password.empty()) {
++      WiFi.begin(credential.ssid.c_str());
++    } else {
++      WiFi.begin(credential.ssid.c_str(), credential.password.c_str());
++    }
++    const unsigned long startedAt = millis();
++    while (millis() - startedAt < AUTO_SYNC_WIFI_TIMEOUT_MS) {
++      if (hasActiveStationWifiConnection()) return true;
++      delay(100);
++    }
++    WiFi.disconnect(false);
++    delay(100);
++    return false;
++  };
++
++  const std::string lastSsid = WIFI_STORE.getLastConnectedSsid();
++  if (!lastSsid.empty()) {
++    const auto credential = WIFI_STORE.findCredential(lastSsid);
++    if (credential && tryNetwork(*credential)) return true;
++  }
++  if (WIFI_STORE.getCredentialCount() == 0) return false;
++
++  // The usual network is not in reach: try the other saved networks that are.
++  const int found = WiFi.scanNetworks();
++  for (int i = 0; i < found; ++i) {
++    const std::string ssid = WiFi.SSID(i).c_str();
++    if (ssid.empty() || ssid == lastSsid) continue;
++    const auto credential = WIFI_STORE.findCredential(ssid);
++    if (credential && tryNetwork(*credential)) {
++      WiFi.scanDelete();
++      return true;
++    }
++  }
++  WiFi.scanDelete();
++  return false;
++}
++
++// Readest Auto-Sync: sync the book in APP_STATE.openEpubPath without drawing,
++// then continue to wherever the trigger was heading.
++void ReadestSyncActivity::runSleepSync() {
++  epubPath = APP_STATE.openEpubPath;
++  const auto when = static_cast<ReadestAutoSync>(autoSyncWhen);
++  if (READEST_STORE.hasCredentials() && !epubPath.empty() && Storage.exists(epubPath.c_str()) && connectQuietly()) {
++    WiFi.setSleep(false);
++    sdFontSystem.releaseForNetwork(renderer);
++    // Real wall-clock time for note and position timestamps.
++    if (!halClock.syncSystemTimeFromNTP()) {
++      LOG_DBG("RDS", "NTP sync unavailable; Readest will stamp records itself");
++    }
++    state = WORKING;
++    runSync();
++    LOG_INF("RDS", "Auto-sync %s", state == DONE ? "done" : "did not complete");
++  } else {
++    LOG_INF("RDS", "Auto-sync skipped: no Wi-Fi or account");
++  }
++
++  CLIPPINGS.unload();
++  readestEpub.reset();
++  epub.reset();
++  wifiOff();
++
++  switch (when) {
++    case ReadestAutoSync::Sleep:
++      enterDeepSleepAfterReadestSync();
++      break;
++    case ReadestAutoSync::Close:
++      silentRestart();
++      break;
++    case ReadestAutoSync::Open:
++    case ReadestAutoSync::Wake:
++      silentRestartToReader(true);
++      break;
++  }
++}
++
 +void ReadestSyncActivity::render(RenderLock&&) {
++  if (sleepMode) return;  // silent boot: whatever is on the panel stays there
 +  renderer.clearScreen();
 +
 +  const auto& metrics = UITheme::getInstance().getMetrics();
@@ -2593,6 +2847,13 @@ index 00000000..7c0915fe
 +}
 +
 +void ReadestSyncActivity::loop() {
++  if (sleepMode) {
++    if (!sleepStarted) {
++      sleepStarted = true;
++      runSleepSync();
++    }
++    return;
++  }
 +  if (state == CHOOSING) {
 +    chooser.handleInput(mappedInput, [this] { requestUpdate(); });
 +    if (chosenIndex >= 0 && chosenIndex < static_cast<int>(candidates.size())) {
@@ -2628,10 +2889,10 @@ index 00000000..7c0915fe
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 00000000..e9292743
+index 00000000..1234b1dd
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,131 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -2684,6 +2945,12 @@ index 00000000..e9292743
 +        epubPath(std::move(epubPath)),
 +        readerOrientation(readerOrientation) {}
 +
++  // Readest Auto-Sync (network boot): syncs the open book without drawing anything,
++  // then deep-sleeps (sleep), goes Home (close) or reopens the book (open).
++  struct SleepSyncTag {};
++  ReadestSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, SleepSyncTag, uint32_t autoSyncWhen)
++      : Activity("ReadestSync", renderer, mappedInput), sleepMode(true), autoSyncWhen(autoSyncWhen) {}
++
 +  static uint32_t encodeBootPayload(uint8_t orientation);
 +  static uint8_t decodeBootOrientation(uint32_t payload);
 +
@@ -2691,7 +2958,7 @@ index 00000000..e9292743
 +  void onExit() override;
 +  void loop() override;
 +  void render(RenderLock&&) override;
-+  bool preventAutoSleep() override { return state == WORKING || state == CHOOSING; }
++  bool preventAutoSleep() override { return sleepMode || state == WORKING || state == CHOOSING; }
 +
 + private:
 +  enum State { WIFI_SELECTION, WORKING, CHOOSING, DONE, FAILED };
@@ -2705,6 +2972,10 @@ index 00000000..e9292743
 +  uint8_t readerOrientation = CrossPointSettings::ORIENTATION_COUNT;
 +  bool restartBeforeNetwork = false;
 +  bool wifiActivated = false;
++  bool sleepMode = false;
++  uint32_t autoSyncWhen = 0;  // ReadestAutoSync: what happens after the silent sync
++  bool sleepStarted = false;
++  bool sleepNeedsChoice = false;  // sleep sync met a book that needs the user's pick
 +
 +  State state = WIFI_SELECTION;
 +  ScreenTransitionRefresh screenTransitionRefresh;
@@ -2720,6 +2991,8 @@ index 00000000..e9292743
 +  int chosenIndex = -1;
 +  bool choiceCancelled = false;
 +
++  void runSleepSync();
++  bool connectQuietly();
 +  void onWifiSelectionComplete(bool success);
 +  void setStatus(const char* message);
 +  void fail(std::string detail);
@@ -3223,7 +3496,7 @@ index 00000000..180540a8
 +  void askPassword();
 +};
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
-index 65bcf1bb..1dac35ee 100644
+index 65bcf1bb..35cac41d 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
 @@ -34,6 +34,7 @@
@@ -3234,6 +3507,15 @@ index 65bcf1bb..1dac35ee 100644
  #include "SdCardFontSystem.h"
  #include "SdFirmwareUpdateActivity.h"
  #include "SettingsList.h"
+@@ -345,7 +346,7 @@ void SettingsActivity::rebuildSettingsLists() {
+   systemFilesCacheSettings = buildSystemFilesCacheSettingsList(allSettings);
+   systemReadingStatsSettings = buildSystemReadingStatsSettingsList(allSettings);
+   systemGlobalStatsSettings = buildSystemGlobalStatsSettingsList(allSettings);
+-  crashinkSettings = buildCrashinkSettingsList();
++  crashinkSettings = buildCrashinkSettingsList(allSettings);
+   controlsSettings = buildControlsSettingsParentList(allSettings);
+   controlsPowerSettings = buildControlsPowerSettingsList(allSettings);
+   controlsHomeButtonSettings = buildControlsHomeButtonSettingsList(allSettings);
 @@ -1135,6 +1136,9 @@ void SettingsActivity::toggleCurrentSetting() {
        case SettingAction::KOReaderSync:
          startActivityForResult(std::make_unique<KOReaderSettingsActivity>(renderer, mappedInput), resultHandler);
@@ -3603,18 +3885,19 @@ index 62c15abd..5c39ffaf 100644
    // an empty string clears an inactive slot, and nullptr preserves the existing
    // background without drawing or registering a target.
 diff --git a/src/main.cpp b/src/main.cpp
-index 62802ca4..904c60aa 100644
+index 62802ca4..2aa33ad8 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -93,6 +93,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+@@ -93,6 +93,8 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
  #include "activities/boot_sleep/ImageFolderIndex.h"
  #include "activities/home/BookActions.h"
  #include "activities/reader/KOReaderSyncActivity.h"
 +#include "activities/reader/ReadestSyncActivity.h"
++#include "readest/ReadestStore.h"
  #include "activities/reader/ReaderUtils.h"
  #include "activities/reader/ReadingStatsUtils.h"
  #include "activities/reader/StatsBackup.h"
-@@ -100,6 +101,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+@@ -100,6 +102,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
  #include "activities/settings/KOReaderAuthActivity.h"
  #include "activities/settings/KOReaderSettingsActivity.h"
  #include "activities/settings/OtaUpdateActivity.h"
@@ -3622,7 +3905,131 @@ index 62802ca4..904c60aa 100644
  #include "activities/settings/SdFirmwareUpdateActivity.h"
  #include "components/UITheme.h"
  #include "components/icons/tablerFilledIcons.h"
-@@ -1503,6 +1505,35 @@ void setup() {
+@@ -365,6 +368,10 @@ using BootResume = SleepWakePolicy::Resume;
+ // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
+ static bool deepSleepInProgress = false;
+ 
++// True in the silent network boot that syncs Readest between pressing sleep and
++// the actual deep sleep. A power press there must not overwrite the resume state.
++static bool readestSleepSyncBoot = false;
++
+ static void restartWithSilentToken() {
+ #ifdef SIMULATOR
+   SimulatorLifecycle::setSilentRebootToken(silentRebootMagic, silentRebootTarget, silentRebootPayload);
+@@ -461,6 +468,37 @@ void silentRestartToNetwork(const NetworkBootTarget target, const uint32_t paylo
+ 
+ void silentRestartToManageFonts() { silentRestartToNetwork(NetworkBootTarget::MANAGE_FONTS); }
+ 
++bool shouldReadestAutoSync(const std::string& epubPath) {
++  if (!SETTINGS.readestAutoSync || !READEST_STORE.hasCredentials()) return false;
++  return !epubPath.empty() && FsHelpers::hasEpubExtension(epubPath) && Storage.exists(epubPath.c_str());
++}
++
++void silentRestartToReadestAutoSync(const ReadestAutoSync when, const std::string& epubPath) {
++  clearSilentRestartReaderPageBuild();
++  // The network boot syncs APP_STATE.openEpubPath.
++  if (APP_STATE.openEpubPath != epubPath) {
++    APP_STATE.openEpubPath = epubPath;
++    APP_STATE.saveToFile();
++  }
++  silentRebootTarget = static_cast<uint32_t>(NetworkBootTarget::READEST_SLEEP_SYNC);
++  silentRebootPayload = static_cast<uint32_t>(when);
++  silentRebootMagic = SILENT_REBOOT_MAGIC;
++  LOG_DBG("MAIN", "Silent restart (target=readest auto-sync, when=%lu)", static_cast<unsigned long>(when));
++  // Opening or closing a book leaves the previous screen up during the sync, so say
++  // what is happening. The sleep variant keeps the sleep screen untouched.
++  if (when == ReadestAutoSync::Close || when == ReadestAutoSync::Open) {
++    // Keep the light as it is across the reboot.
++    const uint8_t lightOn = Frontlight.isOn() ? 1 : 0;
++    if (SETTINGS.frontlightOn != lightOn) {
++      SETTINGS.frontlightOn = lightOn;
++      SETTINGS.saveToFile();
++    }
++    GUI.drawPopup(renderer, tr(STR_READEST_SYNCING_BOOK));
++    delay(50);
++  }
++  restartWithSilentToken();
++}
++
+ static uint32_t encodeKOReaderSyncOrientation(const uint8_t orientation) {
+   return orientation < CrossPointSettings::ORIENTATION_COUNT ? static_cast<uint32_t>(orientation) + 1 : 0;
+ }
+@@ -1073,7 +1111,7 @@ void mirrorWakeShortPressToNvs() {
+ // Enter deep sleep mode
+ void enterDeepSleep(bool fromTimeout) {
+   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
++  if (!readestSleepSyncBoot) APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+ 
+   const bool isQuickResumeSleep =
+       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
+@@ -1088,6 +1126,8 @@ void enterDeepSleep(bool fromTimeout) {
+   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
+   // a WiFi activity would otherwise silentRestart() here and reboot instead.
+   deepSleepInProgress = true;
++  const std::string leavingBook =
++      activityManager.isReaderActivity() ? activityManager.getCurrentBookPath() : std::string();
+   activityManager.goToSleep(fromTimeout);
+ 
+   if (isQuickResumeSleep) {
+@@ -1110,6 +1150,12 @@ void enterDeepSleep(bool fromTimeout) {
+   // Last chance to sample: startDeepSleep() cuts the SD rail on X3, so nothing
+   // can be written again until the next wake.
+   BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Sleep, BoardConfig::ACTIVE.name);
++
++  // "Readest Auto-Sync": the sleep screen is on the panel. Reboot into the lean
++  // network mode to sync the book that was open, then sleep from there.
++  if (!readestSleepSyncBoot && shouldReadestAutoSync(leavingBook)) {
++    silentRestartToReadestAutoSync(ReadestAutoSync::Sleep, leavingBook);
++  }
+   // All sleep-time file writes are complete. Stop SDMMC before the power path
+   // cuts peripheral rails and isolates the bus pads; SPI boards are a no-op.
+   Storage.shutdown();
+@@ -1122,6 +1168,17 @@ void enterDeepSleep(bool fromTimeout) {
+   powerManager.startDeepSleep(gpio);
+ }
+ 
++void enterDeepSleepAfterReadestSync() {
++  HalPowerManager::Lock powerLock;
++  deepSleepInProgress = true;
++  Storage.shutdown();
++  putTiltSensorToSleepForDeepSleep();
++  display.deepSleep();
++  mirrorWakeShortPressToNvs();
++  LOG_DBG("MAIN", "Entering deep sleep after Readest sync");
++  powerManager.startDeepSleep(gpio);
++}
++
+ void setupDisplayAndFonts(const bool seamless, const bool loadReaderResources, const bool useReaderRenderStack) {
+ #if !defined(SIMULATOR) && !FREEINK_MCU_C3
+   // C3 X3/X4 detection already runs in HalGPIO::begin() before SPI owns the
+@@ -1340,6 +1397,12 @@ void setup() {
+   }
+   UITheme::getInstance().reload();
+   ButtonNavigator::setMappedInputManager(mappedInputManager);
++  // "Readest Auto-Sync" on wake-up: a book that was open when the device went to
++  // sleep is synced before it is shown again (the sleep screen stays meanwhile).
++  if (isSleepWake && !isSilentReboot && !recoveryFirmwareMode && APP_STATE.lastSleepFromReader &&
++      shouldReadestAutoSync(APP_STATE.openEpubPath)) {
++    silentRestartToReadestAutoSync(ReadestAutoSync::Wake, APP_STATE.openEpubPath);
++  }
+   logBootHeap("boot state ready");
+   // Silent restarts are invisible recovery steps, so they always retain the
+   // current light state rather than applying wake or schedule policy.
+@@ -1361,6 +1424,12 @@ void setup() {
+       restoreLightOn = false;
+     }
+   }
++  // The silent Readest sleep sync runs between pressing sleep and the real deep
++  // sleep, so the light stays off (the saved setting is untouched for the next wake).
++  if (snapshotTarget == static_cast<uint32_t>(NetworkBootTarget::READEST_SLEEP_SYNC) &&
++      snapshotPayload == static_cast<uint32_t>(ReadestAutoSync::Sleep)) {
++    restoreLightOn = false;
++  }
+   Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
+ 
+   if (recoveryFirmwareMode) {
+@@ -1503,6 +1572,48 @@ void setup() {
        case NetworkBootTarget::FILE_TRANSFER:
          launched = activityManager.resumeFileTransferFromNetworkBoot(snapshotPayload);
          break;
@@ -3652,6 +4059,19 @@ index 62802ca4..904c60aa 100644
 +        } else {
 +          LOG_ERR("MAIN", "OOM: Readest sync activity after minimal boot (free=%u maxAlloc=%u)", ESP.getFreeHeap(),
 +                  ESP.getMaxAllocHeap());
++        }
++        break;
++      }
++      case NetworkBootTarget::READEST_SLEEP_SYNC: {
++        readestSleepSyncBoot = true;
++        auto syncActivity = makeUniqueNoThrow<ReadestSyncActivity>(
++            renderer, mappedInputManager, ReadestSyncActivity::SleepSyncTag{}, snapshotPayload);
++        if (syncActivity) {
++          activityManager.replaceActivity(std::move(syncActivity));
++          launched = true;
++        } else {
++          LOG_ERR("MAIN", "OOM: Readest auto-sync activity after minimal boot (free=%u maxAlloc=%u)",
++                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 +        }
 +        break;
 +      }
