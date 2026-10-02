@@ -328,3 +328,55 @@ index efb83cda..6770e452 100644
    // Button hint labels use three states: non-empty labels draw an active hint,
    // an empty string clears an inactive slot, and nullptr preserves the existing
    // background without drawing or registering a target.
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -180,6 +180,7 @@
+       SETTINGS.frontlightOn = 1;
+       activity.onExternalFrontlightChange();
+       if (persist && (brightness != previousBrightness || !previousOn)) activityManager.persistGlobalSettings();
++      if (persist && !previousOn) activityManager.requestUpdate();
+       return true;
+     }
+     case CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH:
+@@ -190,11 +191,12 @@
+       const int delta = action == CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH ? lightAmount : -lightAmount;
+       const uint8_t warmth = static_cast<uint8_t>(std::clamp(static_cast<int>(Frontlight.warmth()) + delta, 0, 100));
+       Frontlight.setWarmth(warmth);
++      Frontlight.setOn(true);
+       SETTINGS.frontlightWarmth = warmth;
+-      SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
++      SETTINGS.frontlightOn = 1;
+       activity.onExternalFrontlightChange();
+-      if (persist && (warmth != previousWarmth || Frontlight.isOn() != previousOn))
+-        activityManager.persistGlobalSettings();
++      if (persist && (warmth != previousWarmth || !previousOn)) activityManager.persistGlobalSettings();
++      if (persist && !previousOn) activityManager.requestUpdate();
+       return true;
+     }
+     case CrossPointSettings::TWO_FINGER_SWIPE_NEXT_CHAPTER:
+@@ -219,7 +221,11 @@
+ 
+ #if CROSSINK_APP_CAP_TOUCH
+ void finishLiveLightSwipe(LiveLightSwipeState& state, ActivityManager& activityManager) {
+-  if (state.changed) activityManager.persistGlobalSettings();
++  if (state.changed) {
++    activityManager.persistGlobalSettings();
++    // Refresh the status-bar lamp icon if the swipe switched the light on or off.
++    if (Frontlight.isOn() != state.initialOn) activityManager.requestUpdate();
++  }
+   state = {};
+ }
+ 
+@@ -234,9 +240,9 @@
+   const int target = SwipeAdjustment::targetValue(state.initialValue, sign > 0, amount);
+   const int current = brightness ? Frontlight.brightness() : Frontlight.warmth();
+   const int difference = sign * (target - current);
+-  if (difference != 0 || (brightness && amount > 0 && !Frontlight.isOn()))
++  if (difference != 0 || (amount > 0 && !Frontlight.isOn()))
+     applyConfiguredSwipeAction(activity, activityManager, state.action, difference, false);
+-  if (brightness && amount == 0 && Frontlight.isOn() != state.initialOn) {
++  if (amount == 0 && Frontlight.isOn() != state.initialOn) {
+     Frontlight.setOn(state.initialOn);
+     SETTINGS.frontlightOn = state.initialOn ? 1 : 0;
+     activity.onExternalFrontlightChange();
