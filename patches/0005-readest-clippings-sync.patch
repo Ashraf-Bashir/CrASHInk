@@ -1394,15 +1394,15 @@ index 53665682..7fe6860f 100644
    uint8_t sleepScreenCoverMode = FIT;
    // Sleep screen cover filter
 diff --git a/src/GlobalActions.h b/src/GlobalActions.h
-index aa047ce1..326c3300 100644
+index aa047ce1..a1494455 100644
 --- a/src/GlobalActions.h
 +++ b/src/GlobalActions.h
 @@ -60,6 +60,9 @@ inline bool isPowerButtonActionAvailableOutsideReader(const CrossPointSettings::
  }
  
  void enterDeepSleep(bool fromTimeout = false);
-+// Deep sleep from the silent Readest sleep-sync boot: puts the saved sleep screen back
-+// over the "Syncing Readest..." popup first.
++// Deep sleep from the silent Readest sleep-sync boot: the sleep screen is still on the
++// panel (nothing was drawn during the sync), so this only powers down.
 +void enterDeepSleepAfterReadestSync(bool keepSleepFrame);
  bool handleGlobalPowerButtonAction(CrossPointSettings::SHORT_PWRBTN action,
                                     QuickLockTrigger quickLockTrigger = QuickLockTrigger::None);
@@ -1853,7 +1853,7 @@ index d191462c..2ae6797d 100644
      location.add(ReaderDrawerCatalogItem::NearbyPositionSync);
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..cd9b9898
+index 00000000..9c9ac191
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
 @@ -0,0 +1,1080 @@
@@ -2007,9 +2007,9 @@ index 00000000..cd9b9898
 +  if (sleepMode) {
 +    // Silent Readest Auto-Sync boot: no screen, no Wi-Fi picker. The real work
 +    // runs from loop() once the activity is up.
-+    // Sleep and wake draw their own popup here; open and close drew it before the reboot.
-+    const uint32_t when = autoSyncWhen & 0xFF;
-+    if (when == static_cast<uint32_t>(ReadestAutoSync::Wake) || when == static_cast<uint32_t>(ReadestAutoSync::Sleep)) {
++    // Wake draws its popup here; open and close drew it before the reboot. Sleep draws
++    // nothing so the sleep screen stays untouched.
++    if ((autoSyncWhen & 0xFF) == static_cast<uint32_t>(ReadestAutoSync::Wake)) {
 +      GUI.drawPopup(renderer, tr(STR_READEST_SYNCING_BOOK));
 +    }
 +    sdFontSystem.releaseLoadedFont(renderer);
@@ -3962,7 +3962,7 @@ index 62c15abd..5c39ffaf 100644
    // an empty string clears an inactive slot, and nullptr preserves the existing
    // background without drawing or registering a target.
 diff --git a/src/main.cpp b/src/main.cpp
-index 62802ca4..c06985fe 100644
+index 62802ca4..b2da070f 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -93,6 +93,8 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
@@ -4052,7 +4052,7 @@ index 62802ca4..c06985fe 100644
    activityManager.goToSleep(fromTimeout);
  
    if (isQuickResumeSleep) {
-@@ -1110,6 +1153,14 @@ void enterDeepSleep(bool fromTimeout) {
+@@ -1110,6 +1153,13 @@ void enterDeepSleep(bool fromTimeout) {
    // Last chance to sample: startDeepSleep() cuts the SD rail on X3, so nothing
    // can be written again until the next wake.
    BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Sleep, BoardConfig::ACTIVE.name);
@@ -4060,14 +4060,13 @@ index 62802ca4..c06985fe 100644
 +  // "Readest Auto-Sync": the sleep screen is on the panel. Reboot into the lean
 +  // network mode to sync the book that was open, then sleep from there.
 +  if (!readestSleepSyncBoot && shouldReadestAutoSync(leavingBook)) {
-+    // The sync boot draws a popup over the sleep screen and puts the screen back afterwards.
-+    if (!isQuickResumeSleep) saveSleepFrameBuffer();
++    // The sync boot draws nothing: the sleep screen stays on the panel while it syncs.
 +    silentRestartToReadestAutoSync(ReadestAutoSync::Sleep, leavingBook, isQuickResumeSleep);
 +  }
    // All sleep-time file writes are complete. Stop SDMMC before the power path
    // cuts peripheral rails and isolates the bus pads; SPI boards are a no-op.
    Storage.shutdown();
-@@ -1122,6 +1173,39 @@ void enterDeepSleep(bool fromTimeout) {
+@@ -1122,6 +1172,28 @@ void enterDeepSleep(bool fromTimeout) {
    powerManager.startDeepSleep(gpio);
  }
  
@@ -4083,17 +4082,6 @@ index 62802ca4..c06985fe 100644
 +void enterDeepSleepAfterReadestSync(const bool keepSleepFrame) {
 +  HalPowerManager::Lock powerLock;
 +  deepSleepInProgress = true;
-+  // Put the sleep screen back over the "Syncing Readest..." popup.
-+  HalFile frame;
-+  if (Storage.openFileForRead("SLP", SLEEP_FRAME_FILE, frame)) {
-+    const size_t bufferSize = display.getBufferSize();
-+    const size_t bytesRead = frame.read(display.getFrameBuffer(), bufferSize);
-+    frame.close();
-+    if (bytesRead == bufferSize) {
-+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-+      delay(POST_SLEEP_SCREEN_SETTLE_MS);
-+    }
-+  }
 +  // A Quick Resume frame stays for the wake; other sleep screens are not restored on wake.
 +  if (!keepSleepFrame && Storage.exists(SLEEP_FRAME_FILE)) Storage.remove(SLEEP_FRAME_FILE);
 +  Storage.shutdown();
@@ -4107,7 +4095,7 @@ index 62802ca4..c06985fe 100644
  void setupDisplayAndFonts(const bool seamless, const bool loadReaderResources, const bool useReaderRenderStack) {
  #if !defined(SIMULATOR) && !FREEINK_MCU_C3
    // C3 X3/X4 detection already runs in HalGPIO::begin() before SPI owns the
-@@ -1340,6 +1424,12 @@ void setup() {
+@@ -1340,6 +1412,12 @@ void setup() {
    }
    UITheme::getInstance().reload();
    ButtonNavigator::setMappedInputManager(mappedInputManager);
@@ -4120,7 +4108,7 @@ index 62802ca4..c06985fe 100644
    logBootHeap("boot state ready");
    // Silent restarts are invisible recovery steps, so they always retain the
    // current light state rather than applying wake or schedule policy.
-@@ -1361,6 +1451,12 @@ void setup() {
+@@ -1361,6 +1439,12 @@ void setup() {
        restoreLightOn = false;
      }
    }
@@ -4133,7 +4121,7 @@ index 62802ca4..c06985fe 100644
    Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
  
    if (recoveryFirmwareMode) {
-@@ -1503,6 +1599,48 @@ void setup() {
+@@ -1503,6 +1587,48 @@ void setup() {
        case NetworkBootTarget::FILE_TRANSFER:
          launched = activityManager.resumeFileTransferFromNetworkBoot(snapshotPayload);
          break;
