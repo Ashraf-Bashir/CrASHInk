@@ -1,5 +1,58 @@
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index 1d36e43e..3a4b25b3 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -184,6 +184,7 @@ bool applyConfiguredSwipeAction(Activity& activity, ActivityManager& activityMan
+       SETTINGS.frontlightOn = 1;
+       activity.onExternalFrontlightChange();
+       if (persist && (brightness != previousBrightness || !previousOn)) activityManager.persistGlobalSettings();
++      if (persist && !previousOn) activityManager.requestUpdate();
+       return true;
+     }
+     case CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH:
+@@ -194,11 +195,12 @@ bool applyConfiguredSwipeAction(Activity& activity, ActivityManager& activityMan
+       const int delta = action == CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH ? lightAmount : -lightAmount;
+       const uint8_t warmth = static_cast<uint8_t>(std::clamp(static_cast<int>(Frontlight.warmth()) + delta, 0, 100));
+       Frontlight.setWarmth(warmth);
++      Frontlight.setOn(true);
+       SETTINGS.frontlightWarmth = warmth;
+-      SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
++      SETTINGS.frontlightOn = 1;
+       activity.onExternalFrontlightChange();
+-      if (persist && (warmth != previousWarmth || Frontlight.isOn() != previousOn))
+-        activityManager.persistGlobalSettings();
++      if (persist && (warmth != previousWarmth || !previousOn)) activityManager.persistGlobalSettings();
++      if (persist && !previousOn) activityManager.requestUpdate();
+       return true;
+     }
+     case CrossPointSettings::TWO_FINGER_SWIPE_NEXT_CHAPTER:
+@@ -223,7 +225,11 @@ bool isLightSwipeAction(const uint8_t action) {
+ 
+ #if CROSSINK_APP_CAP_TOUCH
+ void finishLiveLightSwipe(LiveLightSwipeState& state, ActivityManager& activityManager) {
+-  if (state.changed) activityManager.persistGlobalSettings();
++  if (state.changed) {
++    activityManager.persistGlobalSettings();
++    // Refresh the status-bar lamp icon if the swipe switched the light on or off.
++    if (Frontlight.isOn() != state.initialOn) activityManager.requestUpdate();
++  }
+   state = {};
+ }
+ 
+@@ -238,9 +244,9 @@ void updateLiveLightSwipe(Activity& activity, ActivityManager& activityManager,
+   const int target = SwipeAdjustment::targetValue(state.initialValue, sign > 0, amount);
+   const int current = brightness ? Frontlight.brightness() : Frontlight.warmth();
+   const int difference = sign * (target - current);
+-  if (difference != 0 || (brightness && amount > 0 && !Frontlight.isOn()))
++  if (difference != 0 || (amount > 0 && !Frontlight.isOn()))
+     applyConfiguredSwipeAction(activity, activityManager, state.action, difference, false);
+-  if (brightness && amount == 0 && Frontlight.isOn() != state.initialOn) {
++  if (amount == 0 && Frontlight.isOn() != state.initialOn) {
+     Frontlight.setOn(state.initialOn);
+     SETTINGS.frontlightOn = state.initialOn ? 1 : 0;
+     activity.onExternalFrontlightChange();
 diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
-index 3512cb59..8e7e437e 100644
+index 336cf566..60be86d1 100644
 --- a/src/activities/home/HomeActivity.cpp
 +++ b/src/activities/home/HomeActivity.cpp
 @@ -4,6 +4,7 @@
@@ -10,7 +63,7 @@ index 3512cb59..8e7e437e 100644
  #include <HalDisplay.h>
  #include <HalStorage.h>
  #include <I18n.h>
-@@ -1441,6 +1442,21 @@ void HomeActivity::loop() {
+@@ -1383,6 +1384,21 @@ void HomeActivity::loop() {
  
    if (quickActionsPopup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
  
@@ -19,7 +72,7 @@ index 3512cb59..8e7e437e 100644
 +    int tapX = 0;
 +    int tapY = 0;
 +    if (mappedInput.wasScreenTapped(tapX, tapY) &&
-+        GUI.isFrontlightIndicatorTap(renderer, UITheme::getInstance().getMetrics().topPadding, tapX, tapY)) {
++        GUI.isFrontlightIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), tapX, tapY)) {
 +      const bool lightOn = !Frontlight.isOn();
 +      Frontlight.setOn(lightOn);
 +      SETTINGS.frontlightOn = lightOn ? 1 : 0;
@@ -33,7 +86,7 @@ index 3512cb59..8e7e437e 100644
      const int touched = coverGridUi->selectedAction(mappedInput);
      if (coverGridUi->app.invalidated()) requestUpdate();
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 15658808..a7abc977 100644
+index 2809d422..f7c715b2 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -8,6 +8,7 @@
@@ -44,7 +97,7 @@ index 15658808..a7abc977 100644
  #include <HalStorage.h>
  #include <I18n.h>
  #include <Logging.h>
-@@ -2844,6 +2845,17 @@ void EpubReaderActivity::loop() {
+@@ -2832,6 +2833,17 @@ void EpubReaderActivity::loop() {
  
    const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput,
                                                        epub && ReaderUtils::isRtlBookLanguage(epub->getLanguage()));
@@ -63,7 +116,7 @@ index 15658808..a7abc977 100644
        automaticPageTurnActive
            ? std::max(UITheme::getStatusBarHeight(),
 diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
-index f9d63b2c..6e36ef2e 100644
+index 5c43813c..4f21e0a4 100644
 --- a/src/activities/reader/TxtReaderActivity.cpp
 +++ b/src/activities/reader/TxtReaderActivity.cpp
 @@ -3,6 +3,7 @@
@@ -93,7 +146,7 @@ index f9d63b2c..6e36ef2e 100644
        (ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight()) ||
         ReaderUtils::isTopStatusBarTap(renderer, touch.y,
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index 8ae74de0..79f0b31a 100644
+index ff836d2e..5ff844c2 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
 @@ -3,6 +3,7 @@
@@ -110,11 +163,11 @@ index 8ae74de0..79f0b31a 100644
  #include "RecentBooksStore.h"
 +#include "StatusIconRow.h"
  #include "activities/reader/BookReadingStats.h"
+ #include "components/HeaderDate.h"
  #include "components/TouchActionButtons.h"
- #include "components/TouchRegistry.h"
-@@ -34,6 +36,53 @@ constexpr int homeMarginTop = 30;
- constexpr int roundedRaffHeaderClockYOffset = 5;
- constexpr int detachedHeaderBatteryTopInset = 5;
+@@ -33,6 +35,53 @@ namespace {
+ constexpr int homeMenuMargin = 20;
+ constexpr int homeMarginTop = 30;
  
 +// Status-bar-sized (20x20), sideways version of icon_lightbulb_28 /
 +// icon_lightbulb_off_28 (frontlightHeaderIcons.h): downsampled to 20px and
@@ -166,7 +219,7 @@ index 8ae74de0..79f0b31a 100644
  }  // namespace
  
  void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
-@@ -123,6 +172,97 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const b
+@@ -122,6 +171,97 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const b
    fillBatteryIcon(renderer, iconRect, percentage, foregroundBlack);
  }
  
@@ -261,10 +314,10 @@ index 8ae74de0..79f0b31a 100644
 +  return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
 +}
 +
- int BaseTheme::homeHeaderClockTextYOffset(const GfxRenderer& renderer) {
-   const auto& metrics = UITheme::getInstance().getMetrics();
-   const int statusBarHeight = metrics.statusBarVerticalMargin;
-@@ -937,6 +1077,17 @@ void BaseTheme::drawReaderStatusBar(GfxRenderer& renderer, const ReaderStatusBar
+ Rect BaseTheme::buttonMenuTouchTarget(const Rect rowRect, const Rect menuRect, const bool isLastItem,
+                                       const int rowSpacing) {
+   if (!isLastItem) return rowRect;
+@@ -870,6 +1010,17 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
      renderer.fillRect(marginLeft + bookmarkOffset, barY, filled, progressHeight, foregroundBlack);
    }
    int bookmarkReserve = 0;
@@ -282,24 +335,11 @@ index 8ae74de0..79f0b31a 100644
    if (!top && content.bookmarked) {
      constexpr int bookmarkWidth = ReaderStatusBarConfig::BOOKMARK_WIDTH;
      constexpr int bookmarkHeight = ReaderStatusBarConfig::BOOKMARK_HEIGHT;
-@@ -1067,6 +1218,12 @@ void BaseTheme::drawReaderStatusBar(GfxRenderer& renderer, const ReaderStatusBar
- void BaseTheme::drawTopStatusBarClock(const GfxRenderer& renderer, int topY, const char* previewTime,
-                                       const bool readerContext, const int textYOffset, const bool darkMode,
-                                       const bool forceVisible) const {
-+  // Deliberately ahead of the clock's own visibility/availability checks
-+  // below, so the frontlight indicators keep rendering even when the clock
-+  // is hidden (no RTC, or the user turned the clock off) - this function is
-+  // the one place every screen, reader and non-reader alike, already calls.
-+  drawFrontlightStatusIndicator(renderer, topY, darkMode);
-+
-   if (!forceVisible && !SETTINGS.shouldShowClockOutsideReader()) {
-     return;
-   }
 diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index efb83cda..6770e452 100644
+index 576070ba..1e98481a 100644
 --- a/src/components/themes/BaseTheme.h
 +++ b/src/components/themes/BaseTheme.h
-@@ -268,6 +268,28 @@ class BaseTheme {
+@@ -269,6 +269,27 @@ class BaseTheme {
                          bool foregroundBlack = true) const;  // Right aligned (UI headers)
    virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
                                 bool foregroundBlack = true) const;
@@ -310,9 +350,8 @@ index efb83cda..6770e452 100644
 +  // (not the settings copy, which only syncs when the frontlight panel
 +  // closes), so it always reflects the current state. Deliberately
 +  // independent of the clock/battery layout: called from
-+  // drawTopStatusBarClock() - the one function every screen (reader and
-+  // non-reader) already calls - ahead of its own visibility checks, so it
-+  // renders every time regardless of clock or battery settings.
++  // drawReaderStatusBar() when it draws the top bar, which is also the status
++  // bar every non-reader screen shows.
 +  void drawFrontlightStatusIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
 +  // Hit-test for the indicator above: shares its geometry (same topY
 +  // argument) so the tappable zone always matches where the icon is drawn,
@@ -328,55 +367,3 @@ index efb83cda..6770e452 100644
    // Button hint labels use three states: non-empty labels draw an active hint,
    // an empty string clears an inactive slot, and nullptr preserves the existing
    // background without drawing or registering a target.
-diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
---- a/src/activities/ActivityManager.cpp
-+++ b/src/activities/ActivityManager.cpp
-@@ -180,6 +180,7 @@
-       SETTINGS.frontlightOn = 1;
-       activity.onExternalFrontlightChange();
-       if (persist && (brightness != previousBrightness || !previousOn)) activityManager.persistGlobalSettings();
-+      if (persist && !previousOn) activityManager.requestUpdate();
-       return true;
-     }
-     case CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH:
-@@ -190,11 +191,12 @@
-       const int delta = action == CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH ? lightAmount : -lightAmount;
-       const uint8_t warmth = static_cast<uint8_t>(std::clamp(static_cast<int>(Frontlight.warmth()) + delta, 0, 100));
-       Frontlight.setWarmth(warmth);
-+      Frontlight.setOn(true);
-       SETTINGS.frontlightWarmth = warmth;
--      SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
-+      SETTINGS.frontlightOn = 1;
-       activity.onExternalFrontlightChange();
--      if (persist && (warmth != previousWarmth || Frontlight.isOn() != previousOn))
--        activityManager.persistGlobalSettings();
-+      if (persist && (warmth != previousWarmth || !previousOn)) activityManager.persistGlobalSettings();
-+      if (persist && !previousOn) activityManager.requestUpdate();
-       return true;
-     }
-     case CrossPointSettings::TWO_FINGER_SWIPE_NEXT_CHAPTER:
-@@ -219,7 +221,11 @@
- 
- #if CROSSINK_APP_CAP_TOUCH
- void finishLiveLightSwipe(LiveLightSwipeState& state, ActivityManager& activityManager) {
--  if (state.changed) activityManager.persistGlobalSettings();
-+  if (state.changed) {
-+    activityManager.persistGlobalSettings();
-+    // Refresh the status-bar lamp icon if the swipe switched the light on or off.
-+    if (Frontlight.isOn() != state.initialOn) activityManager.requestUpdate();
-+  }
-   state = {};
- }
- 
-@@ -234,9 +240,9 @@
-   const int target = SwipeAdjustment::targetValue(state.initialValue, sign > 0, amount);
-   const int current = brightness ? Frontlight.brightness() : Frontlight.warmth();
-   const int difference = sign * (target - current);
--  if (difference != 0 || (brightness && amount > 0 && !Frontlight.isOn()))
-+  if (difference != 0 || (amount > 0 && !Frontlight.isOn()))
-     applyConfiguredSwipeAction(activity, activityManager, state.action, difference, false);
--  if (brightness && amount == 0 && Frontlight.isOn() != state.initialOn) {
-+  if (amount == 0 && Frontlight.isOn() != state.initialOn) {
-     Frontlight.setOn(state.initialOn);
-     SETTINGS.frontlightOn = state.initialOn ? 1 : 0;
-     activity.onExternalFrontlightChange();
