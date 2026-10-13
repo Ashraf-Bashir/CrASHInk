@@ -1380,6 +1380,49 @@ index 49a82a11..0502ed06 100644
   private:
    /**
     * Generate a fallback XPath by streaming the spine item's XHTML and resolving
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+index f6d2facb..28402494 100644
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -177,6 +177,24 @@ bool ClippingStore::removeClippingAt(const size_t index) {
+   return true;
+ }
+ 
++bool ClippingStore::removeClippings(const std::vector<bool>& remove) {
++  if (remove.size() != clippings.size()) return false;
++  std::vector<Clipping> kept;
++  kept.reserve(clippings.size());
++  for (size_t i = 0; i < clippings.size(); ++i) {
++    if (!remove[i]) kept.push_back(clippings[i]);
++  }
++  if (kept.size() == clippings.size()) return true;
++  kept.swap(clippings);
++  dirty = true;
++  if (!saveToFile()) {
++    kept.swap(clippings);
++    dirty = true;
++    return false;
++  }
++  return true;
++}
++
+ const Clipping* ClippingStore::clippingAt(const size_t index) const {
+   if (index >= clippings.size()) return nullptr;
+   return &clippings[index];
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+index 73b450dd..f72776b7 100644
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -81,6 +81,9 @@ class ClippingStore {
+                         uint16_t paragraphIndex, const std::string& text, uint16_t tableSelection,
+                         uint32_t layoutSignature);
+   bool removeClippingAt(size_t index);
++  // Drops every clipping whose flag is set with a single store rewrite. On a
++  // failed save nothing changes and false is returned.
++  bool removeClippings(const std::vector<bool>& remove);
+   bool saveToFile();
+   void clearAll();
+ 
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
 index a4cd19be..6fcc712e 100644
 --- a/src/CrossPointSettings.h
@@ -1858,10 +1901,10 @@ index d191462c..2ae6797d 100644
      location.add(ReaderDrawerCatalogItem::NearbyPositionSync);
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..afb116a2
+index 00000000..4f46e8c4
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,1081 @@
+@@ -0,0 +1,1095 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2587,14 +2630,28 @@ index 00000000..afb116a2
 +  }
 +  if (!flush()) return false;
 +
-+  // 5. Deletions/edits made in Readest (and repairs): drop device clippings,
-+  //    highest index first so earlier indices stay valid.
-+  for (size_t i = local.size(); i-- > 0;) {
++  // 5. Deletions/edits made in Readest (and repairs): drop device clippings.
++  //    One store rewrite for all of them; if that fails, fall back to removing
++  //    one at a time, highest index first so earlier indices stay valid.
++  std::vector<bool> removeFlags(local.size(), false);
++  size_t removing = 0;
++  size_t removingVisible = 0;
++  for (size_t i = 0; i < local.size(); ++i) {
 +    if (!local[i].remove) continue;
-+    if (CLIPPINGS.removeClippingAt(i)) {
-+      if (!local[i].silent) counts.removedHere++;
-+    } else {
-+      LOG_ERR("RDS", "Failed to remove clipping %u", static_cast<unsigned>(i));
++    removeFlags[i] = true;
++    removing++;
++    if (!local[i].silent) removingVisible++;
++  }
++  if (removing > 0 && local.size() == CLIPPINGS.clippingCount() && CLIPPINGS.removeClippings(removeFlags)) {
++    counts.removedHere += removingVisible;
++  } else if (removing > 0) {
++    for (size_t i = local.size(); i-- > 0;) {
++      if (!local[i].remove) continue;
++      if (CLIPPINGS.removeClippingAt(i)) {
++        if (!local[i].silent) counts.removedHere++;
++      } else {
++        LOG_ERR("RDS", "Failed to remove clipping %u", static_cast<unsigned>(i));
++      }
 +    }
 +  }
 +
