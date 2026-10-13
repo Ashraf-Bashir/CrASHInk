@@ -1,5 +1,307 @@
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+index 28402494..e02ae13f 100644
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -3,6 +3,7 @@
+ #include <Arduino.h>
+ #include <HalStorage.h>
+ #include <Logging.h>
++#include <MemoryBudget.h>
+ #include <Serialization.h>
+ #include <Utf8.h>
+ #include <uzlib.h>
+@@ -22,6 +23,8 @@ constexpr uint8_t VERSION = 4;
+ constexpr size_t INITIAL_CLIPPING_RESERVE = 4;
+ constexpr char CLIPPINGS_DIR[] = "/.crosspoint/clippings";
+ constexpr size_t TEXT_COPY_BUFFER_SIZE = 128;
++// Internal RAM left free when the clipping list has to grow without PSRAM.
++constexpr uint32_t CLIPPING_LIST_INTERNAL_HEADROOM = 16U * 1024U;
+ 
+ struct ClippingFileHeader {
+   std::string title;
+@@ -74,6 +77,30 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
+   return true;
+ }
+ 
++// Same clean-up readFromFile used to apply to a title read from disk.
++void sanitizeChapterTitle(char* title) {
++  title[CLIPPING_CHAPTER_TITLE_MAX - 1] = '\0';
++  title[utf8SafeTruncateBuffer(title, static_cast<int>(strlen(title)))] = '\0';
++}
++
++// Bytes between the chapter title and the text: the text-length field.
++uint32_t textLengthFieldBytes(const uint8_t version) {
++  return version == LEGACY_VERSION ? sizeof(uint32_t) : sizeof(uint16_t);
++}
++
++// Fixed part of one record, shared by the full rewrite and the append path.
++bool writeClippingRecord(FsFile& f, const Clipping& clipping, const char* chapterTitle) {
++  return serialization::tryWritePod(f, clipping.spineIndex) && serialization::tryWritePod(f, clipping.startPage) &&
++         serialization::tryWritePod(f, clipping.endPage) && serialization::tryWritePod(f, clipping.pageCount) &&
++         serialization::tryWritePod(f, clipping.startWordIndex) &&
++         serialization::tryWritePod(f, clipping.endWordIndex) && serialization::tryWritePod(f, clipping.wordCount) &&
++         serialization::tryWritePod(f, clipping.paragraphIndex) && serialization::tryWritePod(f, clipping.timestamp) &&
++         serialization::tryWritePod(f, clipping.layoutSignature) &&
++         serialization::tryWritePod(f, clipping.tableSelection) &&
++         f.write(reinterpret_cast<const uint8_t*>(chapterTitle), CLIPPING_CHAPTER_TITLE_MAX) ==
++             CLIPPING_CHAPTER_TITLE_MAX;
++}
++
+ bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
+   std::array<uint8_t, TEXT_COPY_BUFFER_SIZE> buffer{};
+   while (length > 0) {
+@@ -103,6 +130,7 @@ bool ClippingStore::loadForBook(const std::string& filePath, const std::string&
+   bookTitle = title;
+   bookAuthor = author;
+   dirty = false;
++  fileVersion = 0;
+   clippings.clear();
+   if (clippings.capacity() < INITIAL_CLIPPING_RESERVE) {
+     clippings.reserve(INITIAL_CLIPPING_RESERVE);
+@@ -137,6 +165,20 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+     return AddResult::LimitReached;
+   }
+ 
++  if (clippings.size() == clippings.capacity()) {
++    // Grow in bounded steps: doubling a large list needs the old block plus one
++    // twice its size at the same moment, and a failed allocation aborts.
++    const size_t step = std::max<size_t>(64, clippings.size() / 8);
++    const size_t capacity = std::min<size_t>(clippings.size() + step, CLIPPING_MAX_PER_BOOK);
++    const uint32_t bytes = static_cast<uint32_t>(capacity * sizeof(Clipping));
++    if (MemoryBudget::psramSnapshot().maxAllocHeap < bytes &&
++        MemoryBudget::snapshot().maxAllocHeap < bytes + CLIPPING_LIST_INTERNAL_HEADROOM) {
++      LOG_ERR("CLIP", "No memory to grow the clipping list to %u entries", static_cast<unsigned>(capacity));
++      return AddResult::SaveFailed;
++    }
++    clippings.reserve(capacity);
++  }
++
+   Clipping clipping;
+   clipping.spineIndex = spineIndex;
+   clipping.startPage = startPage;
+@@ -149,13 +191,21 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+   clipping.timestamp = static_cast<uint32_t>(millis() / 1000UL);
+   clipping.layoutSignature = layoutSignature;
+   clipping.tableSelection = tableSelection;
+-  copyBounded(clipping.chapterTitle, sizeof(clipping.chapterTitle), chapterTitle);
++  char title[CLIPPING_CHAPTER_TITLE_MAX] = {};
++  copyBounded(title, sizeof(title), chapterTitle);
+   const size_t cappedLength = std::min(text.size(), CLIPPING_TEXT_MAX);
+   clipping.textLength = static_cast<uint16_t>(utf8SafeTruncateBuffer(text.data(), static_cast<int>(cappedLength)));
+ 
+   clippings.push_back(std::move(clipping));
++  // Appending writes only this clipping. A full rewrite copies every saved
++  // clipping's text, which grows with the book's whole clipping history.
++  const bool wasDirty = dirty;
++  if (appendLastToFile(text, title)) {
++    dirty = wasDirty;
++    return AddResult::Added;
++  }
+   dirty = true;
+-  if (!writeToFile(&text, clippings.size() - 1)) {
++  if (!writeToFile(&text, clippings.size() - 1, nullptr, title)) {
+     clippings.pop_back();
+     dirty = true;
+     return AddResult::SaveFailed;
+@@ -164,6 +214,69 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+   return AddResult::Added;
+ }
+ 
++bool ClippingStore::appendLastToFile(const std::string& text, const char* chapterTitle) {
++  // Only an existing current-format file whose records end exactly where memory
++  // says they do. Everything else takes the atomic full rewrite.
++  if (clippings.size() < 2 || fileVersion != VERSION || storeFilePath.empty()) return false;
++  const std::string backupPath = storeFilePath + ".bak";
++  const std::string tmpPath = storeFilePath + ".tmp";
++  if (!Storage.exists(storeFilePath.c_str()) || Storage.exists(backupPath.c_str()) ||
++      Storage.exists(tmpPath.c_str())) {
++    return false;
++  }
++  const Clipping& previous = clippings[clippings.size() - 2];
++  const uint32_t recordStart = previous.textOffset + previous.textLength;
++  Clipping& clipping = clippings.back();
++  const uint16_t count = static_cast<uint16_t>(clippings.size());
++
++  FsFile f = Storage.open(storeFilePath.c_str(), O_RDWR);
++  if (!f) return false;
++  uint8_t version = 0;
++  uint16_t storedCount = 0;
++  if (!serialization::tryReadPod(f, version) || version != VERSION || !serialization::tryReadPod(f, storedCount) ||
++      storedCount != count - 1 || f.size() < recordStart || !f.seek(recordStart)) {
++    f.close();
++    return false;
++  }
++  // Bytes past recordStart can only be an earlier append that never reached
++  // its count update; they are overwritten here.
++  bool ok = writeClippingRecord(f, clipping, chapterTitle) && serialization::tryWritePod(f, clipping.textLength);
++  const uint32_t textOffset = static_cast<uint32_t>(f.position());
++  if (ok && clipping.textLength > 0) {
++    ok = f.write(reinterpret_cast<const uint8_t*>(text.data()), clipping.textLength) == clipping.textLength;
++  }
++  ok = ok && f.sync();
++  // Commit point: the record exists for readers once the header counts it.
++  ok = ok && f.seek(sizeof(uint8_t)) && serialization::tryWritePod(f, count) && f.sync();
++  f.close();
++  if (!ok) {
++    LOG_ERR("CLIP", "Clipping append failed, rewriting store: %s", storeFilePath.c_str());
++    return false;
++  }
++  clipping.textOffset = textOffset;
++  return true;
++}
++
++uint32_t ClippingStore::titleOffset(const Clipping& clipping) const {
++  return clipping.textOffset - textLengthFieldBytes(fileVersion) - CLIPPING_CHAPTER_TITLE_MAX;
++}
++
++bool ClippingStore::readChapterTitle(const size_t index, std::string& out) const {
++  out.clear();
++  const Clipping* clipping = clippingAt(index);
++  if (!clipping || storeFilePath.empty()) return false;
++  FsFile f;
++  if (!Storage.openFileForRead("CLIP", storeFilePath, f)) return false;
++  char title[CLIPPING_CHAPTER_TITLE_MAX] = {};
++  const bool ok = f.seek(titleOffset(*clipping)) &&
++                  f.read(reinterpret_cast<uint8_t*>(title), sizeof(title)) == static_cast<int>(sizeof(title));
++  f.close();
++  if (!ok) return false;
++  sanitizeChapterTitle(title);
++  out = title;
++  return true;
++}
++
+ bool ClippingStore::removeClippingAt(const size_t index) {
+   if (index >= clippings.size()) return false;
+   Clipping clipping = std::move(clippings[index]);
+@@ -280,9 +393,9 @@ void ClippingStore::clearAll() {
+   }
+ }
+ 
+-bool ClippingStore::readFromFile() { return readFromFile(storeFilePath, clippings); }
++bool ClippingStore::readFromFile() { return readFromFile(storeFilePath, clippings, &fileVersion); }
+ 
+-bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>& out) const {
++bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>& out, uint8_t* versionOut) const {
+   out.clear();
+   FsFile f;
+   if (!Storage.openFileForRead("CLIP", path, f)) {
+@@ -309,6 +422,8 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+     f.close();
+     return false;
+   }
++  // Title positions are derived from this, so record it before any records.
++  if (versionOut) *versionOut = version;
+ 
+   out.reserve(count);
+   for (uint16_t i = 0; i < count; ++i) {
+@@ -332,16 +447,11 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+       LOG_ERR("CLIP", "Clipping file truncated at table selection, record %u: %s", i, path.c_str());
+       return false;
+     }
+-    if (f.read(reinterpret_cast<uint8_t*>(clipping.chapterTitle), sizeof(clipping.chapterTitle)) !=
+-        sizeof(clipping.chapterTitle)) {
++    if (!f.seekCur(CLIPPING_CHAPTER_TITLE_MAX)) {
+       f.close();
+       LOG_ERR("CLIP", "Clipping file truncated at chapter title, record %u: %s", i, path.c_str());
+       return false;
+     }
+-    clipping.chapterTitle[sizeof(clipping.chapterTitle) - 1] = '\0';
+-    const int safeTitleLength =
+-        utf8SafeTruncateBuffer(clipping.chapterTitle, static_cast<int>(strlen(clipping.chapterTitle)));
+-    clipping.chapterTitle[safeTitleLength] = '\0';
+     if (version == LEGACY_VERSION) {
+       uint32_t textLen = 0;
+       if (!serialization::tryReadPod(f, textLen)) {
+@@ -382,7 +492,7 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+ }
+ 
+ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
+-                                const std::string* sourcePathOverride) {
++                                const std::string* sourcePathOverride, const char* replacementTitle) {
+   Storage.mkdir("/.crosspoint");
+   Storage.mkdir(CLIPPINGS_DIR);
+ 
+@@ -430,15 +540,20 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+ 
+   for (uint16_t i = 0; i < count; ++i) {
+     const Clipping& clipping = clippings[i];
+-    if (!serialization::tryWritePod(f, clipping.spineIndex) || !serialization::tryWritePod(f, clipping.startPage) ||
+-        !serialization::tryWritePod(f, clipping.endPage) || !serialization::tryWritePod(f, clipping.pageCount) ||
+-        !serialization::tryWritePod(f, clipping.startWordIndex) ||
+-        !serialization::tryWritePod(f, clipping.endWordIndex) || !serialization::tryWritePod(f, clipping.wordCount) ||
+-        !serialization::tryWritePod(f, clipping.paragraphIndex) || !serialization::tryWritePod(f, clipping.timestamp) ||
+-        !serialization::tryWritePod(f, clipping.layoutSignature) ||
+-        !serialization::tryWritePod(f, clipping.tableSelection) ||
+-        f.write(reinterpret_cast<const uint8_t*>(clipping.chapterTitle), sizeof(clipping.chapterTitle)) !=
+-            sizeof(clipping.chapterTitle)) {
++    const bool useReplacement = replacementText && i == replacementIndex;
++    char title[CLIPPING_CHAPTER_TITLE_MAX] = {};
++    if (useReplacement && replacementTitle) {
++      memcpy(title, replacementTitle, sizeof(title));
++    } else if (!source || !source.seek(titleOffset(clipping)) ||
++               source.read(reinterpret_cast<uint8_t*>(title), sizeof(title)) != static_cast<int>(sizeof(title))) {
++      LOG_ERR("CLIP", "Failed to read clipping title %u: %s", i, sourcePath.c_str());
++      f.close();
++      if (source) source.close();
++      Storage.remove(tmpPath.c_str());
++      return false;
++    }
++    sanitizeChapterTitle(title);
++    if (!writeClippingRecord(f, clipping, title)) {
+       LOG_ERR("CLIP", "Failed to write clipping record %u: %s", i, storeFilePath.c_str());
+       f.close();
+       if (source) source.close();
+@@ -446,7 +561,6 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+       return false;
+     }
+ 
+-    const bool useReplacement = replacementText && i == replacementIndex;
+     const uint16_t textLen = clipping.textLength;
+     if (!serialization::tryWritePod(f, textLen)) {
+       LOG_ERR("CLIP", "Failed to write clipping text length %u: %s", i, tmpPath.c_str());
+@@ -499,6 +613,7 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+   if (replacingDestination && Storage.exists(backupPath.c_str())) {
+     Storage.remove(backupPath.c_str());
+   }
++  fileVersion = VERSION;
+   for (uint16_t i = 0; i < count; ++i) {
+     clippings[i].textOffset = newTextOffsets[i];
+     clippings[i].textLength = newTextLengths[i];
+@@ -551,11 +666,13 @@ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std
+ 
+   ClippingStore reader;
+   std::vector<Clipping> migratedClippings;
+-  if (!reader.readFromFile(oldStorePath, migratedClippings)) {
++  uint8_t migratedVersion = 0;
++  if (!reader.readFromFile(oldStorePath, migratedClippings, &migratedVersion)) {
+     return false;
+   }
+ 
+   ClippingStore writer;
++  writer.fileVersion = migratedVersion;
+   writer.bookFilePath = newFilePath;
+   writer.bookTitle = title;
+   writer.bookAuthor = author;
+@@ -631,7 +748,8 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+ 
+   ClippingStore reader;
+   std::vector<Clipping> migratedClippings;
+-  if (!reader.readFromFile(migration.sourcePath, migratedClippings)) {
++  uint8_t migratedVersion = 0;
++  if (!reader.readFromFile(migration.sourcePath, migratedClippings, &migratedVersion)) {
+     LOG_ERR("CLIP", "Failed to load source clippings for rename: %s", migration.sourcePath.c_str());
+     return false;
+   }
+@@ -662,6 +780,7 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+ 
+   migration.active = true;
+   ClippingStore writer;
++  writer.fileVersion = migratedVersion;
+   writer.bookFilePath = newFilePath;
+   writer.bookTitle = title;
+   writer.bookAuthor = author;
 diff --git a/src/ClippingStore.h b/src/ClippingStore.h
-index 73b450dd..f569cb0b 100644
+index f72776b7..746c2dc8 100644
 --- a/src/ClippingStore.h
 +++ b/src/ClippingStore.h
 @@ -7,9 +7,12 @@
@@ -18,6 +320,43 @@ index 73b450dd..f569cb0b 100644
  inline constexpr uint16_t CLIPPING_MAX_PER_BOOK = 65535;
  inline constexpr uint16_t CLIPPING_MAX_PAGE_MATCHES = 16;
  inline constexpr uint32_t CLIPPING_WORD_LAYOUT_VERSION = 2;
+@@ -43,7 +46,8 @@ struct Clipping {
+   // Session-only migration state, intentionally omitted from the on-disk
+   // record.
+   uint8_t resolvedLayoutBoundaries = 0;
+-  char chapterTitle[CLIPPING_CHAPTER_TITLE_MAX] = {};
++  // The chapter title is not kept here: it stays in the on-disk record and is
++  // read on demand (ClippingStore::readChapterTitle), saving 48 bytes per clipping.
+ };
+ 
+ struct ClippedBookEntry {
+@@ -96,6 +100,8 @@ class ClippingStore {
+   bool readClippingText(size_t index, std::string& out) const;
+   bool readClippingPreview(size_t index, std::string& out) const;
+   bool readClippingText(const Clipping& clipping, std::string& out) const;
++  // Chapter title saved with the clipping, read from the store file.
++  bool readChapterTitle(size_t index, std::string& out) const;
+ 
+   static bool hasAnyClippings();
+   static bool getAllClippedBooks(std::vector<ClippedBookEntry>& out);
+@@ -118,11 +124,15 @@ class ClippingStore {
+   std::string bookAuthor;
+   std::string storeFilePath;
+   bool dirty = false;
++  // On-disk format of storeFilePath as last loaded or written; appends need VERSION.
++  uint8_t fileVersion = 0;
+ 
+   bool readFromFile();
+-  bool readFromFile(const std::string& path, std::vector<Clipping>& out) const;
++  bool readFromFile(const std::string& path, std::vector<Clipping>& out, uint8_t* versionOut = nullptr) const;
++  bool appendLastToFile(const std::string& text, const char* chapterTitle);
++  uint32_t titleOffset(const Clipping& clipping) const;
+   bool writeToFile(const std::string* replacementText = nullptr, size_t replacementIndex = SIZE_MAX,
+-                   const std::string* sourcePathOverride = nullptr);
++                   const std::string* sourcePathOverride = nullptr, const char* replacementTitle = nullptr);
+ };
+ 
+ inline bool clippingStoredRangeMatchesLayout(const Clipping& clipping, const uint16_t currentPageCount,
 diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
 index eefe286b..9250bb19 100644
 --- a/src/activities/reader/ClipSelectionActivity.cpp
@@ -114,10 +453,84 @@ index 0247eb58..d5705861 100644
    return static_cast<uint32_t>(now - heldSince) >= TOUCH_PAGE_ADVANCE_HOLD_MS;
  }
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 6ac6fd7b..54507b9f 100644
+index 6ac6fd7b..3a09ac21 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -4782,8 +4782,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -461,21 +461,6 @@ uint16_t countClipTokens(const std::string& text) {
+   return count;
+ }
+ 
+-bool advanceClipCursorToToken(const std::string& text, const uint16_t targetIndex, const char*& cursor,
+-                              const char*& tokenStart, size_t& tokenLen) {
+-  cursor = text.c_str();
+-  uint16_t index = 0;
+-  while (nextClipToken(cursor, tokenStart, tokenLen)) {
+-    if (index == targetIndex) {
+-      return true;
+-    }
+-    index++;
+-  }
+-  tokenStart = nullptr;
+-  tokenLen = 0;
+-  return false;
+-}
+-
+ ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
+                                                               const char* token, const size_t tokenLen,
+                                                               const size_t tokenOffset = 0,
+@@ -522,7 +507,8 @@ bool forEachVisiblePageWord(const Pages& page, Callback&& callback) {
+ }
+ 
+ template <typename Pages>
+-bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText, const uint16_t startPageWord,
++bool matchClipRunFromPageWord(const Pages& page, const uint16_t clipTokenCount, const char* startCursor,
++                              const char* startToken, const size_t startTokenLen, const uint16_t startPageWord,
+                               const uint16_t startClipToken, const uint16_t minPartialMatch,
+                               const uint8_t expectedTableColumn, ClippingPageMatch& match,
+                               const bool allowShortBoundary = false) {
+@@ -532,14 +518,15 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+   if (!ClippingTextMatcher::startsWhereAClipCanContinue(startClipToken, startPageWord)) {
+     return false;
+   }
+-  const char* cursor = nullptr;
+-  const char* token = nullptr;
+-  size_t tokenLen = 0;
+-  if (!advanceClipCursorToToken(clippingText, startClipToken, cursor, token, tokenLen)) {
++  // The caller passes the cursor just past startClipToken, that token, and the
++  // clipping's token count, so the run never rescans the clipping text.
++  const char* cursor = startCursor;
++  const char* token = startToken;
++  size_t tokenLen = startTokenLen;
++  if (!token || tokenLen == 0) {
+     return false;
+   }
+ 
+-  const uint16_t clipTokenCount = countClipTokens(clippingText);
+   uint16_t matchedTokens = 0;
+   uint16_t lastWord = startPageWord;
+   size_t tokenOffset = 0;
+@@ -638,13 +625,18 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+           if (tokenIndex >= tokenCount) {
+             break;
+           }
++          // Past the first page word only the clipping's first token can start a
++          // run (startsWhereAClipCanContinue); later tokens are always rejected.
++          if (tokenIndex > 0 && !ClippingTextMatcher::startsWhereAClipCanContinue(tokenIndex, wordIndex)) {
++            break;
++          }
+           ClippingPageMatch candidate;
+           if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, 0, tokenIndex == 0,
+                                    tokenIndex + 1 == tokenCount)
+                   .match !=
+                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
+-              matchClipRunFromPageWord(page, clippingText, wordIndex, tokenIndex, minPartialMatch, expectedTableColumn,
+-                                       candidate, allowShortBoundary) &&
++              matchClipRunFromPageWord(page, tokenCount, cursor, token, tokenLen, wordIndex, tokenIndex,
++                                       minPartialMatch, expectedTableColumn, candidate, allowShortBoundary) &&
+               (requiredBoundary == UINT16_MAX ||
+                (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
+             const bool candidateComplete = candidate.startsAtClipStart && candidate.reachesClipEnd;
+@@ -4782,8 +4774,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
        }
      }
      const int lineHeight = renderer.getLineHeight(readerFontId);
@@ -134,7 +547,7 @@ index 6ac6fd7b..54507b9f 100644
      static constexpr uint32_t CLIP_SELECTION_WORD_RESERVE_HEADROOM = 16U * 1024U;
      static constexpr size_t CLIP_SELECTION_INITIAL_TEXT_RESERVE = 4U * 1024U;
      // Page density varies with font size and layout. Keep the fixed memory cap,
-@@ -4791,7 +4797,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4791,7 +4789,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      const size_t maxSelectableWords = pagesToLoad > 0 ? MAX_CLIP_SELECTION_WORDS : 0;
      const uint32_t wordReserveBytes = static_cast<uint32_t>(maxSelectableWords * sizeof(WordRef));
      const auto heapBeforeWords = MemoryBudget::snapshot();
@@ -146,7 +559,7 @@ index 6ac6fd7b..54507b9f 100644
        LOG_ERR("CLIP", "Low heap for clipping selection (%u free, %u max alloc, need block %u); skipping",
                heapBeforeWords.freeHeap, heapBeforeWords.maxAllocHeap,
                wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM);
-@@ -6594,7 +6603,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6594,7 +6595,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -155,7 +568,7 @@ index 6ac6fd7b..54507b9f 100644
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -6643,7 +6652,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6643,7 +6644,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -164,7 +577,7 @@ index 6ac6fd7b..54507b9f 100644
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -7750,7 +7759,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7750,7 +7751,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
    const uint16_t currentPageCount = canUseStoredRanges ? static_cast<uint16_t>(section->pageCount) : 0;
    const uint32_t currentClippingLayoutSignature = clippingWordLayoutSignature(activeSectionLayoutSignature);
    std::string clippingText;
@@ -174,7 +587,7 @@ index 6ac6fd7b..54507b9f 100644
    for (size_t clippingIndex = 0; clippingIndex < clippings.size(); ++clippingIndex) {
      const Clipping& clipping = clippings[clippingIndex];
 diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
-index 3b0a4bb3..44ea9d60 100644
+index 3b0a4bb3..99f48377 100644
 --- a/src/activities/reader/EpubReaderClippingListActivity.cpp
 +++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
 @@ -160,7 +160,7 @@ void EpubReaderClippingListActivity::onEnter() {
@@ -195,8 +608,58 @@ index 3b0a4bb3..44ea9d60 100644
    if (!CLIPPINGS.readClippingText(static_cast<size_t>(selectedIndex), text)) {
      text.clear();
    }
+@@ -271,7 +271,9 @@ void EpubReaderClippingListActivity::showClippingActionMenu(const bool ignoreIni
+ 
+   const Clipping* selectedClipping = CLIPPINGS.clippingAt(static_cast<size_t>(selectedIndex));
+   if (!selectedClipping) return;
+-  const char* title = selectedClipping->chapterTitle[0] != '\0' ? selectedClipping->chapterTitle : tr(STR_CLIPPINGS);
++  std::string chapterTitle;
++  CLIPPINGS.readChapterTitle(static_cast<size_t>(selectedIndex), chapterTitle);
++  const std::string title = chapterTitle.empty() ? std::string(tr(STR_CLIPPINGS)) : chapterTitle;
+   const uint16_t selectedSpineIndex = selectedClipping->spineIndex;
+   const uint16_t selectedStartPage = selectedClipping->startPage;
+   const uint16_t selectedStartWordIndex = selectedClipping->startWordIndex;
+@@ -516,7 +518,10 @@ void EpubReaderClippingListActivity::buildListScreen(UiApp::ScreenType& screen)
+     fui::ListItem& item = uiItems[static_cast<size_t>(i)];
+     item = fui::ListItem{};
+     item.label = uiLabels[slot].c_str();
+-    if (clipping) item.subtitle = clipping->chapterTitle[0] != '\0' ? clipping->chapterTitle : tr(STR_UNKNOWN_CHAPTER);
++    if (clipping) {
++      CLIPPINGS.readChapterTitle(static_cast<size_t>(i), uiChapterTitles[slot]);
++      item.subtitle = uiChapterTitles[slot].empty() ? tr(STR_UNKNOWN_CHAPTER) : uiChapterTitles[slot].c_str();
++    }
+     item.actionValue = static_cast<int16_t>(i);
+   }
+ 
+@@ -545,10 +550,10 @@ void EpubReaderClippingListActivity::renderDetail() {
+   const auto& metrics = UITheme::getInstance().getMetrics();
+ 
+   const char* chapter = tr(STR_CLIPPINGS);
+-  const Clipping* selectedClipping =
+-      selectedIndex >= 0 ? CLIPPINGS.clippingAt(static_cast<size_t>(selectedIndex)) : nullptr;
+-  if (selectedClipping && selectedClipping->chapterTitle[0] != '\0') {
+-    chapter = selectedClipping->chapterTitle;
++  std::string chapterTitle;
++  if (selectedIndex >= 0 && CLIPPINGS.readChapterTitle(static_cast<size_t>(selectedIndex), chapterTitle) &&
++      !chapterTitle.empty()) {
++    chapter = chapterTitle.c_str();
+   }
+ 
+   int textStartY = DETAIL_START_Y + contentY;
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.h b/src/activities/reader/EpubReaderClippingListActivity.h
+index 92fd512c..e01a1a93 100644
+--- a/src/activities/reader/EpubReaderClippingListActivity.h
++++ b/src/activities/reader/EpubReaderClippingListActivity.h
+@@ -42,6 +42,7 @@ class EpubReaderClippingListActivity final : public Activity {
+   int topIndex = 0;
+   std::vector<freeink::ui::ListItem> uiItems;
+   std::array<std::string, CLIPPING_WINDOW_SIZE> uiLabels;
++  std::array<std::string, CLIPPING_WINDOW_SIZE> uiChapterTitles;
+ 
+   static void listScreen(UiApp::ScreenType& screen, void* user);
+   static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
-index afb116a2..1b3b7850 100644
+index 4f46e8c4..debf65a9 100644
 --- a/src/activities/reader/ReadestSyncActivity.cpp
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
 @@ -634,7 +634,7 @@ bool ReadestSyncActivity::syncHighlights(const ReadestBook& book, HighlightCount
