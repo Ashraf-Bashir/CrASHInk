@@ -1,5 +1,48 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8af1efc..ce39e42 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,9 @@
++## [Unreleased]
++
++### Fixed
++
++- Readest position sync uses the latest position edit on either device, including rereading earlier chapters. Sync requests and unchanged saves preserve the original edit time.
++
+ ## [v1.6.1] - 2026-10-03
+ 
+ ### Added
+diff --git a/docs/file-formats.md b/docs/file-formats.md
+index 38c7341..9ebd243 100644
+--- a/docs/file-formats.md
++++ b/docs/file-formats.md
+@@ -1138,3 +1138,24 @@ the card to the host. Manage Fonts performs a full rescan; alternatively remove
+ this cache to force reinspection after external same-length font changes.
+ 
+ EPUB layout cache versions and identities are unchanged by this catalog.
++
++
++## EPUB progress.bin version 2 (crASHink)
++
++The 22-byte version-2 record begins with bytes `50 52 47 02` (`PRG`, version 2),
++then little-endian u16 spine, page and page count; u32 visible text offset
++(`0xffffffff` means absent); and u64 UTC milliseconds of the position edit
++(0 means unknown). The timestamp is written atomically with the position using
++the existing temp/backup rotation. Legacy 4-, 6- and 10-byte records remain
++readable with an unknown timestamp. Returning to the same text, opening menus
++and repagination preserve the edit time; applying Readest progress preserves
++its source time. A new reading position gets UTC milliseconds from a valid system clock, falling back to the hardware
++RTC (one second resolution). Timezone display
++settings do not affect this value.
++
++Latest-wins sync refuses to overwrite either side when an existing position
++has an unknown time. For legacy device records, turn a page after updating to
++establish a timestamp. If the clock is unset, sync network time first and then
++move to the desired position. Equal timestamps leave both sides unchanged.
++Older firmware cannot read version 2; retain the firmware and progress backup
++before downgrading. TXT/XTC progress formats are unchanged.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 5dc5d57e..083e8cdb 100644
+index 5dc5d57..083e8cd 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -958,3 +958,43 @@ STR_MONTH_SEP: "September"
@@ -47,7 +90,7 @@ index 5dc5d57e..083e8cdb 100644
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 31eeb08d..9d01eb09 100644
+index 31eeb08..9d01eb0 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
 @@ -7,13 +7,19 @@
@@ -1261,7 +1304,7 @@ index 31eeb08d..9d01eb09 100644
 +  return false;
 +}
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.h b/lib/KOReaderSync/ChapterXPathResolver.h
-index 9676150a..3a652223 100644
+index 9676150..3a65222 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.h
 +++ b/lib/KOReaderSync/ChapterXPathResolver.h
 @@ -6,6 +6,20 @@
@@ -1341,7 +1384,7 @@ index 9676150a..3a652223 100644
 +                                    float positionHint, XPathTextRange& out);
  };
 diff --git a/lib/KOReaderSync/ProgressMapper.cpp b/lib/KOReaderSync/ProgressMapper.cpp
-index 543b112a..ad518745 100644
+index 543b112..ad51874 100644
 --- a/lib/KOReaderSync/ProgressMapper.cpp
 +++ b/lib/KOReaderSync/ProgressMapper.cpp
 @@ -1023,3 +1023,16 @@ std::string ProgressMapper::generateXPath(const std::shared_ptr<Epub>& epub, int
@@ -1362,7 +1405,7 @@ index 543b112a..ad518745 100644
 +  return mapSourceXPathToCurrent(epub, xpath, currentSpineIndex) && currentSpineIndex >= 0;
 +}
 diff --git a/lib/KOReaderSync/ProgressMapper.h b/lib/KOReaderSync/ProgressMapper.h
-index 49a82a11..0502ed06 100644
+index 49a82a1..0502ed0 100644
 --- a/lib/KOReaderSync/ProgressMapper.h
 +++ b/lib/KOReaderSync/ProgressMapper.h
 @@ -92,6 +92,14 @@ class ProgressMapper {
@@ -1380,8 +1423,60 @@ index 49a82a11..0502ed06 100644
   private:
    /**
     * Generate a fallback XPath by streaming the spine item's XHTML and resolving
+diff --git a/lib/hal/HalClock.cpp b/lib/hal/HalClock.cpp
+index cb18db8..c6ed3af 100644
+--- a/lib/hal/HalClock.cpp
++++ b/lib/hal/HalClock.cpp
+@@ -6,6 +6,7 @@
+ #include <esp_netif.h>
+ #include <esp_netif_sntp.h>
+ #include <lwip/dns.h>
++#include <sys/time.h>
+ #include <time.h>
+ 
+ #include <cassert>
+@@ -70,6 +71,25 @@ void HalClock::begin() {
+   LOG_INF("CLK", _available ? "SDK RTC found" : "RTC not found");
+ }
+ 
++int64_t HalClock::utcNowMs() const {
++  timeval now{};
++  if (gettimeofday(&now, nullptr) == 0 && now.tv_sec > 1600000000) {
++    return static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_usec / 1000;
++  }
++  Rtc::DateTime dt;
++  if (_available && _sdkRtc.now(dt) && isValidDate(dt.year, dt.month, dt.day) && dt.year >= 2020) {
++    // Gregorian civil date to Unix days; RTC stores UTC, independent of display offset.
++    int year = dt.year - (dt.month <= 2);
++    const int era = year / 400;
++    const unsigned yoe = static_cast<unsigned>(year - era * 400);
++    const unsigned doy = (153 * (dt.month > 2 ? dt.month - 3 : dt.month + 9) + 2) / 5 + dt.day - 1;
++    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++    const int64_t days = static_cast<int64_t>(era) * 146097 + doe - 719468;
++    return ((days * 24 + dt.hour) * 60 + dt.minute) * 60000LL + dt.second * 1000LL;
++  }
++  return 0;
++}
++
+ bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {
+   if (!_available) return false;
+ 
+diff --git a/lib/hal/HalClock.h b/lib/hal/HalClock.h
+index 3758018..2dd2a83 100644
+--- a/lib/hal/HalClock.h
++++ b/lib/hal/HalClock.h
+@@ -63,6 +63,9 @@ class HalClock {
+   bool formatDate(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48,
+                   DateFormat dateFormat = MONTH_DAY_YEAR_LONG, char numericSeparator = '/') const;
+ 
++  // UTC milliseconds for persisted edits; zero when no trustworthy clock exists.
++  int64_t utcNowMs() const;
++
+   // Sync the RTC from an NTP server. Requires WiFi to be connected.
+   // Blocks for up to ~5s while waiting for SNTP response.
+   // Returns true if the RTC was successfully updated.
 diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
-index f6d2facb..28402494 100644
+index f6d2fac..2840249 100644
 --- a/src/ClippingStore.cpp
 +++ b/src/ClippingStore.cpp
 @@ -177,6 +177,24 @@ bool ClippingStore::removeClippingAt(const size_t index) {
@@ -1410,7 +1505,7 @@ index f6d2facb..28402494 100644
    if (index >= clippings.size()) return nullptr;
    return &clippings[index];
 diff --git a/src/ClippingStore.h b/src/ClippingStore.h
-index 73b450dd..f72776b7 100644
+index 73b450d..f72776b 100644
 --- a/src/ClippingStore.h
 +++ b/src/ClippingStore.h
 @@ -81,6 +81,9 @@ class ClippingStore {
@@ -1424,7 +1519,7 @@ index 73b450dd..f72776b7 100644
    void clearAll();
  
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
-index a4cd19be..6fcc712e 100644
+index a4cd19b..6fcc712 100644
 --- a/src/CrossPointSettings.h
 +++ b/src/CrossPointSettings.h
 @@ -440,6 +440,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
@@ -1437,7 +1532,7 @@ index a4cd19be..6fcc712e 100644
    uint8_t sleepScreenCoverMode = FIT;
    // Sleep screen cover filter
 diff --git a/src/GlobalActions.h b/src/GlobalActions.h
-index e19c1b1c..ae9ca4c5 100644
+index e19c1b1..ae9ca4c 100644
 --- a/src/GlobalActions.h
 +++ b/src/GlobalActions.h
 @@ -61,6 +61,12 @@ inline bool isPowerButtonActionAvailableOutsideReader(const CrossPointSettings::
@@ -1454,7 +1549,7 @@ index e19c1b1c..ae9ca4c5 100644
                                     QuickLockTrigger quickLockTrigger = QuickLockTrigger::None);
  bool dispatchShortcutAction(CrossPointSettings::SHORT_PWRBTN action);
 diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
-index 8688b689..054a0b93 100644
+index 8688b68..054a0b9 100644
 --- a/src/SettingsList.cpp
 +++ b/src/SettingsList.cpp
 @@ -34,6 +34,8 @@ const std::vector<SettingInfo>& getBaseSettingsList() {
@@ -1467,7 +1562,7 @@ index 8688b689..054a0b93 100644
                            {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_MINIMAL, StrId::STR_THEME_DASHBOARD,
                             StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED, StrId::STR_THEME_LYRA_CAROUSEL,
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index cfb74459..14607d27 100644
+index cfb7445..14607d2 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
 @@ -781,9 +781,10 @@ inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<
@@ -1498,7 +1593,7 @@ index cfb74459..14607d27 100644
    systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
    systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
 diff --git a/src/SilentRestart.h b/src/SilentRestart.h
-index 73ba26bf..3c28210a 100644
+index 73ba26b..3c28210 100644
 --- a/src/SilentRestart.h
 +++ b/src/SilentRestart.h
 @@ -14,6 +14,9 @@ enum class NetworkBootTarget : uint32_t {
@@ -1552,7 +1647,7 @@ index 73ba26bf..3c28210a 100644
  void armSilentRestartReaderPageBuild(const std::string& bookPath, uint16_t spineIndex, uint16_t targetPage,
                                       bool autoPageTurnActive);
 diff --git a/src/activities/Activity.cpp b/src/activities/Activity.cpp
-index 498e4d4c..79bf2119 100644
+index 498e4d4..79bf211 100644
 --- a/src/activities/Activity.cpp
 +++ b/src/activities/Activity.cpp
 @@ -5,6 +5,7 @@
@@ -1580,7 +1675,7 @@ index 498e4d4c..79bf2119 100644
  void Activity::startActivityForResult(std::unique_ptr<Activity>&& activity, ActivityResultHandler resultHandler) {
    this->resultHandler = std::move(resultHandler);
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index 3a4b25b3..293f90ce 100644
+index 3a4b25b..293f90c 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
 @@ -1058,6 +1058,10 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
@@ -1606,7 +1701,7 @@ index 3a4b25b3..293f90ce 100644
  void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
  
 diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
-index 805e4be7..2fe86704 100644
+index 805e4be..2fe8670 100644
 --- a/src/activities/home/HomeActivity.cpp
 +++ b/src/activities/home/HomeActivity.cpp
 @@ -36,6 +36,7 @@
@@ -1630,7 +1725,7 @@ index 805e4be7..2fe86704 100644
  }
  
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 8242d1b6..6ac6fd7b 100644
+index 8242d1b..6ac6fd7 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -28,6 +28,7 @@
@@ -1841,7 +1936,7 @@ index 8242d1b6..6ac6fd7b 100644
    PendingOverlayResume resume;
    resume.origin = PendingOverlayOrigin::Reader;
 diff --git a/src/activities/reader/EpubReaderDrawerActivity.cpp b/src/activities/reader/EpubReaderDrawerActivity.cpp
-index d2a4c38f..96deca3b 100644
+index d2a4c38..96deca3 100644
 --- a/src/activities/reader/EpubReaderDrawerActivity.cpp
 +++ b/src/activities/reader/EpubReaderDrawerActivity.cpp
 @@ -1829,6 +1829,9 @@ void EpubReaderDrawerActivity::activateRow(const RowId row) {
@@ -1872,7 +1967,7 @@ index d2a4c38f..96deca3b 100644
      case RowId::ResetBookReaderSettings:
      case RowId::DeleteBookmarks:
 diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
-index d191462c..2ae6797d 100644
+index d191462..2ae6797 100644
 --- a/src/activities/reader/EpubReaderMenuModel.h
 +++ b/src/activities/reader/EpubReaderMenuModel.h
 @@ -35,6 +35,7 @@ enum class EpubReaderMenuAction : uint8_t {
@@ -1899,12 +1994,145 @@ index d191462c..2ae6797d 100644
    if (available.buttonDevice) {
      location.add(ReaderDrawerCatalogItem::SyncProgress);
      location.add(ReaderDrawerCatalogItem::NearbyPositionSync);
+diff --git a/src/activities/reader/EpubReaderUtils.h b/src/activities/reader/EpubReaderUtils.h
+index 9a114f2..1502bdd 100644
+--- a/src/activities/reader/EpubReaderUtils.h
++++ b/src/activities/reader/EpubReaderUtils.h
+@@ -4,10 +4,12 @@
+ #include <HalStorage.h>
+ #include <Logging.h>
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <optional>
+ #include <string>
+ 
++#include "HalClock.h"
+ #include "util/FileContentEquals.h"
+ 
+ namespace EpubReaderUtils {
+@@ -19,6 +21,7 @@ struct Progress {
+   bool hasPageCount = false;
+   uint32_t visibleTextOffset = 0;
+   bool hasVisibleTextOffset = false;
++  int64_t updatedAtMs = 0;  // UTC time of the position edit, not the sync request.
+ };
+ 
+ inline bool readProgressFile(const char* moduleName, const std::string& path, Progress& progress) {
+@@ -31,30 +34,40 @@ inline bool readProgressFile(const char* moduleName, const std::string& path, Pr
+     return false;
+   }
+ 
+-  uint8_t data[10];
+-  const int dataSize = f.read(data, sizeof(data));
++  uint8_t storage[22];
++  const auto fileSize = f.size();
++  const int dataSize = f.read(storage, sizeof(storage));
++  const bool version2 =
++      dataSize == 22 && storage[0] == 'P' && storage[1] == 'R' && storage[2] == 'G' && storage[3] == 2;
++  const uint8_t* data = storage + (version2 ? 4 : 0);
+   f.close();
+-  if (dataSize != 4 && dataSize != 6 && dataSize != 10) {
++  if (fileSize != static_cast<size_t>(dataSize) || (!version2 && dataSize != 4 && dataSize != 6 && dataSize != 10)) {
+     LOG_ERR(moduleName, "Progress file has unexpected size: %d", dataSize);
+     return false;
+   }
+ 
++  progress = Progress{};
+   progress.spineIndex = static_cast<int>(static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8));
+   progress.pageNumber = static_cast<int>(static_cast<uint16_t>(data[2]) | (static_cast<uint16_t>(data[3]) << 8));
+   if (progress.pageNumber == UINT16_MAX) {
+     progress.pageNumber = 0;
+   }
+-  if (dataSize == 6 || dataSize == 10) {
++  if (version2 || dataSize == 6 || dataSize == 10) {
+     progress.pageCount = static_cast<int>(static_cast<uint16_t>(data[4]) | (static_cast<uint16_t>(data[5]) << 8));
+     progress.hasPageCount = true;
+   } else {
+     progress.pageCount = 0;
+     progress.hasPageCount = false;
+   }
+-  if (dataSize == 10) {
++  if (version2 || dataSize == 10) {
+     progress.visibleTextOffset = static_cast<uint32_t>(data[6]) | (static_cast<uint32_t>(data[7]) << 8) |
+                                  (static_cast<uint32_t>(data[8]) << 16) | (static_cast<uint32_t>(data[9]) << 24);
+-    progress.hasVisibleTextOffset = true;
++    progress.hasVisibleTextOffset = !version2 || progress.visibleTextOffset != UINT32_MAX;
++  }
++  if (version2) {
++    uint64_t stamp = 0;
++    for (int i = 0; i < 8; ++i) stamp |= static_cast<uint64_t>(data[10 + i]) << (8 * i);
++    if (stamp <= static_cast<uint64_t>(INT64_MAX)) progress.updatedAtMs = static_cast<int64_t>(stamp);
+   }
+   return true;
+ }
+@@ -75,31 +88,40 @@ inline bool loadProgress(const Epub& epub, Progress& progress, const char* modul
+ 
+ // Persists reader progress for an EPUB to its cache directory. Returns true on success.
+ inline bool saveProgress(Epub& epub, int spineIndex, int pageNumber, int pageCount,
+-                         const std::optional<uint32_t> visibleTextOffset = std::nullopt) {
++                         const std::optional<uint32_t> visibleTextOffset = std::nullopt,
++                         const std::optional<int64_t> sourceUpdatedAtMs = std::nullopt) {
+   if (spineIndex < 0 || spineIndex > 0xFFFF || pageNumber < 0 || pageNumber > 0xFFFF || pageCount < 0 ||
+       pageCount > 0xFFFF) {
+     LOG_ERR("ERS", "Progress values out of range: spine=%d page=%d count=%d", spineIndex, pageNumber, pageCount);
+     return false;
+   }
+-  uint8_t data[10];
++  Progress previous;
++  const bool loaded = loadProgress(epub, previous);
++  const bool samePosition =
++      loaded && previous.spineIndex == spineIndex &&
++      (previous.hasVisibleTextOffset && visibleTextOffset.has_value() ? previous.visibleTextOffset == *visibleTextOffset
++                                                                      : previous.pageNumber == pageNumber);
++  // Menu/reopen/relayout saves must not make an old position look newly read.
++  const int64_t updatedAtMs = sourceUpdatedAtMs.has_value() ? *sourceUpdatedAtMs
++                              : samePosition                ? previous.updatedAtMs
++                                                            : halClock.utcNowMs();
++  uint8_t storage[22] = {'P', 'R', 'G', 2};
++  uint8_t* data = storage + 4;
+   data[0] = spineIndex & 0xFF;
+   data[1] = (spineIndex >> 8) & 0xFF;
+   data[2] = pageNumber & 0xFF;
+   data[3] = (pageNumber >> 8) & 0xFF;
+   data[4] = pageCount & 0xFF;
+   data[5] = (pageCount >> 8) & 0xFF;
+-  size_t dataSize = 6;
+-  if (visibleTextOffset.has_value()) {
+-    data[6] = *visibleTextOffset & 0xFF;
+-    data[7] = (*visibleTextOffset >> 8) & 0xFF;
+-    data[8] = (*visibleTextOffset >> 16) & 0xFF;
+-    data[9] = (*visibleTextOffset >> 24) & 0xFF;
+-    dataSize = sizeof(data);
+-  }
++  const uint32_t offset = visibleTextOffset.value_or(UINT32_MAX);
++  for (int i = 0; i < 4; ++i) data[6 + i] = (offset >> (8 * i)) & 0xFF;
++  const uint64_t stamp = static_cast<uint64_t>(std::max<int64_t>(0, updatedAtMs));
++  for (int i = 0; i < 8; ++i) data[10 + i] = (stamp >> (8 * i)) & 0xFF;
++  constexpr size_t dataSize = sizeof(storage);
+   const std::string progressPath = epub.getCachePath() + "/progress.bin";
+   // Repeated menu, restart and exit saves can describe the same position.
+   // Compare the complete payload so relayout counts and text offsets still persist.
+-  if (fileContentEquals("ERS", progressPath.c_str(), data, dataSize)) return true;
++  if (fileContentEquals("ERS", progressPath.c_str(), storage, dataSize)) return true;
+ 
+   const std::string tmpPath = progressPath + ".tmp";
+   const std::string backupPath = progressPath + ".bak";
+@@ -114,7 +136,7 @@ inline bool saveProgress(Epub& epub, int spineIndex, int pageNumber, int pageCou
+     LOG_ERR("ERS", "Could not open progress temp file for write!");
+     return false;
+   }
+-  const size_t written = f.write(data, dataSize);
++  const size_t written = f.write(storage, dataSize);
+   if (written != dataSize) {
+     LOG_ERR("ERS", "Short write saving progress: %u/%u bytes", (unsigned)written, (unsigned)dataSize);
+     f.close();
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 00000000..4f46e8c4
+index 0000000..d3c0349
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,1095 @@
+@@ -0,0 +1,1103 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1929,11 +2157,11 @@ index 00000000..4f46e8c4
 +#include "ClippingStore.h"
 +#include "CrossPointState.h"
 +#include "EpubReaderUtils.h"
++#include "GlobalActions.h"
 +#include "HalClock.h"
 +#include "KOReaderDocumentId.h"
 +#include "MappedInputManager.h"
 +#include "ProgressMapper.h"
-+#include "GlobalActions.h"
 +#include "ReaderUtils.h"
 +#include "SdCardFontSystem.h"
 +#include "SilentRestart.h"
@@ -1946,6 +2174,7 @@ index 00000000..4f46e8c4
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
 +#include "readest/ReadestBookMap.h"
++#include "readest/ReadestPositionPolicy.h"
 +#include "readest/ReadestStore.h"
 +
 +namespace {
@@ -1960,7 +2189,6 @@ index 00000000..4f46e8c4
 +// virtual 1000-page chapter so "jump to clipping" lands near the right page.
 +constexpr uint16_t VIRTUAL_PAGE_COUNT = 1000;
 +// Position differences below this fraction count as "already in sync".
-+constexpr float POSITION_EPSILON = 0.002f;
 +constexpr unsigned long AUTO_RETURN_DELAY_MS = 2000;
 +// Readest Auto-Sync gives up on a saved network after this long.
 +constexpr unsigned long AUTO_SYNC_WIFI_TIMEOUT_MS = 8000;
@@ -2688,7 +2916,10 @@ index 00000000..4f46e8c4
 +
 +std::string ReadestSyncActivity::syncPosition(const ReadestBook& book) {
 +  EpubReaderUtils::Progress progress;
-+  EpubReaderUtils::loadProgress(*epub, progress, "RDS");
++  if (!EpubReaderUtils::loadProgress(*epub, progress, "RDS")) {
++    LOG_ERR("RDS", "Cannot sync an unreadable local position");
++    return tr(STR_READEST_POS_UNAVAILABLE);
++  }
 +  if (progress.spineIndex < 0 || progress.spineIndex >= epub->getSpineItemsCount()) progress.spineIndex = 0;
 +  CrossPointPosition local = {progress.spineIndex, progress.pageNumber,
 +                              progress.hasPageCount ? std::max(1, progress.pageCount) : 1};
@@ -2741,12 +2972,18 @@ index 00000000..4f46e8c4
 +    }
 +  }
 +
-+  if (remoteMapped && remotePct > localKo.percentage + POSITION_EPSILON) {
++  const auto action = ReadestPositionPolicy::choose(localKo.valid && !localKo.xpath.empty(), progress.updatedAtMs,
++                                                    remote.found, remote.updatedAtMs, remoteMapped);
++  LOG_INF("RDS", "Latest position: local=%lld remote=%lld action=%d", static_cast<long long>(progress.updatedAtMs),
++          static_cast<long long>(remote.updatedAtMs), static_cast<int>(action));
++  if (action == ReadestPositionPolicy::Action::Unavailable) return tr(STR_READEST_POS_UNAVAILABLE);
++  if (action == ReadestPositionPolicy::Action::None) return tr(STR_READEST_POS_IN_SYNC);
++  if (action == ReadestPositionPolicy::Action::Download) {
 +    const int pageCount = std::max(remotePos.totalPages, remotePos.pageNumber + 1);
 +    const std::optional<uint32_t> visibleTextOffset =
 +        remotePos.hasVisibleTextOffset ? std::optional<uint32_t>(remotePos.visibleTextOffset) : std::nullopt;
-+    if (!EpubReaderUtils::saveProgress(*epub, remotePos.spineIndex, remotePos.pageNumber, pageCount,
-+                                       visibleTextOffset)) {
++    if (!EpubReaderUtils::saveProgress(*epub, remotePos.spineIndex, remotePos.pageNumber, pageCount, visibleTextOffset,
++                                       remote.updatedAtMs)) {
 +      LOG_ERR("RDS", "Failed to save Readest position");
 +      return tr(STR_READEST_POS_UNAVAILABLE);
 +    }
@@ -2754,8 +2991,7 @@ index 00000000..4f46e8c4
 +    return formatCount(tr(STR_READEST_POS_FROM_READEST_FORMAT), percentOf(remotePct));
 +  }
 +
-+  const bool deviceAhead = !remoteMapped || localKo.percentage > remotePct + POSITION_EPSILON;
-+  if (localKo.valid && !localKo.xpath.empty() && deviceAhead) {
++  if (action == ReadestPositionPolicy::Action::Upload) {
 +    // Device -> Readest: the text at the device position, found in Readest's copy.
 +    std::string readestXPath;
 +    if (readestEpub == epub && !readestCopyMissing) {
@@ -2778,7 +3014,7 @@ index 00000000..4f46e8c4
 +      LOG_ERR("RDS", "Device position text not found in Readest's copy");
 +      return tr(STR_READEST_POS_UNAVAILABLE);
 +    }
-+    const auto pushed = client.pushProgress(book, readestXPath, localKo.percentage);
++    const auto pushed = client.pushProgress(book, readestXPath, localKo.percentage, progress.updatedAtMs);
 +    if (pushed != ReadestClient::OK) {
 +      LOG_ERR("RDS", "Position push failed: %d", static_cast<int>(pushed));
 +      return tr(STR_READEST_POS_UNAVAILABLE);
@@ -3002,7 +3238,7 @@ index 00000000..4f46e8c4
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 00000000..48138e02
+index 0000000..2d4af53
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
 @@ -0,0 +1,135 @@
@@ -3036,8 +3272,8 @@ index 00000000..48138e02
 + *     (ReadestLinks): additions, deletions and edits on either side are
 + *     applied to the other. Pulled clippings store the device's own wording
 + *     so the reader always finds them.
-+ *  4. Position: furthest wins, anchored on a text snippet at the reading
-+ *     position and found in the other copy.
++ *  4. Position: latest edit wins, including backward moves; preserve the source
++ *     timestamp. Text snippets map the position between differing copies.
 + *
 + * Like KOReader sync, the reader first hands off to a tiny instance that
 + * reboots into the lean network mode (freeing the reader's heap before
@@ -3143,7 +3379,7 @@ index 00000000..48138e02
 +};
 diff --git a/src/activities/settings/ReadestAuthActivity.cpp b/src/activities/settings/ReadestAuthActivity.cpp
 new file mode 100644
-index 00000000..9a73e41f
+index 0000000..9a73e41
 --- /dev/null
 +++ b/src/activities/settings/ReadestAuthActivity.cpp
 @@ -0,0 +1,132 @@
@@ -3281,7 +3517,7 @@ index 00000000..9a73e41f
 +}
 diff --git a/src/activities/settings/ReadestAuthActivity.h b/src/activities/settings/ReadestAuthActivity.h
 new file mode 100644
-index 00000000..44b8c0c7
+index 0000000..44b8c0c
 --- /dev/null
 +++ b/src/activities/settings/ReadestAuthActivity.h
 @@ -0,0 +1,33 @@
@@ -3320,7 +3556,7 @@ index 00000000..44b8c0c7
 +};
 diff --git a/src/activities/settings/ReadestSettingsActivity.cpp b/src/activities/settings/ReadestSettingsActivity.cpp
 new file mode 100644
-index 00000000..505a5cec
+index 0000000..505a5ce
 --- /dev/null
 +++ b/src/activities/settings/ReadestSettingsActivity.cpp
 @@ -0,0 +1,228 @@
@@ -3554,7 +3790,7 @@ index 00000000..505a5cec
 +}
 diff --git a/src/activities/settings/ReadestSettingsActivity.h b/src/activities/settings/ReadestSettingsActivity.h
 new file mode 100644
-index 00000000..180540a8
+index 0000000..180540a
 --- /dev/null
 +++ b/src/activities/settings/ReadestSettingsActivity.h
 @@ -0,0 +1,54 @@
@@ -3613,7 +3849,7 @@ index 00000000..180540a8
 +  void askPassword();
 +};
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
-index b454a7e8..a911477a 100644
+index b454a7e..a911477 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
 @@ -34,6 +34,8 @@
@@ -3667,7 +3903,7 @@ index b454a7e8..a911477a 100644
          startActivityForResult(std::make_unique<OpdsServerListActivity>(renderer, mappedInput), resultHandler);
          break;
 diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
-index 8edaeea2..d08edc8c 100644
+index 8edaeea..d08edc8 100644
 --- a/src/activities/settings/SettingsActivity.h
 +++ b/src/activities/settings/SettingsActivity.h
 @@ -24,6 +24,7 @@ enum class SettingAction {
@@ -3679,7 +3915,7 @@ index 8edaeea2..d08edc8c 100644
    DisplaySleepScreen,
    DisplayFrontlight,
 diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
-index c7088131..7bd3d9cb 100644
+index c708813..7bd3d9c 100644
 --- a/src/activities/util/FrontlightPanelActivity.cpp
 +++ b/src/activities/util/FrontlightPanelActivity.cpp
 @@ -242,12 +242,12 @@ void FrontlightPanelActivity::openGlobalSettings() {
@@ -3716,7 +3952,7 @@ index c7088131..7bd3d9cb 100644
    requestUpdate();
  }
 diff --git a/src/activities/util/FrontlightPanelModel.h b/src/activities/util/FrontlightPanelModel.h
-index 15a72f23..5e6b89d4 100644
+index 15a72f2..5e6b89d 100644
 --- a/src/activities/util/FrontlightPanelModel.h
 +++ b/src/activities/util/FrontlightPanelModel.h
 @@ -11,6 +11,7 @@ enum class FrontlightPanelAction : uint8_t {
@@ -3728,7 +3964,7 @@ index 15a72f23..5e6b89d4 100644
  
  enum class FrontlightBookSource : uint8_t { CurrentBook = 0, LastBook, DeviceOnly };
 diff --git a/src/clippings/ClippingTextMatcher.h b/src/clippings/ClippingTextMatcher.h
-index 45e9a3bc..16c16956 100644
+index 45e9a3b..16c1695 100644
 --- a/src/clippings/ClippingTextMatcher.h
 +++ b/src/clippings/ClippingTextMatcher.h
 @@ -20,10 +20,101 @@ struct TokenFragmentResult {
@@ -3916,7 +4152,7 @@ index 45e9a3bc..16c16956 100644
      return {};
    }
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index 5879285e..d7acabca 100644
+index 5879285..d7acabc 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
 @@ -1132,6 +1132,7 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
@@ -3999,7 +4235,7 @@ index 5879285e..d7acabca 100644
    ReaderStatusBarContent content;
    content.outsideReader = true;
 diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
-index 600c881e..a6b2fc03 100644
+index 600c881..a6b2fc0 100644
 --- a/src/components/themes/BaseTheme.h
 +++ b/src/components/themes/BaseTheme.h
 @@ -296,9 +296,9 @@ class BaseTheme {
@@ -4030,7 +4266,7 @@ index 600c881e..a6b2fc03 100644
    // an empty string clears an inactive slot, and nullptr preserves the existing
    // background without drawing or registering a target.
 diff --git a/src/main.cpp b/src/main.cpp
-index d0da1720..3fc3264b 100644
+index d0da172..3fc3264 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -95,6 +95,8 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
@@ -4248,7 +4484,7 @@ index d0da1720..3fc3264b 100644
          if (fontsActivity) {
 diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
 new file mode 100644
-index 00000000..f1916ebd
+index 0000000..f1916eb
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.cpp
 @@ -0,0 +1,172 @@
@@ -4426,7 +4662,7 @@ index 00000000..f1916ebd
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
 new file mode 100644
-index 00000000..00149749
+index 0000000..0014974
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.h
 @@ -0,0 +1,60 @@
@@ -4492,10 +4728,10 @@ index 00000000..00149749
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
 new file mode 100644
-index 00000000..8a079aad
+index 0000000..e52baf6
 --- /dev/null
 +++ b/src/readest/ReadestClient.cpp
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,558 @@
 +#include "ReadestClient.h"
 +
 +#include <ArduinoJson.h>
@@ -4908,6 +5144,7 @@ index 00000000..8a079aad
 +  configFilter["book_hash"] = true;
 +  configFilter["xpointer"] = true;
 +  configFilter["progress"] = true;
++  configFilter["updated_at"] = true;
 +  configFilter["deleted_at"] = true;
 +
 +  JsonDocument doc;
@@ -4932,6 +5169,7 @@ index 00000000..8a079aad
 +  for (const JsonObjectConst config : doc["configs"].as<JsonArrayConst>()) {
 +    if (book.hash != (config["book_hash"] | "") || !config["deleted_at"].isNull()) continue;
 +    out.found = true;
++    out.updatedAtMs = parseIsoMs(config["updated_at"] | static_cast<const char*>(nullptr));
 +    out.xpointer = config["xpointer"] | "";
 +    // progress is stored as a JSON string "[current,total]" (or an array).
 +    int current = 0;
@@ -4951,7 +5189,7 @@ index 00000000..8a079aad
 +}
 +
 +ReadestClient::Error ReadestClient::pushProgress(const ReadestBook& book, const std::string& xpointer,
-+                                                 const float fraction) {
++                                                 const float fraction, const int64_t updatedAtMs) {
 +  JsonDocument doc;
 +  doc["books"].to<JsonArray>();
 +  doc["notes"].to<JsonArray>();
@@ -4965,8 +5203,10 @@ index 00000000..8a079aad
 +  const float clamped = std::max(0.0f, std::min(1.0f, fraction));
 +  progress.add(static_cast<int>(clamped * 1000.0f + 0.5f));
 +  progress.add(1000);
-+  const time_t now = time(nullptr);
-+  if (now > 1600000000) config["updatedAt"] = static_cast<int64_t>(now) * 1000;
++  // Preserve the reading event's time. Stamping the request would let an old
++  // device position masquerade as the latest edit on the next sync.
++  if (updatedAtMs <= 0) return JSON_ERROR;
++  config["updatedAt"] = updatedAtMs;
 +
 +  std::string body;
 +  serializeJson(doc, body);
@@ -5052,10 +5292,10 @@ index 00000000..8a079aad
 +}
 diff --git a/src/readest/ReadestClient.h b/src/readest/ReadestClient.h
 new file mode 100644
-index 00000000..c2f252c4
+index 0000000..4722555
 --- /dev/null
 +++ b/src/readest/ReadestClient.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,97 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -5085,6 +5325,7 @@ index 00000000..c2f252c4
 +// Reading position Readest stores for a book (book_configs row).
 +struct ReadestProgress {
 +  bool found = false;
++  int64_t updatedAtMs = 0;
 +  std::string xpointer;    // KOReader xpointer, may be empty
 +  float fraction = -1.0f;  // progress[0] / progress[1], -1 when unknown
 +};
@@ -5142,7 +5383,7 @@ index 00000000..c2f252c4
 +
 +  // Reading position for exactly this Readest book (same book_hash).
 +  Error pullProgress(const ReadestBook& book, ReadestProgress& out);
-+  Error pushProgress(const ReadestBook& book, const std::string& xpointer, float fraction);
++  Error pushProgress(const ReadestBook& book, const std::string& xpointer, float fraction, int64_t updatedAtMs);
 +
 +  static const char* errorString(Error error);
 +
@@ -5152,9 +5393,30 @@ index 00000000..c2f252c4
 +  Error requestToken(const char* grantType, const std::string& body);
 +  Error postSync(const std::string& body);
 +};
+diff --git a/src/readest/ReadestPositionPolicy.h b/src/readest/ReadestPositionPolicy.h
+new file mode 100644
+index 0000000..2a9291d
+--- /dev/null
++++ b/src/readest/ReadestPositionPolicy.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <cstdint>
++
++namespace ReadestPositionPolicy {
++enum class Action { None, Upload, Download, Unavailable };
++
++constexpr Action choose(bool localValid, int64_t localTime, bool remoteFound, int64_t remoteTime, bool remoteMapped) {
++  if (!localValid || localTime <= 0) return Action::Unavailable;
++  if (!remoteFound) return Action::Upload;
++  if (remoteTime <= 0) return Action::Unavailable;
++  if (localTime > remoteTime) return Action::Upload;
++  if (remoteTime > localTime) return remoteMapped ? Action::Download : Action::Unavailable;
++  return Action::None;
++}
++}  // namespace ReadestPositionPolicy
 diff --git a/src/readest/ReadestStore.cpp b/src/readest/ReadestStore.cpp
 new file mode 100644
-index 00000000..c44719f0
+index 0000000..c44719f
 --- /dev/null
 +++ b/src/readest/ReadestStore.cpp
 @@ -0,0 +1,63 @@
@@ -5223,7 +5485,7 @@ index 00000000..c44719f0
 +}
 diff --git a/src/readest/ReadestStore.h b/src/readest/ReadestStore.h
 new file mode 100644
-index 00000000..fa7f3025
+index 0000000..fa7f302
 --- /dev/null
 +++ b/src/readest/ReadestStore.h
 @@ -0,0 +1,65 @@
@@ -5294,7 +5556,7 @@ index 00000000..fa7f3025
 +#define READEST_STORE ReadestStore::getInstance()
 diff --git a/src/readest/ReadestTextEpub.cpp b/src/readest/ReadestTextEpub.cpp
 new file mode 100644
-index 00000000..7b1bdc8c
+index 0000000..7b1bdc8
 --- /dev/null
 +++ b/src/readest/ReadestTextEpub.cpp
 @@ -0,0 +1,293 @@
@@ -5593,7 +5855,7 @@ index 00000000..7b1bdc8c
 +}  // namespace ReadestTextEpub
 diff --git a/src/readest/ReadestTextEpub.h b/src/readest/ReadestTextEpub.h
 new file mode 100644
-index 00000000..0ca19c37
+index 0000000..0ca19c3
 --- /dev/null
 +++ b/src/readest/ReadestTextEpub.h
 @@ -0,0 +1,22 @@
@@ -5619,8 +5881,18 @@ index 00000000..0ca19c37
 +namespace ReadestTextEpub {
 +bool download(const std::string& url, const std::string& destPath);
 +}  // namespace ReadestTextEpub
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 1b989fd..3bcbcc2 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -108,3 +108,5 @@ add_subdirectory(library_recent_order)
+ add_subdirectory(scalable_fonts)
+ 
+ add_subdirectory(glyph_bitmap)
++
++add_subdirectory(readest_position_sync)
 diff --git a/test/clip_word_store/ClipWordStoreTest.cpp b/test/clip_word_store/ClipWordStoreTest.cpp
-index a7da7074..43ad1295 100644
+index a7da707..43ad129 100644
 --- a/test/clip_word_store/ClipWordStoreTest.cpp
 +++ b/test/clip_word_store/ClipWordStoreTest.cpp
 @@ -456,8 +456,98 @@ TEST(ClippingTextMatcher, RejectsCoincidentalShortPageBoundaryRuns) {
@@ -5725,3 +5997,210 @@ index a7da7074..43ad1295 100644
 +                .match,
 +            ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN);
 +}
+diff --git a/test/readest_position_sync/CMakeLists.txt b/test/readest_position_sync/CMakeLists.txt
+new file mode 100644
+index 0000000..9ff5c54
+--- /dev/null
++++ b/test/readest_position_sync/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_executable(readest_position_sync_test ReadestPositionSyncTest.cpp)
++target_include_directories(readest_position_sync_test PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${REPO_ROOT})
++target_compile_options(readest_position_sync_test PRIVATE -UNDEBUG)
++add_test(NAME readest_position_sync COMMAND readest_position_sync_test)
+diff --git a/test/readest_position_sync/ReadestPositionSyncTest.cpp b/test/readest_position_sync/ReadestPositionSyncTest.cpp
+new file mode 100644
+index 0000000..64920e6
+--- /dev/null
++++ b/test/readest_position_sync/ReadestPositionSyncTest.cpp
+@@ -0,0 +1,67 @@
++#include <cassert>
++#include <iostream>
++
++#include "src/activities/reader/EpubReaderUtils.h"
++#include "src/readest/ReadestPositionPolicy.h"
++using ReadestPositionPolicy::Action;
++using ReadestPositionPolicy::choose;
++int main() {
++  // A later 1% edit must beat an older 28% edit, in either direction.
++  assert(choose(true, 2000, true, 1000, true) == Action::Upload);
++  assert(choose(true, 1000, true, 2000, true) == Action::Download);
++  assert(choose(true, 2000, true, 2000, true) == Action::None);
++  assert(choose(true, 2000, false, 0, false) == Action::Upload);
++  assert(choose(true, 0, true, 2000, true) == Action::Unavailable);
++  assert(choose(true, 2000, true, 0, true) == Action::Unavailable);
++  assert(choose(false, 3000, true, 2000, true) == Action::Unavailable);
++  assert(choose(true, 1000, true, 2000, false) == Action::Unavailable);
++  assert(choose(true, 3000, true, 2000, false) == Action::Upload);
++  Epub book;
++  EpubReaderUtils::Progress p;
++  halClock.now = 1000;
++  assert(EpubReaderUtils::saveProgress(book, 3, 10, 50, 500));
++  assert(files["/book/progress.bin"].size() == 22);
++  assert(EpubReaderUtils::loadProgress(book, p));
++  assert(p.spineIndex == 3 && p.pageNumber == 10 && p.visibleTextOffset == 500 && p.updatedAtMs == 1000);
++  const auto original = files["/book/progress.bin"];
++  halClock.now = 2000;
++  // Exiting/menu/reopen does not renew the timestamp or rewrite the record.
++  assert(EpubReaderUtils::saveProgress(book, 3, 10, 50, 500));
++  assert(files["/book/progress.bin"] == original);
++  // Repagination moves the same text to another page; still not a new edit.
++  assert(EpubReaderUtils::saveProgress(book, 3, 20, 100, 500));
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 1000);
++  // A backward move IS a new edit.
++  assert(EpubReaderUtils::saveProgress(book, 0, 1, 100, 10));
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 2000);
++  // A remote apply preserves its edit time instead of using download time.
++  halClock.now = 9000;
++  assert(EpubReaderUtils::saveProgress(book, 0, 0, 100, 0, 3000));
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 3000);
++  assert(EpubReaderUtils::saveProgress(book, 0, 0, 100, 0));
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 3000);
++  // A failed replacement keeps the existing position and timestamp paired.
++  failRename = true;
++  assert(!EpubReaderUtils::saveProgress(book, 1, 0, 100, 0));
++  failRename = false;
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 3000 && p.spineIndex == 0);
++  // No valid clock never fabricates a timestamp.
++  halClock.now = 0;
++  assert(EpubReaderUtils::saveProgress(book, 2, 0, 100));
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 0 && !p.hasVisibleTextOffset);
++  // Legacy records remain readable; opening one does not date it as 'now'.
++  for (size_t n : {4u, 6u, 10u}) {
++    files["/book/progress.bin"] = std::vector<uint8_t>(n, 0);
++    halClock.now = 10000;
++    assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 0);
++    assert(EpubReaderUtils::saveProgress(book, 0, 0, 0));
++    assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 0);
++    assert(EpubReaderUtils::saveProgress(book, 0, 1, 10));
++    assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 10000);
++  }
++  // Truncated/corrupt v2 falls back to a complete backup.
++  files["/book/progress.bin.bak"] = files["/book/progress.bin"];
++  files["/book/progress.bin"].resize(15);
++  assert(EpubReaderUtils::loadProgress(book, p) && p.updatedAtMs == 10000);
++  std::cout << "Readest latest-wins and progress persistence checks passed\n";
++}
+diff --git a/test/readest_position_sync/stubs/Epub.h b/test/readest_position_sync/stubs/Epub.h
+new file mode 100644
+index 0000000..3b33af9
+--- /dev/null
++++ b/test/readest_position_sync/stubs/Epub.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <string>
++struct Epub {
++  std::string getCachePath() const { return "/book"; }
++};
+diff --git a/test/readest_position_sync/stubs/HalClock.h b/test/readest_position_sync/stubs/HalClock.h
+new file mode 100644
+index 0000000..17d006d
+--- /dev/null
++++ b/test/readest_position_sync/stubs/HalClock.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include <cstdint>
++struct HalClock {
++  int64_t now = 0;
++  int64_t utcNowMs() const { return now; }
++};
++inline HalClock halClock;
+diff --git a/test/readest_position_sync/stubs/HalStorage.h b/test/readest_position_sync/stubs/HalStorage.h
+new file mode 100644
+index 0000000..39dd211
+--- /dev/null
++++ b/test/readest_position_sync/stubs/HalStorage.h
+@@ -0,0 +1,46 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++inline std::map<std::string, std::vector<uint8_t>> files;
++inline bool failRename = false;
++struct FsFile {
++  std::string path;
++  size_t size() const { return files.at(path).size(); }
++  int read(void* out, size_t count) {
++    auto& bytes = files[path];
++    const size_t n = std::min(count, bytes.size());
++    std::memcpy(out, bytes.data(), n);
++    return static_cast<int>(n);
++  }
++  size_t write(const uint8_t* data, size_t n) {
++    files[path] = {data, data + n};
++    return n;
++  }
++  void flush() {}
++  bool sync() { return true; }
++  bool close() { return true; }
++};
++struct HalStorage {
++  bool exists(const char* path) { return files.count(path) != 0; }
++  bool openFileForRead(const char*, const std::string& path, FsFile& f) {
++    f.path = path;
++    return files.count(path) != 0;
++  }
++  bool openFileForWrite(const char*, const std::string& path, FsFile& f) {
++    f.path = path;
++    files[path] = {};
++    return true;
++  }
++  bool remove(const char* path) { return files.erase(path) > 0; }
++  bool rename(const char* from, const char* to) {
++    if (failRename || !files.count(from)) return false;
++    files[to] = files[from];
++    files.erase(from);
++    return true;
++  }
++};
++inline HalStorage Storage;
+diff --git a/test/readest_position_sync/stubs/Logging.h b/test/readest_position_sync/stubs/Logging.h
+new file mode 100644
+index 0000000..ba55734
+--- /dev/null
++++ b/test/readest_position_sync/stubs/Logging.h
+@@ -0,0 +1,3 @@
++#pragma once
++#define LOG_ERR(...) ((void)0)
++#define LOG_DBG(...) ((void)0)
+diff --git a/test/readest_position_sync/stubs/util/FileContentEquals.h b/test/readest_position_sync/stubs/util/FileContentEquals.h
+new file mode 100644
+index 0000000..ffec3c8
+--- /dev/null
++++ b/test/readest_position_sync/stubs/util/FileContentEquals.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include <HalStorage.h>
++inline bool fileContentEquals(const char*, const char* path, const uint8_t* bytes, size_t size) {
++  const auto it = files.find(path);
++  return it != files.end() && it->second == std::vector<uint8_t>(bytes, bytes + size);
++}
+diff --git a/test/section_persistence/EpubProgressPersistenceTest.cpp b/test/section_persistence/EpubProgressPersistenceTest.cpp
+index 1e2fd8a..00b7ffe 100644
+--- a/test/section_persistence/EpubProgressPersistenceTest.cpp
++++ b/test/section_persistence/EpubProgressPersistenceTest.cpp
+@@ -49,7 +49,7 @@ TEST_F(EpubProgressPersistenceTest, MissingOrTruncatedFilesAreRecreated) {
+   Storage.put("/cache/progress.bin", {1, 0, 2, 0});
+   ASSERT_TRUE(EpubReaderUtils::saveProgress(epub, 1, 2, 10, 123));
+   EXPECT_EQ(Storage.writeOpens, 3U);
+-  EXPECT_EQ(Storage.bytes("/cache/progress.bin").size(), 10U);
++  EXPECT_EQ(Storage.bytes("/cache/progress.bin").size(), 22U);
+ }
+ 
+ TEST_F(EpubProgressPersistenceTest, FailedWritesKeepTheOldPositionAndRemainRetryable) {
+diff --git a/test/section_persistence/stubs/HalClock.h b/test/section_persistence/stubs/HalClock.h
+new file mode 100644
+index 0000000..17d006d
+--- /dev/null
++++ b/test/section_persistence/stubs/HalClock.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include <cstdint>
++struct HalClock {
++  int64_t now = 0;
++  int64_t utcNowMs() const { return now; }
++};
++inline HalClock halClock;
