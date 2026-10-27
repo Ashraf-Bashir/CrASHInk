@@ -13,7 +13,7 @@ index 91aa7b9a..f91c3be0 100644
    return dictionaryNameHeight;
  #endif
 @@ -503,14 +502,8 @@ int DictionaryDefinitionActivity::dictionaryFooterHeight() const {
- 
+
  #if CROSSINK_APP_CAP_TOUCH
  bool DictionaryDefinitionActivity::dictionarySwitchButtonContains(const int x, const int y) const {
 -  const int buttonY = modalY_ + modalHeight_ - kDictionarySwitchTouchHeight * (hasClippingRequest_ ? 2 : 1);
@@ -26,7 +26,7 @@ index 91aa7b9a..f91c3be0 100644
 -         y < buttonY + kDictionarySwitchTouchHeight;
 +  return x >= modalX_ && x < modalX_ + modalWidth_ && y >= buttonY && y < buttonY + kDictionarySwitchTouchHeight;
  }
- 
+
  bool DictionaryDefinitionActivity::modalContains(const int x, const int y) const {
 @@ -1345,12 +1338,6 @@ void DictionaryDefinitionActivity::loop() {
  #if CROSSINK_APP_CAP_TOUCH
@@ -52,7 +52,7 @@ index 91aa7b9a..f91c3be0 100644
      constexpr int switchButtonHeight = 0;
  #endif
 @@ -1653,26 +1639,14 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
- 
+
  #if CROSSINK_APP_CAP_TOUCH
    if (!isWordSelectMode && showTouchDictionarySwitch()) {
 -    const Rect buttonRect{modalX_,
@@ -79,7 +79,7 @@ index 91aa7b9a..f91c3be0 100644
 -    }
    }
  #endif
- 
+
 diff --git a/src/activities/reader/DictionaryDefinitionActivity.h b/src/activities/reader/DictionaryDefinitionActivity.h
 index 425d572c..9d2c68a0 100644
 --- a/src/activities/reader/DictionaryDefinitionActivity.h
@@ -124,7 +124,7 @@ index b7474a37..9d9f1337 100644
 --- a/src/activities/reader/DictionaryWordSelectActivity.cpp
 +++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
 @@ -153,6 +153,8 @@ constexpr uint8_t styleToBitMask(EpdFontFamily::Style style) {
- 
+
  void DictionaryWordSelectActivity::onEnter() {
    Activity::onEnter();
 +  // One selected word is looked up; two or more are saved as a clipping.
@@ -142,11 +142,11 @@ index b7474a37..9d9f1337 100644
 +  }
    controller.lookupOrPopup(phrase, wordCount);
  }
- 
+
 @@ -908,6 +914,16 @@ void DictionaryWordSelectActivity::resetCrossPageSelection() {
    crossPageFirstWordWasMerged_ = false;
  }
- 
+
 +void DictionaryWordSelectActivity::finishSelectionAsClipping() {
 +  // The reader saves the returned range straight away (no confirm step).
 +  if (!captureClippingRequest()) {
@@ -195,7 +195,7 @@ index b7474a37..9d9f1337 100644
          setResult(ActivityResult{});
          finish();
 @@ -1094,7 +1101,14 @@ void DictionaryWordSelectActivity::loop() {
- 
+
      touchDragLookup_ = false;
      const size_t wordCount = crossPageLookupWordCount_ + navigator.getLookupSelectionWordCount();
 -    controller.lookupOrPopup(finishTouchLookupPhrase(), wordCount);
@@ -212,7 +212,7 @@ index b7474a37..9d9f1337 100644
    }
 @@ -1126,6 +1140,10 @@ void DictionaryWordSelectActivity::loop() {
    }
- 
+
    if (controller.handleMultiSelect(navigator)) {
 +    if (controller.consumeClipRequest()) {
 +      finishSelectionAsClipping();
@@ -223,7 +223,7 @@ index b7474a37..9d9f1337 100644
    }
 @@ -1133,6 +1151,10 @@ void DictionaryWordSelectActivity::loop() {
    if (navigator.isMultiSelecting()) return;
- 
+
    if (controller.handleConfirmLookup(navigator)) {
 +    if (controller.consumeClipRequest()) {
 +      finishSelectionAsClipping();
@@ -259,7 +259,7 @@ index a27834f1..1bf995c8 100644
 +++ b/src/util/DictionaryLookupController.cpp
 @@ -24,13 +24,11 @@
  #include "util/Dictionary.h"
- 
+
  DictionaryLookupController::DictionaryLookupController(GfxRenderer& renderer, MappedInputManager& mappedInput,
 -                                                       Activity& owner, const std::string& cachePath,
 -                                                       const bool allowCreateClipping)
@@ -295,7 +295,7 @@ index a27834f1..1bf995c8 100644
 -#endif
      return LookupEvent::None;
    }
- 
+
 @@ -236,10 +225,6 @@ DictionaryLookupController::LookupEvent DictionaryLookupController::handleInput(
        if (altFormUiApp.invalidated()) owner.requestUpdate();
        touchAction = event.action;
@@ -384,7 +384,7 @@ index a27834f1..1bf995c8 100644
 +  lookupOrPopup(phrase, navigator.getLookupSelectionWordCount());
    return true;
  }
- 
+
 +size_t DictionaryLookupController::phraseWordCount(const std::string& phrase) {
 +  size_t words = 0;
 +  bool inWord = false;
@@ -418,7 +418,7 @@ index 272624e2..bbe0a916 100644
 -                             const std::string& cachePath, bool allowCreateClipping = false);
 +                             const std::string& cachePath);
    ~DictionaryLookupController();
- 
+
    // Start a lookup. Transitions Idle → LookingUp and notifies the shared
 @@ -130,14 +129,23 @@ class DictionaryLookupController {
    const DictLocation& getFoundLocation() const { return foundLocation; }
@@ -436,7 +436,7 @@ index 272624e2..bbe0a916 100644
 +  // Words in a lookup phrase (space-separated runs). Hyphen-split or glued
 +  // pieces of one word are already joined in the phrase, so they count once.
 +  static size_t phraseWordCount(const std::string& phrase);
- 
+
   private:
  #if CROSSINK_APP_CAP_TOUCH
    using AltFormUiApp = freeink::ui::FreeInkApp<3, 1>;
@@ -444,7 +444,7 @@ index 272624e2..bbe0a916 100644
    static constexpr freeink::ui::ActionId ACTION_ALT_FORM_YES = 2;
 -  static constexpr freeink::ui::ActionId ACTION_CREATE_CLIPPING = 3;
    static constexpr freeink::ui::ActionId ACTION_SWITCH_DICTIONARY = 4;
- 
+
    static void altFormPromptScreen(AltFormUiApp::ScreenType& screen, void* user);
 @@ -162,7 +170,8 @@ class DictionaryLookupController {
    bool recordHistory_ = true;
@@ -455,4 +455,289 @@ index 272624e2..bbe0a916 100644
 +  bool clipRequested_ = false;
    bool shouldOfferAltForms_ = true;
    std::string preparedQuickIndexPath;
- 
+
+
+diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
+--- a/src/util/WordSelectNavigator.cpp
++++ b/src/util/WordSelectNavigator.cpp
+@@ -573,7 +573,7 @@
+   if (!w) return Rect{};
+   const int cursorWidth = touchDragCursorVisible ? 10 : 0;
+   return Rect{static_cast<int>(w->screenX) - 2, static_cast<int>(w->screenY) - 2,
+-              static_cast<int>(w->width) + 4 + cursorWidth, w->heightOr(lineHeight) + 4};
++              static_cast<int>(w->width) + 4 + cursorWidth, w->heightOr(lineHeight) + (touchDragCursorVisible ? 5 : 4)};
+ }
+
+ WordSelectNavigator::Rect WordSelectNavigator::computeDirtyRect(int prevWordIdx, int currWordIdx,
+@@ -592,14 +592,41 @@
+
+ std::optional<WordSelectNavigator::Rect> WordSelectNavigator::renderHighlightDifferential(
+     GfxRenderer& renderer, int lineHeight, int prevWordIdx, int currWordIdx, const bool foregroundBlack) {
+-  // Fallback paths.
+-  if (inMultiSelectMode) return std::nullopt;
+   const auto* curr = getWordAt(currWordIdx);
+   if (!curr) return std::nullopt;
+   if (curr->continuationIndex >= 0 || curr->continuationOf >= 0) {
+     // Hyphenated wrap — two-word highlight is not yet supported by the
+     // single-snapshot fast path. Caller falls back to full repaint.
+     return std::nullopt;
++  }
++
++  Rect newRect = boundsForWord(currWordIdx, lineHeight);
++  const auto include = [&newRect](const Rect& rect) {
++    const int right = std::max(newRect.x + newRect.width, rect.x + rect.width);
++    const int bottom = std::max(newRect.y + newRect.height, rect.y + rect.height);
++    newRect.x = std::min(newRect.x, rect.x);
++    newRect.y = std::min(newRect.y, rect.y);
++    newRect.width = right - newRect.x;
++    newRect.height = bottom - newRect.y;
++  };
++  if (inMultiSelectMode) {
++    if (anchorFlatIndex < 0) return std::nullopt;
++    const int lo = std::min(anchorFlatIndex, currWordIdx);
++    const int hi = std::max(anchorFlatIndex, currWordIdx);
++    for (int i = lo; i <= hi; ++i) {
++      const auto* word = getWordAt(i);
++      // Keep the established full-repaint path for split/hyphenated words.
++      if (!word || word->continuationIndex >= 0 || word->continuationOf >= 0) return std::nullopt;
++      include(boundsForWord(i, lineHeight));
++    }
++  }
++  Rect dirty = newRect;
++  if (prevWordIdx >= 0 && snapshot_.valid()) {
++    const int left = std::min(dirty.x, static_cast<int>(snapshot_.x()));
++    const int top = std::min(dirty.y, static_cast<int>(snapshot_.y()));
++    const int right = std::max(dirty.x + dirty.width, static_cast<int>(snapshot_.x() + snapshot_.w()));
++    const int bottom = std::max(dirty.y + dirty.height, static_cast<int>(snapshot_.y() + snapshot_.h()));
++    dirty = Rect{left, top, right - left, bottom - top};
+   }
+
+   // Step 1: restore pixels under the previous highlight (wipe it).
+@@ -615,7 +642,6 @@
+
+   // Step 2: snapshot pixels under the new highlight, clamping coordinates so we
+   // never pass negative values into the renderer's uint16_t API.
+-  const Rect newRect = boundsForWord(currWordIdx, lineHeight);
+   const uint16_t snapX = static_cast<uint16_t>(std::max(newRect.x, 0));
+   const uint16_t snapY = static_cast<uint16_t>(std::max(newRect.y, 0));
+   const uint16_t snapW = static_cast<uint16_t>(std::max(newRect.width, 0));
+@@ -626,9 +652,14 @@
+   }
+
+   // Step 3: draw the new highlight on top of the captured pixels.
+-  drawSingleHighlight(renderer, lineHeight, currWordIdx, foregroundBlack);
+-  drawTouchDragCursor(renderer, lineHeight, currWordIdx, foregroundBlack);
+-
+-  // Step 4: caller pushes the union region.
+-  return computeDirtyRect(prevWordIdx, currWordIdx, lineHeight);
+-}
++  if (inMultiSelectMode) {
++    renderHighlight(renderer, lineHeight, foregroundBlack);
++  } else {
++    drawSingleHighlight(renderer, lineHeight, currWordIdx, foregroundBlack);
++    drawTouchDragCursor(renderer, lineHeight, currWordIdx, foregroundBlack);
++  }
++
++  // The existing caller still performs a full-panel fast refresh. Only the
++  // CPU-side page repaint is avoided; large ranges fall back at capture().
++  return dirty;
++}
+diff --git a/src/util/WordSelectNavigator.h b/src/util/WordSelectNavigator.h
+--- a/src/util/WordSelectNavigator.h
++++ b/src/util/WordSelectNavigator.h
+@@ -195,10 +195,10 @@
+   // unused by current callers; only the optional's .has_value() distinguishes
+   // success from fallback.
+   //
++  // Multi-word drags reuse the same fixed 4 KB buffer; no extra allocation.
+   // Returns std::nullopt when the caller must fall back to a full repaint:
+   //   - the new highlight is too large for HighlightSnapshot's buffer
+   //   - the selection has a hyphenated continuation (multi-word fallback for now)
+-  //   - the navigator is in multi-select mode
+   //   - the snapshot capture is rejected by the renderer (e.g. out of bounds)
+   //
+   // Mutates internal snapshot state, so this method is non-const.
+diff --git a/test/drag_highlight/CMakeLists.txt b/test/drag_highlight/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/drag_highlight/CMakeLists.txt
+@@ -0,0 +1,6 @@
++add_executable(drag_highlight_test DragHighlightTest.cpp
++  ${REPO_ROOT}/src/util/WordSelectNavigator.cpp ${REPO_ROOT}/lib/Utf8/Utf8.cpp)
++target_include_directories(drag_highlight_test PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${REPO_ROOT}/src ${REPO_ROOT}/lib/Utf8)
++target_compile_options(drag_highlight_test PRIVATE -UNDEBUG)
++add_test(NAME drag_highlight COMMAND drag_highlight_test)
+diff --git a/test/drag_highlight/DragHighlightTest.cpp b/test/drag_highlight/DragHighlightTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/drag_highlight/DragHighlightTest.cpp
+@@ -0,0 +1,77 @@
++#include <cassert>
++#include <iostream>
++
++#include "GfxRenderer.h"
++#include "util/WordSelectNavigator.h"
++
++int main() {
++  WordSelectNavigator nav;
++  WordSelectNavigator::HighlightSnapshotStorage storage;
++  nav.setHighlightSnapshotStorage(&storage);
++  std::vector<WordSelectNavigator::WordInfo> words(4);
++  for (int i = 0; i < 4; ++i) {
++    words[i].screenX = 20 + i * 60;
++    words[i].screenY = 20;
++    words[i].width = 40;
++    words[i].row = 0;
++  }
++  nav.load(std::move(words), {{20, 0, 4}}, "", false);
++  nav.setTouchDragCursorVisible(true);
++  nav.selectWordAtPoint(25, 25, 20);
++  assert(nav.beginTouchMultiSelect());
++  GfxRenderer renderer;
++  for (size_t i = 0; i < renderer.pixels.size(); ++i) renderer.pixels[i] = (i % 13) == 0;
++  const auto base = renderer.pixels;
++  assert(nav.renderHighlightDifferential(renderer, 20, -1, 0, true));
++  // Grow, shrink, and reverse across the anchor. Every result must match a
++  // clean page plus the ordinary multi-word highlight, without stale pixels.
++  int prev = 0;
++  for (int next : {2, 1, 3, 0, 2}) {
++    nav.selectWordAtPoint(25 + next * 60, 25, 20);
++    assert(nav.renderHighlightDifferential(renderer, 20, prev, next, true));
++    GfxRenderer reference;
++    reference.pixels = base;
++    nav.renderHighlight(reference, 20, true);
++    if (renderer.pixels != reference.pixels) {
++      for (size_t p = 0; p < renderer.pixels.size(); ++p)
++        if (renderer.pixels[p] != reference.pixels[p]) {
++          std::cerr << "next=" << next << " pixel=" << p % 800 << "," << p / 800
++                    << " actual=" << int(renderer.pixels[p]) << " expected=" << int(reference.pixels[p]) << "\n";
++          break;
++        }
++      assert(false);
++    }
++    prev = next;
++  }
++  renderer.pixels = base;
++  nav.selectWordAtPoint(145, 25, 20);
++  assert(nav.beginTouchMultiSelect());
++  assert(nav.renderHighlightDifferential(renderer, 20, -1, 2, true));
++  prev = 2;
++  for (int next : {0, 1, 3, 2}) {
++    nav.selectWordAtPoint(25 + next * 60, 25, 20);
++    assert(nav.renderHighlightDifferential(renderer, 20, prev, next, true));
++    GfxRenderer reference;
++    reference.pixels = base;
++    nav.renderHighlight(reference, 20, true);
++    assert(renderer.pixels == reference.pixels);
++    prev = next;
++  }
++  // Snapshot capacity is a hard limit: oversized ranges ask for a full repaint.
++  nav.reset();
++  std::vector<WordSelectNavigator::WordInfo> large(2);
++  large[0].screenX = 20;
++  large[0].screenY = 20;
++  large[0].width = 40;
++  large[0].row = 0;
++  large[1].screenX = 720;
++  large[1].screenY = 420;
++  large[1].width = 40;
++  large[1].row = 1;
++  nav.load(std::move(large), {{20, 0, 1}, {420, 1, 1}}, "", false);
++  nav.selectWordAtPoint(25, 25, 20);
++  assert(nav.beginTouchMultiSelect());
++  nav.selectWordAtPoint(725, 425, 20);
++  assert(!nav.renderHighlightDifferential(renderer, 20, -1, 1, true));
++  std::cout << "Drag differential rendering checks passed\n";
++}
+diff --git a/test/drag_highlight/stubs/EpdFontFamily.h b/test/drag_highlight/stubs/EpdFontFamily.h
+new file mode 100644
+--- /dev/null
++++ b/test/drag_highlight/stubs/EpdFontFamily.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <cstdint>
++struct EpdFontFamily {
++  enum Style : uint8_t { REGULAR = 0, BOLD = 1 };
++};
+diff --git a/test/drag_highlight/stubs/GfxRenderer.h b/test/drag_highlight/stubs/GfxRenderer.h
+new file mode 100644
+--- /dev/null
++++ b/test/drag_highlight/stubs/GfxRenderer.h
+@@ -0,0 +1,38 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <vector>
++
++#include "EpdFontFamily.h"
++namespace BidiUtils {
++enum class BidiBaseDir { RTL, LTR };
++}
++class GfxRenderer {
++ public:
++  enum class Orientation { Portrait, PortraitInverted, LandscapeClockwise, LandscapeCounterClockwise };
++  mutable std::vector<uint8_t> pixels = std::vector<uint8_t>(800 * 480, 0);
++  Orientation getOrientation() const { return Orientation::Portrait; }
++  void fillRect(int x, int y, int w, int h, bool black = true) const {
++    for (int j = std::max(0, y); j < std::min(480, y + h); ++j)
++      for (int i = std::max(0, x); i < std::min(800, x + w); ++i) pixels[j * 800 + i] = black;
++  }
++  void drawLine(int x, int y, int x2, int y2, int width, bool black) const {
++    fillRect(std::min(x, x2), std::min(y, y2), std::abs(x2 - x) + 1, std::abs(y2 - y) + width, black);
++  }
++  template <class... Args>
++  void drawText(Args...) const {}
++  size_t readFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t* out, size_t capacity) const {
++    size_t stride = (w + 7) / 8, bytes = stride * h;
++    if (bytes > capacity || x + w > 800 || y + h > 480) return 0;
++    std::fill(out, out + bytes, 0);
++    for (int j = 0; j < h; ++j)
++      for (int i = 0; i < w; ++i)
++        if (pixels[(y + j) * 800 + x + i]) out[j * stride + i / 8] |= 1 << (i % 8);
++    return bytes;
++  }
++  void writeFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t* data) {
++    size_t stride = (w + 7) / 8;
++    for (int j = 0; j < h; ++j)
++      for (int i = 0; i < w; ++i) pixels[(y + j) * 800 + x + i] = (data[j * stride + i / 8] >> (i % 8)) & 1;
++  }
++};
+diff --git a/test/drag_highlight/stubs/MappedInputManager.h b/test/drag_highlight/stubs/MappedInputManager.h
+new file mode 100644
+--- /dev/null
++++ b/test/drag_highlight/stubs/MappedInputManager.h
+@@ -0,0 +1,10 @@
++#pragma once
++inline unsigned long millis() { return 0; }
++class MappedInputManager {
++ public:
++  enum class Button { Left, Right, Up, Down, Confirm, Back };
++  bool wasReleased(Button) const { return false; }
++  bool isPressed(Button) const { return false; }
++  bool isFrontNavButtonSwapActive() const { return false; }
++  unsigned long getHeldTime() const { return 0; }
++};
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -38,6 +38,8 @@
+
+ enable_testing()
+ include(GoogleTest)
++
++add_subdirectory(drag_highlight)
+
+ add_subdirectory(streaming_json_parser)
+ add_subdirectory(release_json_parser)
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ ### Fixed
+
+ - Readest position sync uses the latest position edit on either device, including rereading earlier chapters. Sync requests and unchanged saves preserve the original edit time.
++- Touch-drag highlights reuse the existing bounded selection snapshot instead of repainting the page for each word; the drag cursor is fully cleared when the selection moves.
+
+ ## [v1.6.1] - 2026-10-03
+
