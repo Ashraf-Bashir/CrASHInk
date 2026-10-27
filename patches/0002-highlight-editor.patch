@@ -308,7 +308,7 @@ diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/re
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/HighlightEditActivity.cpp
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,255 @@
 +#include "HighlightEditActivity.h"
 +
 +#include <I18n.h>
@@ -326,6 +326,37 @@ new file mode 100644
 +#include "fontIds.h"
 +
 +namespace {
++// KOReader's boundary controls use the symbols ◁▒▒, ▷☓▒, ▒☓◁, ▒▒▷.
++// Draw the same outline arrows, crossed-out word and shaded word blocks
++// directly: the UI font need not contain these Unicode glyphs.
++void drawBoundaryIcon(const GfxRenderer& renderer, const Rect& rect, const int action) {
++  constexpr int cell = 14;
++  constexpr int gap = 3;
++  constexpr int height = 18;
++  const int left = rect.x + (rect.width - (3 * cell + 2 * gap)) / 2;
++  const int top = rect.y + (rect.height - height) / 2;
++  for (int slot = 0; slot < 3; ++slot) {
++    const int x = left + slot * (cell + gap);
++    const bool arrow = (action < 2 && slot == 0) || (action >= 2 && slot == 2);
++    const bool removed = (action == 1 || action == 2) && slot == 1;
++    if (arrow) {
++      const bool pointsLeft = action == 0 || action == 2;
++      const int tip = pointsLeft ? x + 1 : x + cell - 2;
++      const int base = pointsLeft ? x + cell - 2 : x + 1;
++      renderer.drawLine(tip, top + height / 2, base, top + 1, 2, true);
++      renderer.drawLine(base, top + 1, base, top + height - 2, 2, true);
++      renderer.drawLine(base, top + height - 2, tip, top + height / 2, 2, true);
++    } else if (removed) {
++      renderer.drawLine(x + 2, top + 2, x + cell - 3, top + height - 3, 2, true);
++      renderer.drawLine(x + cell - 3, top + 2, x + 2, top + height - 3, 2, true);
++    } else {
++      for (int y = 0; y < height; y += 2) {
++        for (int dx = (y / 2) % 2; dx < cell; dx += 2) renderer.fillRect(x + dx, top + y, 1, 1, true);
++      }
++    }
++  }
++}
++
 +// One bounded preview line at a time, without a second copy of the full draft.
 +std::string nextLine(const GfxRenderer& renderer, const std::string& text, size_t& offset, int width) {
 +  while (offset < text.size() && text[offset] == ' ') ++offset;
@@ -378,11 +409,11 @@ new file mode 100644
 +  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
 +  constexpr int gap = 6;
 +  constexpr int height = 44;
-+  const int row = button < 4 ? button / 2 : 2;
-+  const int cols = row < 2 ? 2 : 3;
-+  const int col = row < 2 ? button % 2 : button - 4;
++  const int row = button < 4 ? 0 : 1;
++  const int cols = row == 0 ? 4 : 3;
++  const int col = row == 0 ? button : button - 4;
 +  const int width = (safe.width - gap * (cols + 1)) / cols;
-+  return Rect{safe.x + gap + col * (width + gap), safe.y + safe.height - (3 - row) * (height + gap), width, height};
++  return Rect{safe.x + gap + col * (width + gap), safe.y + safe.height - (2 - row) * (height + gap), width, height};
 +}
 +
 +void HighlightEditActivity::adjust(HighlightWordEdit::Action action) {
@@ -518,17 +549,16 @@ new file mode 100644
 +  snprintf(page, sizeof(page), "%d/%d", previewPage + 1, previewPages);
 +  renderer.drawText(SMALL_FONT_ID, safe.x + 12, buttonRect(0).y - 30,
 +                    failed ? tr(STR_HIGHLIGHT_EDIT_UNAVAILABLE) : page);
-+  const char* labels[] = {tr(STR_HIGHLIGHT_EXTEND_START),
-+                          tr(STR_HIGHLIGHT_TRIM_START),
-+                          tr(STR_HIGHLIGHT_TRIM_END),
-+                          tr(STR_HIGHLIGHT_EXTEND_END),
-+                          tr(STR_SAVE),
-+                          confirmDelete ? tr(STR_HIGHLIGHT_CONFIRM_DELETE) : tr(STR_DELETE),
++  const char* labels[] = {tr(STR_SAVE), confirmDelete ? tr(STR_HIGHLIGHT_CONFIRM_DELETE) : tr(STR_DELETE),
 +                          tr(STR_CANCEL)};
 +  for (int i = 0; i < 7; ++i) {
 +    const Rect rect = buttonRect(i);
 +    renderer.drawRect(rect.x, rect.y, rect.width, rect.height, true);
-+    const std::string label = renderer.truncatedText(UI_10_FONT_ID, labels[i], rect.width - 8);
++    if (i < 4) {
++      drawBoundaryIcon(renderer, rect, i);
++      continue;
++    }
++    const std::string label = renderer.truncatedText(UI_10_FONT_ID, labels[i - 4], rect.width - 8);
 +    renderer.drawText(UI_10_FONT_ID, rect.x + (rect.width - renderer.getTextWidth(UI_10_FONT_ID, label.c_str())) / 2,
 +                      rect.y + (rect.height - renderer.getLineHeight(UI_10_FONT_ID)) / 2, label.c_str());
 +  }
