@@ -308,7 +308,7 @@ diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/re
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/HighlightEditActivity.cpp
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,295 @@
 +#include "HighlightEditActivity.h"
 +
 +#include <I18n.h>
@@ -401,8 +401,29 @@ new file mode 100644
 +      hint = location.total ? static_cast<float>(location.start) / location.total : hint;
 +    }
 +  }
++  refreshContext();
 +  failed = !editable;
 +  requestUpdate();
++}
++
++void HighlightEditActivity::refreshContext() {
++  beforeContext.clear();
++  afterContext.clear();
++  if (!editable) return;
++  XPathTextLocation location;
++  if (!ChapterXPathResolver::locateText(book, spine, draft, hint, location) || location.loose) return;
++  hint = location.total ? static_cast<float>(location.start) / location.total : hint;
++  XPathTextLocation context = location;
++  if (location.start > 0) {
++    context.start = location.start > 80 ? location.start - 80 : 0;
++    context.end = location.start - 1;
++    ChapterXPathResolver::extractText(book, spine, context, beforeContext);
++  }
++  if (location.end + 1 < location.total) {
++    context.start = location.end + 1;
++    context.end = std::min(location.total - 1, context.start + 79);
++    ChapterXPathResolver::extractText(book, spine, context, afterContext);
++  }
 +}
 +
 +Rect HighlightEditActivity::buttonRect(int button) const {
@@ -444,6 +465,7 @@ new file mode 100644
 +  if (HighlightWordEdit::adjust(draft, action, neighbour, CLIPPING_TEXT_MAX, replacement)) {
 +    draft = std::move(replacement);
 +    changed = true;
++    refreshContext();
 +    previewPage =
 +        action == HighlightWordEdit::Action::ExtendEnd || action == HighlightWordEdit::Action::TrimEnd ? INT_MAX : 0;
 +  } else {
@@ -527,10 +549,11 @@ new file mode 100644
 +  TouchHeaderBackButton::drawCompact(renderer, tr(STR_EDIT_HIGHLIGHT), true);
 +  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
 +  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
-+  const int top = header.y + header.height + 8;
++  const int contextTop = header.y + header.height + 8;
 +  const int width = std::max(1, safe.width - 24);
 +  const int lineStep = renderer.getLineHeight(UI_10_FONT_ID) + 4;
-+  const int rows = std::max(1, (buttonRect(0).y - top - 40) / std::max(1, lineStep));
++  const int top = contextTop + lineStep + 4;
++  const int rows = std::max(1, (buttonRect(0).y - top - lineStep - 44) / std::max(1, lineStep));
 +  size_t offset = 0;
 +  int lines = 0;
 +  while (offset < draft.size()) {
@@ -542,8 +565,25 @@ new file mode 100644
 +  offset = 0;
 +  for (int line = 0; line < (previewPage + 1) * rows && offset < draft.size(); ++line) {
 +    const std::string text = nextLine(renderer, draft, offset, width);
-+    if (line >= previewPage * rows)
-+      renderer.drawText(UI_10_FONT_ID, safe.x + 12, top + (line % rows) * lineStep, text.c_str());
++    if (line >= previewPage * rows) {
++      const int y = top + (line % rows) * lineStep;
++      renderer.fillRect(safe.x + 10, y, width + 4, lineStep, true);
++      renderer.drawText(UI_10_FONT_ID, safe.x + 12, y, text.c_str(), false);
++    }
++  }
++  if (previewPage == 0 && !beforeContext.empty()) {
++    size_t start = 0;
++    while (start < beforeContext.size() &&
++           renderer.getTextWidth(UI_10_FONT_ID, beforeContext.c_str() + start) > width - 24) {
++      ++start;
++      while (start < beforeContext.size() && (static_cast<unsigned char>(beforeContext[start]) & 0xC0) == 0x80) ++start;
++    }
++    const std::string before = "... " + beforeContext.substr(start);
++    renderer.drawText(UI_10_FONT_ID, safe.x + 12, contextTop, before.c_str());
++  }
++  if (previewPage == previewPages - 1 && !afterContext.empty()) {
++    const std::string after = renderer.truncatedText(UI_10_FONT_ID, afterContext.c_str(), width);
++    renderer.drawText(UI_10_FONT_ID, safe.x + 12, top + rows * lineStep + 4, after.c_str());
 +  }
 +  char page[24];
 +  snprintf(page, sizeof(page), "%d/%d", previewPage + 1, previewPages);
@@ -568,7 +608,7 @@ diff --git a/src/activities/reader/HighlightEditActivity.h b/src/activities/read
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/HighlightEditActivity.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,41 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -595,6 +635,8 @@ new file mode 100644
 +  uint16_t spine = 0;
 +  float hint;
 +  std::string draft;
++  std::string beforeContext;
++  std::string afterContext;
 +  bool editable = false;
 +  bool tableSelection = false;
 +  bool changed = false;
@@ -604,6 +646,7 @@ new file mode 100644
 +  int previewPages = 1;
 +  Rect buttonRect(int button) const;
 +  void adjust(HighlightWordEdit::Action action);
++  void refreshContext();
 +  void accept();
 +  void cancel();
 +};
@@ -791,7 +834,7 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
  
  ### Added
 +
-+- crASHink: tapping a highlight opens a word editor with start/end extension and trimming, a paged text preview, Save, Cancel, and Delete.
++- crASHink: tapping a highlight opens a word editor with start/end extension and trimming, a paged text preview with surrounding context and a visibly marked selection, Save, Cancel, and Delete.
  
  - Assign a physical-button-only Home/Reader shortcut that returns from nested reader menus directly to the open book, and otherwise returns Home.
  - Turn reading stats tracking on or off for the whole device or individual EPUB and XTC books, while keeping saved history and Time Left estimates.

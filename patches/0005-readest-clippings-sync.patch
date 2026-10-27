@@ -1,8 +1,7 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 8af1efc..ce39e42 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -1,3 +1,9 @@
+@@ -1,6 +1,14 @@
 +## [Unreleased]
 +
 +### Fixed
@@ -10,8 +9,13 @@ index 8af1efc..ce39e42 100644
 +- Readest position sync uses the latest position edit on either device, including rereading earlier chapters. Sync requests and unchanged saves preserve the original edit time.
 +
  ## [v1.6.1] - 2026-10-03
- 
+
  ### Added
++
++- Uncertain Readest destinations show a chapter, percentage, and text preview with Go there/Keep here in manual and automatic sync; exact, verified positions still sync silently.
+
+ - crASHink: tapping a highlight opens a word editor with start/end extension and trimming, a paged text preview with surrounding context and a visibly marked selection, Save, Cancel, and Delete.
+
 diff --git a/docs/file-formats.md b/docs/file-formats.md
 index 38c7341..9ebd243 100644
 --- a/docs/file-formats.md
@@ -42,10 +46,9 @@ index 38c7341..9ebd243 100644
 +Older firmware cannot read version 2; retain the firmware and progress backup
 +before downgrading. TXT/XTC progress formats are unchanged.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 5dc5d57..083e8cd 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -958,3 +958,43 @@ STR_MONTH_SEP: "September"
+@@ -967,3 +967,49 @@
  STR_MONTH_OCT: "October"
  STR_MONTH_NOV: "November"
  STR_MONTH_DEC: "December"
@@ -89,13 +92,18 @@ index 5dc5d57..083e8cd 100644
 +STR_READEST_ERR_NO_CREDENTIALS: "Connect Readest in Settings first"
 +STR_READEST_CHOOSE_BOOK: "Which Readest book is this?"
 +STR_READEST_RESET_MATCHES: "Reset Book Matches"
++
++STR_READEST_POSITION_PREVIEW: "Confirm reading position"
++STR_READEST_GO_THERE: "Go there"
++STR_READEST_KEEP_HERE: "Keep here"
++STR_READEST_POSITION_KEPT: "Kept this device's position"
++STR_READEST_PREVIEW_NO_TEXT: "Exact opening text unavailable"
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.cpp b/lib/KOReaderSync/ChapterXPathResolver.cpp
-index 31eeb08..9d01eb0 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.cpp
 +++ b/lib/KOReaderSync/ChapterXPathResolver.cpp
-@@ -7,13 +7,19 @@
+@@ -7,12 +7,18 @@
  #include <expat.h>
- 
+
  #include <algorithm>
 +#include <cctype>
 +#include <climits>
@@ -107,13 +115,12 @@ index 31eeb08..9d01eb0 100644
  #include <string_view>
  #include <utility>
  #include <vector>
- 
-+#include "Epub/htmlEntities.h"
 +
++#include "Epub/htmlEntities.h"
+
  namespace {
  std::string stripPrefix(const XML_Char* name) {
-   if (!name) {
-@@ -692,3 +698,1189 @@ std::string ChapterXPathResolver::findXPathForVisibleTextOffset(const std::share
+@@ -692,3 +698,1203 @@
    }
    return xpath;
  }
@@ -608,7 +615,9 @@ index 31eeb08..9d01eb0 100644
 +
 +// Runs pass 1 in `mode` and picks the occurrence nearest `positionHint`.
 +bool locateTextWithMode(const std::shared_ptr<Epub>& epub, const std::string& href, const std::string& text,
-+                        const float positionHint, const MatchMode mode, XPathTextLocation& out) {
++                        const float positionHint, const MatchMode mode, XPathTextLocation& out, bool* unique = nullptr,
++                        bool* scanned = nullptr) {
++  if (scanned) *scanned = false;
 +  const std::vector<uint32_t> needle = matchCodepoints(text, mode);
 +  if (needle.empty()) return false;
 +
@@ -616,7 +625,9 @@ index 31eeb08..9d01eb0 100644
 +  if (!scanner.ok() || !epub->readItemContentsToStream(href, scanner, 1024) || !scanner.finish()) {
 +    return false;
 +  }
++  if (scanned) *scanned = true;
 +  const auto& matches = scanner.getMatches();
++  if (unique) *unique = matches.size() == 1;
 +  if (matches.empty()) return false;
 +
 +  const uint32_t total = scanner.totalPositions();
@@ -806,12 +817,9 @@ index 31eeb08..9d01eb0 100644
 +
 +    const size_t spanDelta = span > m ? span - m : m - span;
 +    const float distance =
-+        positionHint >= 0.0f
-+            ? std::fabs(static_cast<float>(match.start) / static_cast<float>(n) - positionHint)
-+            : 0.0f;
++        positionHint >= 0.0f ? std::fabs(static_cast<float>(match.start) / static_cast<float>(n) - positionHint) : 0.0f;
 +
-+    if (match.edits < best.edits ||
-+        (match.edits == best.edits && spanDelta < bestSpanDelta) ||
++    if (match.edits < best.edits || (match.edits == best.edits && spanDelta < bestSpanDelta) ||
 +        (match.edits == best.edits && spanDelta == bestSpanDelta && distance < bestDistance)) {
 +      best = match;
 +      bestDistance = distance;
@@ -829,17 +837,13 @@ index 31eeb08..9d01eb0 100644
 +  }
 +  if (best.edits > maxEdits) return false;
 +
-+  const size_t bestSpan =
-+      best.end >= best.start
-+          ? static_cast<size_t>(best.end - best.start + 1)
-+          : 0;
++  const size_t bestSpan = best.end >= best.start ? static_cast<size_t>(best.end - best.start + 1) : 0;
 +  const size_t editBudget = static_cast<size_t>(maxEdits);
 +  const size_t minSpan = m > editBudget ? m - editBudget : 1;
 +  const size_t maxSpan = m + editBudget;
 +
 +  if (bestSpan < minSpan || bestSpan > maxSpan) {
-+    LOG_DBG("KOX", "Rejected fuzzy match: span %zu/%zu, edits %d/%d",
-+            bestSpan, m, best.edits, maxEdits);
++    LOG_DBG("KOX", "Rejected fuzzy match: span %zu/%zu, edits %d/%d", bestSpan, m, best.edits, maxEdits);
 +    return false;
 +  }
 +
@@ -1303,14 +1307,31 @@ index 31eeb08..9d01eb0 100644
 +  }
 +  return false;
 +}
++
++bool ChapterXPathResolver::hasUniqueExactText(const std::shared_ptr<Epub>& epub, const std::string& text) {
++  if (!epub || text.empty()) return false;
++  int found = 0;
++  for (int spine = 0; spine < epub->getSpineItemsCount(); ++spine) {
++    XPathTextLocation location;
++    bool unique = false;
++    bool scanned = false;
++    const bool matched = locateTextWithMode(epub, epub->getSpineItem(spine).href, text, -1.0f, MatchMode::Strict,
++                                            location, &unique, &scanned);
++    if (!scanned) return false;  // An unreadable chapter cannot establish global uniqueness.
++    if (matched) {
++      if (!unique || ++found > 1) return false;
++    }
++  }
++  return found == 1;
++}
 diff --git a/lib/KOReaderSync/ChapterXPathResolver.h b/lib/KOReaderSync/ChapterXPathResolver.h
-index 9676150..3a65222 100644
 --- a/lib/KOReaderSync/ChapterXPathResolver.h
 +++ b/lib/KOReaderSync/ChapterXPathResolver.h
-@@ -6,6 +6,20 @@
+@@ -5,6 +5,20 @@
+ #include <cstdint>
  #include <memory>
  #include <string>
- 
++
 +struct XPathTextRange {
 +  std::string start;  // xpointer of the first matched character
 +  std::string end;    // xpointer just past the last matched character
@@ -1324,11 +1345,10 @@ index 9676150..3a65222 100644
 +  uint32_t total = 0;  // positions in the whole spine item
 +  bool loose = false;  // matched ignoring case and punctuation
 +};
-+
+
  class ChapterXPathResolver {
   public:
-   /**
-@@ -42,4 +56,54 @@ class ChapterXPathResolver {
+@@ -42,4 +56,56 @@
    // page position stored in CrossInk's section cache, independent of layout.
    static std::string findXPathForVisibleTextOffset(const std::shared_ptr<Epub>& epub, int spineIndex,
                                                     uint32_t visibleTextOffset, uint8_t minimumPathDepth = 0);
@@ -1378,6 +1398,8 @@ index 9676150..3a65222 100644
 +
 +  // Text reduced to what loose matching compares (letters and digits, case
 +  // folded), for "is this the same highlight?" checks across readers.
++  static bool hasUniqueExactText(const std::shared_ptr<Epub>& epub, const std::string& text);
++
 +  static std::string looseTextKey(const std::string& text);
 +
 +  static bool findXPathRangeForText(const std::shared_ptr<Epub>& epub, int spineIndex, const std::string& text,
@@ -2129,10 +2151,9 @@ index 9a114f2..1502bdd 100644
      f.close();
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 0000000..d3c0349
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,1103 @@
+@@ -0,0 +1,1166 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2143,6 +2164,7 @@ index 0000000..d3c0349
 +#include <I18n.h>
 +#include <Logging.h>
 +#include <MD5Builder.h>
++#include <Memory.h>
 +#include <WiFi.h>
 +
 +#include <algorithm>
@@ -2163,6 +2185,7 @@ index 0000000..d3c0349
 +#include "MappedInputManager.h"
 +#include "ProgressMapper.h"
 +#include "ReaderUtils.h"
++#include "ReadestPositionPreviewActivity.h"
 +#include "SdCardFontSystem.h"
 +#include "SilentRestart.h"
 +#include "WifiCredentialStore.h"
@@ -2529,7 +2552,6 @@ index 0000000..d3c0349
 +  HighlightCounts counts;
 +  if (!syncHighlights(book, counts)) return;
 +  setStatus(tr(STR_READEST_SYNCING_POSITION));
-+  const std::string position = syncPosition(book);
 +
 +  LOG_INF("RDS", "Sync done: pulled=%d pushed=%d removedHere=%d removedThere=%d skipped=%d", counts.pulled,
 +          counts.pushed, counts.removedHere, counts.removedThere, counts.skipped);
@@ -2538,6 +2560,13 @@ index 0000000..d3c0349
 +    detail += "\n" + formatCount(tr(STR_READEST_REMOVED_FORMAT), counts.removedHere + counts.removedThere);
 +  }
 +  if (counts.skipped > 0) detail += "\n" + formatCount(tr(STR_READEST_SKIPPED_FORMAT), counts.skipped);
++  syncSummary = std::move(detail);
++  const std::string position = syncPosition(book);
++  if (!positionPreviewPending) finishPositionSync(position);
++}
++
++void ReadestSyncActivity::finishPositionSync(std::string position) {
++  std::string detail = syncSummary;
 +  if (!position.empty()) detail += "\n" + position;
 +  if (readestCopyMissing) detail += "\n" + std::string(tr(STR_READEST_COPY_MISSING));
 +  {
@@ -2546,6 +2575,15 @@ index 0000000..d3c0349
 +    statusMessage = tr(STR_READEST_SYNC_DONE);
 +    detailMessage = std::move(detail);
 +    autoReturnAt = millis() + AUTO_RETURN_DELAY_MS;
++  }
++  if (sleepMode && positionPreviewPending) {
++    positionPreviewPending = false;
++    CLIPPINGS.unload();
++    readestEpub.reset();
++    epub.reset();
++    wifiOff();
++    finishAutoSync(false);
++    return;
 +  }
 +  if (!sleepMode) requestUpdate(true);
 +}
@@ -2939,6 +2977,8 @@ index 0000000..d3c0349
 +  // Readest -> device: read a snippet at Readest's position in Readest's copy
 +  // and find that text in the device copy.
 +  bool remoteMapped = false;
++  bool remoteTextUnique = false;
++  std::string mappedDeviceXPath;
 +  float remotePct = -1.0f;
 +  CrossPointPosition remotePos{};
 +  if (remote.found && !remote.xpointer.empty()) {
@@ -2956,10 +2996,12 @@ index 0000000..d3c0349
 +          ChapterXPathResolver::findTextInBook(epub, snippet, remote.fraction, -1, spine, location) &&
 +          ChapterXPathResolver::rangeForLocation(epub, spine, location, range)) {
 +        deviceXPath = range.start;
++        remoteTextUnique = !location.loose && ChapterXPathResolver::hasUniqueExactText(epub, snippet);
 +      } else {
 +        LOG_ERR("RDS", "Readest position text not found in the device copy");
 +      }
 +    }
++    mappedDeviceXPath = deviceXPath;
 +    if (!deviceXPath.empty()) {
 +      KOReaderPosition ko;
 +      ko.xpath = deviceXPath;
@@ -2972,23 +3014,51 @@ index 0000000..d3c0349
 +    }
 +  }
 +
++  std::string remoteOpening;
++  int openingSpine = -1;
++  const bool readableAnchor =
++      remoteMapped && ChapterXPathResolver::textAtXPath(epub, mappedDeviceXPath, 140, remoteOpening, openingSpine) &&
++      openingSpine == remotePos.spineIndex;
++
 +  const auto action = ReadestPositionPolicy::choose(localKo.valid && !localKo.xpath.empty(), progress.updatedAtMs,
 +                                                    remote.found, remote.updatedAtMs, remoteMapped);
 +  LOG_INF("RDS", "Latest position: local=%lld remote=%lld action=%d", static_cast<long long>(progress.updatedAtMs),
 +          static_cast<long long>(remote.updatedAtMs), static_cast<int>(action));
-+  if (action == ReadestPositionPolicy::Action::Unavailable) return tr(STR_READEST_POS_UNAVAILABLE);
-+  if (action == ReadestPositionPolicy::Action::None) return tr(STR_READEST_POS_IN_SYNC);
-+  if (action == ReadestPositionPolicy::Action::Download) {
-+    const int pageCount = std::max(remotePos.totalPages, remotePos.pageNumber + 1);
-+    const std::optional<uint32_t> visibleTextOffset =
-+        remotePos.hasVisibleTextOffset ? std::optional<uint32_t>(remotePos.visibleTextOffset) : std::nullopt;
-+    if (!EpubReaderUtils::saveProgress(*epub, remotePos.spineIndex, remotePos.pageNumber, pageCount, visibleTextOffset,
-+                                       remote.updatedAtMs)) {
-+      LOG_ERR("RDS", "Failed to save Readest position");
-+      return tr(STR_READEST_POS_UNAVAILABLE);
++  if (action == ReadestPositionPolicy::Action::Unavailable && !remoteMapped) return tr(STR_READEST_POS_UNAVAILABLE);
++  const bool conflictingTie =
++      action == ReadestPositionPolicy::Action::None && remoteMapped &&
++      (remotePos.spineIndex != local.spineIndex || (remotePos.hasVisibleTextOffset && local.hasVisibleTextOffset &&
++                                                    remotePos.visibleTextOffset != local.visibleTextOffset));
++  if (action == ReadestPositionPolicy::Action::None && !conflictingTie) return tr(STR_READEST_POS_IN_SYNC);
++  if (action == ReadestPositionPolicy::Action::Download || action == ReadestPositionPolicy::Action::Unavailable ||
++      conflictingTie) {
++    const bool uncertain = ReadestPositionPolicy::needsPositionDecision(
++        action, conflictingTie, remotePos.hasVisibleTextOffset && readableAnchor,
++        readestEpub == epub && !readestCopyMissing, remoteTextUnique, readestCopyMissing);
++    if (uncertain) {
++      const int toc = epub->getTocIndexForSpineIndex(remotePos.spineIndex);
++      std::string chapter = toc >= 0 ? epub->getTocItem(toc).title : tr(STR_UNKNOWN_CHAPTER);
++
++      const float percent = remote.fraction >= 0 ? remote.fraction : remotePct;
++      auto preview = makeUniqueNoThrow<ReadestPositionPreviewActivity>(renderer, mappedInput, std::move(chapter),
++                                                                       std::move(remoteOpening), percentOf(percent));
++      if (!preview) {
++        LOG_ERR("RDS", "Cannot allocate sync position preview");
++        return tr(STR_READEST_POS_UNAVAILABLE);
++      }
++      if (sleepMode) wifiOff();  // Network work is complete; do not keep Wi-Fi on while awaiting a choice.
++      positionPreviewPending = true;
++      if (sleepMode) ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
++      startActivityForResult(
++          std::move(preview), [this, remotePos, timestamp = remote.updatedAtMs, percent](const ActivityResult& result) {
++            const std::string message =
++                result.isCancelled ? tr(STR_READEST_POSITION_KEPT) : applyRemotePosition(remotePos, timestamp, percent);
++            finishPositionSync(message);
++            if (!sleepMode) positionPreviewPending = false;
++          });
++      return "";
 +    }
-+    RecentBookProgress::saveCachedEpubPercent(*epub, remotePos.spineIndex, remotePos.pageNumber, pageCount);
-+    return formatCount(tr(STR_READEST_POS_FROM_READEST_FORMAT), percentOf(remotePct));
++    return applyRemotePosition(remotePos, remote.updatedAtMs, remotePct);
 +  }
 +
 +  if (action == ReadestPositionPolicy::Action::Upload) {
@@ -3023,6 +3093,19 @@ index 0000000..d3c0349
 +  }
 +
 +  return remoteMapped ? tr(STR_READEST_POS_IN_SYNC) : tr(STR_READEST_POS_UNAVAILABLE);
++}
++
++std::string ReadestSyncActivity::applyRemotePosition(const CrossPointPosition& position, int64_t timestamp,
++                                                     float percent) {
++  const int pageCount = std::max(position.totalPages, position.pageNumber + 1);
++  const std::optional<uint32_t> offset =
++      position.hasVisibleTextOffset ? std::optional<uint32_t>(position.visibleTextOffset) : std::nullopt;
++  if (!EpubReaderUtils::saveProgress(*epub, position.spineIndex, position.pageNumber, pageCount, offset, timestamp)) {
++    LOG_ERR("RDS", "Failed to save Readest position");
++    return tr(STR_READEST_POS_UNAVAILABLE);
++  }
++  RecentBookProgress::saveCachedEpubPercent(*epub, position.spineIndex, position.pageNumber, pageCount);
++  return formatCount(tr(STR_READEST_POS_FROM_READEST_FORMAT), percentOf(percent));
 +}
 +
 +void ReadestSyncActivity::returnToReader() { activityManager.goToReader(epubPath, false, false, true); }
@@ -3092,6 +3175,7 @@ index 0000000..d3c0349
 +    abortIfPowerPressed();
 +    state = WORKING;
 +    runSync();
++    if (positionPreviewPending) return;  // Child preview owns the decision, including silent boots.
 +    LOG_INF("RDS", "Auto-sync %s", state == DONE ? "done" : "did not complete");
 +  } else {
 +    LOG_INF("RDS", "Auto-sync skipped: no Wi-Fi or account");
@@ -3238,10 +3322,9 @@ index 0000000..d3c0349
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
-index 0000000..2d4af53
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,140 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -3253,6 +3336,7 @@ index 0000000..2d4af53
 +
 +#include "ChapterXPathResolver.h"
 +#include "CrossPointSettings.h"
++#include "ProgressMapper.h"
 +#include "activities/Activity.h"
 +#include "activities/ScreenTransitionRefresh.h"
 +#include "components/OptionPopup.h"
@@ -3374,6 +3458,10 @@ index 0000000..2d4af53
 +  // Adds a pulled clipping; false if not added (fail() already called when
 +  // saving failed, i.e. state == FAILED).
 +  bool addPulledClipping(const PulledText& pulled);
++  bool positionPreviewPending = false;
++  std::string syncSummary;
++  void finishPositionSync(std::string position);
++  std::string applyRemotePosition(const CrossPointPosition& position, int64_t timestamp, float percent);
 +  std::string syncPosition(const ReadestBook& book);
 +  void returnToReader();
 +};
@@ -5395,10 +5483,9 @@ index 0000000..4722555
 +};
 diff --git a/src/readest/ReadestPositionPolicy.h b/src/readest/ReadestPositionPolicy.h
 new file mode 100644
-index 0000000..2a9291d
 --- /dev/null
 +++ b/src/readest/ReadestPositionPolicy.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,24 @@
 +#pragma once
 +#include <cstdint>
 +
@@ -5412,6 +5499,15 @@ index 0000000..2a9291d
 +  if (localTime > remoteTime) return Action::Upload;
 +  if (remoteTime > localTime) return remoteMapped ? Action::Download : Action::Unavailable;
 +  return Action::None;
++}
++// A fuzzy/repeated passage or an unverified source copy is not a safe silent jump.
++constexpr bool needsPreview(bool exactCoordinate, bool sameFile, bool uniqueText, bool missingCopy) {
++  return !exactCoordinate || missingCopy || (!sameFile && !uniqueText);
++}
++constexpr bool needsPositionDecision(Action action, bool conflictingTie, bool exactCoordinate, bool sameFile,
++                                     bool uniqueText, bool missingCopy) {
++  return conflictingTie || action == Action::Unavailable ||
++         needsPreview(exactCoordinate, sameFile, uniqueText, missingCopy);
 +}
 +}  // namespace ReadestPositionPolicy
 diff --git a/src/readest/ReadestStore.cpp b/src/readest/ReadestStore.cpp
@@ -5882,12 +5978,15 @@ index 0000000..0ca19c3
 +bool download(const std::string& url, const std::string& destPath);
 +}  // namespace ReadestTextEpub
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
-index 1b989fd..3bcbcc2 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -108,3 +108,5 @@ add_subdirectory(library_recent_order)
+@@ -106,6 +106,9 @@
+ add_subdirectory(library_input_buffer)
+
+ add_subdirectory(library_recent_order)
++add_subdirectory(readest_text_confidence)
  add_subdirectory(scalable_fonts)
- 
+
  add_subdirectory(glyph_bitmap)
 +
 +add_subdirectory(readest_position_sync)
@@ -6010,10 +6109,9 @@ index 0000000..9ff5c54
 +add_test(NAME readest_position_sync COMMAND readest_position_sync_test)
 diff --git a/test/readest_position_sync/ReadestPositionSyncTest.cpp b/test/readest_position_sync/ReadestPositionSyncTest.cpp
 new file mode 100644
-index 0000000..64920e6
 --- /dev/null
 +++ b/test/readest_position_sync/ReadestPositionSyncTest.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,77 @@
 +#include <cassert>
 +#include <iostream>
 +
@@ -6022,6 +6120,16 @@ index 0000000..64920e6
 +using ReadestPositionPolicy::Action;
 +using ReadestPositionPolicy::choose;
 +int main() {
++  assert(ReadestPositionPolicy::needsPositionDecision(Action::None, true, true, true, false, false));
++  assert(ReadestPositionPolicy::needsPositionDecision(Action::Unavailable, false, true, true, false, false));
++  assert(!ReadestPositionPolicy::needsPositionDecision(Action::Download, false, true, true, false, false));
++  using ReadestPositionPolicy::needsPreview;
++  assert(!needsPreview(true, true, false, false));
++  assert(!needsPreview(true, false, true, false));
++  assert(needsPreview(false, true, false, false));
++  assert(needsPreview(true, false, false, false));
++  assert(needsPreview(true, false, true, true));
++
 +  // A later 1% edit must beat an older 28% edit, in either direction.
 +  assert(choose(true, 2000, true, 1000, true) == Action::Upload);
 +  assert(choose(true, 1000, true, 2000, true) == Action::Download);
@@ -6204,3 +6312,147 @@ index 0000000..17d006d
 +  int64_t utcNowMs() const { return now; }
 +};
 +inline HalClock halClock;
+diff --git a/src/activities/reader/ReadestPositionPreviewActivity.cpp b/src/activities/reader/ReadestPositionPreviewActivity.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/ReadestPositionPreviewActivity.cpp
+@@ -0,0 +1,71 @@
++#include "ReadestPositionPreviewActivity.h"
++
++#include <I18n.h>
++
++#include <cstdio>
++
++#include "components/TouchHeaderBackButton.h"
++#include "fontIds.h"
++
++ReadestPositionPreviewActivity::ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input,
++                                                               std::string chapter, std::string opening, int percent)
++    : Activity("ReadestPositionPreview", renderer, input),
++      chapter(std::move(chapter)),
++      opening(std::move(opening)),
++      percent(percent) {}
++void ReadestPositionPreviewActivity::onEnter() {
++  Activity::onEnter();
++  requestUpdate();
++}
++Rect ReadestPositionPreviewActivity::button(bool go) const {
++  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
++  const int width = (safe.width - 18) / 2;
++  return Rect{safe.x + 6 + (go ? 0 : width + 6), safe.y + safe.height - 54, width, 48};
++}
++void ReadestPositionPreviewActivity::choose(bool go) {
++  ActivityResult result;
++  result.isCancelled = !go;
++  setResult(std::move(result));
++  finish();
++}
++void ReadestPositionPreviewActivity::loop() {
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
++      TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
++    choose(false);
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++    choose(true);
++    return;
++  }
++  for (bool go : {true, false}) {
++    const Rect rect = button(go);
++    if (mappedInput.wasTapInRect(rect.x, rect.y, rect.width, rect.height)) {
++      choose(go);
++      return;
++    }
++  }
++}
++void ReadestPositionPreviewActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  TouchHeaderBackButton::drawCompact(renderer, tr(STR_READEST_POSITION_PREVIEW), false);
++  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
++  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++  const int line = renderer.getLineHeight(UI_10_FONT_ID) + 6;
++  const int y = header.y + header.height + 12;
++  const Rect text{safe.x + 12, y, safe.width - 24, button(true).y - y - 12};
++  char percentText[24];
++  snprintf(percentText, sizeof(percentText), "%d%%", percent);
++  renderer.drawText(UI_12_FONT_ID, text.x, y, percentText, true, EpdFontFamily::BOLD);
++  UITheme::drawCenteredWrappedText(renderer, text, UI_10_FONT_ID, y + line * 2, chapter.c_str(), 2, true);
++  UITheme::drawCenteredWrappedText(renderer, text, UI_10_FONT_ID, y + line * 5,
++                                   opening.empty() ? tr(STR_READEST_PREVIEW_NO_TEXT) : opening.c_str(), 4, false);
++  for (bool go : {true, false}) {
++    const Rect rect = button(go);
++    renderer.drawRect(rect.x, rect.y, rect.width, rect.height, true);
++    const char* label = go ? tr(STR_READEST_GO_THERE) : tr(STR_READEST_KEEP_HERE);
++    renderer.drawText(UI_10_FONT_ID, rect.x + (rect.width - renderer.getTextWidth(UI_10_FONT_ID, label)) / 2,
++                      rect.y + (rect.height - renderer.getLineHeight(UI_10_FONT_ID)) / 2, label);
++  }
++  renderer.displayBuffer();
++}
+diff --git a/src/activities/reader/ReadestPositionPreviewActivity.h b/src/activities/reader/ReadestPositionPreviewActivity.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/ReadestPositionPreviewActivity.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include "activities/Activity.h"
++#include "components/UITheme.h"
++
++class ReadestPositionPreviewActivity final : public Activity {
++ public:
++  ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input, std::string chapter,
++                                 std::string opening, int percent);
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++  bool preventAutoSleep() override { return true; }
++
++ private:
++  std::string chapter;
++  std::string opening;
++  int percent;
++  Rect button(bool go) const;
++  void choose(bool go);
++};
+diff --git a/test/readest_text_confidence/CMakeLists.txt b/test/readest_text_confidence/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/readest_text_confidence/CMakeLists.txt
+@@ -0,0 +1,12 @@
++add_executable(readest_text_confidence_test ReadestTextConfidenceTest.cpp
++  ${REPO_ROOT}/lib/KOReaderSync/ChapterXPathResolver.cpp
++  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
++  ${REPO_ROOT}/lib/Epub/Epub/htmlEntities.cpp
++  ${REPO_ROOT}/lib/expat/xmlparse.c ${REPO_ROOT}/lib/expat/xmlrole.c ${REPO_ROOT}/lib/expat/xmltok.c)
++target_include_directories(readest_text_confidence_test PRIVATE
++  ${REPO_ROOT}/test/koreader_xpath_resolver/stubs ${REPO_ROOT}/src
++  ${REPO_ROOT}/lib/KOReaderSync ${REPO_ROOT}/lib/Epub ${REPO_ROOT}/lib/Utf8
++  ${REPO_ROOT}/lib/XmlParserUtils ${REPO_ROOT}/lib/expat)
++target_compile_definitions(readest_text_confidence_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
++target_compile_options(readest_text_confidence_test PRIVATE -UNDEBUG)
++add_test(NAME readest_text_confidence COMMAND readest_text_confidence_test)
+diff --git a/test/readest_text_confidence/ReadestTextConfidenceTest.cpp b/test/readest_text_confidence/ReadestTextConfidenceTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/readest_text_confidence/ReadestTextConfidenceTest.cpp
+@@ -0,0 +1,21 @@
++#include <cassert>
++#include <iostream>
++
++#include "ChapterXPathResolver.h"
++int main() {
++  assert(ChapterXPathResolver::hasUniqueExactText(
++      std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>Unique passage.</p></body></html>"}),
++      "Unique passage."));
++  assert(!ChapterXPathResolver::hasUniqueExactText(
++      std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>Repeat Repeat</p></body></html>"}), "Repeat"));
++  assert(!ChapterXPathResolver::hasUniqueExactText(
++      std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>Repeat</p></body></html>",
++                                                      "<html><body><p>Repeat</p></body></html>"}),
++      "Repeat"));
++  assert(!ChapterXPathResolver::hasUniqueExactText(
++      std::make_shared<Epub>(
++          std::vector<std::string>{"<html><body><p>Unique passage.</p></body></html>", "<html><body><p>Unclosed"}),
++      "Unique passage."));
++  assert(!ChapterXPathResolver::hasUniqueExactText(nullptr, "test"));
++  std::cout << "Readest text confidence checks passed\n";
++}

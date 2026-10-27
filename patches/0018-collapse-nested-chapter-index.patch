@@ -1,0 +1,377 @@
+diff --git a/src/activities/reader/EpubReaderChapterSelectionActivity.cpp b/src/activities/reader/EpubReaderChapterSelectionActivity.cpp
+--- a/src/activities/reader/EpubReaderChapterSelectionActivity.cpp
++++ b/src/activities/reader/EpubReaderChapterSelectionActivity.cpp
+@@ -29,19 +29,19 @@
+       uiTarget(makeUiTarget(renderer)),
+       app(uiTarget, uiTarget.deviceContext()) {}
+
+-int EpubReaderChapterSelectionActivity::getTotalItems() const { return epub->getTocItemsCount(); }
++int EpubReaderChapterSelectionActivity::getTotalItems() const { return static_cast<int>(tree.visible.size()); }
+
+ void EpubReaderChapterSelectionActivity::onEnter() {
+   Activity::onEnter();
+   mappedInput.setReaderTouchscreenOverride(true);
+
+-  // epub is a required collaborator: the caller dereferences it before constructing
+-  // this activity, and loop()/render() use it unguarded on every frame.
+-  selectorIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+-  if (selectorIndex < 0) selectorIndex = 0;
+-  topIndex = 0;
++  const int current = epub->getTocIndexForSpineIndex(currentSpineIndex);
++  std::vector<uint8_t> levels;
++  levels.reserve(epub->getTocItemsCount());
++  for (int i = 0; i < epub->getTocItemsCount(); ++i) levels.push_back(epub->getTocItem(i).level);
++  tree.reset(std::move(levels), current);
++  nav.reset(tree.rowFor(current));
+   visibleRows = 1;
+-  initialViewportPending = true;
+   uiReady = false;
+   applySharedUiTheme(app, uiTarget);
+   app.on(ACTION_ROW, &EpubReaderChapterSelectionActivity::onRowEvent, this);
+@@ -55,23 +55,34 @@
+ }
+
+ void EpubReaderChapterSelectionActivity::selectChapter() {
+-  const auto tocItem = epub->getTocItem(selectorIndex);
++  if (nav.selected < 0 || nav.selected >= getTotalItems()) return;
++  const auto tocItem = epub->getTocItem(tree.visible[nav.selected]);
+   if (tocItem.spineIndex < 0) {
+-    ActivityResult result;
+-    result.isCancelled = true;
+-    setResult(std::move(result));
+-  } else {
+-    setResult(ChapterResult{tocItem.spineIndex, tocItem.anchor});
+-  }
++    requestUpdate();  // Structural TOC headings may have children but no destination.
++    return;
++  }
++  setResult(ChapterResult{tocItem.spineIndex, tocItem.anchor});
+   finish();
++}
++
++void EpubReaderChapterSelectionActivity::activateChapter(bool openParent) {
++  RenderLock lock(*this);
++  if (nav.selected < 0 || nav.selected >= getTotalItems()) return;
++  const uint16_t index = tree.visible[nav.selected];
++  if (!openParent && tree.toggle(index)) {
++    nav.selected = tree.rowFor(index);
++    nav.follow(getTotalItems());
++    requestUpdate();
++  } else
++    selectChapter();
+ }
+
+ void EpubReaderChapterSelectionActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+   auto* self = static_cast<EpubReaderChapterSelectionActivity*>(user);
+   if (event.value < 0 || event.value >= self->getTotalItems()) return;
+-  self->selectorIndex = event.value;
++  self->nav.selected = event.value;
+   self->app.clearTapFlash();
+-  self->selectChapter();
++  self->activateChapter(event.longPress);
+ }
+
+ void EpubReaderChapterSelectionActivity::loop() {
+@@ -89,6 +100,8 @@
+     return;
+   }
+
++  if (totalItems == 0) return;
++
+   if (uiReady) {
+     const fui::InputSnapshot snap = touchSnapshotFrom(mappedInput);
+     if (snap.touchPressed || snap.touchReleased) {
+@@ -100,32 +113,40 @@
+
+   const auto swipe = mappedInput.wasSwipe();
+   if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
+-    const int delta = swipe == MappedInputManager::SwipeDir::Up ? visibleRows : -visibleRows;
+-    const int next = scrollListBy(topIndex, delta, visibleRows, totalItems);
+-    if (next != topIndex) {
+-      topIndex = next;
++    if (nav.scrollBy(swipe == MappedInputManager::SwipeDir::Up ? visibleRows : -visibleRows, totalItems))
+       requestUpdate();
+-    }
+     return;
+   }
+
+   const auto moveSelection = [this, totalItems](const int index) {
+-    selectorIndex = index;
+-    topIndex = followListSelection(selectorIndex, topIndex, visibleRows, totalItems);
++    nav.selected = index;
++    nav.follow(totalItems);
+     requestUpdate();
+   };
+   buttonNavigator.onNextRelease(
+-      [this, totalItems, &moveSelection] { moveSelection(ButtonNavigator::nextIndex(selectorIndex, totalItems)); });
++      [this, totalItems, &moveSelection] { moveSelection(ButtonNavigator::nextIndex(nav.selected, totalItems)); });
+   buttonNavigator.onPreviousRelease(
+-      [this, totalItems, &moveSelection] { moveSelection(ButtonNavigator::previousIndex(selectorIndex, totalItems)); });
++      [this, totalItems, &moveSelection] { moveSelection(ButtonNavigator::previousIndex(nav.selected, totalItems)); });
+   buttonNavigator.onNextContinuous([this, totalItems, &moveSelection] {
+-    moveSelection(ButtonNavigator::nextPageIndex(selectorIndex, totalItems, visibleRows));
++    moveSelection(ButtonNavigator::nextPageIndex(nav.selected, totalItems, visibleRows));
+   });
+   buttonNavigator.onPreviousContinuous([this, totalItems, &moveSelection] {
+-    moveSelection(ButtonNavigator::previousPageIndex(selectorIndex, totalItems, visibleRows));
++    moveSelection(ButtonNavigator::previousPageIndex(nav.selected, totalItems, visibleRows));
+   });
+
+-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) selectChapter();
++  if (!confirmHoldHandled && mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
++      mappedInput.getHeldTime() >= 500) {
++    confirmHoldHandled = true;
++    mappedInput.suppressNextConfirmRelease();
++    activateChapter(true);
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++    if (confirmHoldHandled)
++      confirmHoldHandled = false;
++    else
++      activateChapter();
++  }
+ }
+
+ void EpubReaderChapterSelectionActivity::chapterScreen(UiApp::ScreenType& screen, void* user) {
+@@ -142,36 +163,41 @@
+   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+
+   const int totalItems = getTotalItems();
++  if (totalItems == 0) {
++    screen.centeredText(tr(STR_NO_CHAPTERS), screen.theme().bodyText);
++    return;
++  }
+   fui::ListProps props;
+   props.labelText = screen.theme().bodyText;
+-  const auto rows = configureUiList(props, screen.theme(), screen.body());
+-  visibleRows = rows > 0 ? rows : 1;
+-  topIndex = initialViewportPending ? followListSelection(selectorIndex, 0, visibleRows, totalItems)
+-                                    : scrollListBy(topIndex, 0, visibleRows, totalItems);
+-  initialViewportPending = false;
++  configureUiList(props, screen.theme(), screen.body(), UiListRowType::WithSubtitle);
++  nav.syncToProps(screen.body(), props.rowHeight, props.rowGap, totalItems, props);
++  visibleRows = std::min(static_cast<int>(CHAPTER_WINDOW_SIZE), std::max(1, nav.visibleRows));
+
+   const size_t drawCount =
+-      std::min({static_cast<size_t>(visibleRows), CHAPTER_WINDOW_SIZE, static_cast<size_t>(totalItems - topIndex)});
++      std::min({static_cast<size_t>(visibleRows), CHAPTER_WINDOW_SIZE, static_cast<size_t>(totalItems - nav.top)});
+   for (size_t i = 0; i < drawCount; ++i) {
+-    const auto item = epub->getTocItem(topIndex + static_cast<int>(i));
+-    const size_t indent = item.level > 0 ? static_cast<size_t>(item.level - 1) * 2 : 0;
++    const auto index = tree.visible[nav.top + static_cast<int>(i)];
++    const auto item = epub->getTocItem(index);
++    const size_t indent = item.level > 0 ? std::min<size_t>(8, item.level - 1) * 2 : 0;
+     labelWindow[i].assign(indent, ' ');
++    if (tree.hasChildren(index)) labelWindow[i] += tree.expanded[index] ? "[-] " : "[+] ";
+     labelWindow[i] += item.title;
+     itemWindow[i] = fui::ListItem{};
+     itemWindow[i].label = labelWindow[i].c_str();
+-    itemWindow[i].actionValue = static_cast<int16_t>(topIndex + static_cast<int>(i));
++    if (tree.hasChildren(index) && item.spineIndex >= 0) itemWindow[i].subtitle = tr(STR_HOLD_TO_OPEN_CHAPTER);
++    itemWindow[i].actionValue = static_cast<int16_t>(nav.top + static_cast<int>(i));
+   }
+
+   props.items = itemWindow.data();
+-  props.count = static_cast<uint16_t>(drawCount);
+-  props.selectedIndex = static_cast<int16_t>(selectorIndex - topIndex);
++  props.count = static_cast<uint16_t>(totalItems);
++  props.itemsWindowFirst = static_cast<uint16_t>(nav.top);
++  props.itemsWindowCount = static_cast<uint16_t>(drawCount);
++  props.selectedIndex = static_cast<int16_t>(nav.selected);
+   props.action = ACTION_ROW;
+-  props.inputMask = fui::InputTouch;
+-  props.topIndex = 0;
++  props.inputMask = fui::InputTouch | fui::InputLongPress;
++  props.topIndex = static_cast<uint16_t>(nav.top);
+   screen.list(props);
+-  fui::drawListScrollIndicator(screen.target(), screen.body(), static_cast<size_t>(totalItems), visibleRows, topIndex,
+-                               screen.theme().listScrollWidth, screen.theme().listScrollSide,
+-                               screen.theme().listScrollInset);
++  visibleRows = std::max(1, nav.pageRowsFor(totalItems));
+ }
+
+ void EpubReaderChapterSelectionActivity::render(RenderLock&&) {
+@@ -186,7 +212,14 @@
+     GUI.drawHeader(renderer, header, tr(STR_SELECT_CHAPTER), nullptr, true);
+   }
+   uiReady = false;
+-  app.render();
++  do {
++    renderer.clearScreen();
++    if (mappedInput.hasTouchHardware())
++      TouchHeaderBackButton::draw(renderer, uiTarget, header, tr(STR_SELECT_CHAPTER), true);
++    else
++      GUI.drawHeader(renderer, header, tr(STR_SELECT_CHAPTER), nullptr, true);
++    app.render();
++  } while (nav.consumeRebuildNeeded());
+   uiReady = true;
+   const auto labels =
+       mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+diff --git a/src/activities/reader/EpubReaderChapterSelectionActivity.h b/src/activities/reader/EpubReaderChapterSelectionActivity.h
+--- a/src/activities/reader/EpubReaderChapterSelectionActivity.h
++++ b/src/activities/reader/EpubReaderChapterSelectionActivity.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <string>
+
++#include "CollapsibleToc.h"
+ #include "activities/Activity.h"
+ #include "util/ButtonNavigator.h"
+
+@@ -19,13 +20,13 @@
+   std::string epubPath;
+   ButtonNavigator buttonNavigator;
+   int currentSpineIndex = 0;
+-  int selectorIndex = 0;
++  freeink::ui::ListNav nav;
++  CollapsibleToc tree;
++  bool confirmHoldHandled = false;
+   freeink::ui::GfxRendererTarget uiTarget;
+   UiApp app;
+   std::atomic<bool> uiReady{false};
+   int visibleRows = 1;
+-  int topIndex = 0;
+-  bool initialViewportPending = true;
+   std::array<std::string, CHAPTER_WINDOW_SIZE> labelWindow{};
+   std::array<freeink::ui::ListItem, CHAPTER_WINDOW_SIZE> itemWindow{};
+
+@@ -33,6 +34,7 @@
+   static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);
+   void buildChapterScreen(UiApp::ScreenType& screen);
+   void selectChapter();
++  void activateChapter(bool openParent = false);
+
+   // Total TOC items count
+   int getTotalItems() const;
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -1,6 +1,7 @@
+ _language_name: "English"
+ _language_code: "EN"
+ _order: "0"
++STR_HOLD_TO_OPEN_CHAPTER: "Hold to open chapter"
+
+ STR_EDIT_HIGHLIGHT: "Edit highlight"
+ STR_HIGHLIGHT_EXTEND_START: "Extend start"
+diff --git a/src/activities/reader/CollapsibleToc.h b/src/activities/reader/CollapsibleToc.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/CollapsibleToc.h
+@@ -0,0 +1,48 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <vector>
++
++class CollapsibleToc {
++ public:
++  std::vector<uint8_t> levels;
++  std::vector<uint8_t> expanded;
++  std::vector<uint16_t> visible;
++  bool hasChildren(size_t index) const { return index + 1 < levels.size() && levels[index + 1] > levels[index]; }
++  void reset(std::vector<uint8_t> depths, int current) {
++    levels = std::move(depths);
++    expanded.assign(levels.size(), 0);
++    visible.clear();
++    visible.reserve(levels.size());
++    if (current < 0 || current >= static_cast<int>(levels.size())) current = -1;
++    // Open only the current chapter's ancestor chain, not unrelated branches.
++    for (int i = current - 1, depth = current >= 0 && current < static_cast<int>(levels.size()) ? levels[current] : -1;
++         i >= 0; --i) {
++      if (levels[i] < depth) {
++        expanded[i] = 1;
++        depth = levels[i];
++      }
++    }
++    rebuild();
++  }
++  void rebuild() {
++    visible.clear();
++    int hiddenLevel = -1;
++    for (size_t i = 0; i < levels.size(); ++i) {
++      if (hiddenLevel >= 0 && levels[i] > hiddenLevel) continue;
++      hiddenLevel = -1;
++      visible.push_back(static_cast<uint16_t>(i));
++      if (hasChildren(i) && !expanded[i]) hiddenLevel = levels[i];
++    }
++  }
++  bool toggle(size_t index) {
++    if (!hasChildren(index)) return false;
++    expanded[index] = !expanded[index];
++    rebuild();
++    return true;
++  }
++  int rowFor(size_t index) const {
++    const auto it = std::find(visible.begin(), visible.end(), index);
++    return it == visible.end() ? 0 : static_cast<int>(it - visible.begin());
++  }
++};
+diff --git a/test/collapsible_toc/CMakeLists.txt b/test/collapsible_toc/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/collapsible_toc/CMakeLists.txt
+@@ -0,0 +1,4 @@
++add_executable(collapsible_toc_test CollapsibleTocTest.cpp)
++target_include_directories(collapsible_toc_test PRIVATE ${REPO_ROOT}/src)
++target_compile_options(collapsible_toc_test PRIVATE -UNDEBUG)
++add_test(NAME collapsible_toc COMMAND collapsible_toc_test)
+diff --git a/test/collapsible_toc/CollapsibleTocTest.cpp b/test/collapsible_toc/CollapsibleTocTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/collapsible_toc/CollapsibleTocTest.cpp
+@@ -0,0 +1,30 @@
++#include <cassert>
++#include <iostream>
++
++#include "activities/reader/CollapsibleToc.h"
++int main() {
++  CollapsibleToc toc;
++  toc.reset({1, 2, 3, 2, 1, 2}, -1);
++  assert((toc.visible == std::vector<uint16_t>{0, 4}));
++  toc.toggle(0);
++  assert((toc.visible == std::vector<uint16_t>{0, 1, 3, 4}));
++  toc.toggle(1);
++  assert((toc.visible == std::vector<uint16_t>{0, 1, 2, 3, 4}));
++  toc.toggle(0);
++  assert((toc.visible == std::vector<uint16_t>{0, 4}));
++  toc.toggle(0);
++  assert((toc.visible == std::vector<uint16_t>{0, 1, 2, 3, 4}));
++  assert(!toc.toggle(2));
++  toc.reset({1, 2, 3, 2, 1, 2}, 2);
++  assert(toc.expanded[0] && toc.expanded[1]);
++  assert(toc.visible[toc.rowFor(2)] == 2);
++  toc.reset({2, 4, 3, 2}, -1);
++  assert((toc.visible == std::vector<uint16_t>{0, 3}));
++  toc.toggle(0);
++  assert(toc.visible.size() == 4);
++  toc.reset({}, 999);
++  assert(toc.visible.empty());
++  toc.reset({1, 1, 1}, -1);
++  assert(toc.visible.size() == 3);
++  std::cout << "Collapsible chapter tests passed\n";
++}
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -45,6 +45,7 @@
+ add_subdirectory(highlight_chapter_groups)
+ add_subdirectory(release_json_parser)
+ add_subdirectory(differential_rounding)
++add_subdirectory(collapsible_toc)
+ add_subdirectory(hyphenation_eval)
+ add_subdirectory(utf8_compose)
+ add_subdirectory(minibidi_arabic)
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+
+ ### Fixed
++
++- The EPUB contents index collapses parent chapters, opens the current chapter's ancestors, and supports holding a parent to navigate to it.
+
+ - Highlights are grouped under collapsible chapter headers with counts; opening and deleting a highlight preserve its original identity.
+

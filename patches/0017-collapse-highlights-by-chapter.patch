@@ -1,0 +1,497 @@
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
+--- a/src/activities/reader/EpubReaderClippingListActivity.cpp
++++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
+@@ -2,6 +2,7 @@
+
+ #include <GfxRenderer.h>
+ #include <I18n.h>
++#include <Memory.h>
+
+ #include <algorithm>
+ #include <cstdio>
+@@ -145,10 +146,69 @@
+ }
+ }  // namespace
+
+-EpubReaderClippingListActivity::EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
++EpubReaderClippingListActivity::EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
++                                                               Epub* book, std::string bookPath)
+     : Activity("EpubClippingList", renderer, mappedInput),
++      book(book),
++      bookPath(std::move(bookPath)),
+       uiTarget(makeUiTarget(renderer)),
+       app(uiTarget, uiTarget.deviceContext()) {}
++
++void EpubReaderClippingListActivity::rebuildGroups() {
++  if (!book && !bookPath.empty() && !metadataBook) {
++    metadataBook = makeUniqueNoThrow<Epub>(bookPath, "/.crosspoint");
++    if (metadataBook) {
++      metadataBook->setupCacheDir();
++      if (metadataBook->load(false, true, Epub::XLocationLoadMode::Skip, true))
++        book = metadataBook.get();
++      else
++        LOG_ERR("CLIP", "Chapter metadata unavailable; grouping by spine");
++    } else
++      LOG_ERR("CLIP", "Cannot allocate clipping chapter metadata");
++  }
++  std::vector<HighlightChapterGroups::Entry> entries;
++  entries.reserve(CLIPPINGS.clippingCount());
++  // Group by the TOC identity, not its title: repeated chapter names stay distinct.
++  int lastSpine = -1;
++  int toc = -1;
++  for (size_t i = 0; i < CLIPPINGS.clippingCount(); ++i) {
++    const Clipping* clipping = CLIPPINGS.clippingAt(i);
++    if (lastSpine != clipping->spineIndex) {
++      lastSpine = clipping->spineIndex;
++      toc = book ? book->getTocIndexForSpineIndex(clipping->spineIndex) : -1;
++    }
++    const uint32_t chapter = toc >= 0 ? static_cast<uint32_t>(toc) : 0x10000U + clipping->spineIndex;
++    entries.push_back({chapter, static_cast<uint16_t>(i)});
++  }
++  chapterGroups.build(std::move(entries));
++}
++
++std::string EpubReaderClippingListActivity::groupTitle(size_t index) const {
++  const auto& group = chapterGroups.groups[index];
++  if (book && group.chapter < 0x10000U) return book->getTocItem(static_cast<int>(group.chapter)).title;
++  std::string title;
++  CLIPPINGS.readChapterTitle(chapterGroups.entries[group.begin].clipping, title);
++  return title.empty() ? tr(STR_UNKNOWN_CHAPTER) : title;
++}
++
++void EpubReaderClippingListActivity::activateRow(bool longPress, bool ignoreInitialConfirmRelease) {
++  RenderLock lock(*this);
++  if (listNav.selected < 0 || listNav.selected >= static_cast<int>(chapterGroups.rows.size())) return;
++  if (chapterGroups.header(listNav.selected)) {
++    const auto group = -chapterGroups.rows[listNav.selected] - 1;
++    chapterGroups.toggle(listNav.selected);
++    const auto it = std::find(chapterGroups.rows.begin(), chapterGroups.rows.end(), -group - 1);
++    listNav.selected = static_cast<int>(it - chapterGroups.rows.begin());
++    listNav.follow(static_cast<int>(chapterGroups.rows.size()));
++    requestUpdate();
++    return;
++  }
++  selectedClipping = static_cast<size_t>(chapterGroups.rows[listNav.selected]);
++  if (longPress)
++    showClippingActionMenu(ignoreInitialConfirmRelease);
++  else
++    openSelectedDetail();
++}
+
+ void EpubReaderClippingListActivity::onEnter() {
+   Activity::onEnter();
+@@ -161,7 +221,7 @@
+   app.setScreen(&EpubReaderClippingListActivity::listScreen, this);
+   detailText.reserve(CLIPPING_TEXT_RESERVE);
+   detailLines.reserve(32);
+-  uiItems.resize(CLIPPINGS.clippingCount());
++  rebuildGroups();
+   // At most 20 reusable 259-byte previews, instead of full text plus a copy per row.
+   for (size_t i = 0; i < std::min(CLIPPINGS.clippingCount(), CLIPPING_WINDOW_SIZE); ++i) {
+     uiLabels[i].reserve(clippingPreview::MAX_BYTES + clippingPreview::ELLIPSIS_BYTES);
+@@ -207,21 +267,21 @@
+ }
+
+ void EpubReaderClippingListActivity::jumpToSelectedClipping() {
+-  if (listNav.selected < 0 || listNav.selected >= static_cast<int>(CLIPPINGS.clippingCount())) return;
+-
+-  const Clipping* clipping = CLIPPINGS.clippingAt(static_cast<size_t>(listNav.selected));
++  if (selectedClipping >= CLIPPINGS.clippingCount()) return;
++
++  const Clipping* clipping = CLIPPINGS.clippingAt(static_cast<size_t>(selectedClipping));
+   if (!clipping) return;
+   setResult(ClippingJumpResult{clipping->spineIndex, clipping->startPage, clipping->pageCount, clipping->paragraphIndex,
+-                               static_cast<uint16_t>(listNav.selected)});
++                               static_cast<uint16_t>(selectedClipping)});
+   finish();
+ }
+
+ void EpubReaderClippingListActivity::openSelectedDetail() {
+-  if (listNav.selected < 0 || listNav.selected >= static_cast<int>(CLIPPINGS.clippingCount())) return;
++  if (selectedClipping >= CLIPPINGS.clippingCount()) return;
+
+   std::string text;
+   text.reserve(CLIPPING_TEXT_RESERVE);
+-  if (!CLIPPINGS.readClippingText(static_cast<size_t>(listNav.selected), text)) {
++  if (!CLIPPINGS.readClippingText(static_cast<size_t>(selectedClipping), text)) {
+     text.clear();
+   }
+   buildOneLineSnippetText(text, detailText);
+@@ -246,9 +306,10 @@
+ }
+
+ void EpubReaderClippingListActivity::deleteSelectedClipping() {
+-  if (listNav.selected < 0 || listNav.selected >= static_cast<int>(CLIPPINGS.clippingCount())) return;
+-
+-  if (!CLIPPINGS.removeClippingAt(static_cast<size_t>(listNav.selected))) return;
++  RenderLock lock(*this);
++  if (selectedClipping >= CLIPPINGS.clippingCount()) return;
++
++  if (!CLIPPINGS.removeClippingAt(static_cast<size_t>(selectedClipping))) return;
+
+   detailMode = false;
+   detailText.clear();
+@@ -256,27 +317,28 @@
+   detailLayoutWidth = 0;
+   detailLinesPerPage = 0;
+   if (CLIPPINGS.clippingCount() == 0) {
+-    listNav.selected = 0;
+-  } else if (listNav.selected >= static_cast<int>(CLIPPINGS.clippingCount())) {
+-    listNav.selected = static_cast<int>(CLIPPINGS.clippingCount()) - 1;
+-  }
+-  listNav.follow(static_cast<int>(CLIPPINGS.clippingCount()));
+-  uiItems.resize(CLIPPINGS.clippingCount());
++    selectedClipping = 0;
++  } else if (selectedClipping >= CLIPPINGS.clippingCount()) {
++    selectedClipping = static_cast<int>(CLIPPINGS.clippingCount()) - 1;
++  }
++  rebuildGroups();
++  listNav.selected = std::min<int>(listNav.selected, std::max(0, static_cast<int>(chapterGroups.rows.size()) - 1));
++  listNav.follow(static_cast<int>(chapterGroups.rows.size()));
+   requestUpdate();
+ }
+
+ void EpubReaderClippingListActivity::showClippingActionMenu(const bool ignoreInitialConfirmRelease) {
+-  if (listNav.selected < 0 || listNav.selected >= static_cast<int>(CLIPPINGS.clippingCount())) return;
+-
+-  const Clipping* selectedClipping = CLIPPINGS.clippingAt(static_cast<size_t>(listNav.selected));
+-  if (!selectedClipping) return;
++  if (selectedClipping >= CLIPPINGS.clippingCount()) return;
++
++  const Clipping* clippingToEdit = CLIPPINGS.clippingAt(static_cast<size_t>(selectedClipping));
++  if (!clippingToEdit) return;
+   std::string chapterTitle;
+-  CLIPPINGS.readChapterTitle(static_cast<size_t>(listNav.selected), chapterTitle);
++  CLIPPINGS.readChapterTitle(static_cast<size_t>(selectedClipping), chapterTitle);
+   const std::string title = chapterTitle.empty() ? std::string(tr(STR_CLIPPINGS)) : chapterTitle;
+-  const uint16_t selectedSpineIndex = selectedClipping->spineIndex;
+-  const uint16_t selectedStartPage = selectedClipping->startPage;
+-  const uint16_t selectedStartWordIndex = selectedClipping->startWordIndex;
+-  const uint32_t selectedTimestamp = selectedClipping->timestamp;
++  const uint16_t selectedSpineIndex = clippingToEdit->spineIndex;
++  const uint16_t selectedStartPage = clippingToEdit->startPage;
++  const uint16_t selectedStartWordIndex = clippingToEdit->startWordIndex;
++  const uint32_t selectedTimestamp = clippingToEdit->timestamp;
+   std::vector<FileBrowserActionActivity::MenuItem> items;
+   items.reserve(1);
+   items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
+@@ -303,7 +365,7 @@
+           if (!clipping) continue;
+           if (clipping->spineIndex == selectedSpineIndex && clipping->startPage == selectedStartPage &&
+               clipping->startWordIndex == selectedStartWordIndex && clipping->timestamp == selectedTimestamp) {
+-            listNav.selected = static_cast<int>(i);
++            selectedClipping = static_cast<int>(i);
+             deleteSelectedClipping();
+             return;
+           }
+@@ -343,7 +405,10 @@
+       mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+       mappedInput.getHeldTime() >= ReaderUtils::DELETE_HOLD_MS) {
+     longPressConfirmHandled = true;
+-    showClippingActionMenu(true);
++    if (detailMode)
++      showClippingActionMenu(true);
++    else
++      activateRow(true, true);
+     return;
+   }
+
+@@ -352,18 +417,14 @@
+       longPressConfirmHandled = false;
+       return;
+     }
+-    if (CLIPPINGS.clippingCount() > 0 && listNav.selected >= 0 &&
+-        listNav.selected < static_cast<int>(CLIPPINGS.clippingCount())) {
+-      if (detailMode) {
+-        jumpToSelectedClipping();
+-      } else {
+-        openSelectedDetail();
+-      }
+-    }
+-    return;
+-  }
+-
+-  const int total = static_cast<int>(CLIPPINGS.clippingCount());
++    if (detailMode)
++      jumpToSelectedClipping();
++    else
++      activateRow();
++    return;
++  }
++
++  const int total = static_cast<int>(chapterGroups.rows.size());
+   if (total == 0) return;
+
+   if (detailMode) {
+@@ -471,15 +532,10 @@
+
+ void EpubReaderClippingListActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+   auto* self = static_cast<EpubReaderClippingListActivity*>(user);
+-  if (event.value < 0 || event.value >= static_cast<int16_t>(CLIPPINGS.clippingCount())) return;
++  if (event.value < 0 || event.value >= static_cast<int>(self->chapterGroups.rows.size())) return;
+   self->listNav.selected = event.value;
+-  if (event.longPress) {
+-    self->app.clearTapFlash();
+-    self->showClippingActionMenu(false);
+-    return;
+-  }
+   self->app.clearTapFlash();
+-  self->openSelectedDetail();
++  self->activateRow(event.longPress);
+ }
+
+ void EpubReaderClippingListActivity::listScreen(UiApp::ScreenType& screen, void* user) {
+@@ -494,7 +550,7 @@
+       static_cast<int16_t>(renderer.getScreenWidth() - safe.x - safe.width),
+       static_cast<int16_t>(renderer.getScreenHeight() - safe.y - safe.height), static_cast<int16_t>(safe.x)});
+   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+-  const size_t count = CLIPPINGS.clippingCount();
++  const size_t count = chapterGroups.rows.size();
+   if (count == 0) {
+     screen.centeredText(tr(STR_NO_CLIPPINGS), screen.theme().bodyText);
+     return;
+@@ -505,27 +561,30 @@
+   const fui::Rect bounds = screen.body();
+   const auto rows = configureUiList(props, screen.theme(), bounds, UiListRowType::WithSubtitle);
+   listNav.syncToProps(bounds, props.rowHeight, props.rowGap, static_cast<int>(count), props);
+-  const int windowRows = std::min(rows > 0 ? static_cast<int>(rows) : 1,
+-                                  static_cast<int>(CLIPPING_WINDOW_SIZE));
+-  const int end = std::min({static_cast<int>(count), static_cast<int>(uiItems.size()), listNav.top + windowRows});
++  const int windowRows = std::min(rows > 0 ? static_cast<int>(rows) : 1, static_cast<int>(CLIPPING_WINDOW_SIZE));
++  const int end = std::min({static_cast<int>(count), listNav.top + windowRows});
+   for (int i = listNav.top; i < end; ++i) {
+     const size_t slot = static_cast<size_t>(i - listNav.top);
+-    CLIPPINGS.readClippingPreview(static_cast<size_t>(i), uiLabels[slot]);
+-    const Clipping* clipping = CLIPPINGS.clippingAt(static_cast<size_t>(i));
+-    fui::ListItem& item = uiItems[static_cast<size_t>(i)];
++    fui::ListItem& item = uiItems[slot];
+     item = fui::ListItem{};
++    if (chapterGroups.header(i)) {
++      const auto group = static_cast<size_t>(-chapterGroups.rows[i] - 1);
++      const auto& entry = chapterGroups.groups[group];
++      uiLabels[slot] = entry.open ? "[-] " : "[+] ";
++      uiLabels[slot] += groupTitle(group);
++      uiChapterTitles[slot] = std::to_string(entry.count);
++      item.value = uiChapterTitles[slot].c_str();
++    } else {
++      CLIPPINGS.readClippingPreview(static_cast<size_t>(chapterGroups.rows[i]), uiLabels[slot]);
++    }
+     item.label = uiLabels[slot].c_str();
+-    if (clipping) {
+-      CLIPPINGS.readChapterTitle(static_cast<size_t>(i), uiChapterTitles[slot]);
+-      item.subtitle = uiChapterTitles[slot].empty() ? tr(STR_UNKNOWN_CHAPTER) : uiChapterTitles[slot].c_str();
+-    }
+     item.actionValue = static_cast<int16_t>(i);
+   }
+
+   // Keep previews limited to the populated window while giving FreeInkUI the
+   // full count so its scroll indicator reflects the whole clipping list.
+   const int drawCount = std::max(0, end - listNav.top);
+-  props.items = uiItems.data() + listNav.top;
++  props.items = uiItems.data();
+   props.itemsWindowFirst = static_cast<uint16_t>(listNav.top);
+   props.itemsWindowCount = static_cast<uint16_t>(drawCount);
+   props.count = static_cast<uint16_t>(count);
+@@ -549,8 +608,7 @@
+
+   const char* chapter = tr(STR_CLIPPINGS);
+   std::string chapterTitle;
+-  if (listNav.selected >= 0 && CLIPPINGS.readChapterTitle(static_cast<size_t>(listNav.selected), chapterTitle) &&
+-      !chapterTitle.empty()) {
++  if (CLIPPINGS.readChapterTitle(static_cast<size_t>(selectedClipping), chapterTitle) && !chapterTitle.empty()) {
+     chapter = chapterTitle.c_str();
+   }
+
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.h b/src/activities/reader/EpubReaderClippingListActivity.h
+--- a/src/activities/reader/EpubReaderClippingListActivity.h
++++ b/src/activities/reader/EpubReaderClippingListActivity.h
+@@ -1,26 +1,38 @@
+ #pragma once
+
++#include <Epub.h>
+ #include <FreeInkApp.h>
+ #include <FreeInkUIGfxRenderer.h>
+
+ #include <array>
+ #include <atomic>
++#include <memory>
+ #include <string>
+ #include <vector>
+
+ #include "ClippingStore.h"
++#include "HighlightChapterGroups.h"
+ #include "activities/Activity.h"
+ #include "util/ButtonNavigator.h"
+
+ class EpubReaderClippingListActivity final : public Activity {
+  public:
+-  EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
++  EpubReaderClippingListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Epub* book = nullptr,
++                                 std::string bookPath = {});
+
+   void onEnter() override;
+   void loop() override;
+   void render(RenderLock&&) override;
+
+  private:
++  Epub* book = nullptr;  // Borrowed reader book, or metadataBook owned below.
++  std::unique_ptr<Epub> metadataBook;
++  std::string bookPath;
++  HighlightChapterGroups chapterGroups;
++  size_t selectedClipping = 0;
++  void rebuildGroups();
++  void activateRow(bool longPress = false, bool ignoreInitialConfirmRelease = false);
++  std::string groupTitle(size_t index) const;
+   std::string detailText;
+   std::vector<std::string> detailLines;
+   ButtonNavigator buttonNavigator;
+@@ -39,7 +51,7 @@
+   UiApp app;
+   std::atomic<bool> uiReady{false};
+   int visibleRows = 1;
+-  std::vector<freeink::ui::ListItem> uiItems;
++  std::array<freeink::ui::ListItem, CLIPPING_WINDOW_SIZE> uiItems;
+   std::array<std::string, CLIPPING_WINDOW_SIZE> uiLabels;
+   std::array<std::string, CLIPPING_WINDOW_SIZE> uiChapterTitles;
+
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -4502,7 +4502,7 @@
+     }
+     case EpubReaderMenuAction::VIEW_CLIPPINGS: {
+       pauseReadingPaceTimer("clipping_list");
+-      startActivityForResult(std::make_unique<EpubReaderClippingListActivity>(renderer, mappedInput),
++      startActivityForResult(std::make_unique<EpubReaderClippingListActivity>(renderer, mappedInput, epub.get()),
+                              [this, returnToReaderMenu](const ActivityResult& result) {
+                                if (!result.isCancelled) {
+                                  const auto& clipping = std::get<ClippingJumpResult>(result.data);
+diff --git a/src/activities/home/SavedItemsHomeActivity.cpp b/src/activities/home/SavedItemsHomeActivity.cpp
+--- a/src/activities/home/SavedItemsHomeActivity.cpp
++++ b/src/activities/home/SavedItemsHomeActivity.cpp
+@@ -370,7 +370,7 @@
+ void SavedItemsHomeActivity::openClippingList(const SavedBookEntry& entry) {
+   CLIPPINGS.loadForBook(entry.bookPath, entry.bookTitle, entry.bookAuthor, entry.bookType);
+
+-  startActivityForResult(std::make_unique<EpubReaderClippingListActivity>(renderer, mappedInput),
++  startActivityForResult(std::make_unique<EpubReaderClippingListActivity>(renderer, mappedInput, nullptr, entry.bookPath),
+                          [this, entry](const ActivityResult& result) {
+                            if (!result.isCancelled) {
+                              const auto* clipping = std::get_if<ClippingJumpResult>(&result.data);
+diff --git a/src/activities/reader/HighlightChapterGroups.h b/src/activities/reader/HighlightChapterGroups.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightChapterGroups.h
+@@ -0,0 +1,61 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <vector>
++
++class HighlightChapterGroups {
++ public:
++  struct Entry {
++    uint32_t chapter;
++    uint16_t clipping;
++  };
++  struct Group {
++    uint32_t chapter;
++    uint32_t begin;
++    uint32_t count;
++    bool open = false;
++  };
++  std::vector<Entry> entries;
++  std::vector<Group> groups;
++  // Negative values identify headers; nonnegative values are ORIGINAL clipping indexes.
++  std::vector<int32_t> rows;
++  void build(std::vector<Entry> values) {
++    std::vector<uint32_t> opened;
++    opened.reserve(groups.size());
++    for (const auto& group : groups)
++      if (group.open) opened.push_back(group.chapter);
++    entries = std::move(values);
++    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
++      return a.chapter != b.chapter ? a.chapter < b.chapter : a.clipping < b.clipping;
++    });
++    size_t count = 0;
++    for (size_t i = 0; i < entries.size(); ++i)
++      if (i == 0 || entries[i].chapter != entries[i - 1].chapter) ++count;
++    groups.clear();
++    groups.reserve(count);
++    for (size_t i = 0; i < entries.size(); ++i) {
++      if (groups.empty() || groups.back().chapter != entries[i].chapter)
++        groups.push_back({entries[i].chapter, static_cast<uint32_t>(i), 0,
++                          std::find(opened.begin(), opened.end(), entries[i].chapter) != opened.end()});
++      ++groups.back().count;
++    }
++    rows.reserve(entries.size() + groups.size());
++    rebuild();
++  }
++  void rebuild() {
++    rows.clear();
++    for (size_t i = 0; i < groups.size(); ++i) {
++      rows.push_back(-static_cast<int32_t>(i) - 1);
++      if (groups[i].open)
++        for (size_t j = groups[i].begin; j < groups[i].begin + groups[i].count; ++j)
++          rows.push_back(entries[j].clipping);
++    }
++  }
++  bool header(int row) const { return row >= 0 && row < static_cast<int>(rows.size()) && rows[row] < 0; }
++  void toggle(int row) {
++    if (!header(row)) return;
++    const size_t group = static_cast<size_t>(-rows[row] - 1);
++    groups[group].open = !groups[group].open;
++    rebuild();
++  }
++};
+diff --git a/test/highlight_chapter_groups/CMakeLists.txt b/test/highlight_chapter_groups/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_chapter_groups/CMakeLists.txt
+@@ -0,0 +1,4 @@
++add_executable(highlight_chapter_groups_test HighlightChapterGroupsTest.cpp)
++target_include_directories(highlight_chapter_groups_test PRIVATE ${REPO_ROOT}/src)
++target_compile_options(highlight_chapter_groups_test PRIVATE -UNDEBUG)
++add_test(NAME highlight_chapter_groups COMMAND highlight_chapter_groups_test)
+diff --git a/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp b/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp
+@@ -0,0 +1,14 @@
++#include <cassert>
++#include <iostream>
++#include "activities/reader/HighlightChapterGroups.h"
++int main() {
++  HighlightChapterGroups groups;
++  groups.build({{4,2},{1,0},{4,3},{2,1}});
++  assert(groups.groups.size()==3&&groups.rows.size()==3);
++  groups.toggle(0);assert(groups.rows[1]==0);
++  groups.toggle(2);assert(groups.rows[3]==1);
++  groups.build({{1,0},{4,1}});assert(groups.groups[0].open&&groups.rows[1]==0);
++  assert(groups.groups.size()==2);
++  groups.build({});assert(groups.rows.empty());
++  std::cout << "Highlight chapter group checks passed\n";
++}
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -42,6 +42,7 @@
+ add_subdirectory(drag_highlight)
+
+ add_subdirectory(streaming_json_parser)
++add_subdirectory(highlight_chapter_groups)
+ add_subdirectory(release_json_parser)
+ add_subdirectory(differential_rounding)
+ add_subdirectory(hyphenation_eval)
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+
+ ### Fixed
++
++- Highlights are grouped under collapsible chapter headers with counts; opening and deleting a highlight preserve its original identity.
+
+ - Readest position sync translates original chapter coordinates through the optimizer source map when the cloud EPUB is unavailable; converted books without a map leave the device position unchanged.
+
