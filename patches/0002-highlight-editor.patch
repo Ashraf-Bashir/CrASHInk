@@ -1,0 +1,767 @@
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -30,6 +30,7 @@
+ #include "BookStatsActivity.h"
+ #include "BookStatsTracking.h"
+ #include "ClipSelectionActivity.h"
++#include "HighlightEditActivity.h"
+ #include "ClippingStore.h"
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+@@ -3105,6 +3106,9 @@
+ 
+ #if CROSSINK_APP_CAP_TOUCH
+   if (!atEndOfBook && touch.tapped && handleTouchFootnoteLink(touch.x, touch.y)) {
++    return;
++  }
++  if (!atEndOfBook && touch.tapped && handleTouchClippingTap(touch.x, touch.y)) {
+     return;
+   }
+ #endif
+@@ -7558,10 +7562,68 @@
+   navigateToHref(currentPageFootnotes[bestIndex].href, true, /*preferFootnotePreview=*/true);
+   return true;
+ }
++
++bool EpubReaderActivity::handleTouchClippingTap(const int touchX, const int touchY) {
++  if (!SETTINGS.touchReaderControls || !mappedInput.hasTouch() || RenderLock::peek() ||
++      currentPageClippingTouchTargetCount == 0) {
++    return false;
++  }
++
++  int bestIndex = -1;
++  int64_t bestDistance = std::numeric_limits<int64_t>::max();
++  for (size_t i = 0; i < currentPageClippingTouchTargetCount && i < currentPageClippingTouchTargets.size(); ++i) {
++    const auto& target = currentPageClippingTouchTargets[i];
++    if (target.width <= 0 || target.height <= 0 || target.clippingIndex >= CLIPPINGS.clippingCount()) continue;
++
++    const int expandedWidth = std::max<int>(target.width, TOUCH_FOOTNOTE_TARGET_SIZE);
++    const int expandedHeight = std::max<int>(target.height, TOUCH_FOOTNOTE_TARGET_SIZE);
++    const int screenWidth = renderer.getScreenWidth();
++    const int screenHeight = renderer.getScreenHeight();
++    const int left = std::max(0, std::min(target.x - (expandedWidth - target.width) / 2,
++                                          screenWidth - std::min(screenWidth, expandedWidth)));
++    const int top = std::max(0, std::min(target.y - (expandedHeight - target.height) / 2,
++                                         screenHeight - std::min(screenHeight, expandedHeight)));
++    const int right = std::min(screenWidth, left + expandedWidth);
++    const int bottom = std::min(screenHeight, top + expandedHeight);
++    if (touchX < left || touchX >= right || touchY < top || touchY >= bottom) continue;
++
++    const int centerX = target.x + target.width / 2;
++    const int centerY = target.y + target.height / 2;
++    const int64_t deltaX = static_cast<int64_t>(touchX) - centerX;
++    const int64_t deltaY = static_cast<int64_t>(touchY) - centerY;
++    const int64_t distance = deltaX * deltaX + deltaY * deltaY;
++    if (distance < bestDistance) {
++      bestDistance = distance;
++      bestIndex = static_cast<int>(i);
++    }
++  }
++
++  if (bestIndex < 0) return false;
++  showClippingEditor(currentPageClippingTouchTargets[bestIndex].clippingIndex);
++  return true;
++}
++
++#if CROSSINK_APP_CAP_TOUCH
++void EpubReaderActivity::showClippingEditor(const size_t clippingIndex) {
++  if (clippingIndex >= CLIPPINGS.clippingCount()) return;
++
++  const float hint = section && section->pageCount > 1
++                         ? static_cast<float>(section->currentPage) / (section->pageCount - 1) : -1.0f;
++  // The child owns its draft; cancellation leaves the original clipping intact.
++  auto editor = makeUniqueNoThrow<HighlightEditActivity>(renderer, mappedInput, epub, clippingIndex, hint);
++  if (!editor) { LOG_ERR("CLIP", "Cannot allocate highlight editor"); return; }
++  pauseReadingPaceTimer("highlight_edit");
++  startActivityForResult(std::move(editor), [this](const ActivityResult&) {
++    resumeReadingPaceTimer("highlight_edit_return");
++    pagesUntilFullRefresh = 1;
++    requestUpdate();
++  });
++}
+ #endif
++#endif
+ 
+ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
+-                                                const int orientedMarginLeft) const {
++                                                const int orientedMarginLeft) {
+   if (!section || !CLIPPINGS.hasClippings() || renderer.getRenderMode() != GfxRenderer::BW) {
+     return;
+   }
+@@ -7570,7 +7632,13 @@
+   // that marker in the grayscale anti-aliasing planes overlays gray pixels on
+   // the glyphs and makes a saved clipping look washed out.
+ 
++#if CROSSINK_APP_CAP_TOUCH
++  currentPageClippingTouchTargets.fill({});
++  currentPageClippingTouchTargetCount = 0;
++#endif
++
+   std::array<ClippingPageMatch, CLIPPING_MAX_PAGE_MATCHES> matches;
++  std::array<size_t, CLIPPING_MAX_PAGE_MATCHES> matchClippingIndices;
+   uint16_t matchCount = 0;
+   const bool canUseStoredRanges = section->pageCount > 0 && section->pageCount <= UINT16_MAX &&
+                                   section->currentPage >= 0 && section->currentPage < section->pageCount;
+@@ -7614,7 +7682,9 @@
+       }
+     }
+     if (matchedStoredRange || matchedText) {
+-      matches[matchCount++] = match;
++      matches[matchCount] = match;
++      matchClippingIndices[matchCount] = clippingIndex;
++      matchCount++;
+       if (matchCount >= matches.size()) {
+         break;
+       }
+@@ -7624,22 +7694,26 @@
+     return;
+   }
+ 
+-  const auto isHighlightedWord = [&matches, matchCount](const uint16_t pageWordIndex, const PageTextLine& line) {
++  const auto getMatchIndexForWord = [&matches, matchCount](const uint16_t pageWordIndex, const PageTextLine& line) -> int {
+     for (uint16_t matchIndex = 0; matchIndex < matchCount; ++matchIndex) {
+       if (pageWordIndex >= matches[matchIndex].startWord && pageWordIndex <= matches[matchIndex].endWord &&
+           ClippingHighlightGeometry::matchesTableSelection(matches[matchIndex].tableSelection, line.tableSelection)) {
+-        return true;
+-      }
+-    }
+-    return false;
++        return matchIndex;
++      }
++    }
++    return -1;
+   };
+ 
+   ClippingHighlightGeometry::WordRect previousHighlight;
+   const TextBlock* previousHighlightBlock = nullptr;
+   bool hasPreviousHighlight = false;
++#if CROSSINK_APP_CAP_TOUCH
++  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> clippingBounds{};
++#endif
+   forEachVisiblePageWord(page, [&](const uint16_t pageWordIndex, const PageTextLine& line, const TextBlock& block,
+                                    const size_t i) {
+-    if (!isHighlightedWord(pageWordIndex, line)) {
++    const int matchIndex = getMatchIndexForWord(pageWordIndex, line);
++    if (matchIndex < 0) {
+       hasPreviousHighlight = false;
+       return true;
+     }
+@@ -7669,7 +7743,7 @@
+       const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", nextTextStyle) : 0;
+       const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
+       const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
+-      if (isHighlightedWord(pageWordIndex + 1, line) && nextWordX > wordX + wordW) {
++      if (getMatchIndexForWord(pageWordIndex + 1, line) >= 0 && nextWordX > wordX + wordW) {
+         wordW = nextWordX - wordX;
+       } else if (nextWordX > wordX && wordW > nextWordX - wordX) {
+         wordW = nextWordX - wordX;
+@@ -7712,6 +7786,22 @@
+       if (line.clipWidth > 0 && line.clipHeight > 0) {
+         renderer.endTextClip();
+       }
++#if CROSSINK_APP_CAP_TOUCH
++      if (matchIndex >= 0 && matchIndex < static_cast<int>(clippingBounds.size())) {
++        auto& bounds = clippingBounds[matchIndex];
++        if (bounds.width <= 0 || bounds.height <= 0) {
++          bounds = {static_cast<int16_t>(wordX), static_cast<int16_t>(wordY), static_cast<int16_t>(wordW),
++                    static_cast<int16_t>(wordH), matchClippingIndices[matchIndex]};
++        } else {
++          const int left = std::min<int>(bounds.x, wordX);
++          const int top = std::min<int>(bounds.y, wordY);
++          const int right = std::max<int>(bounds.x + bounds.width, wordX + wordW);
++          const int bottom = std::max<int>(bounds.y + bounds.height, wordY + wordH);
++          bounds = {static_cast<int16_t>(left), static_cast<int16_t>(top), static_cast<int16_t>(right - left),
++                    static_cast<int16_t>(bottom - top), matchClippingIndices[matchIndex]};
++        }
++      }
++#endif
+       previousHighlight = currentHighlight;
+       previousHighlightBlock = &block;
+       hasPreviousHighlight = true;
+@@ -7720,6 +7810,15 @@
+     }
+     return true;
+   });
++
++#if CROSSINK_APP_CAP_TOUCH
++  for (uint16_t i = 0; i < matchCount && currentPageClippingTouchTargetCount < currentPageClippingTouchTargets.size(); ++i) {
++    if (clippingBounds[i].width > 0 && clippingBounds[i].height > 0) {
++      currentPageClippingTouchTargets[currentPageClippingTouchTargetCount++] = clippingBounds[i];
++    }
++  }
++  LOG_DBG("CLIP", "Built %zu touch targets from %u matches", currentPageClippingTouchTargetCount, matchCount);
++#endif
+ }
+ 
+ void EpubReaderActivity::renderStatusBar() const {
+diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+--- a/src/activities/reader/EpubReaderActivity.h
++++ b/src/activities/reader/EpubReaderActivity.h
+@@ -14,6 +14,7 @@
+ 
+ #include "BookReadingStats.h"
+ #include "BookmarkStore.h"
++#include "ClippingStore.h"
+ #include "EndOfBookOptions.h"
+ #include "EpubLinkReturnState.h"
+ #include "EpubReaderMenuModel.h"
+@@ -267,6 +268,15 @@
+ #if CROSSINK_APP_CAP_TOUCH
+   ReaderPinchGesture pinchFontGesture;
+   FootnoteLinkTargets currentPageFootnoteTouchTargets{};
++  struct ClippingTouchTarget {
++    int16_t x = 0;
++    int16_t y = 0;
++    int16_t width = 0;
++    int16_t height = 0;
++    size_t clippingIndex = SIZE_MAX;
++  };
++  std::array<ClippingTouchTarget, CLIPPING_MAX_PAGE_MATCHES> currentPageClippingTouchTargets{};
++  size_t currentPageClippingTouchTargetCount = 0;
+ #endif
+   using SavedPosition = EpubLinkReturnState::Position;
+   static constexpr int MAX_FOOTNOTE_DEPTH = EpubLinkReturnState::MAX_DEPTH;
+@@ -323,7 +333,7 @@
+                       int orientedMarginBottom, int orientedMarginLeft, bool updatePanel);
+   bool ensureGrayscaleStripScratch();
+   void releaseGrayscaleStripScratch(bool force = false);
+-  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft) const;
++  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
+   void renderStatusBar() const;
+   void refreshChapterGroupEstimate(uint16_t viewportWidth, uint16_t viewportHeight);
+   bool resolveChapterGroupPageProgress(int& currentPage, int& pageCount, float& chapterProgress,
+@@ -436,6 +446,8 @@
+   void resetPinchFontGesture();
+   void buildFootnoteTouchTargets(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
+   bool handleTouchFootnoteLink(int touchX, int touchY);
++  bool handleTouchClippingTap(int touchX, int touchY);
++  void showClippingEditor(size_t clippingIndex);
+ #endif
+   void suppressPowerShortcutRelease();
+   bool consumeLongPowerButtonRelease();
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -89,6 +89,30 @@
+   return true;
+ }
+ }  // namespace
++
++bool ClippingStore::updateClippingText(const size_t index, const std::string& text) {
++  if (index >= clippings.size() || text.empty() || text.size() > CLIPPING_TEXT_MAX) return false;
++  const Clipping previous = clippings[index];
++  const bool previousDirty = dirty;
++  Clipping& clipping = clippings[index];
++  clipping.textLength = static_cast<uint16_t>(text.size());
++  size_t words = 1;
++  for (char ch : text) if (ch == ' ') ++words;
++  clipping.wordCount = static_cast<uint16_t>(std::min<size_t>(words, UINT16_MAX));
++  // An edit invalidates page/word ordinals. Text matching redraws the new range
++  // across pages, and Readest sync detects the changed text on its next run.
++  clipping.layoutSignature = 0;
++  clipping.resolvedLayoutBoundaries = 0;
++  dirty = true;
++  if (!writeToFile(&text, index)) {
++    clippings[index] = previous;
++    dirty = previousDirty;
++    LOG_ERR("CLIP", "Failed to replace edited clipping %u", static_cast<unsigned>(index));
++    return false;
++  }
++  dirty = false;
++  return true;
++}
+ 
+ ClippingStore ClippingStore::instance;
+ 
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -75,6 +75,7 @@
+   bool loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
+                    const std::string& bookType);
+   void unload();
++  bool updateClippingText(size_t index, const std::string& text);
+ 
+   AddResult addClipping(uint16_t spineIndex, uint16_t startPage, uint16_t endPage, uint16_t pageCount,
+                         uint16_t startWordIndex, uint16_t endWordIndex, uint16_t wordCount, const char* chapterTitle,
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -1,6 +1,15 @@
+ _language_name: "English"
+ _language_code: "EN"
+ _order: "0"
++
++STR_EDIT_HIGHLIGHT: "Edit highlight"
++STR_HIGHLIGHT_EXTEND_START: "Extend start"
++STR_HIGHLIGHT_TRIM_START: "Trim start"
++STR_HIGHLIGHT_TRIM_END: "Trim end"
++STR_HIGHLIGHT_EXTEND_END: "Extend end"
++STR_HIGHLIGHT_CONFIRM_DELETE: "Confirm delete"
++STR_HIGHLIGHT_EDIT_UNAVAILABLE: "Cannot adjust this edge"
++
+ STR_CROSSINK: "CrossInk"
+ STR_BOOTING: "BOOTING"
+ STR_AM: "AM"
+diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/reader/HighlightEditActivity.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightEditActivity.cpp
+@@ -0,0 +1,225 @@
++#include "HighlightEditActivity.h"
++
++#include <I18n.h>
++#include <Logging.h>
++
++#include <algorithm>
++#include <climits>
++#include <cstdio>
++
++#include "ChapterXPathResolver.h"
++#include "ClippingStore.h"
++#include "clippings/HighlightNeighbourWord.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++
++namespace {
++// One bounded preview line at a time, without a second copy of the full draft.
++std::string nextLine(const GfxRenderer& renderer, const std::string& text, size_t& offset, int width) {
++  while (offset < text.size() && text[offset] == ' ') ++offset;
++  const size_t start = offset;
++  size_t lastSpace = std::string::npos;
++  std::string line;
++  line.reserve(128);
++  while (offset < text.size()) {
++    const unsigned char ch = text[offset];
++    size_t bytes = ch < 0x80 ? 1 : ch < 0xE0 ? 2 : ch < 0xF0 ? 3 : ch <= 0xF4 ? 4 : 1;
++    if (offset + bytes > text.size()) bytes = 1;
++    line.append(text, offset, bytes);
++    if (renderer.getTextWidth(UI_10_FONT_ID, line.c_str()) > width && offset > start) {
++      if (lastSpace != std::string::npos) offset = lastSpace;
++      line = text.substr(start, offset - start);
++      break;
++    }
++    if (ch == ' ') lastSpace = offset;
++    offset += bytes;
++  }
++  return line;
++}
++}  // namespace
++
++HighlightEditActivity::HighlightEditActivity(GfxRenderer& renderer, MappedInputManager& input,
++                                             std::shared_ptr<Epub> book, size_t index, float positionHint)
++    : Activity("HighlightEdit", renderer, input), book(std::move(book)), index(index), hint(positionHint) {}
++
++void HighlightEditActivity::onEnter() {
++  Activity::onEnter();
++  const Clipping* clipping = CLIPPINGS.clippingAt(index);
++  if (clipping && CLIPPINGS.readClippingText(index, draft)) {
++    spine = clipping->spineIndex;
++    tableSelection = clipping->tableSelection != UINT16_MAX;
++    XPathTextLocation location;
++    std::string normalized;
++    // Strict matching preserves the actual words; never edit a fuzzy guess.
++    editable = ChapterXPathResolver::locateText(book, spine, draft, hint, location) && !location.loose &&
++               ChapterXPathResolver::extractText(book, spine, location, normalized) && !normalized.empty();
++    if (editable) {
++      draft = std::move(normalized);
++      hint = location.total ? static_cast<float>(location.start) / location.total : hint;
++    }
++  }
++  failed = !editable;
++  requestUpdate();
++}
++
++Rect HighlightEditActivity::buttonRect(int button) const {
++  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
++  constexpr int gap = 6;
++  constexpr int height = 44;
++  const int row = button < 4 ? button / 2 : 2;
++  const int cols = row < 2 ? 2 : 3;
++  const int col = row < 2 ? button % 2 : button - 4;
++  const int width = (safe.width - gap * (cols + 1)) / cols;
++  return Rect{safe.x + gap + col * (width + gap), safe.y + safe.height - (3 - row) * (height + gap), width, height};
++}
++
++void HighlightEditActivity::adjust(HighlightWordEdit::Action action) {
++  RenderLock lock(*this);
++  confirmDelete = false;
++  failed = false;
++  if (!editable) {
++    failed = true;
++    requestUpdate();
++    return;
++  }
++  std::string neighbour;
++  const bool extending =
++      action == HighlightWordEdit::Action::ExtendStart || action == HighlightWordEdit::Action::ExtendEnd;
++  if (extending) {
++    XPathTextLocation location;
++    // Do not extend a column selection into the adjacent table cell.
++    if (tableSelection || !ChapterXPathResolver::locateText(book, spine, draft, hint, location) || location.loose ||
++        !HighlightWordEdit::neighbourWord(book, spine, location, action == HighlightWordEdit::Action::ExtendStart,
++                                          neighbour)) {
++      failed = true;
++      requestUpdate();
++      return;
++    }
++    hint = location.total ? static_cast<float>(location.start) / location.total : hint;
++  }
++  std::string replacement;
++  if (HighlightWordEdit::adjust(draft, action, neighbour, CLIPPING_TEXT_MAX, replacement)) {
++    draft = std::move(replacement);
++    changed = true;
++    previewPage =
++        action == HighlightWordEdit::Action::ExtendEnd || action == HighlightWordEdit::Action::TrimEnd ? INT_MAX : 0;
++  } else {
++    failed = true;
++  }
++  requestUpdate();
++}
++
++void HighlightEditActivity::cancel() {
++  ActivityResult result;
++  result.isCancelled = true;
++  setResult(std::move(result));
++  finish();
++}
++
++void HighlightEditActivity::accept() {
++  RenderLock lock(*this);
++  if (!changed || CLIPPINGS.updateClippingText(index, draft)) {
++    finish();
++  } else {
++    LOG_ERR("CLIP", "Failed to save edited clipping %u", static_cast<unsigned>(index));
++    failed = true;
++    requestUpdate();
++  }
++}
++
++void HighlightEditActivity::loop() {
++  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
++      mappedInput.wasReleased(MappedInputManager::Button::Back)) {
++    cancel();
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++    accept();
++    return;
++  }
++  const auto swipe = mappedInput.wasSwipe();
++  if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
++    RenderLock lock(*this);
++    if (swipe == MappedInputManager::SwipeDir::Up && previewPage < previewPages - 1) {
++      ++previewPage;
++      requestUpdate();
++    } else if (swipe == MappedInputManager::SwipeDir::Down && previewPage > 0) {
++      --previewPage;
++      requestUpdate();
++    }
++    return;
++  }
++  for (int i = 0; i < 7; ++i) {
++    const Rect rect = buttonRect(i);
++    if (!mappedInput.wasTapInRect(rect.x, rect.y, rect.width, rect.height)) continue;
++    if (i < 4) {
++      static constexpr HighlightWordEdit::Action actions[] = {
++          HighlightWordEdit::Action::ExtendStart, HighlightWordEdit::Action::TrimStart,
++          HighlightWordEdit::Action::TrimEnd, HighlightWordEdit::Action::ExtendEnd};
++      adjust(actions[i]);
++    } else if (i == 4) {
++      accept();
++    } else if (i == 5) {
++      RenderLock lock(*this);
++      if (!confirmDelete) {
++        confirmDelete = true;
++        requestUpdate();
++        return;
++      }
++      if (CLIPPINGS.removeClippingAt(index))
++        finish();
++      else {
++        failed = true;
++        requestUpdate();
++      }
++    } else {
++      cancel();
++    }
++    return;
++  }
++}
++
++void HighlightEditActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  TouchHeaderBackButton::drawCompact(renderer, tr(STR_EDIT_HIGHLIGHT), true);
++  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
++  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++  const int top = header.y + header.height + 8;
++  const int width = std::max(1, safe.width - 24);
++  const int lineStep = renderer.getLineHeight(UI_10_FONT_ID) + 4;
++  const int rows = std::max(1, (buttonRect(0).y - top - 40) / std::max(1, lineStep));
++  size_t offset = 0;
++  int lines = 0;
++  while (offset < draft.size()) {
++    nextLine(renderer, draft, offset, width);
++    ++lines;
++  }
++  previewPages = std::max(1, (lines + rows - 1) / rows);
++  previewPage = std::min(previewPage, previewPages - 1);
++  offset = 0;
++  for (int line = 0; line < (previewPage + 1) * rows && offset < draft.size(); ++line) {
++    const std::string text = nextLine(renderer, draft, offset, width);
++    if (line >= previewPage * rows)
++      renderer.drawText(UI_10_FONT_ID, safe.x + 12, top + (line % rows) * lineStep, text.c_str());
++  }
++  char page[24];
++  snprintf(page, sizeof(page), "%d/%d", previewPage + 1, previewPages);
++  renderer.drawText(SMALL_FONT_ID, safe.x + 12, buttonRect(0).y - 30,
++                    failed ? tr(STR_HIGHLIGHT_EDIT_UNAVAILABLE) : page);
++  const char* labels[] = {tr(STR_HIGHLIGHT_EXTEND_START),
++                          tr(STR_HIGHLIGHT_TRIM_START),
++                          tr(STR_HIGHLIGHT_TRIM_END),
++                          tr(STR_HIGHLIGHT_EXTEND_END),
++                          tr(STR_SAVE),
++                          confirmDelete ? tr(STR_HIGHLIGHT_CONFIRM_DELETE) : tr(STR_DELETE),
++                          tr(STR_CANCEL)};
++  for (int i = 0; i < 7; ++i) {
++    const Rect rect = buttonRect(i);
++    renderer.drawRect(rect.x, rect.y, rect.width, rect.height, true);
++    const std::string label = renderer.truncatedText(UI_10_FONT_ID, labels[i], rect.width - 8);
++    renderer.drawText(UI_10_FONT_ID, rect.x + (rect.width - renderer.getTextWidth(UI_10_FONT_ID, label.c_str())) / 2,
++                      rect.y + (rect.height - renderer.getLineHeight(UI_10_FONT_ID)) / 2, label.c_str());
++  }
++  renderer.displayBuffer();
++}
+diff --git a/src/activities/reader/HighlightEditActivity.h b/src/activities/reader/HighlightEditActivity.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightEditActivity.h
+@@ -0,0 +1,38 @@
++#pragma once
++#include <Epub.h>
++
++#include <memory>
++#include <string>
++
++#include "activities/Activity.h"
++#include "clippings/HighlightWordEdit.h"
++#include "components/UITheme.h"
++
++// A temporary draft owns only the selected text and one replacement buffer,
++// bounded by CLIPPING_TEXT_MAX. The chapter is streamed rather than retained.
++class HighlightEditActivity final : public Activity {
++ public:
++  HighlightEditActivity(GfxRenderer& renderer, MappedInputManager& input, std::shared_ptr<Epub> book, size_t index,
++                        float positionHint);
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++
++ private:
++  std::shared_ptr<Epub> book;
++  size_t index;
++  uint16_t spine = 0;
++  float hint;
++  std::string draft;
++  bool editable = false;
++  bool tableSelection = false;
++  bool changed = false;
++  bool confirmDelete = false;
++  bool failed = false;
++  int previewPage = 0;
++  int previewPages = 1;
++  Rect buttonRect(int button) const;
++  void adjust(HighlightWordEdit::Action action);
++  void accept();
++  void cancel();
++};
+diff --git a/src/clippings/HighlightWordEdit.h b/src/clippings/HighlightWordEdit.h
+new file mode 100644
+--- /dev/null
++++ b/src/clippings/HighlightWordEdit.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <cstddef>
++#include <string>
++
++namespace HighlightWordEdit {
++enum class Action { ExtendStart, TrimStart, TrimEnd, ExtendEnd };
++
++// Work in reading order, independently of visual RTL direction. UTF-8 bytes
++// inside a word are never split; EPUB extraction normalizes separators to spaces.
++inline bool adjust(const std::string& text, const Action action, const std::string& neighbour, const size_t maxBytes,
++                   std::string& out) {
++  out.clear();
++  if (text.empty()) return false;
++  if (action == Action::ExtendStart || action == Action::ExtendEnd) {
++    if (neighbour.empty() || text.size() + neighbour.size() + 1 > maxBytes) return false;
++    out = action == Action::ExtendStart ? neighbour + " " + text : text + " " + neighbour;
++    return true;
++  }
++  const size_t split = action == Action::TrimStart ? text.find(' ') : text.rfind(' ');
++  if (split == std::string::npos) return false;  // Keep one word; Delete removes the whole highlight.
++  out = action == Action::TrimStart ? text.substr(split + 1) : text.substr(0, split);
++  return !out.empty();
++}
++}  // namespace HighlightWordEdit
+diff --git a/src/clippings/HighlightNeighbourWord.h b/src/clippings/HighlightNeighbourWord.h
+new file mode 100644
+--- /dev/null
++++ b/src/clippings/HighlightNeighbourWord.h
+@@ -0,0 +1,34 @@
++#pragma once
++#include <algorithm>
++
++#include "ChapterXPathResolver.h"
++#include "ClippingStore.h"
++
++namespace HighlightWordEdit {
++// Stream bounded context, widening only when an adjacent word is unusually
++// long. Discard the incomplete word at the outer edge of each context span.
++inline bool neighbourWord(const std::shared_ptr<Epub>& book, int spine, const XPathTextLocation& location, bool before,
++                          std::string& word) {
++  if ((before && location.start == 0) || (!before && location.end + 1 >= location.total)) return false;
++  for (uint32_t budget = 256; budget <= CLIPPING_TEXT_MAX; budget *= 2) {
++    XPathTextLocation context = location;
++    if (before) {
++      context.start = location.start > budget ? location.start - budget : 0;
++      context.end = location.start - 1;
++    } else {
++      context.start = location.end + 1;
++      context.end = std::min(location.total - 1, context.start + budget - 1);
++    }
++    std::string text;
++    if (!ChapterXPathResolver::extractText(book, spine, context, text) || text.empty()) return false;
++    const size_t split = before ? text.rfind(' ') : text.find(' ');
++    const bool reachesEdge = before ? context.start == 0 : context.end + 1 == location.total;
++    if (split != std::string::npos || reachesEdge) {
++      word = split == std::string::npos ? text : before ? text.substr(split + 1) : text.substr(0, split);
++      return !word.empty();
++    }
++  }
++  return false;
++}
++
++}  // namespace HighlightWordEdit
+diff --git a/test/highlight_word_edit/HighlightWordEditTest.cpp b/test/highlight_word_edit/HighlightWordEditTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/HighlightWordEditTest.cpp
+@@ -0,0 +1,54 @@
++#include <cassert>
++#include <iostream>
++
++#include "clippings/HighlightNeighbourWord.h"
++#include "clippings/HighlightWordEdit.h"
++
++int main() {
++  using HighlightWordEdit::Action;
++  const auto book = std::make_shared<Epub>(std::vector<std::string>{
++      "<html><body><p>Before, alpha <em>bravo</em> caf&#233;. After!</p><p>Next paragraph.</p></body></html>"});
++  XPathTextLocation location;
++  assert(ChapterXPathResolver::locateText(book, 0, "alpha bravo", -1, location));
++  std::string word, result;
++  assert(HighlightWordEdit::neighbourWord(book, 0, location, true, word));
++  assert(word == "Before,");
++  assert(HighlightWordEdit::adjust("alpha bravo", Action::ExtendStart, word, 1024, result));
++  assert(result == "Before, alpha bravo");
++  assert(HighlightWordEdit::neighbourWord(book, 0, location, false, word));
++  assert(word == "caf\xc3\xa9.");
++  assert(HighlightWordEdit::adjust("alpha bravo", Action::ExtendEnd, word, 1024, result));
++  assert(result == "alpha bravo caf\xc3\xa9.");
++  assert(HighlightWordEdit::adjust(result, Action::TrimStart, "", 1024, word));
++  assert(word == "bravo caf\xc3\xa9.");
++  assert(HighlightWordEdit::adjust(word, Action::TrimEnd, "", 1024, result));
++  assert(result == "bravo");
++  assert(!HighlightWordEdit::adjust("bravo", Action::TrimStart, "", 1024, result));
++  assert(!HighlightWordEdit::adjust("bravo", Action::TrimEnd, "", 1024, result));
++  assert(!HighlightWordEdit::adjust("bravo", Action::ExtendEnd, "", 1024, result));
++  assert(!HighlightWordEdit::adjust("bravo", Action::ExtendEnd, "six", 8, result));
++  assert(ChapterXPathResolver::locateText(book, 0, "Before,", -1, location));
++  assert(!HighlightWordEdit::neighbourWord(book, 0, location, true, word));
++  assert(ChapterXPathResolver::locateText(book, 0, "paragraph.", -1, location));
++  assert(!HighlightWordEdit::neighbourWord(book, 0, location, false, word));
++  // A block/page boundary supplies a word separator, not a glued token.
++  assert(ChapterXPathResolver::locateText(book, 0, "After!", -1, location));
++  assert(HighlightWordEdit::neighbourWord(book, 0, location, false, word));
++  assert(word == "Next");
++  const auto rtl = std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>قبل كلمة بعد</p></body></html>"});
++  assert(ChapterXPathResolver::locateText(rtl, 0, "كلمة", -1, location));
++  assert(HighlightWordEdit::neighbourWord(rtl, 0, location, true, word) && word == "قبل");
++  assert(HighlightWordEdit::neighbourWord(rtl, 0, location, false, word) && word == "بعد");
++  const auto softHyphen =
++      std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>one hy&#173;phen two</p></body></html>"});
++  assert(ChapterXPathResolver::locateText(softHyphen, 0, "two", -1, location));
++  assert(HighlightWordEdit::neighbourWord(softHyphen, 0, location, true, word) && word == "hyphen");
++  // A clipped context edge must not return the last part of a long word.
++  const std::string longWord(600, 'x');
++  const auto longBook = std::make_shared<Epub>(
++      std::vector<std::string>{"<html><body><p>prefix " + longWord + " target</p></body></html>"});
++  assert(ChapterXPathResolver::locateText(longBook, 0, "target", -1, location));
++  assert(HighlightWordEdit::neighbourWord(longBook, 0, location, true, word));
++  assert(word == longWord);
++  std::cout << "Highlight word editing checks passed\n";
++}
+diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/CMakeLists.txt
+@@ -0,0 +1,12 @@
++add_executable(highlight_word_edit_test HighlightWordEditTest.cpp
++  ${REPO_ROOT}/lib/KOReaderSync/ChapterXPathResolver.cpp
++  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
++  ${REPO_ROOT}/lib/Epub/Epub/htmlEntities.cpp
++  ${REPO_ROOT}/lib/expat/xmlparse.c ${REPO_ROOT}/lib/expat/xmlrole.c ${REPO_ROOT}/lib/expat/xmltok.c)
++target_include_directories(highlight_word_edit_test PRIVATE
++  ${REPO_ROOT}/test/koreader_xpath_resolver/stubs ${REPO_ROOT}/src
++  ${REPO_ROOT}/lib/KOReaderSync ${REPO_ROOT}/lib/Epub ${REPO_ROOT}/lib/Utf8
++  ${REPO_ROOT}/lib/XmlParserUtils ${REPO_ROOT}/lib/expat)
++target_compile_definitions(highlight_word_edit_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
++target_compile_options(highlight_word_edit_test PRIVATE -UNDEBUG)
++add_test(NAME highlight_word_edit COMMAND highlight_word_edit_test)
+diff --git a/test/koreader_xpath_resolver/stubs/Epub.h b/test/koreader_xpath_resolver/stubs/Epub.h
+--- a/test/koreader_xpath_resolver/stubs/Epub.h
++++ b/test/koreader_xpath_resolver/stubs/Epub.h
+@@ -15,6 +15,17 @@
+   };
+ 
+   explicit Epub(std::vector<std::string> spineContents) : spineContents(std::move(spineContents)) {}
++
++  size_t getBookSize() const {
++    size_t size = 0;
++    for (const auto& text : spineContents) size += text.size();
++    return size;
++  }
++  size_t getCumulativeSpineItemSize(int index) const {
++    size_t size = 0;
++    for (int i = 0; i <= index && i < getSpineItemsCount(); ++i) size += spineContents[i].size();
++    return size;
++  }
+ 
+   int getSpineItemsCount() const { return static_cast<int>(spineContents.size()); }
+ 
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -49,6 +49,7 @@
+ add_subdirectory(preview_block_locator)
+ add_subdirectory(text_pool)
+ add_subdirectory(clip_word_store)
++add_subdirectory(highlight_word_edit)
+ add_subdirectory(clipping_preview)
+ add_subdirectory(dict_layout)
+ add_subdirectory(reader_progress_save_debouncer)
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [v1.6.1] - 2026-10-03
+ 
+ ### Added
++
++- crASHink: tapping a highlight opens a word editor with start/end extension and trimming, a paged text preview, Save, Cancel, and Delete.
+ 
+ - Assign a physical-button-only Home/Reader shortcut that returns from nested reader menus directly to the open book, and otherwise returns Home.
+ - Turn reading stats tracking on or off for the whole device or individual EPUB and XTC books, while keeping saved history and Time Left estimates.

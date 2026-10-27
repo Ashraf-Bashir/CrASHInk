@@ -1,0 +1,146 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+ 
+ ### Fixed
++
++- Readest position sync translates original chapter coordinates through the optimizer source map when the cloud EPUB is unavailable; converted books without a map leave the device position unchanged.
+ 
+ - Clipping lists use measured row heights so all saved entries remain reachable when scrolling.
+ 
+diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
+--- a/src/activities/reader/ReadestSyncActivity.cpp
++++ b/src/activities/reader/ReadestSyncActivity.cpp
+@@ -40,6 +40,7 @@
+ #include "network/WifiUtils.h"
+ #include "readest/ReadestBookMap.h"
+ #include "readest/ReadestPositionPolicy.h"
++#include "readest/ReadestPositionResolver.h"
+ #include "readest/ReadestStore.h"
+ 
+ namespace {
+@@ -810,6 +811,12 @@
+     std::string deviceXPath;
+     if (readestEpub == epub && !readestCopyMissing) {
+       deviceXPath = remote.xpointer;  // identical files
++    } else if (readestCopyMissing) {
++      // Readest's chapter numbering belongs to the original EPUB. Never read
++      // its XPath in the optimized copy before translating the source map.
++      if (!ReadestPositionResolver::mapWithoutSourceCopy(epub, remote.xpointer, deviceXPath)) {
++        LOG_ERR("RDS", "Readest position needs the original EPUB or a valid optimizer source map");
++      }
+     } else {
+       std::string snippet;
+       int remoteSpine = -1;
+diff --git a/src/readest/ReadestPositionResolver.h b/src/readest/ReadestPositionResolver.h
+new file mode 100644
+--- /dev/null
++++ b/src/readest/ReadestPositionResolver.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <ProgressMapper.h>
++
++#include <memory>
++#include <string>
++#include <utility>
++
++namespace ReadestPositionResolver {
++// A different file hash alone cannot establish matching chapter numbering.
++// Without the original copy, only the optimizer's explicit source map can
++// translate Readest's XPath into this book. Failure leaves the output empty.
++inline bool mapWithoutSourceCopy(const std::shared_ptr<Epub>& deviceBook, const std::string& sourceXPath,
++                                 std::string& deviceXPath) {
++  deviceXPath.clear();
++  if (!deviceBook || !deviceBook->hasSourceSpineMap() || sourceXPath.empty()) return false;
++  std::string mapped = sourceXPath;
++  int spine = -1;
++  if (!ProgressMapper::sourceXPathToCurrent(deviceBook, mapped, spine) || spine < 0 ||
++      spine >= deviceBook->getSpineItemsCount()) {
++    return false;
++  }
++  deviceXPath = std::move(mapped);
++  return true;
++}
++}  // namespace ReadestPositionResolver
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -110,3 +110,5 @@
+ add_subdirectory(glyph_bitmap)
+ 
+ add_subdirectory(readest_position_sync)
++
++add_subdirectory(readest_source_position)
+diff --git a/test/readest_source_position/CMakeLists.txt b/test/readest_source_position/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/readest_source_position/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_executable(readest_source_position_test ReadestSourcePositionTest.cpp)
++target_include_directories(readest_source_position_test PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${REPO_ROOT})
++target_compile_options(readest_source_position_test PRIVATE -UNDEBUG)
++add_test(NAME readest_source_position COMMAND readest_source_position_test)
+diff --git a/test/readest_source_position/ReadestSourcePositionTest.cpp b/test/readest_source_position/ReadestSourcePositionTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/readest_source_position/ReadestSourcePositionTest.cpp
+@@ -0,0 +1,28 @@
++#include <cassert>
++#include <iostream>
++#include "src/readest/ReadestPositionResolver.h"
++
++int main() {
++  auto book = std::make_shared<Epub>();
++  const std::string source = "/body/DocFragment[3]/body/p[40]/text().7";
++  std::string mapped;
++  assert(ReadestPositionResolver::mapWithoutSourceCopy(book, source, mapped));
++  assert(mapped == "/body/DocFragment[6]/body/p[10]/text().7");
++  assert(mapped != source);
++  // A converted book without a map must not silently use original numbering.
++  book->hasMap = false;
++  assert(!ReadestPositionResolver::mapWithoutSourceCopy(book, source, mapped));
++  assert(mapped.empty());
++  book->hasMap = true;
++  book->mappingSucceeds = false;
++  assert(!ReadestPositionResolver::mapWithoutSourceCopy(book, source, mapped));
++  assert(mapped.empty());
++  book->mappingSucceeds = true;
++  book->mappedSpine = 8;
++  assert(!ReadestPositionResolver::mapWithoutSourceCopy(book, source, mapped));
++  book->mappedSpine = -1;
++  assert(!ReadestPositionResolver::mapWithoutSourceCopy(book, source, mapped));
++  assert(!ReadestPositionResolver::mapWithoutSourceCopy(nullptr, source, mapped));
++  assert(!ReadestPositionResolver::mapWithoutSourceCopy(book, "", mapped));
++  std::cout << "Readest source-position routing checks passed\n";
++}
+diff --git a/test/readest_source_position/stubs/ProgressMapper.h b/test/readest_source_position/stubs/ProgressMapper.h
+new file mode 100644
+--- /dev/null
++++ b/test/readest_source_position/stubs/ProgressMapper.h
+@@ -0,0 +1,22 @@
++#pragma once
++#include <memory>
++#include <string>
++class Epub {
++ public:
++  bool hasMap = true;
++  bool mappingSucceeds = true;
++  int mappedSpine = 5;
++  bool hasSourceSpineMap() const { return hasMap; }
++  int getSpineItemsCount() const { return 8; }
++};
++class ProgressMapper {
++ public:
++  static bool sourceXPathToCurrent(const std::shared_ptr<Epub>& book, std::string& xpath, int& spine) {
++    if (!book->mappingSucceeds) return false;
++    spine = book->mappedSpine;
++    // The original's chapter 3 was split; this point is in device chapter 6.
++    if (xpath != "/body/DocFragment[3]/body/p[40]/text().7") return false;
++    xpath = "/body/DocFragment[6]/body/p[10]/text().7";
++    return true;
++  }
++};
