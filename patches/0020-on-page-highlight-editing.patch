@@ -1,15 +1,16 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -143,6 +143,13 @@
+@@ -143,6 +143,14 @@
 
  ### crASHink patch updates
 
 +- Added: tap saved highlights for on-page edge handles and a floating pencil/trash toolbar with rounded corners, a subtle shadow and round stem handles. The toolbar uses a shared action list and wraps automatically for future options. Dragging hides the toolbar; releasing saves the resized range while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
 +- Changed: hold briefly (200 ms) to start selection, then drag freely. Only release decides the action: one word opens the dictionary, multiple words save a highlight. Pausing while holding never opens a dictionary popup. Dictionary lookup also works on highlighted words.
 +- Changed: saved clippings open directly in the full editor, with Save, Open, Delete and a top-right close button. Save is disabled when the selection matches the original, including after reversing changes.
++- Changed: selected highlights form continuous blocks across inter-word spaces on each line, without coloring outside the selected endpoints.
 +- Changed: successful highlights save silently without the Clipping saved toast or its pause; save errors remain visible.
-+- Performance: touch drags coalesce to the latest finger endpoint, invert only words entering or leaving the range, and avoid full-page repaints for large selections. Saved-highlight resizing also reuses the current page, restoring only two small handle regions (512 bytes). Input and release are retained during panel refresh; page advance requires deliberate overshoot, and selection hit boxes stay inside actual words.
++- Performance: touch drags coalesce to the latest finger endpoint, invert only words entering or leaving the range, and avoid full-page repaints for large selections. Saved-highlight resizing also reuses the current page, restoring only two small handle regions (512 bytes). Input and release are retained during panel refresh; dragging into the broad bottom margin for 200 ms advances without having to hit the last word first. Resting on text never advances; selection hit boxes stay inside actual words and the Home swipe is suppressed during word selection.
 +- Performance: cache nearby words and queue word-control clicks during e-ink refreshes instead of rescanning the chapter for every click.
 +
  - Changed: touchscreen page turns use swipes only; removed tap page-turn settings.
@@ -101,7 +102,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      requestUpdate();
    }
 
-@@ -1088,30 +1091,70 @@
+@@ -1088,30 +1091,87 @@
    if (touchDragLookup_) {
      int dragX = 0;
      int dragY = 0;
@@ -114,9 +115,16 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
 +      touchPageAwaitMotion_ = false;
 +    }
 +    touchDragInput_.record(held, dragX, dragY);
-+    // The panel can remain busy for hundreds of ms. Keep polling input instead
-+    // of blocking here, then apply its latest point before processing release.
-+    if (RenderLock::peek()) return;
++    // Start the bottom-edge dwell while the panel is busy, so a completed
++    // refresh does not add another whole dwell before the page can advance.
++    if (RenderLock::peek()) {
++      if (held && dragY >= renderer.getScreenHeight() - 48 &&
++          ClipSelectionPaging::hasDraggedFrom(touchDragStartX_, touchDragStartY_, dragX, dragY)) {
++        if (!touchPageEdgeSince_) touchPageEdgeSince_ = millis();
++      } else
++        touchPageEdgeSince_ = 0;
++      return;
++    }
 +    if (touchDragInput_.pointPending) {
 +      RenderLock lock(*this);
 +      dragX = touchDragInput_.x;
@@ -130,24 +138,34 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
          requestUpdate();
 -      } else if (hit && touchDragHasMoved_ && navigator.getCurrentFlatIndex() == previousIdx &&
 -                 navigator.getWordAt(previousIdx + 1) == nullptr && continueTouchSelectionOnNextPage()) {
++      touchEndpointHit_ = hit;
 +      touchDragInput_.pointPending = false;
 +    }
 +    if (!touchDragInput_.released) {
-+      // The bottom edge remains usable even after the finger leaves the last
-+      // word's small hit box. A short dwell prevents accidental page changes.
-+      const int current = navigator.getCurrentFlatIndex();
-+      const auto* last = navigator.getWordAt(current);
-+      const bool pastEnd =
-+          last && (touchDragInput_.y >=
-+                       last->screenY + last->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) + 16 ||
-+                   (last->isRtl ? touchDragInput_.x <= last->screenX - 16
-+                                : touchDragInput_.x >= last->screenX + last->width + 16));
-+      const bool atEnd = touchDragHasMoved_ && last && !navigator.getWordAt(current + 1) && pastEnd;
++      // A broad bottom-margin target is reachable without hitting the exact
++      // final word. Text hit boxes remain strict: resting on a word never
++      // requests a page change, even near the bottom of the screen.
++      const int lastIndex = navigator.getLastFlatIndex();
++      const auto* last = navigator.getWordAt(lastIndex);
++      const bool inBottomMargin =
++          last &&
++          (touchDragInput_.y >= renderer.getScreenHeight() - 48 ||
++           touchDragInput_.y >= last->screenY + last->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) + 8);
++      const bool atEnd = touchDragHasMoved_ && last && !touchEndpointHit_ && inBottomMargin;
 +      if (!atEnd)
 +        touchPageEdgeSince_ = 0;
 +      else if (!touchPageEdgeSince_)
 +        touchPageEdgeSince_ = millis();
-+      else if (millis() - touchPageEdgeSince_ >= 180 && !RenderLock::peek() && continueTouchSelectionOnNextPage()) {
++      else if (millis() - touchPageEdgeSince_ >= 200 && !RenderLock::peek()) {
++        {
++          RenderLock lock(*this);
++          bool hit = false;
++          navigator.selectWordAtPoint(
++              last->screenX + last->width / 2,
++              last->screenY + last->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) / 2,
++              renderer.getLineHeight(SETTINGS.getReaderFontId()), &hit);
++        }
++        if (!continueTouchSelectionOnNextPage()) return;
 +        touchPageArrivalX_ = touchDragInput_.x;
 +        touchPageArrivalY_ = touchDragInput_.y;
 +        touchPageAwaitMotion_ = true;
@@ -182,7 +200,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1123,13 +1166,16 @@
+@@ -1123,13 +1183,16 @@
      bool touchedWord = false;
      navigator.selectWordAtPoint(touchX, touchY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &touchedWord);
      if (touchedWord && navigator.beginTouchMultiSelect()) {
@@ -202,7 +220,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      }
      return;
    }
-@@ -1178,7 +1224,7 @@
+@@ -1178,7 +1241,7 @@
    //   - the controller has nothing pending to draw,
    //   - we have a current selection.
    if (nextRenderMode_ == RenderMode::Differential && !controller.isActive() && currIdx >= 0) {
@@ -211,7 +229,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      auto dirty =
          navigator.renderHighlightDifferential(renderer, lineHeight, prevHighlightIdx_, currIdx, foregroundBlack);
      if (dirty.has_value()) {
-@@ -1219,7 +1265,7 @@
+@@ -1219,7 +1282,7 @@
          renderer.fillRect(bezelLeft, clearY, clearW, reservedBottomHeight_, false);
        }
 
@@ -231,12 +249,21 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.h b/src/activiti
  #include "util/DictionaryLookupController.h"
  #include "util/WordSelectNavigator.h"
 
-@@ -132,6 +133,10 @@
+@@ -56,6 +57,7 @@
+   void onExit() override;
+   void loop() override;
+   void render(RenderLock&&) override;
++  bool allowGlobalHomeSwipeGesture() const override { return false; }
+
+  private:
+   std::unique_ptr<Page> page;
+@@ -132,6 +134,11 @@
    char dictionaryFontFamilyName_[64] = "";
    uint8_t dictionaryFontPointSize_ = 0;
    bool touchDragLookup_ = false;
 +  TouchDragInput touchDragInput_;
 +  unsigned long touchPageEdgeSince_ = 0;
++  bool touchEndpointHit_ = false;
 +  bool touchPageAwaitMotion_ = false;
 +  int touchPageArrivalX_ = 0, touchPageArrivalY_ = 0;
    bool touchDragHasMoved_ = false;
@@ -923,7 +950,7 @@ diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,388 @@
 +#include "OnPageHighlightActivity.h"
 +
 +#include <BidiUtils.h>
@@ -938,6 +965,7 @@ new file mode 100644
 +#include "HighlightTouchPolicy.h"
 +#include "PageWordGeometry.h"
 +#include "ReaderUtils.h"
++#include "SelectionGap.h"
 +#include "fontIds.h"
 +
 +namespace {
@@ -1008,6 +1036,7 @@ new file mode 100644
 +bool OnPageHighlightActivity::visitLine(const PageTextLine& line, bool measure, std::string& text) {
 +  if (!line.block || line.isTableText) return false;
 +  const auto& block = *line.block;
++  const uint16_t row = buildRow++;
 +  for (uint16_t i = 0; i < block.wordCount(); ++i) {
 +    std::string token(block.wordText(i));
 +    if (block.wordEndsWithInsertedHyphen(i) && !token.empty() && token.back() == '-') token.pop_back();
@@ -1022,6 +1051,7 @@ new file mode 100644
 +      const auto geometry = pageWordGeometry(renderer, SETTINGS.getReaderFontId(), line, block, i);
 +      word.rect = Rect{left + line.xPos + geometry.xOffset, top + line.yPos, geometry.width,
 +                       line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(SETTINGS.getReaderFontId())};
++      word.row = row;
 +      word.rtl = (BidiUtils::detectParagraphLevel(token.c_str(), block.getBlockStyle().isRtl ? 1 : 0) & 1) != 0;
 +      word.start = original.total;  // running relative page position, rebased below
 +      word.end = word.start + length - 1;
@@ -1058,6 +1088,7 @@ new file mode 100644
 +    return false;
 +  }
 +  wordCount = 0;
++  buildRow = 0;
 +  context.measure = false;
 +  const uint32_t total = original.total;
 +  original.total = pageLocation.start;
@@ -1228,6 +1259,16 @@ new file mode 100644
 +    const bool wasSelected = incremental && w.end >= paintedRange.start && w.start <= paintedRange.end;
 +    const auto& r = w.rect;
 +    if (selected != wasSelected) renderer.invertRect(r.x, r.y, r.width, r.height);
++    if (i > 0 && words[i - 1].row == w.row) {
++      const auto& previous = words[i - 1];
++      const bool joined = selected && previous.end >= range.start && previous.start <= range.end;
++      const bool wasJoined = wasSelected && previous.end >= paintedRange.start && previous.start <= paintedRange.end;
++      if (joined != wasJoined) {
++        const auto& p = previous.rect;
++        const auto gap = SelectionGap::between({p.x, p.y, p.width, p.height}, {r.x, r.y, r.width, r.height});
++        if (gap.width > 0) renderer.invertRect(gap.x, gap.y, gap.width, gap.height);
++      }
++    }
 +    if (!selected) continue;
 +    if (!selection.width)
 +      selection = r;
@@ -1302,7 +1343,7 @@ diff --git a/src/activities/reader/OnPageHighlightActivity.h b/src/activities/re
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,64 @@
 +#pragma once
 +#include <Epub.h>
 +#include <Epub/Page.h>
@@ -1331,11 +1372,13 @@ new file mode 100644
 +    Rect rect{};
 +    uint32_t start = 0, end = 0;
 +    bool rtl = false;
++    uint16_t row = 0;
 +  };
 +  std::shared_ptr<Epub> book;
 +  std::unique_ptr<Page> page;
 +  std::unique_ptr<Word[]> words;
 +  size_t wordCount = 0, index;
++  uint16_t buildRow = 0;
 +  int left, top;
 +  float hint;
 +  uint16_t spine = 0;
@@ -1388,6 +1431,28 @@ new file mode 100644
 +    return start != oldStart || end != oldEnd;
 +  }
 +};
+diff --git a/src/activities/reader/SelectionGap.h b/src/activities/reader/SelectionGap.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/SelectionGap.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include <algorithm>
++namespace SelectionGap {
++struct Rect {
++  int x = 0, y = 0, width = 0, height = 0;
++};
++// Only call for adjacent words on the same text line. The intersection in Y
++// avoids painting line spacing; outer selection margins are never included.
++inline Rect between(const Rect& a, const Rect& b) {
++  if (a.width <= 0 || b.width <= 0 || a.height <= 0 || b.height <= 0) return {};
++  const int top = std::max(a.y, b.y), bottom = std::min(a.y + a.height, b.y + b.height);
++  if (bottom <= top) return {};
++  if (a.x + a.width <= b.x) return {a.x + a.width, top, b.x - a.x - a.width, bottom - top};
++  if (b.x + b.width <= a.x) return {b.x + b.width, top, a.x - b.x - b.width, bottom - top};
++  return {};
++}
++}  // namespace SelectionGap
 diff --git a/src/activities/reader/TouchDragInput.h b/src/activities/reader/TouchDragInput.h
 new file mode 100644
 --- /dev/null
@@ -1443,7 +1508,15 @@ new file mode 100644
 diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
 --- a/src/util/WordSelectNavigator.cpp
 +++ b/src/util/WordSelectNavigator.cpp
-@@ -82,6 +82,7 @@
+@@ -8,6 +8,7 @@
+
+ #include "MappedInputManager.h"
+ #include "TextPool.h"
++#include "activities/reader/SelectionGap.h"
+
+ namespace {
+ constexpr unsigned long WORD_REPEAT_START_MS = 500;
+@@ -82,6 +83,7 @@
    wordRepeatActive = false;
    pendingSnapIdx = -1;
    snapshot_.clear();
@@ -1451,7 +1524,7 @@ diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
  }
 
  const WordSelectNavigator::WordInfo* WordSelectNavigator::getSelected() const {
-@@ -352,7 +353,8 @@
+@@ -352,7 +354,8 @@
    if (hit) *hit = false;
    if (rows.empty() || words.empty() || lineHeight <= 0) return false;
 
@@ -1461,7 +1534,7 @@ diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
 
    int bestIdx = -1;
    int bestScore = INT_MAX;
-@@ -360,12 +362,12 @@
+@@ -360,12 +363,12 @@
    for (int idx = 0; idx < static_cast<int>(words.size()); idx++) {
      const auto& word = words[idx];
      const int wordHeight = word.heightOr(lineHeight);
@@ -1476,7 +1549,7 @@ diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
 
      const int centerX = static_cast<int>(word.screenX) + static_cast<int>(word.width) / 2;
      const int centerY = static_cast<int>(word.screenY) + wordHeight / 2;
-@@ -495,8 +497,33 @@
+@@ -495,8 +498,43 @@
    std::string().swap(ownedTextPool);
  }
 
@@ -1489,8 +1562,18 @@ diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
 +  };
 +  for (int i = 0; i < static_cast<int>(words.size()); ++i) {
 +    const auto* word = getWordAt(i);
-+    if (selected(*word, i, lo, hi) == selected(*word, i, oldLo, oldHi)) continue;
-+    renderer.invertRect(word->screenX, word->screenY, word->width, word->heightOr(lineHeight));
++    const bool now = selected(*word, i, lo, hi), before = selected(*word, i, oldLo, oldHi);
++    if (now != before) renderer.invertRect(word->screenX, word->screenY, word->width, word->heightOr(lineHeight));
++    const auto* previous = getWordAt(i - 1);
++    if (!previous || previous->row != word->row || previous->isTableText || word->isTableText) continue;
++    const bool joined = now && selected(*previous, i - 1, lo, hi);
++    const bool wasJoined = before && selected(*previous, i - 1, oldLo, oldHi);
++    if (joined != wasJoined) {
++      const auto gap =
++          SelectionGap::between({previous->screenX, previous->screenY, previous->width, previous->heightOr(lineHeight)},
++                                {word->screenX, word->screenY, word->width, word->heightOr(lineHeight)});
++      if (gap.width > 0) renderer.invertRect(gap.x, gap.y, gap.width, gap.height);
++    }
 +  }
 +}
 +
@@ -1510,7 +1593,7 @@ diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
    if (inMultiSelectMode) {
      const int cursorIdx = getCurrentFlatIndex();
      const int lo = std::min(anchorFlatIndex, cursorIdx);
-@@ -594,6 +621,24 @@
+@@ -594,6 +632,24 @@
      GfxRenderer& renderer, int lineHeight, int prevWordIdx, int currWordIdx, const bool foregroundBlack) {
    const auto* curr = getWordAt(currWordIdx);
    if (!curr) return std::nullopt;
@@ -1538,7 +1621,15 @@ diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
 diff --git a/src/util/WordSelectNavigator.h b/src/util/WordSelectNavigator.h
 --- a/src/util/WordSelectNavigator.h
 +++ b/src/util/WordSelectNavigator.h
-@@ -195,7 +195,9 @@
+@@ -137,6 +137,7 @@
+
+   // Flat index of the current cursor word. -1 if empty.
+   int getCurrentFlatIndex() const;
++  int getLastFlatIndex() const { return words.empty() ? -1 : static_cast<int>(words.size()) - 1; }
+
+   // Range selected for the current lookup. A completed multi-select remains
+   // available until its caller consumes it, even though the visual mode exits.
+@@ -195,7 +196,9 @@
    // unused by current callers; only the optional's .has_value() distinguishes
    // success from fallback.
    //
@@ -1549,7 +1640,7 @@ diff --git a/src/util/WordSelectNavigator.h b/src/util/WordSelectNavigator.h
    // Returns std::nullopt when the caller must fall back to a full repaint:
    //   - the new highlight is too large for HighlightSnapshot's buffer
    //   - the selection has a hyphenated continuation (multi-word fallback for now)
-@@ -327,6 +329,10 @@
+@@ -327,6 +330,10 @@
    // renderHighlightDifferential to restore the framebuffer before drawing the
    // next highlight, so a cursor move repaints only the affected regions.
    HighlightSnapshot snapshot_;
@@ -1588,7 +1679,7 @@ diff --git a/test/drag_highlight/DragHighlightTest.cpp b/test/drag_highlight/Dra
    nav.reset();
    std::vector<WordSelectNavigator::WordInfo> large(2);
    large[0].screenX = 20;
-@@ -72,6 +81,23 @@
+@@ -72,6 +81,34 @@
    nav.selectWordAtPoint(25, 25, 20);
    assert(nav.beginTouchMultiSelect());
    nav.selectWordAtPoint(725, 425, 20);
@@ -1611,6 +1702,17 @@ diff --git a/test/drag_highlight/DragHighlightTest.cpp b/test/drag_highlight/Dra
 +    assert(renderer.pixels==reference.pixels);prev=next;
 +  }
 +  assert(renderer.snapshots==0);
++  nav.reset();
++  std::vector<WordSelectNavigator::WordInfo> spaced(2);
++  for(int i=0;i<2;++i){spaced[i].screenX=20+i*60;spaced[i].screenY=20;spaced[i].width=40;spaced[i].row=0;}
++  nav.load(std::move(spaced),{{20,0,2}},"",false);nav.setTouchDragCursorVisible(true);
++  nav.selectWordAtPoint(25,25,20);assert(nav.beginTouchMultiSelect());
++  nav.selectWordAtPoint(85,25,20);renderer.pixels.assign(renderer.pixels.size(),0);
++  assert(nav.renderHighlightDifferential(renderer,20,-1,1,true));
++  assert(renderer.pixels[25*800+70]==1); // inter-word space is part of the block
++  assert(renderer.pixels[25*800+10]==0 && renderer.pixels[25*800+125]==0);
++  nav.selectWordAtPoint(25,25,20);assert(nav.renderHighlightDifferential(renderer,20,1,0,true));
++  assert(renderer.pixels[25*800+70]==0); // trimming removes the old gap too
    std::cout << "Drag differential rendering checks passed\n";
  }
 diff --git a/test/drag_highlight/stubs/GfxRenderer.h b/test/drag_highlight/stubs/GfxRenderer.h
@@ -2156,7 +2258,7 @@ diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageRenderTest.cpp
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,94 @@
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -2166,6 +2268,7 @@ new file mode 100644
 +#include <memory>
 +#include <vector>
 +#include "activities/reader/HighlightToolbar.h"
++#include "activities/reader/SelectionGap.h"
 +#include "activities/reader/OnPageHighlightModel.h"
 +struct Rect {int x=0,y=0,width=0,height=0;};
 +enum class Color {White,LightGray};
@@ -2210,7 +2313,7 @@ new file mode 100644
 +};
 +class OnPageHighlightActivity {
 + public:
-+ struct Word {Rect rect;uint32_t start,end;bool rtl=false;};
++ struct Word {Rect rect;uint32_t start,end;bool rtl=false;uint16_t row=0;};
 + GfxRenderer renderer;std::unique_ptr<Page> page=std::make_unique<Page>();
 + Word words[4]={{{20,80,40,20},0,4},{{80,80,40,20},5,9},{{20,120,40,20},10,14},{{80,120,40,20},15,19}};
 + size_t wordCount=4;int left=0,top=0;
@@ -2228,12 +2331,19 @@ new file mode 100644
 +};
 +#include "OnPageRender.inc"
 +int main() {
++ const auto rtlGap=SelectionGap::between({80,20,40,20},{20,20,40,20});
++ assert(rtlGap.x==60 && rtlGap.width==20);
++ assert(SelectionGap::between({20,20,40,20},{20,50,40,20}).width==0);
 + OnPageHighlightActivity actual;actual.render(RenderLock{});
 + assert(actual.page->renders==2);
 + for(auto range:{OnPageHighlightRange{0,19},{0,9},{5,14},{10,19},{15,19},{0,4}}) {
 +  actual.range=range;actual.render(RenderLock{});
 +  OnPageHighlightActivity reference;reference.range=range;reference.render(RenderLock{});
 +  assert(actual.renderer.pixels==reference.renderer.pixels);
++  if(range.start==0 && range.end==19) {
++    const size_t gap=90*240+70;
++    assert(actual.renderer.pixels[gap] != (gap%17==0));
++  }
 +  assert(actual.page->renders==2); // no page/glyph render during subsequent moves
 + }
 + actual.dragging=false;actual.render(RenderLock{});
@@ -2247,7 +2357,7 @@ diff --git a/test/highlight_word_edit/TouchReleaseTest.cpp b/test/highlight_word
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/TouchReleaseTest.cpp
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,102 @@
 +#include <cassert>
 +#include <cstddef>
 +#include <cstdlib>
@@ -2261,7 +2371,7 @@ new file mode 100644
 + bool held=true;int x=0,y=0;
 + bool isScreenTouchHeld(int& a,int& b) const {a=x;b=y;return held;}
 +};
-+struct Renderer {int getLineHeight(int) const {return 20;}};
++struct Renderer {int getLineHeight(int) const {return 20;}int getScreenHeight() const {return 320;}};
 +struct {int getReaderFontId() const {return 0;}} SETTINGS;
 +struct RenderLock {
 + static inline bool busy=false;
@@ -2274,7 +2384,8 @@ new file mode 100644
 + int screenX=10,width=40;bool isRtl=false;
 + int heightOr(int height) const {return height;}
 + int getCurrentFlatIndex() const {return current;}
-+ bool selectWordAtPoint(int x,int,int,bool* hit) { ++selectCalls;*hit=true;int old=current;current=x>10?1:0;return old!=current; }
++ int getLastFlatIndex() const {return 1;}
++ bool selectWordAtPoint(int x,int y,int,bool* hit) { ++selectCalls;if(y>=20){*hit=false;return false;}*hit=true;int old=current;current=x>10?1:0;return old!=current; }
 + int screenY=0;
 + const Navigator* getWordAt(int i) const {return i>=0 && i<2?this:nullptr;}
 +};
@@ -2287,7 +2398,7 @@ new file mode 100644
 +struct Selection {
 + bool touchDragLookup_=true,touchDragHasMoved_=false;
 + TouchDragInput touchDragInput_;
-+ unsigned long touchPageEdgeSince_=0;
++ unsigned long touchPageEdgeSince_=0;bool touchEndpointHit_=false;
 + bool touchPageAwaitMotion_=false;int touchPageArrivalX_=0,touchPageArrivalY_=0;
 + int touchDragStartX_=0,touchDragStartY_=0;
 + Input mappedInput;Renderer renderer;Navigator navigator;DictionaryLookupController controller;
@@ -2320,14 +2431,23 @@ new file mode 100644
 + assert(slow.controller.lookups==0 && slow.clips==0 && slow.pageLoads==0);
 + slow.mappedInput.held=false;slow.loop();
 + assert(slow.clips==1 && slow.controller.lookups==0 && !slow.touchDragLookup_);
-+ Selection crossing;crossing.pageOk=true;crossing.mappedInput.x=100;
++ Selection crossing;crossing.pageOk=true;crossing.mappedInput.x=100;crossing.mappedInput.y=300;
 + for(int i=0;i<500 && !crossing.touchPageAwaitMotion_;++i) crossing.loop();
 + assert(crossing.touchPageAwaitMotion_ && crossing.navigator.current==0);
 + const auto updates=crossing.navigator.selectCalls;
 + for(int i=0;i<100;++i) crossing.loop();
 + assert(crossing.navigator.current==0 && crossing.navigator.selectCalls==updates);
-+ crossing.mappedInput.x=0;crossing.loop();
++ crossing.mappedInput.x=0;crossing.mappedInput.y=0;crossing.loop();
 + assert(!crossing.touchPageAwaitMotion_ && crossing.navigator.current==0);
++ Selection skippedLast;skippedLast.pageOk=true;skippedLast.mappedInput.x=0;skippedLast.mappedInput.y=300;
++ for(int i=0;i<500 && !skippedLast.touchPageAwaitMotion_;++i) skippedLast.loop();
++ assert(skippedLast.touchPageAwaitMotion_ && skippedLast.pageLoads==1);
++ Selection edgeBusy;edgeBusy.pageOk=true;edgeBusy.mappedInput.y=300;
++ RenderLock::busy=true;edgeBusy.loop();
++ assert(edgeBusy.touchPageEdgeSince_!=0);
++ for(int i=0;i<250;++i) millis();
++ RenderLock::busy=false;edgeBusy.loop();
++ assert(edgeBusy.touchPageAwaitMotion_ && edgeBusy.pageLoads==1);
 + Selection one;
 + for(int i=0;i<10000;++i) one.loop();
 + one.mappedInput.held=false;one.loop();
