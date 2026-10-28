@@ -2662,3 +2662,65 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
  ## [v1.6.0] - 2026-09-21
 
  ### Added
+
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -98,6 +98,7 @@
+   bool saveToFile();
+   void clearAll();
+
++  bool isLoadedFor(const std::string& path) const { return bookFilePath == path && !loadFailed_; }
+   bool hasLoadError() const { return loadFailed_; }
+   uint32_t contentRevision() const { return contentRevision_; }
+   bool hasClippings() const { return !clippings.empty(); }
+@@ -113,6 +114,7 @@
+   bool readClippingText(const Clipping& clipping, std::string& out, HalFile& reader) const;
+   // Chapter title saved with the clipping, read from the store file.
+   bool readChapterTitle(size_t index, std::string& out) const;
++  bool readChapterTitle(size_t index, std::string& out, HalFile& reader) const;
+
+   static bool hasAnyClippings();
+   static bool getAllClippedBooks(std::vector<ClippedBookEntry>& out);
+
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -317,15 +317,18 @@
+ }
+
+ bool ClippingStore::readChapterTitle(const size_t index, std::string& out) const {
++  FsFile reader;
++  if (!openTextReader(reader)) { out.clear(); return false; }
++  return readChapterTitle(index, out, reader);
++}
++
++bool ClippingStore::readChapterTitle(const size_t index, std::string& out, FsFile& reader) const {
+   out.clear();
+   const Clipping* clipping = clippingAt(index);
+-  if (!clipping || storeFilePath.empty()) return false;
+-  FsFile f;
+-  if (!Storage.openFileForRead("CLIP", storeFilePath, f)) return false;
++  if (!clipping || !reader) return false;
+   char title[CLIPPING_CHAPTER_TITLE_MAX] = {};
+-  const bool ok = f.seek(titleOffset(*clipping)) &&
+-                  f.read(reinterpret_cast<uint8_t*>(title), sizeof(title)) == static_cast<int>(sizeof(title));
+-  f.close();
++  const bool ok = reader.seek(titleOffset(*clipping)) &&
++                  reader.read(reinterpret_cast<uint8_t*>(title), sizeof(title)) == static_cast<int>(sizeof(title));
+   if (!ok) return false;
+   sanitizeChapterTitle(title);
+   out = title;
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -130,6 +130,8 @@
+
+ ### crASHink patch updates
+
++- Read saved chapter titles through one shared clipping reader when grouping the full list.
++
+ - Delete in the highlight editor now acts immediately without an extra confirmation.
+
+ - Compare Here/Xteink and There/Readest by chapter, chapter page/total and book percentage, marking estimates; decision buttons include their percentage. Failed local reads stop highlight sync, and missing remote notes are not treated as explicit deletions.

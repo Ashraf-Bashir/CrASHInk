@@ -923,3 +923,425 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
  ## [v1.6.0] - 2026-09-21
 
  ### Added
+
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
+--- a/src/activities/reader/EpubReaderClippingListActivity.cpp
++++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
+@@ -1,6 +1,7 @@
+ #include "EpubReaderClippingListActivity.h"
+
+ #include <GfxRenderer.h>
++#include <HalStorage.h>
+ #include <I18n.h>
+ #include <Memory.h>
+
+@@ -169,29 +170,44 @@
+     } else
+       LOG_ERR("CLIP", "Cannot allocate clipping chapter metadata");
+   }
++  const std::string expectedPath = book ? book->getPath() : bookPath;
++  if (!expectedPath.empty() && !CLIPPINGS.isLoadedFor(expectedPath)) {
++    CLIPPINGS.loadForBook(expectedPath, book ? book->getTitle() : "", book ? book->getAuthor() : "", "epub");
++  }
+   std::vector<HighlightChapterGroups::Entry> entries;
+   entries.reserve(CLIPPINGS.clippingCount());
+-  // Group by the TOC identity, not its title: repeated chapter names stay distinct.
++  const size_t estimatedGroups = book ? static_cast<size_t>(book->getTocItemsCount() + book->getSpineItemsCount())
++                                     : CLIPPINGS.clippingCount();
++  chapterLabels.labels.reserve(std::max(chapterLabels.labels.size(), std::min(CLIPPINGS.clippingCount(), estimatedGroups)));
++  FsFile reader;
++  CLIPPINGS.openTextReader(reader);
+   int lastSpine = -1;
+-  int toc = -1;
++  int logicalSpine = -1;
++  std::string fallbackTitle;
++  std::string savedTitle;
++  savedTitle.reserve(CLIPPING_CHAPTER_TITLE_MAX);
+   for (size_t i = 0; i < CLIPPINGS.clippingCount(); ++i) {
+     const Clipping* clipping = CLIPPINGS.clippingAt(i);
++    if (!clipping) continue;
+     if (lastSpine != clipping->spineIndex) {
+       lastSpine = clipping->spineIndex;
+-      toc = book ? book->getTocIndexForSpineIndex(clipping->spineIndex) : -1;
+-    }
+-    const uint32_t chapter = toc >= 0 ? static_cast<uint32_t>(toc) : 0x10000U + clipping->spineIndex;
++      logicalSpine = lastSpine;
++      int lastPart = lastSpine;
++      if (book) book->resolveChapterGroupRange(lastSpine, logicalSpine, lastPart);
++      const int toc = book ? book->getTocIndexForSpineIndex(logicalSpine) : -1;
++      fallbackTitle = toc >= 0 ? book->getTocItem(toc).title : tr(STR_UNKNOWN_CHAPTER);
++    }
++    if (!CLIPPINGS.readChapterTitle(i, savedTitle, reader) || savedTitle.empty()) savedTitle = fallbackTitle;
++    const uint32_t chapter = chapterLabels.keyFor(static_cast<uint16_t>(logicalSpine), savedTitle);
+     entries.push_back({chapter, static_cast<uint16_t>(i)});
+   }
+   chapterGroups.build(std::move(entries));
++  groupsRevision = CLIPPINGS.contentRevision();
+ }
+
+ std::string EpubReaderClippingListActivity::groupTitle(size_t index) const {
+-  const auto& group = chapterGroups.groups[index];
+-  if (book && group.chapter < 0x10000U) return book->getTocItem(static_cast<int>(group.chapter)).title;
+-  std::string title;
+-  CLIPPINGS.readChapterTitle(chapterGroups.entries[group.begin].clipping, title);
+-  return title.empty() ? tr(STR_UNKNOWN_CHAPTER) : title;
++  const char* title = chapterLabels.title(chapterGroups.groups[index].chapter);
++  return *title ? title : tr(STR_UNKNOWN_CHAPTER);
+ }
+
+ void EpubReaderClippingListActivity::activateRow(bool /*longPress*/, bool ignoreInitialConfirmRelease) {
+@@ -619,6 +635,7 @@
+ }
+
+ void EpubReaderClippingListActivity::buildListScreen(UiApp::ScreenType& screen) {
++  if (groupsRevision != CLIPPINGS.contentRevision()) rebuildGroups();
+   const auto& metrics = UITheme::getInstance().getMetrics();
+   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+   screen.setContentMargin(fui::Insets{
+@@ -646,10 +663,14 @@
+   const fui::Rect bounds = screen.body();
+   const auto rows = configureUiList(props, screen.theme(), bounds, UiListRowType::WithSubtitle);
+   listNav.syncToProps(bounds, props.rowHeight, props.rowGap, static_cast<int>(count), props);
++  // Keep one render-generation snapshot. Navigation may update the atomic
++  // viewport while SD previews are being read; mixing it into slot/index
++  // calculations mislabels rows and can write outside the 20-item window.
++  const int windowTop = props.topIndex;
+   const int windowRows = std::min(rows > 0 ? static_cast<int>(rows) : 1, static_cast<int>(CLIPPING_WINDOW_SIZE));
+-  const int end = std::min({static_cast<int>(count), listNav.top + windowRows});
+-  for (int i = listNav.top; i < end; ++i) {
+-    const size_t slot = static_cast<size_t>(i - listNav.top);
++  const int end = std::min({static_cast<int>(count), windowTop + windowRows});
++  for (int i = windowTop; i < end; ++i) {
++    const size_t slot = static_cast<size_t>(i - windowTop);
+     fui::ListItem& item = uiItems[slot];
+     item = fui::ListItem{};
+     if (chapterGroups.header(i)) {
+@@ -661,7 +682,13 @@
+       item.value = uiChapterTitles[slot].c_str();
+     } else {
+       item.icon = disclosureIcon::bitmap(1, false, false, props.rowHeight);
+-      CLIPPINGS.readClippingPreview(static_cast<size_t>(chapterGroups.rows[i]), uiLabels[slot]);
++      const size_t originalIndex = static_cast<size_t>(chapterGroups.rows[i]);
++      if (!CLIPPINGS.readClippingPreview(originalIndex, uiLabels[slot]) || uiLabels[slot].empty()) {
++        char unavailable[96];
++        snprintf(unavailable, sizeof(unavailable), tr(STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT),
++                 static_cast<unsigned>(originalIndex + 1));
++        uiLabels[slot] = unavailable;
++      }
+     }
+     item.label = uiLabels[slot].c_str();
+     item.actionValue = static_cast<int16_t>(i);
+@@ -669,13 +696,11 @@
+
+   // Keep previews limited to the populated window while giving FreeInkUI the
+   // full count so its scroll indicator reflects the whole clipping list.
+-  const int drawCount = std::max(0, end - listNav.top);
++  const int drawCount = std::max(0, end - windowTop);
+   props.items = uiItems.data();
+-  props.itemsWindowFirst = static_cast<uint16_t>(listNav.top);
++  props.itemsWindowFirst = static_cast<uint16_t>(windowTop);
+   props.itemsWindowCount = static_cast<uint16_t>(drawCount);
+   props.count = static_cast<uint16_t>(count);
+-  props.selectedIndex = static_cast<int16_t>(listNav.selected);
+-  props.topIndex = static_cast<uint16_t>(listNav.top);
+   screen.list(props);
+   visibleRows = std::max(1, listNav.pageRowsFor(static_cast<int>(count)));
+ }
+
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.h b/src/activities/reader/EpubReaderClippingListActivity.h
+--- a/src/activities/reader/EpubReaderClippingListActivity.h
++++ b/src/activities/reader/EpubReaderClippingListActivity.h
+@@ -12,6 +12,7 @@
+
+ #include "ClippingStore.h"
+ #include "HighlightChapterGroups.h"
++#include "HighlightChapterLabels.h"
+ #include "components/UITheme.h"
+ #include "activities/Activity.h"
+ #include "util/ButtonNavigator.h"
+@@ -30,6 +31,8 @@
+   std::unique_ptr<Epub> metadataBook;
+   std::string bookPath;
+   HighlightChapterGroups chapterGroups;
++  HighlightChapterLabels chapterLabels;
++  uint32_t groupsRevision = 0;
+   size_t selectedClipping = 0;
+   void rebuildGroups();
+   void editSelectedClipping();
+
+diff --git a/src/activities/reader/HighlightChapterLabels.h b/src/activities/reader/HighlightChapterLabels.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightChapterLabels.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// A TOC index is not a chapter identity: distinct spine items can point to the
++// same entry, and one spine can contain multiple titled chapters. Keep the
++// saved chapter title together with its logical spine group. IDs remain stable
++// through rebuilds/deletes so expanded groups do not switch identities.
++class HighlightChapterLabels {
++ public:
++  struct Label { uint32_t key; uint16_t spine; std::string title; };
++  std::vector<Label> labels;
++  uint32_t keyFor(uint16_t spine, const std::string& title) {
++    uint32_t count = 0;
++    for (const auto& label : labels) {
++      if (label.spine != spine) continue;
++      if (label.title == title) return label.key;
++      ++count;
++    }
++    const uint32_t key = (static_cast<uint32_t>(spine) << 16) | count;
++    labels.push_back({key, spine, title});
++    return key;
++  }
++  const char* title(uint32_t key) const {
++    for (const auto& label : labels) if (label.key == key) return label.title.c_str();
++    return "";
++  }
++};
+
+diff --git a/test/clipping_list_visibility/CMakeLists.txt b/test/clipping_list_visibility/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_list_visibility/CMakeLists.txt
+@@ -0,0 +1,14 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(LIST_INC ${CMAKE_CURRENT_BINARY_DIR}/ClippingList.inc)
++add_custom_command(OUTPUT ${LIST_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractList.py
++    ${REPO_ROOT}/src/activities/reader/EpubReaderClippingListActivity.cpp ${LIST_INC}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/EpubReaderClippingListActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractList.py VERBATIM)
++add_executable(clipping_list_visibility_test ClippingListVisibilityTest.cpp ${LIST_INC})
++target_include_directories(clipping_list_visibility_test PRIVATE ${REPO_ROOT}/src
++  ${REPO_ROOT}/freeink-sdk/libs/ui/FreeInkUI/include ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(clipping_list_visibility_test PRIVATE -UNDEBUG)
++add_test(NAME clipping_list_visibility COMMAND clipping_list_visibility_test)
++target_sources(clipping_list_visibility_test PRIVATE
++  ${REPO_ROOT}/freeink-sdk/libs/ui/FreeInkUI/src/FreeInkUI.cpp)
+
+diff --git a/test/clipping_list_visibility/ClippingListVisibilityTest.cpp b/test/clipping_list_visibility/ClippingListVisibilityTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_list_visibility/ClippingListVisibilityTest.cpp
+@@ -0,0 +1,168 @@
++#include <algorithm>
++#include <array>
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <vector>
++#include <FreeInkUI.h>
++#include "activities/reader/HighlightChapterGroups.h"
++#include "activities/reader/HighlightChapterLabels.h"
++#include "components/DisclosureIcon.h"
++namespace fui=freeink::ui;
++#define LOG_ERR(...) do {} while(0)
++constexpr size_t CLIPPING_CHAPTER_TITLE_MAX=48;
++struct Rect { int x,y,width,height; };
++struct ThemeMetrics { int topPadding=8,verticalSpacing=8; };
++struct Renderer { int getScreenWidth() const {return 480;} int getScreenHeight() const {return 800;} };
++struct Input {};
++struct Target { int lineHeight(fui::FontId) const {return 20;} };
++struct UITheme {
++  static UITheme& getInstance(){static UITheme t;return t;}
++  Rect getScreenSafeArea(const Renderer&,bool,bool) const{return {0,0,480,800};}
++  ThemeMetrics getMetrics() const{return {};}
++};
++struct TouchHeaderBackButton { static int height(const ThemeMetrics&,const Input&){return 40;} };
++enum class UiListRowType{WithSubtitle};
++int16_t uiListRowHeight(const fui::ThemeTokens&,UiListRowType){return 72;}
++uint16_t configureUiList(fui::ListProps& props,const fui::ThemeTokens&,fui::Rect body,UiListRowType){
++ props.rowGap=8;return fui::listVisibleRows(body,props.rowHeight,props.rowGap);
++}
++enum StringId{STR_UNKNOWN_CHAPTER,STR_CLIPPINGS_LOAD_FAILED,STR_NO_CLIPPINGS,STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT};
++const char* tr(StringId id){return id==STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT?"Highlight %u (preview unavailable)":"Unknown";}
++class Epub {
++ public:
++  enum class XLocationLoadMode{Skip};
++  bool split=false;
++  Epub()=default;Epub(std::string,std::string){}
++  void setupCacheDir(){}
++  bool load(bool,bool,XLocationLoadMode,bool){return true;}
++  std::string getPath() const{return "book.epub";}
++  std::string getTitle() const{return "Book";}
++  std::string getAuthor() const{return "Author";}
++  int getTocItemsCount() const{return 3;}
++  int getSpineItemsCount() const{return 4;}
++  int getTocIndexForSpineIndex(int) const{return 2;} // deliberately aliased metadata
++  struct Toc {std::string title;};
++  Toc getTocItem(int) const{return {"Chapter 2"};}
++  bool resolveChapterGroupRange(int spine,int& first,int& last) const{
++   first=split&&spine>=2?2:spine;last=split&&spine>=2?3:spine;return true;
++  }
++};
++template<typename T,typename...Args>std::unique_ptr<T> makeUniqueNoThrow(Args&&...args){return std::make_unique<T>(std::forward<Args>(args)...);}
++struct FsFile{};
++struct Clip {uint16_t spineIndex;std::string title;};
++using Clipping=Clip;
++struct Store {
++ std::vector<Clip> clips;
++ std::string loadedPath="book.epub";
++ uint32_t revision=1;
++ size_t opens=0,titles=0,loads=0;
++ std::function<void()> onPreview;
++ size_t clippingCount() const{return clips.size();}
++ const Clip* clippingAt(size_t i) const{return &clips.at(i);}
++ bool isLoadedFor(const std::string& path) const{return loadedPath==path;}
++ bool loadForBook(const std::string& path,const std::string&,const std::string&,const std::string&){loadedPath=path;++loads;++revision;return true;}
++ uint32_t contentRevision() const{return revision;}
++ bool hasLoadError() const{return false;}
++ bool openTextReader(FsFile&){++opens;return true;}
++ bool readChapterTitle(size_t i,std::string& out,FsFile&){++titles;out=clips.at(i).title;return true;}
++ bool readClippingPreview(size_t i,std::string& out){
++  if(onPreview){auto change=std::move(onPreview);onPreview={};change();}
++  out=i%11==0?"":"clip-"+std::to_string(i);
++  return i%13!=0;
++ }
++}CLIPPINGS;
++struct Screen {
++ struct Row{int index;std::string label,value;uint16_t iconWidth;};
++ fui::ThemeTokens tokens{};
++ fui::Rect bounds{0,0,480,800};
++ std::vector<Row> drawn;
++ uint16_t first=0;
++ const fui::ThemeTokens& theme() const{return tokens;}
++ void setContentMargin(fui::Insets margin){bounds=fui::Rect{0,0,480,800}.inset(margin);}
++ void spacer(int16_t height){bounds.y+=height;bounds.height-=height;}
++ fui::Rect body() const{return bounds;}
++ void centeredText(const char*,const fui::TextStyle&){}
++ void list(const fui::ListProps& props){
++  first=props.itemsWindowFirst;
++  for(unsigned slot=0;slot<props.itemsWindowCount;++slot){
++   const auto& item=props.items[slot];
++   assert(item.actionValue==props.itemsWindowFirst+slot);
++   drawn.push_back({item.actionValue,item.label?item.label:"",item.value?item.value:"",item.icon.width});
++  }
++ }
++};
++struct UiApp{using ScreenType=Screen;};
++class EpubReaderClippingListActivity {
++ public:
++ Epub* book=nullptr;
++ std::unique_ptr<Epub> metadataBook;
++ std::string bookPath="book.epub";
++ HighlightChapterGroups chapterGroups;
++ HighlightChapterLabels chapterLabels;
++ uint32_t groupsRevision=0;
++ Renderer renderer;Input mappedInput;Target uiTarget;
++ fui::ListNav listNav;
++ static constexpr size_t CLIPPING_WINDOW_SIZE=20;
++ static constexpr fui::ActionId ACTION_ROW=1;
++ std::array<std::string,20>uiLabels,uiChapterTitles;
++ std::array<fui::ListItem,20>uiItems;
++ int visibleRows=1;
++ void rebuildGroups();std::string groupTitle(size_t)const;void buildListScreen(UiApp::ScreenType&);
++};
++#include "ClippingList.inc"
++int main(){
++ Epub book;EpubReaderClippingListActivity list;list.book=&book;
++ const std::string names[]={"Introduction","Chapter 1","Chapter 2"};
++ for(unsigned i=0;i<90;++i)CLIPPINGS.clips.push_back({static_cast<uint16_t>(i%3),names[i%3]});
++ list.rebuildGroups();
++ assert(list.chapterGroups.groups.size()==3&&list.chapterGroups.entries.size()==90);
++ assert(CLIPPINGS.opens==1&&CLIPPINGS.titles==90); // one batched reader
++ for(unsigned g=0;g<3;++g){assert(list.groupTitle(g)==names[g]);assert(list.chapterGroups.groups[g].count==30);list.chapterGroups.groups[g].open=true;}
++ list.chapterGroups.rebuild();
++ std::vector<bool>seen(90,false);
++ int top=0;
++ for(int page=0;page<30;++page){
++  list.listNav.top=top;
++  Screen screen;list.buildListScreen(screen);
++  assert(!screen.drawn.empty());
++  for(const auto& row:screen.drawn){
++   assert(!row.label.empty());
++   if(!list.chapterGroups.header(row.index)){
++    const auto original=list.chapterGroups.rows[row.index];seen.at(original)=true;
++    if(original%11==0||original%13==0)assert(row.label.find("preview unavailable")!=std::string::npos);
++    else assert(row.label=="clip-"+std::to_string(original));
++   }
++  }
++  const int next=std::min(static_cast<int>(list.chapterGroups.rows.size())-list.visibleRows,top+list.visibleRows);
++  if(next<=top)break;top=next;
++ }
++ for(bool present:seen)assert(present); // every rendered/store record is reachable
++ // Input changes the live viewport while a preview is read. This render must
++ // keep the original top/slot/action snapshot and stay inside its array.
++ list.listNav.top=0;
++ CLIPPINGS.onPreview=[&]{list.listNav.top=40;};
++ Screen concurrent;list.buildListScreen(concurrent);
++ assert(concurrent.first==0&&concurrent.drawn.front().index==0&&list.listNav.top==40);
++ // A live store update is reflected without reopening the list.
++ CLIPPINGS.clips.push_back({0,"Introduction"});++CLIPPINGS.revision;
++ Screen updated;list.buildListScreen(updated);
++ assert(list.chapterGroups.entries.size()==91&&list.chapterGroups.groups[0].count==31);
++ // Same-name chapters in different spines stay separate; multiple saved
++ // chapter names within a single spine also stay separate.
++ auto first=list.chapterLabels.keyFor(0,"Repeated");
++ assert(first!=list.chapterLabels.keyFor(1,"Repeated"));
++ assert(list.chapterLabels.keyFor(0,"Introduction")!=list.chapterLabels.keyFor(0,"Chapter 1"));
++ const auto stable=list.chapterLabels.keyFor(0,"Introduction");
++ list.rebuildGroups();assert(list.chapterLabels.keyFor(0,"Introduction")==stable);
++ // Optimizer-created pieces still group as their logical chapter.
++ EpubReaderClippingListActivity split;book.split=true;split.book=&book;
++ CLIPPINGS.clips={{2,"Chapter 2"},{3,"Chapter 2"}};++CLIPPINGS.revision;
++ split.rebuildGroups();assert(split.chapterGroups.groups.size()==1&&split.chapterGroups.groups[0].count==2);
++ CLIPPINGS.loadedPath="other.epub";split.rebuildGroups();assert(CLIPPINGS.loads==1&&CLIPPINGS.loadedPath=="book.epub");
++ std::cout<<"All 90 clipping IDs remain reachable across aliased chapter metadata and paging; failed previews, live updates and concurrent viewport changes passed\n";
++}
+
+diff --git a/test/clipping_list_visibility/ExtractList.py b/test/clipping_list_visibility/ExtractList.py
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_list_visibility/ExtractList.py
+@@ -0,0 +1,8 @@
++from pathlib import Path
++import sys
++source=Path(sys.argv[1]).read_text()
++a=source.index('void EpubReaderClippingListActivity::rebuildGroups()')
++b=source.index('void EpubReaderClippingListActivity::activateRow(',a)
++c=source.index('void EpubReaderClippingListActivity::buildListScreen(')
++d=source.index('void EpubReaderClippingListActivity::renderDetail()',c)
++Path(sys.argv[2]).write_text(source[a:b]+source[c:d])
+
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -120,3 +120,5 @@
+ add_subdirectory(readest_position_sync)
+
+ add_subdirectory(readest_source_position)
++
++add_subdirectory(clipping_list_visibility)
+
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -1034,3 +1034,5 @@
+ STR_OPEN_IN_BOOK: "Open in book"
+ STR_CLIPPINGS_COUNT_FORMAT: "%u clippings"
+ STR_CLIPPINGS_PAGE_FORMAT: "Page %d/%d"
++
++STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT: "Highlight %u (preview unavailable)"
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -141,6 +141,8 @@
+
+ ### crASHink patch updates
+
++- Keep every clipping reachable when TOC labels overlap: group by logical chapter and saved title, refresh on store changes, and freeze each rendered row window during navigation. Failed previews remain visible as selectable entries.
++
+ - Read saved chapter titles through one shared clipping reader when grouping the full list.
+
+ - Delete in the highlight editor now acts immediately without an extra confirmation.
