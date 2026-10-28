@@ -1,10 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -143,6 +143,8 @@
+@@ -143,6 +143,10 @@
 
  ### crASHink patch updates
 
++- Fixed: expandable clipping rows accept the platform chapter-index integer type, fixing the X4 Pro build.
++
 +- Added: clipping rows have separate expand/collapse arrows. Full text loads only when requested, flows through list pages, and supports multiple independently expanded clippings. Only one full quote is cached; other expanded quotes are reread only when visible. Tapping text still opens the highlight editor.
 +
  - Fixed: crossing pages during a drag invalidates the old page framebuffer before drawing the new selection.
@@ -14,7 +16,7 @@ diff --git a/src/activities/reader/ClippingTextExpansion.h b/src/activities/read
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/ClippingTextExpansion.h
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,221 @@
 +#pragma once
 +#include <algorithm>
 +#include <cstdint>
@@ -190,9 +192,10 @@ new file mode 100644
 +    entries.push_back({cache.clipping, cache.baseRow, cache.chunks()});
 +    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.base < b.base; });
 +  }
-+  void rebase(const std::vector<int>& rows) {
++  template <class RowIndex>
++  void rebase(const std::vector<RowIndex>& rows) {
 +    for (auto it = entries.begin(); it != entries.end();) {
-+      const auto row = std::find(rows.begin(), rows.end(), static_cast<int>(it->clipping));
++      const auto row = std::find(rows.begin(), rows.end(), static_cast<RowIndex>(it->clipping));
 +      if (row == rows.end()) {
 +        if (cache.clipping == it->clipping) cache.clear();
 +        it = entries.erase(it);
@@ -586,7 +589,28 @@ diff --git a/test/clipping_list_visibility/ClippingListVisibilityTest.cpp b/test
   Renderer renderer;Input mappedInput;Target uiTarget;
   fui::ListNav listNav;
   static constexpr size_t CLIPPING_WINDOW_SIZE=20;
-@@ -142,6 +157,32 @@
+@@ -116,6 +131,20 @@
+ };
+ #include "ClippingList.inc"
+ int main(){
++ // ESP32 defines int32_t as long, while this host defines it as int. Exercise
++ // both container types so native tests catch the target ABI mismatch.
++ ClippingExpansionSet typed;
++ typed.cache.text="full quote";
++ typed.cache.open(7,2,100,[](const std::string& s){return static_cast<int>(s.size());});
++ typed.entries={{5,1,2},{7,2,typed.cache.chunks()}};
++ typed.rebase(std::vector<long>{-1L,7L,5L});
++ assert(typed.isOpen(1) && typed.isOpen(2) && typed.cache.baseRow==1);
++ assert(typed.entries[0].clipping==7 && typed.entries[1].clipping==5);
++ typed.rebase(std::vector<int32_t>{-1,7});
++ assert(typed.entries.size()==1 && typed.cache.baseRow==1);
++ typed.rebase(std::vector<long>{-1L});
++ assert(!typed.active() && !typed.cache.active());
++
+  Epub book;EpubReaderClippingListActivity list;list.book=&book;
+  const std::string names[]={"Introduction","Chapter 1","Chapter 2"};
+  for(unsigned i=0;i<90;++i)CLIPPINGS.clips.push_back({static_cast<uint16_t>(i%3),names[i%3]});
+@@ -142,6 +171,32 @@
    if(next<=top)break;top=next;
   }
   for(bool present:seen)assert(present); // every rendered/store record is reachable
