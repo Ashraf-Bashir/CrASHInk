@@ -6,7 +6,7 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
  ### crASHink patch updates
 
 +- Added: tap saved highlights for on-page edge handles and a nearby Edit button. Dragging hides Edit; releasing saves the resized range while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
-+- Changed: hold still for dictionary lookup (600 ms); hold briefly (200 ms) then drag to create a highlight. Dictionary lookup also works on highlighted words.
++- Changed: hold briefly (200 ms) to start selection, then drag freely. Only release decides the action: one word opens the dictionary, multiple words save a highlight. Pausing while holding never opens a dictionary popup. Dictionary lookup also works on highlighted words.
 +- Changed: saved clippings open directly in the full editor, with Save, Open, Delete and a top-right close button. Save is disabled when the selection matches the original, including after reversing changes.
 +- Performance: cache nearby words and queue word-control clicks during e-ink refreshes instead of rescanning the chapter for every click.
 +
@@ -69,31 +69,16 @@ diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
 diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activities/reader/DictionaryWordSelectActivity.cpp
 --- a/src/activities/reader/DictionaryWordSelectActivity.cpp
 +++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
-@@ -1,3 +1,4 @@
-+#include "HighlightTouchPolicy.h"
- #include "DictionaryWordSelectActivity.h"
-
- #include <BidiUtils.h>
-@@ -1091,6 +1092,18 @@
+@@ -1091,6 +1091,8 @@
      if (mappedInput.isScreenTouchHeld(dragX, dragY)) {
        touchDragHasMoved_ =
            touchDragHasMoved_ || ClipSelectionPaging::hasDraggedFrom(touchDragStartX_, touchDragStartY_, dragX, dragY);
-+      // A short hold arms selection; motion chooses highlighting. Staying on
-+      // the same word until 600 ms chooses dictionary, including saved quotes.
-+      int holdX = 0, holdY = 0;
-+      unsigned long heldMs = 0;
-+      if (mappedInput.isScreenTouchTapCandidate(holdX, holdY, heldMs) &&
-+          HighlightTouchPolicy::wantsDictionary(touchDragHasMoved_, heldMs)) {
-+        touchDragLookup_ = false;
-+        const std::string phrase = finishTouchLookupPhrase();
-+        controller.lookupOrPopup(phrase, 1);
-+        if (controller.isLookingUp()) captureClippingRequest();
-+        return;
-+      }
++      // Keep the contact in selection mode until release. A slow start or
++      // pause during a drag must never open the dictionary under the finger.
        const int previousIdx = navigator.getCurrentFlatIndex();
        bool hit = false;
        if (navigator.selectWordAtPoint(dragX, dragY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &hit)) {
-@@ -1103,7 +1116,6 @@
+@@ -1103,7 +1105,6 @@
      }
 
      touchDragLookup_ = false;
@@ -101,19 +86,15 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      const std::string phrase = finishTouchLookupPhrase();
      // Several words are a clipping, saved at once without asking; counting
      // words in the joined phrase keeps a hyphen-split word as one word.
-@@ -1111,8 +1123,10 @@
+@@ -1111,7 +1112,7 @@
        finishSelectionAsClipping();
        return;
      }
 -    controller.lookupOrPopup(phrase, wordCount);
--    if (controller.isLookingUp()) captureClippingRequest();
-+    // Releasing before dictionary hold, without selecting multiple words,
-+    // dismisses the armed selection instead of doing an accidental lookup.
-+    setResult(ActivityResult{});
-+    finish();
++    controller.lookupOrPopup(phrase, DictionaryLookupController::phraseWordCount(phrase));
+     if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
@@ -674,13 +655,10 @@ diff --git a/src/activities/reader/HighlightTouchPolicy.h b/src/activities/reade
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/HighlightTouchPolicy.h
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,4 @@
 +#pragma once
-+
 +namespace HighlightTouchPolicy {
 +constexpr unsigned long SelectionHoldMs = 200;
-+constexpr unsigned long DictionaryHoldMs = 600;
-+inline bool wantsDictionary(bool hasMoved, unsigned long heldMs) { return !hasMoved && heldMs >= DictionaryHoldMs; }
 +}  // namespace HighlightTouchPolicy
 diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
 new file mode 100644
@@ -886,7 +864,7 @@ new file mode 100644
 +    }
 +  }
 +  unsigned long held = 0;
-+  if (mappedInput.isScreenTouchTapCandidate(x, y, held) && HighlightTouchPolicy::wantsDictionary(false, held)) {
++  if (mappedInput.isScreenTouchTapCandidate(x, y, held) && held >= HighlightTouchPolicy::SelectionHoldMs) {
 +    returnAction(false, x, y);
 +    return;
 +  }
@@ -1077,7 +1055,7 @@ new file mode 100644
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 --- a/test/highlight_word_edit/CMakeLists.txt
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -10,3 +10,50 @@
+@@ -10,3 +10,61 @@
  target_compile_definitions(highlight_word_edit_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
  target_compile_options(highlight_word_edit_test PRIVATE -UNDEBUG)
  add_test(NAME highlight_word_edit COMMAND highlight_word_edit_test)
@@ -1128,6 +1106,17 @@ diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/
 +target_compile_definitions(onpage_highlight_actions_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
 +target_compile_options(onpage_highlight_actions_test PRIVATE -UNDEBUG)
 +add_test(NAME onpage_highlight_actions COMMAND onpage_highlight_actions_test)
++
++set(TOUCH_RELEASE ${CMAKE_CURRENT_BINARY_DIR}/TouchRelease.inc)
++add_custom_command(OUTPUT ${TOUCH_RELEASE}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractTouchRelease.py
++    ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp ${TOUCH_RELEASE}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractTouchRelease.py VERBATIM)
++add_executable(highlight_touch_release_test TouchReleaseTest.cpp ${TOUCH_RELEASE})
++target_include_directories(highlight_touch_release_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(highlight_touch_release_test PRIVATE -UNDEBUG)
++add_test(NAME highlight_touch_release COMMAND highlight_touch_release_test)
 diff --git a/test/highlight_word_edit/ExtractBoundaryActions.py b/test/highlight_word_edit/ExtractBoundaryActions.py
 new file mode 100644
 --- /dev/null
@@ -1163,11 +1152,22 @@ new file mode 100644
 +a=text.index('void OnPageHighlightActivity::returnAction(')
 +b=text.index('void OnPageHighlightActivity::render(',a)
 +Path(sys.argv[2]).write_text(text[a:b])
+diff --git a/test/highlight_word_edit/ExtractTouchRelease.py b/test/highlight_word_edit/ExtractTouchRelease.py
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractTouchRelease.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++text = Path(sys.argv[1]).read_text()
++a = text.index('  if (touchDragLookup_) {', text.index('void DictionaryWordSelectActivity::loop()'))
++b = text.index('\n  int touchX = 0;', a)
++Path(sys.argv[2]).write_text('void Selection::loop() {\n' + text[a:b] + '\n}\n')
 diff --git a/test/highlight_word_edit/HighlightBoundaryActionsTest.cpp b/test/highlight_word_edit/HighlightBoundaryActionsTest.cpp
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/HighlightBoundaryActionsTest.cpp
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,69 @@
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -1202,9 +1202,6 @@ new file mode 100644
 +#include "BoundaryActions.inc"
 +int main() {
 + using A=HighlightWordEdit::Action;
-+ assert(!HighlightTouchPolicy::wantsDictionary(false,599));
-+ assert(HighlightTouchPolicy::wantsDictionary(false,600));
-+ assert(!HighlightTouchPolicy::wantsDictionary(true,1000));
 + HighlightEditActivity editor;
 + editor.book=std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>before alpha bravo café after tail</p></body></html>"});
 + editor.draft="alpha bravo";
@@ -1507,6 +1504,72 @@ new file mode 100644
 + failure.range.start=0;CLIPPINGS.ok=false;failure.saveRange();
 + assert(failure.failed && failure.range.start==6 && failure.saved.start==6);
 + std::cout<<"Actual on-page handlers: live drag, one release write, delayed release, Edit, dictionary and failure rollback passed\n";
++}
+diff --git a/test/highlight_word_edit/TouchReleaseTest.cpp b/test/highlight_word_edit/TouchReleaseTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/TouchReleaseTest.cpp
+@@ -0,0 +1,61 @@
++#include <cassert>
++#include <cstddef>
++#include <cstdlib>
++#include <iostream>
++#include <string>
++namespace ClipSelectionPaging {
++bool hasDraggedFrom(int x,int y,int a,int b) {return std::abs(a-x)>10 || std::abs(b-y)>10;}
++}
++struct Input {
++ bool held=true;int x=0,y=0;
++ bool isScreenTouchHeld(int& a,int& b) const {a=x;b=y;return held;}
++};
++struct Renderer {int getLineHeight(int) const {return 20;}};
++struct {int getReaderFontId() const {return 0;}} SETTINGS;
++struct Navigator {
++ int current=0;
++ int getCurrentFlatIndex() const {return current;}
++ bool selectWordAtPoint(int x,int,int,bool* hit) { *hit=true;int old=current;current=x>10?1:0;return old!=current; }
++ const void* getWordAt(int i) const {return i<2?this:nullptr;}
++};
++struct DictionaryLookupController {
++ unsigned lookups=0;std::string text;
++ static size_t phraseWordCount(const std::string& text) {return text.empty()?0:text.find(' ')==std::string::npos?1:2;}
++ void lookupOrPopup(const std::string& value,size_t) {++lookups;text=value;}
++ bool isLookingUp() const {return lookups>0;}
++};
++struct Selection {
++ bool touchDragLookup_=true,touchDragHasMoved_=false;
++ int touchDragStartX_=0,touchDragStartY_=0;
++ Input mappedInput;Renderer renderer;Navigator navigator;DictionaryLookupController controller;
++ unsigned clips=0,captures=0;
++ void requestUpdate() {}
++ bool continueTouchSelectionOnNextPage() {return false;}
++ std::string finishTouchLookupPhrase() {return navigator.current?"one two":"one";}
++ void finishSelectionAsClipping() {++clips;}
++ void captureClippingRequest() {++captures;}
++ void loop();
++};
++#include "TouchRelease.inc"
++int main() {
++ Selection slow;
++ // Holding for arbitrarily many input frames never starts dictionary lookup.
++ for(int i=0;i<10000;++i) slow.loop();
++ assert(slow.controller.lookups==0 && slow.clips==0 && slow.touchDragLookup_);
++ slow.mappedInput.x=50;slow.loop();
++ for(int i=0;i<10000;++i) slow.loop();
++ assert(slow.controller.lookups==0 && slow.clips==0);
++ slow.mappedInput.held=false;slow.loop();
++ assert(slow.clips==1 && slow.controller.lookups==0 && !slow.touchDragLookup_);
++ Selection one;
++ for(int i=0;i<10000;++i) one.loop();
++ one.mappedInput.held=false;one.loop();
++ assert(one.clips==0 && one.controller.lookups==1 && one.controller.text=="one" && one.captures==1);
++ Selection reversed;
++ reversed.mappedInput.x=50;reversed.loop();
++ reversed.mappedInput.x=0;reversed.loop();
++ assert(reversed.controller.lookups==0);
++ reversed.mappedInput.held=false;reversed.loop();
++ assert(reversed.clips==0 && reversed.controller.lookups==1);
++ std::cout<<"Production touch flow: no lookup while held; release selects single-word lookup or multi-word highlight\n";
 +}
 diff --git a/test/koreader_xpath_resolver/stubs/Epub.h b/test/koreader_xpath_resolver/stubs/Epub.h
 --- a/test/koreader_xpath_resolver/stubs/Epub.h
