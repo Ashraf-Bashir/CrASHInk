@@ -1,0 +1,225 @@
+diff --git a/src/activities/reader/ReaderUtils.h b/src/activities/reader/ReaderUtils.h
+--- a/src/activities/reader/ReaderUtils.h
++++ b/src/activities/reader/ReaderUtils.h
+@@ -135,25 +135,11 @@
+     return result;
+   }
+
+-  const int width = renderer.getScreenWidth();
+-  if (width <= 0) {
+-    return result;
+-  }
+-
+-  const auto allowsSwipe = [](const uint8_t gesture) {
+-    return gesture == CrossPointSettings::TAP_AND_SWIPE || gesture == CrossPointSettings::SWIPE_ONLY;
+-  };
+-  const auto allowsTap = [](const uint8_t gesture) {
+-    return gesture == CrossPointSettings::TAP_AND_SWIPE || gesture == CrossPointSettings::TAP_ONLY ||
+-           gesture == CrossPointSettings::INVERTED_TAP;
+-  };
+-
++  (void)renderer;
+   const auto swipe = input.wasSwipe();
+   if (swipe != MappedInputManager::SwipeDir::None) {
+-    result.prev = swipe == (rtlBook ? MappedInputManager::SwipeDir::Left : MappedInputManager::SwipeDir::Right) &&
+-                  allowsSwipe(SETTINGS.previousPageGesture);
+-    result.next = swipe == (rtlBook ? MappedInputManager::SwipeDir::Right : MappedInputManager::SwipeDir::Left) &&
+-                  allowsSwipe(SETTINGS.pageTurnGesture);
++    result.prev = swipe == (rtlBook ? MappedInputManager::SwipeDir::Left : MappedInputManager::SwipeDir::Right);
++    result.next = swipe == (rtlBook ? MappedInputManager::SwipeDir::Right : MappedInputManager::SwipeDir::Left);
+     return result;
+   }
+
+@@ -166,21 +152,8 @@
+   result.x = x;
+   result.y = y;
+   result.heldMs = input.getHeldTime();
+-  // Reserve the top/bottom gesture bands for vertical edge swipes. If the touch
+-  // controller loses part of a short edge swipe, do not reinterpret it as a page tap.
+-  if (input.isInVerticalEdgeGestureZone(y)) {
+-    return result;
+-  }
+-
+-  // Give the entire page tap area to the sole tap-enabled direction. When
+-  // both accept taps, RTL books and Inverted Tap each swap their shared zones.
+-  const bool nextTaps = allowsTap(SETTINGS.pageTurnGesture);
+-  const bool previousTaps = allowsTap(SETTINGS.previousPageGesture);
+-  const bool invertedTaps = (SETTINGS.pageTurnGesture == CrossPointSettings::INVERTED_TAP ||
+-                             SETTINGS.previousPageGesture == CrossPointSettings::INVERTED_TAP) != rtlBook;
+-  const bool nextZone = invertedTaps ? x < (width * 2) / 3 : x >= width / 3;
+-  result.next = nextTaps && (!previousTaps || nextZone);
+-  result.prev = previousTaps && (!nextTaps || !nextZone);
++  // Preserve tap coordinates for highlights, links and reader controls.
++  // Content taps never turn pages, including with legacy tap settings.
+   return result;
+ #endif
+ }
+diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
+--- a/src/SettingsList.cpp
++++ b/src/SettingsList.cpp
+@@ -236,14 +236,6 @@
+                              "longPressBackAction", ShortcutOptionCatalog::LongPress));
+     add(SettingInfo::Toggle(StrId::STR_PWR_BTN_FOOTNOTE_BACK, &CrossPointSettings::pwrBtnFootnoteBack,
+                             "pwrBtnFootnoteBack", StrId::STR_CAT_CONTROLS));
+-    add(SettingInfo::Enum(StrId::STR_NEXT_PAGE, &CrossPointSettings::pageTurnGesture,
+-                          {StrId::STR_TAP_AND_SWIPE, StrId::STR_TAP_ONLY, StrId::STR_SWIPE_ONLY,
+-                           StrId::STR_INVERTED_TAP, StrId::STR_DISABLED},
+-                          "pageTurnGesture", StrId::STR_CAT_CONTROLS));
+-    add(SettingInfo::Enum(StrId::STR_PREV_PAGE, &CrossPointSettings::previousPageGesture,
+-                          {StrId::STR_TAP_AND_SWIPE, StrId::STR_TAP_ONLY, StrId::STR_SWIPE_ONLY,
+-                           StrId::STR_INVERTED_TAP, StrId::STR_DISABLED},
+-                          "previousPageGesture", StrId::STR_CAT_CONTROLS));
+     add(SettingInfo::Toggle(StrId::STR_TAP_HIDE_STATUS_BAR, &CrossPointSettings::tapToHideStatusBar,
+                             "tapToHideStatusBar", StrId::STR_CAT_CONTROLS));
+
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -501,8 +501,8 @@
+   // Touch screen reader zones/gestures on boards with a touch controller.
+   uint8_t touchReaderControls = TOUCH_READER_ON;
+   // Page-turn gestures remain independently configurable while touch reader controls stay enabled.
+-  uint8_t pageTurnGesture = TAP_AND_SWIPE;
+-  uint8_t previousPageGesture = TAP_AND_SWIPE;
++  uint8_t pageTurnGesture = SWIPE_ONLY;
++  uint8_t previousPageGesture = SWIPE_ONLY;
+   uint8_t customBootscreenEnabled = 1;
+   uint8_t tapToHideStatusBar = 1;
+   // Disables all touchscreen input while a reader is active. Reader menus temporarily override this.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -143,6 +143,8 @@
+
+ ### crASHink patch updates
+
++- Changed: touchscreen page turns use swipes only; removed tap page-turn settings.
++
+ - Keep every clipping reachable when TOC labels overlap: group by logical chapter and saved title, refresh on store changes, and freeze each rendered row window during navigation. Failed previews remain visible as selectable entries.
+
+ - Read saved chapter titles through one shared clipping reader when grouping the full list.
+diff --git a/test/touch_page_turn/test_swipe_only.py b/test/touch_page_turn/test_swipe_only.py
+new file mode 100644
+--- /dev/null
++++ b/test/touch_page_turn/test_swipe_only.py
+@@ -0,0 +1,65 @@
++"""Compile and exercise the production touch routing function in isolation."""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'src/activities/reader/ReaderUtils.h').read_text()
++start = source.index('inline TouchPageTurn detectTouchPageTurn(')
++end = source.index('\ninline bool isBottomStatusBarTap', start)
++fixture = r'''
++#include <cassert>
++#include <cstdint>
++#define CROSSINK_APP_CAP_TOUCH 1
++struct { bool touchReaderControls=true; uint8_t pageTurnGesture=0, previousPageGesture=0; } SETTINGS;
++struct GfxRenderer {};
++struct MappedInputManager {
++ enum class SwipeDir { None, Left, Right, Up, Down };
++ SwipeDir swipe=SwipeDir::None;
++ bool touch=true, tap=false;
++ bool hasTouch() const { return touch; }
++ SwipeDir wasSwipe() const { return swipe; }
++ bool wasScreenTapped(int& x,int& y) const { x=120; y=300; return tap; }
++ unsigned long getHeldTime() const { return 50; }
++};
++struct TouchPageTurn { bool prev,next,tapped; int x,y; unsigned long heldMs; };
++'''
++checks = r'''
++int main() {
++ GfxRenderer renderer;
++ MappedInputManager input;
++ // Every old persisted gesture combination must now behave identically.
++ for(int next=0;next<5;++next) for(int prev=0;prev<5;++prev) {
++  SETTINGS.pageTurnGesture=next; SETTINGS.previousPageGesture=prev;
++  input.swipe=MappedInputManager::SwipeDir::None; input.tap=true;
++  auto tap=detectTouchPageTurn(renderer,input);
++  assert(tap.tapped && !tap.next && !tap.prev && tap.x==120 && tap.y==300);
++  input.tap=false;
++  for(bool rtl : {false,true}) {
++   input.swipe=MappedInputManager::SwipeDir::Left;
++   auto left=detectTouchPageTurn(renderer,input,rtl);
++   assert(left.next==!rtl && left.prev==rtl && !left.tapped);
++   input.swipe=MappedInputManager::SwipeDir::Right;
++   auto right=detectTouchPageTurn(renderer,input,rtl);
++   assert(right.prev==!rtl && right.next==rtl);
++  }
++ }
++ input.swipe=MappedInputManager::SwipeDir::Left;
++ SETTINGS.touchReaderControls=false;
++ auto disabled=detectTouchPageTurn(renderer,input);
++ assert(!disabled.next && !disabled.prev && !disabled.tapped);
++ SETTINGS.touchReaderControls=true; input.touch=false;
++ disabled=detectTouchPageTurn(renderer,input);
++ assert(!disabled.next && !disabled.prev);
++}
++'''
++with tempfile.TemporaryDirectory() as directory:
++    cpp = Path(directory)/'test.cpp'
++    cpp.write_text('#include <initializer_list>\n' + fixture + source[start:end] + checks)
++    executable = Path(directory)/'test'
++    subprocess.run(['c++','-std=c++17',str(cpp),'-o',str(executable)],check=True)
++    subprocess.run([str(executable)],check=True)
++settings = (root/'src/SettingsList.cpp').read_text()
++assert '&CrossPointSettings::pageTurnGesture' not in settings
++assert '&CrossPointSettings::previousPageGesture' not in settings
++print('Swipe-only routing passed: legacy settings, LTR/RTL, taps, disabled touch, settings removal.')
+diff --git a/src/MappedInputManager.cpp b/src/MappedInputManager.cpp
+--- a/src/MappedInputManager.cpp
++++ b/src/MappedInputManager.cpp
+@@ -705,11 +705,8 @@
+
+ bool MappedInputManager::wasBackGesture() const {
+   if (!touchInputEnabled()) return false;
+-  // A disabled previous-page swipe must not fall through to Back/Home.
+-  if (readerMode && SETTINGS.previousPageGesture != CrossPointSettings::TAP_AND_SWIPE &&
+-      SETTINGS.previousPageGesture != CrossPointSettings::SWIPE_ONLY) {
+-    return false;
+-  }
++  // Horizontal swipes in readers belong to page navigation.
++  if (readerMode) return false;
+   // Back = left-to-right swipe starting near the left edge. Edge-anchored so that
+   // mid-screen horizontal swipes stay available to activities that consume
+   // SwipeDir::Left/Right (e.g. percent selection, image viewer).
+diff --git a/src/simulator/SimulatorSmokeTest.cpp b/src/simulator/SimulatorSmokeTest.cpp
+--- a/src/simulator/SimulatorSmokeTest.cpp
++++ b/src/simulator/SimulatorSmokeTest.cpp
+@@ -260,20 +260,11 @@
+       for (uint8_t previous = 0; previous < CrossPointSettings::PAGE_TURN_GESTURE_COUNT; ++previous) {
+         SETTINGS.pageTurnGesture = next;
+         SETTINGS.previousPageGesture = previous;
+-        const bool inverted = next == CrossPointSettings::INVERTED_TAP || previous == CrossPointSettings::INVERTED_TAP;
+-        const bool nextTap = next == CrossPointSettings::TAP_AND_SWIPE || next == CrossPointSettings::TAP_ONLY ||
+-                             next == CrossPointSettings::INVERTED_TAP;
+-        const bool previousTap = previous == CrossPointSettings::TAP_AND_SWIPE ||
+-                                 previous == CrossPointSettings::TAP_ONLY ||
+-                                 previous == CrossPointSettings::INVERTED_TAP;
+         for (const int x : {0, width / 3 - 1, width / 3, width * 2 / 3 - 1, width * 2 / 3, width - 1}) {
+           mappedInputManager.simulatorInjectTouchDown(x, y);
+           mappedInputManager.simulatorInjectTouchRelease(x, y);
+           const auto result = ReaderUtils::detectTouchPageTurn(renderer, mappedInputManager);
+-          const bool nextZone = inverted ? x < width * 2 / 3 : x >= width / 3;
+-          const bool expectedNext = nextTap && (!previousTap || nextZone);
+-          const bool expectedPrevious = previousTap && (!nextTap || !nextZone);
+-          if (!result.tapped || result.next != expectedNext || result.prev != expectedPrevious) {
++          if (!result.tapped || result.next || result.prev) {
+             fail("Mixed page tap mismatch: next=%u previous=%u x=%d", next, previous, x);
+           }
+           mappedInputManager.simulatorClearInputFrame();
+@@ -285,10 +276,8 @@
+           mappedInputManager.simulatorInjectTouchMove(endX, y);
+           mappedInputManager.simulatorInjectTouchRelease(endX, y);
+           const auto result = ReaderUtils::detectTouchPageTurn(renderer, mappedInputManager);
+-          const uint8_t mode = right ? previous : next;
+-          const bool expected = (mode == CrossPointSettings::TAP_AND_SWIPE || mode == CrossPointSettings::SWIPE_ONLY);
+-          if (result.next != (!right && expected) || result.prev != (right && expected) ||
+-              (right && !expected && mappedInputManager.wasReleased(MappedInputManager::Button::Back))) {
++          if (result.next != !right || result.prev != right ||
++              mappedInputManager.wasBackGesture()) {
+             fail("Mixed page swipe mismatch: next=%u previous=%u right=%d", next, previous, right);
+           }
+           mappedInputManager.simulatorClearInputFrame();
