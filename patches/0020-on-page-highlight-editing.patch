@@ -7,7 +7,7 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 
 +- Fixed: crossing pages during a drag invalidates the old page framebuffer before drawing the new selection.
 +- Changed: center the floating toolbar on the selection with an 8-pixel gap, adjusting only to clear visible handles or screen edges.
-+- Added: tap saved highlights for on-page edge handles and a floating pencil/trash toolbar with rounded corners, a subtle shadow and round stem handles. The toolbar uses a shared action list and wraps automatically for future options. Dragging hides the toolbar; releasing saves the resized range while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
++- Added: tap saved highlights for on-page edge handles and a floating pencil/trash toolbar with rounded corners, a subtle shadow and round stem handles. The toolbar uses a shared action list and wraps automatically for future options. Dragging hides the toolbar; releasing saves the resized range and returns directly to reading without reopening the toolbar while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
 +- Changed: hold briefly (200 ms) to start selection, then drag freely. Only release decides the action: one word opens the dictionary, multiple words save a highlight. Pausing while holding never opens a dictionary popup. Dictionary lookup also works on highlighted words.
 +- Changed: saved clippings open directly in the full editor, with Save, Open, Delete and a top-right close button. Save is disabled when the selection matches the original, including after reversing changes.
 +- Changed: selected highlights form continuous blocks across inter-word spaces on each line, without coloring outside the selected endpoints.
@@ -970,7 +970,7 @@ diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,395 @@
 +#include "OnPageHighlightActivity.h"
 +
 +#include <BidiUtils.h>
@@ -1179,7 +1179,12 @@ new file mode 100644
 +    activeEdge = -1;
 +    dragging.store(false);
 +    releasePending = false;
-+    requestUpdate();
++    if (failed)
++      requestUpdate();
++    else {
++      closeAfterAdjustment = true;
++      finish();
++    }
 +    return;
 +  }
 +  if (RenderLock::peek()) return;
@@ -1254,6 +1259,8 @@ new file mode 100644
 +}
 +
 +void OnPageHighlightActivity::render(RenderLock&&) {
++  // A queued drag repaint must not flash the toolbar before the parent resumes.
++  if (closeAfterAdjustment) return;
 +  updateDrag();
 +  const bool incremental = dragging.load() && dragFrameReady && firstSnapshot.valid && lastSnapshot.valid;
 +  if (incremental) {
@@ -1363,7 +1370,7 @@ diff --git a/src/activities/reader/OnPageHighlightActivity.h b/src/activities/re
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,65 @@
 +#pragma once
 +#include <Epub.h>
 +#include <Epub/Page.h>
@@ -1415,6 +1422,7 @@ new file mode 100644
 +    void restore(GfxRenderer& renderer) const;
 +  } firstSnapshot, lastSnapshot;
 +  bool dragFrameReady = false;
++  bool closeAfterAdjustment = false;
 +  OnPageHighlightRange paintedRange{};
 +  bool ready = false, failed = false;
 +  int activeEdge = -1;
@@ -2277,7 +2285,7 @@ diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/high
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,138 @@
 +#include <algorithm>
 +#include <atomic>
 +#include <cassert>
@@ -2323,7 +2331,7 @@ new file mode 100644
 + OnPageHighlightRange range{6,15},saved{6,15};
 + Rect firstHandle{40,0,20,20},lastHandle{130,0,20,20};
 + HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(200,100,480);
-+ bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false;
++ bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false,closeAfterAdjustment=false;
 + int activeEdge=-1,updates=0;
 + int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0;
 + std::atomic<bool> dragging{false};std::atomic<int> dragX{0},dragY{0};
@@ -2366,9 +2374,16 @@ new file mode 100644
 + // Release is retained while a panel refresh owns the render lock.
 + RenderLock::busy=true;a.mappedInput.held=false;a.loop();
 + assert(a.releasePending && CLIPPINGS.writes==0);
++ const auto beforeReleaseUpdates=a.updates;
 + RenderLock::busy=false;a.loop();
 + assert(!a.dragging && CLIPPINGS.writes==1 && CLIPPINGS.text=="before alpha bravo");
 + assert(a.saved.start==0 && a.saved.end==15);
++ assert(a.finished && a.closeAfterAdjustment && !a.action.editor && a.updates==beforeReleaseUpdates);
++ OnPageHighlightActivity unchanged;
++ const auto writesBefore=CLIPPINGS.writes;
++ unchanged.mappedInput={50,10,true,true,false,false,0};unchanged.loop();
++ unchanged.mappedInput.held=false;unchanged.mappedInput.down=false;unchanged.loop();
++ assert(unchanged.finished && unchanged.closeAfterAdjustment && CLIPPINGS.writes==writesBefore);
 + OnPageHighlightActivity shortQuote;
 + shortQuote.firstHandle={40,0,20,20};shortQuote.lastHandle={65,0,20,20};
 + shortQuote.mappedInput={70,10,true,true,false,false,0};shortQuote.loop();
@@ -2413,7 +2428,7 @@ diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageRenderTest.cpp
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,97 @@
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -2472,7 +2487,7 @@ new file mode 100644
 + GfxRenderer renderer;std::unique_ptr<Page> page=std::make_unique<Page>();
 + Word words[4]={{{20,80,40,20},0,4},{{80,80,40,20},5,9},{{20,120,40,20},10,14},{{80,120,40,20},15,19}};
 + size_t wordCount=4;int left=0,top=0;
-+ bool ready=true,failed=false,dragFrameReady=false;
++ bool ready=true,failed=false,dragFrameReady=false,closeAfterAdjustment=false;
 + int firstAnchorY=0,lastAnchorY=0;
 + Rect firstHandle{},lastHandle{};HighlightToolbar::Layout toolbar{};
 + std::atomic<bool> dragging{true};
@@ -2506,6 +2521,9 @@ new file mode 100644
 + assert(actual.toolbar.area.x>=6 && actual.toolbar.area.y>=6);
 + assert(actual.toolbar.area.x+actual.toolbar.area.width<=234);
 + assert(actual.toolbar.area.y+actual.toolbar.area.height<=314);
++ const auto renderCount=actual.page->renders;
++ actual.closeAfterAdjustment=true;actual.render(RenderLock{});
++ assert(actual.page->renders==renderCount); // pending repaint cannot flash a popup
 + std::cout<<"Saved highlight drag: incremental pixels match clean redraws, no page renders during movement, floating toolbar on release\n";
 +}
 diff --git a/test/highlight_word_edit/TouchReleaseTest.cpp b/test/highlight_word_edit/TouchReleaseTest.cpp
