@@ -1504,3 +1504,708 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 +### crASHink page-turn performance
 +
 +- Reuse one clipping-file reader per render, filter impossible highlight matches before SD reads, and collect short boundary candidates in one matching pass. Filters are session-only, conservative, and invalidated after edits.
+
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -400,14 +400,7 @@
+
+ bool hasVisibleWordText(const std::string& text) { return hasVisibleWordText(text.c_str()); }
+
+-struct ClippingPageMatch {
+-  uint16_t startWord = 0;
+-  uint16_t endWord = 0;
+-  uint16_t tableSelection = UINT16_MAX;
+-  uint16_t matchedTokens = 0;
+-  bool startsAtClipStart = false;
+-  bool reachesClipEnd = false;
+-};
++using ClippingPageMatch = ClippingPageMatchCache::Match;
+
+ bool isUtf8SpaceAt(const char* cursor, size_t& advance) {
+   const auto c = static_cast<unsigned char>(cursor[0]);
+@@ -721,12 +714,14 @@
+ struct ClippingNeighborPageCache {
+   int index = -1;
+   std::unique_ptr<Page> page;
++  bool failed = false;
+
+   Page* load(Section& section, const int requestedIndex) {
+     if (index != requestedIndex) {
+       page.reset();
+       index = requestedIndex;
+       page = section.loadPage(requestedIndex);
++      if (!page) failed = true;
+     }
+     return page.get();
+   }
+@@ -735,7 +730,7 @@
+ bool findClippingTextOnPage(Section& section, const Page& page, const std::string& rawClippingText,
+                             ClippingPageMatch& match, bool* uniqueMatch = nullptr,
+                             const uint8_t expectedTableColumn = UINT8_MAX,
+-                            ClippingNeighborPageCache* sharedNeighborCache = nullptr) {
++                            ClippingNeighborPageCache* sharedNeighborCache = nullptr, int requestedPage = -1) {
+   ClippingNeighborPageCache localNeighborCache;
+   auto& neighborCache = sharedNeighborCache ? *sharedNeighborCache : localNeighborCache;
+   const std::string clippingText = trimLeadingClipPunctuation(rawClippingText);
+@@ -750,7 +745,7 @@
+   if (currentWordCount == 0) return false;
+   for (const int direction : {1, -1}) {
+     if (!(boundaryDirections & (direction > 0 ? 1 : 2))) continue;
+-    const int neighborIndex = section.currentPage + direction;
++    const int neighborIndex = (requestedPage >= 0 ? requestedPage : section.currentPage) + direction;
+     if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
+     // loadPage leaves currentPage unchanged; reuse this neighbor for later clips.
+     const auto* neighbor = neighborCache.load(section, neighborIndex);
+@@ -2541,6 +2536,8 @@
+ }
+
+ void EpubReaderActivity::onExit() {
++  clippingPreparePage.reset();
++  clippingPageMatches.reset();
+   sdFontSystem.setSettingsPersistenceCallback(nullptr, nullptr);
+   // Drop the scalable-family catalog retained during reading. The active font
+   // and its PSRAM face lifetime remain managed by SdCardFontSystem.
+@@ -3452,7 +3449,8 @@
+     if (drainPendingManualPageTurn()) {
+       return;
+     }
+-    idlePrewarmNextPage();
++    idlePrepareClippingMatches();
++    if (!clippingPreparePage) idlePrewarmNextPage();
+     return;
+   }
+
+@@ -7763,23 +7761,69 @@
+ #endif
+ #endif
+
+-void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
+-                                                const int orientedMarginLeft) {
+-  if (!section || !CLIPPINGS.hasClippings() || renderer.getRenderMode() != GfxRenderer::BW) {
+-    return;
+-  }
+-
+-  // The BW frame owns the dithered marker and its redrawn black text. Repeating
+-  // that marker in the grayscale anti-aliasing planes overlays gray pixels on
+-  // the glyphs and makes a saved clipping look washed out.
+-
+-#if CROSSINK_APP_CAP_TOUCH
+-  currentPageClippingTouchTargets.fill({});
+-  currentPageClippingTouchTargetCount = 0;
+-#endif
+-
++ClippingPageMatchCache* EpubReaderActivity::prepareClippingMatchCache() {
++  if (!CLIPPINGS.hasClippings()) {
++    clippingPreparePage.reset();
++    clippingPageMatches.reset();
++    return nullptr;
++  }
++  if (!section || activeSectionLayoutSignature == 0) return nullptr;
++  if (!clippingPageMatches) {
++    if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), 20U * 1024U, 8U * 1024U)) return nullptr;
++    clippingPageMatches = makeUniqueNoThrow<ClippingPageMatchCache>();
++    if (!clippingPageMatches) return nullptr;
++  }
++  const ClippingPageMatchCache::Key key{section.get(), activeSectionLayoutSignature, CLIPPINGS.contentRevision(),
++                                        currentSpineIndex, section->pageCount};
++  if (clippingPageMatches->resetFor(key)) {
++    clippingPrepareRetryAt = 0;
++    clippingPreparePage.reset();
++    clippingPreparePageNumber = -1;
++  }
++  return clippingPageMatches.get();
++}
++
++void EpubReaderActivity::idlePrepareClippingMatches() {
++  RenderLock lock(*this, RenderLock::Mode::Try);
++  if (!lock.ownsLock() || !section || activeFootnotePreview || pendingManualPageTurns.hasPending() ||
++      lastRenderCompleteMs == 0 || millis() - lastRenderCompleteMs < 100) return;
++  auto* cache = prepareClippingMatchCache();
++  if (!cache || static_cast<int32_t>(millis() - clippingPrepareRetryAt) < 0) return;
++  // Prioritize the next page, then backwards navigation, then two more forward
++  // pages. One bounded slice runs per idle loop; currentPage never changes.
++  for (const int distance : {1, -1, 2, -2, 3}) {
++    const int target = section->currentPage + distance;
++    if (target < 0 || target >= section->pageCount) continue;
++    auto* entry = cache->find(target);
++    if (entry && entry->ready) continue;
++    entry = &cache->claim(target);
++    if (!clippingPreparePage || clippingPreparePageNumber != target) {
++      clippingPreparePage.reset();
++      if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), 32U * 1024U, 16U * 1024U)) return;
++      clippingPreparePageNumber = target;
++      clippingPreparePage = section->loadPage(target);
++      if (!clippingPreparePage) { clippingPrepareRetryAt = millis() + 1000; return; }
++    }
++    collectClippingPageMatches(*clippingPreparePage, *entry, true);
++    if (entry->ready || entry->failed) {
++      if (entry->failed) clippingPrepareRetryAt = millis() + 1000;
++      clippingPreparePage.reset();
++      clippingPreparePageNumber = -1;
++    }
++    return;
++  }
++}
++
++void EpubReaderActivity::collectClippingPageMatches(const Page& page, ClippingPageMatchCache::Entry& entry,
++                                                   const bool incremental) {
++  if (entry.failed) {
++    entry.nextClipping = 0;
++    entry.count = 0;
++    entry.failed = false;
++  }
+   const auto highlightStartedMs = millis();
+   uint16_t highlightTextReads = 0;
++  size_t visited = 0;
+   uint16_t highlightRejected = 0;
+   clippingPageFilter::Page textFilter;
+   forEachVisiblePageWord(page, [&](const uint16_t, const PageTextLine&, const TextBlock& block, const size_t i) {
+@@ -7789,19 +7833,23 @@
+     return true;
+   });
+   ClippingNeighborPageCache neighborCache;
+-  std::array<ClippingPageMatch, CLIPPING_MAX_PAGE_MATCHES> matches;
+-  std::array<size_t, CLIPPING_MAX_PAGE_MATCHES> matchClippingIndices;
+-  uint16_t matchCount = 0;
++  auto& matches = entry.matches;
++  auto& matchClippingIndices = entry.clippingIndices;
++  auto& matchCount = entry.count;
+   const bool canUseStoredRanges = section->pageCount > 0 && section->pageCount <= UINT16_MAX &&
+-                                  section->currentPage >= 0 && section->currentPage < section->pageCount;
+-  const uint16_t currentPage = canUseStoredRanges ? static_cast<uint16_t>(section->currentPage) : 0;
++                                  entry.page >= 0 && entry.page < section->pageCount;
++  const uint16_t currentPage = canUseStoredRanges ? static_cast<uint16_t>(entry.page) : 0;
+   const uint16_t currentPageCount = canUseStoredRanges ? static_cast<uint16_t>(section->pageCount) : 0;
+   const uint32_t currentClippingLayoutSignature = clippingWordLayoutSignature(activeSectionLayoutSignature);
+   std::string clippingText;
+   FsFile clippingReader;
+   bool clippingReaderAttempted = false;
+   const auto& clippings = CLIPPINGS.getClippings();
+-  for (size_t clippingIndex = 0; clippingIndex < clippings.size(); ++clippingIndex) {
++  for (; entry.nextClipping < clippings.size() && matchCount < matches.size();) {
++    // Yield between clipping checks so input and visible renders can run.
++    if (incremental && visited > 0 && (visited >= 8 || millis() - highlightStartedMs >= 6)) break;
++    ++visited;
++    const size_t clippingIndex = entry.nextClipping++;
+     const Clipping& clipping = clippings[clippingIndex];
+     if (clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex)) {
+       continue;
+@@ -7837,13 +7885,15 @@
+         const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
+         matchedText =
+             findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn,
+-                                   &neighborCache);
++                                   &neighborCache, entry.page);
+         const bool coversStoredBoundaries = (currentPage != clipping.startPage || match.startsAtClipStart) &&
+                                             (currentPage != clipping.endPage || match.reachesClipEnd);
+         if (matchedText && uniqueTextMatch && coversStoredBoundaries && legacyWordLayout) {
+           CLIPPINGS.cacheResolvedLayoutRange(clippingIndex, currentPage, match.startWord, match.endWord,
+                                              currentClippingLayoutSignature);
+         }
++      } else {
++        entry.failed = true;
+       }
+     }
+     if (matchedStoredRange || matchedText) {
+@@ -7855,6 +7905,8 @@
+       }
+     }
+   }
++  entry.failed = entry.failed || neighborCache.failed;
++  entry.ready = !entry.failed && (entry.nextClipping >= clippings.size() || matchCount >= matches.size());
+   clippingReader.close();
+   neighborCache.page.reset();
+   const auto highlightElapsedMs = millis() - highlightStartedMs;
+@@ -7862,6 +7914,35 @@
+     LOG_DBG("CLIP", "Page highlight matching: %lu ms, %u text reads, %u rejected",
+             static_cast<unsigned long>(highlightElapsedMs), highlightTextReads, highlightRejected);
+   }
++}
++
++void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
++                                                const int orientedMarginLeft) {
++  if (!section || !CLIPPINGS.hasClippings() || renderer.getRenderMode() != GfxRenderer::BW) {
++    return;
++  }
++
++  // The BW frame owns the dithered marker and its redrawn black text. Repeating
++  // that marker in the grayscale anti-aliasing planes overlays gray pixels on
++  // the glyphs and makes a saved clipping look washed out.
++
++#if CROSSINK_APP_CAP_TOUCH
++  currentPageClippingTouchTargets.fill({});
++  currentPageClippingTouchTargetCount = 0;
++#endif
++
++  clippingPreparePage.reset();
++  clippingPreparePageNumber = -1;
++  ClippingPageMatchCache::Entry fallback;
++  ClippingPageMatchCache::Entry* prepared = &fallback;
++  fallback.page = section->currentPage;
++  if (auto* cache = prepareClippingMatchCache()) {
++    prepared = &cache->claim(section->currentPage);
++  }
++  if (!prepared->ready) collectClippingPageMatches(page, *prepared, false);
++  const auto& matches = prepared->matches;
++  const auto& matchClippingIndices = prepared->clippingIndices;
++  const uint16_t matchCount = prepared->count;
+   if (matchCount == 0) {
+     return;
+   }
+
+diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+--- a/src/activities/reader/EpubReaderActivity.h
++++ b/src/activities/reader/EpubReaderActivity.h
+@@ -15,6 +15,7 @@
+ #include "BookReadingStats.h"
+ #include "BookmarkStore.h"
+ #include "ClippingStore.h"
++#include "clippings/ClippingPageMatchCache.h"
+ #include "EndOfBookOptions.h"
+ #include "EpubLinkReturnState.h"
+ #include "EpubReaderMenuModel.h"
+@@ -262,6 +263,14 @@
+   bool pendingReadFolderMove = false;
+   // The end screen owns these UI resources only while it is visible.
+   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
++
++  std::unique_ptr<ClippingPageMatchCache> clippingPageMatches;
++  std::unique_ptr<Page> clippingPreparePage;
++  int clippingPreparePageNumber = -1;
++  unsigned long clippingPrepareRetryAt = 0;
++  ClippingPageMatchCache* prepareClippingMatchCache();
++  void collectClippingPageMatches(const Page& page, ClippingPageMatchCache::Entry& entry, bool incremental);
++  void idlePrepareClippingMatches();
+
+   // Footnote support
+   std::vector<FootnoteEntry> currentPageFootnotes;
+@@ -528,8 +537,8 @@
+   bool backgroundSectionBuildHasHeap();
+   void idlePrewarmNextPage();
+   bool skipLoopDelay() override {
+-    return sectionBuildWantsTick() && !backgroundBuildPausedForLowMemory &&
+-           !backgroundBuildYieldForInput.load(std::memory_order_relaxed);
++    return clippingPreparePage || (sectionBuildWantsTick() && !backgroundBuildPausedForLowMemory &&
++                                  !backgroundBuildYieldForInput.load(std::memory_order_relaxed));
+   }
+   bool isReaderActivity() const override { return true; }
+   bool isBookReaderActivity() const override { return true; }
+
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -98,6 +98,7 @@
+   bool saveToFile();
+   void clearAll();
+
++  uint32_t contentRevision() const { return contentRevision_; }
+   bool hasClippings() const { return !clippings.empty(); }
+   size_t clippingCount() const { return clippings.size(); }
+   const Clipping* clippingAt(size_t index) const;
+@@ -132,6 +133,7 @@
+   std::string bookTitle;
+   std::string bookAuthor;
+   std::string storeFilePath;
++  uint32_t contentRevision_ = 1;
+   bool dirty = false;
+   // On-disk format of storeFilePath as last loaded or written; appends need VERSION.
+   uint8_t fileVersion = 0;
+
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -118,6 +118,7 @@
+ }  // namespace
+
+ bool ClippingStore::updateClippingText(const size_t index, const std::string& text) {
++  ++contentRevision_;
+   if (index >= clippings.size() || text.empty() || text.size() > CLIPPING_TEXT_MAX) return false;
+   const Clipping previous = clippings[index];
+   const bool previousDirty = dirty;
+@@ -146,6 +147,7 @@
+
+ bool ClippingStore::loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
+                                 const std::string& bookType) {
++  ++contentRevision_;
+   if (bookType != "epub") {
+     LOG_ERR("CLIP", "Unknown clipping book type: %s", bookType.c_str());
+     return false;
+@@ -170,6 +172,7 @@
+ }
+
+ void ClippingStore::unload() {
++  ++contentRevision_;
+   if (dirty) saveToFile();
+   std::vector<Clipping>().swap(clippings);
+   bookFilePath.clear();
+@@ -185,6 +188,7 @@
+                                                     const uint16_t wordCount, const char* chapterTitle,
+                                                     const uint16_t paragraphIndex, const std::string& text,
+                                                     const uint16_t tableSelection, const uint32_t layoutSignature) {
++  ++contentRevision_;
+   if (clippings.size() >= CLIPPING_MAX_PER_BOOK) {
+     LOG_ERR("CLIP", "Clipping limit (%u) reached", CLIPPING_MAX_PER_BOOK);
+     return AddResult::LimitReached;
+@@ -303,6 +307,7 @@
+ }
+
+ bool ClippingStore::removeClippingAt(const size_t index) {
++  ++contentRevision_;
+   if (index >= clippings.size()) return false;
+   Clipping clipping = std::move(clippings[index]);
+   clippings.erase(clippings.begin() + index);
+@@ -316,6 +321,7 @@
+ }
+
+ bool ClippingStore::removeClippings(const std::vector<bool>& remove) {
++  ++contentRevision_;
+   if (remove.size() != clippings.size()) return false;
+   std::vector<Clipping> kept;
+   kept.reserve(clippings.size());
+@@ -415,6 +421,7 @@
+ }
+
+ void ClippingStore::clearAll() {
++  ++contentRevision_;
+   std::vector<Clipping>().swap(clippings);
+   dirty = false;
+   if (!storeFilePath.empty() && Storage.exists(storeFilePath.c_str())) {
+
+diff --git a/test/clipping_page_turn/CMakeLists.txt b/test/clipping_page_turn/CMakeLists.txt
+--- a/test/clipping_page_turn/CMakeLists.txt
++++ b/test/clipping_page_turn/CMakeLists.txt
+@@ -19,3 +19,13 @@
+ target_include_directories(clipping_page_turn_io_test PRIVATE ${REPO_ROOT}/src ${CMAKE_CURRENT_BINARY_DIR})
+ target_compile_options(clipping_page_turn_io_test PRIVATE -UNDEBUG)
+ add_test(NAME clipping_page_turn_io COMMAND clipping_page_turn_io_test)
++set(COLLECTOR_INC ${CMAKE_CURRENT_BINARY_DIR}/ClippingCollector.inc)
++set(FULL_MATCHER_INC ${CMAKE_CURRENT_BINARY_DIR}/ClippingFullMatcher.inc)
++add_custom_command(OUTPUT ${COLLECTOR_INC} ${FULL_MATCHER_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractCollector.py
++    ${MATCHER_SOURCE} ${FULL_MATCHER_INC} ${COLLECTOR_INC}
++  DEPENDS ${MATCHER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractCollector.py VERBATIM)
++add_executable(clipping_page_cache_test ClippingPageCacheTest.cpp ${COLLECTOR_INC} ${FULL_MATCHER_INC})
++target_include_directories(clipping_page_cache_test PRIVATE ${REPO_ROOT}/src ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(clipping_page_cache_test PRIVATE -UNDEBUG)
++add_test(NAME clipping_page_cache COMMAND clipping_page_cache_test)
+
+diff --git a/test/clipping_page_turn/ExtractMatcher.py b/test/clipping_page_turn/ExtractMatcher.py
+--- a/test/clipping_page_turn/ExtractMatcher.py
++++ b/test/clipping_page_turn/ExtractMatcher.py
+@@ -1,6 +1,6 @@
+ from pathlib import Path
+ import sys
+ source = Path(sys.argv[1]).read_text()
+-start = source.index('struct ClippingPageMatch {')
++start = source.index('using ClippingPageMatch = ClippingPageMatchCache::Match;')
+ end = source.index('uint16_t countVisiblePageWords(', start)
+ Path(sys.argv[2]).write_text(source[start:end])
+
+diff --git a/test/clipping_page_turn/ClippingPageTurnTest.cpp b/test/clipping_page_turn/ClippingPageTurnTest.cpp
+--- a/test/clipping_page_turn/ClippingPageTurnTest.cpp
++++ b/test/clipping_page_turn/ClippingPageTurnTest.cpp
+@@ -11,6 +11,7 @@
+ #include <vector>
+
+ #include "ClippingStore.h"
++#include "clippings/ClippingPageMatchCache.h"
+ #include "clippings/ClippingHighlightGeometry.h"
+ #include "clippings/ClippingMatchTracker.h"
+ #include "clippings/ClippingPageFilter.h"
+
+diff --git a/test/clipping_page_turn/ClippingPageTurnIoTest.cpp b/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
+--- a/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
++++ b/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
+@@ -51,6 +51,7 @@
+  public:
+   std::string storeFilePath = "clippings.bin";
+   std::vector<Clipping> clippings;
++  uint32_t contentRevision_ = 1;
+   bool dirty = false, failWrite = false;
+   bool writeToFile(const std::string*, size_t) { return !failWrite; }
+   bool openTextReader(FsFile&) const;
+
+diff --git a/src/clippings/ClippingPageMatchCache.h b/src/clippings/ClippingPageMatchCache.h
+new file mode 100644
+--- /dev/null
++++ b/src/clippings/ClippingPageMatchCache.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++// Resolved positive AND negative results. Entries contain no Page/TextBlock
++// pointers; repainting a prepared page needs no text reads or text matching.
++class ClippingPageMatchCache {
++ public:
++  struct Match {
++    uint16_t startWord = 0;
++    uint16_t endWord = 0;
++    uint16_t tableSelection = UINT16_MAX;
++    uint16_t matchedTokens = 0;
++    bool startsAtClipStart = false;
++    bool reachesClipEnd = false;
++  };
++  static constexpr size_t MATCHES = 16;
++  static constexpr size_t PAGES = 6;
++  struct Key {
++    const void* section = nullptr;
++    uint32_t layout = 0;
++    uint32_t revision = 0;
++    int spine = -1;
++    int pageCount = 0;
++    bool operator==(const Key& other) const {
++      return section == other.section && layout == other.layout && revision == other.revision && spine == other.spine &&
++             pageCount == other.pageCount;
++    }
++  };
++  struct Entry {
++    std::array<Match, MATCHES> matches{};
++    std::array<size_t, MATCHES> clippingIndices{};
++    size_t nextClipping = 0;
++    uint32_t usedAt = 0;
++    int page = -1;
++    uint16_t count = 0;
++    bool ready = false;
++    bool failed = false;
++  };
++  bool resetFor(const Key& next) {
++    if (key == next) return false;
++    key = next;
++    entries = {};
++    tick = 0;
++    return true;
++  }
++  Entry* find(int page) {
++    for (auto& entry : entries) {
++      if (entry.page == page) {
++        entry.usedAt = ++tick;
++        return &entry;
++      }
++    }
++    return nullptr;
++  }
++  Entry& claim(int page) {
++    if (auto* entry = find(page)) return *entry;
++    auto* victim = &entries[0];
++    for (auto& entry : entries) {
++      if (entry.page < 0) {
++        victim = &entry;
++        break;
++      }
++      if (entry.usedAt < victim->usedAt) victim = &entry;
++    }
++    *victim = {};
++    victim->page = page;
++    victim->usedAt = ++tick;
++    return *victim;
++  }
++
++ private:
++  Key key;
++  std::array<Entry, PAGES> entries{};
++  uint32_t tick = 0;
++};
++static_assert(sizeof(ClippingPageMatchCache) <= 2304, "Bounded nearby-page result cache");
+
+diff --git a/test/clipping_page_turn/ExtractCollector.py b/test/clipping_page_turn/ExtractCollector.py
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/ExtractCollector.py
+@@ -0,0 +1,9 @@
++from pathlib import Path
++import sys
++source = Path(sys.argv[1]).read_text()
++a = source.index('using ClippingPageMatch = ClippingPageMatchCache::Match;')
++b = source.index('uint16_t clampSectionPage(', a)
++c = source.index('void EpubReaderActivity::collectClippingPageMatches(')
++d = source.index('void EpubReaderActivity::drawClippingHighlights(', c)
++Path(sys.argv[2]).write_text(source[a:b])
++Path(sys.argv[3]).write_text(source[c:d])
+
+diff --git a/test/clipping_page_turn/ClippingPageCacheTest.cpp b/test/clipping_page_turn/ClippingPageCacheTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/ClippingPageCacheTest.cpp
+@@ -0,0 +1,169 @@
++#include <algorithm>
++#include <cassert>
++#include <cctype>
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <type_traits>
++#include <vector>
++
++#include "ClippingStore.h"
++#undef CLIPPINGS
++#include "clippings/ClippingHighlightGeometry.h"
++#include "clippings/ClippingMatchTracker.h"
++#include "clippings/ClippingPageMatchCache.h"
++#define LOG_DBG(...) \
++  do {               \
++  } while (0)
++#define LOG_ERR(...) \
++  do {               \
++  } while (0)
++unsigned long ticks = 0;
++unsigned long millis() { return ticks++; }
++struct TextBlock {
++  std::vector<std::string> words;
++  uint16_t wordCount() const { return words.size(); }
++  const char* wordText(uint16_t i) const { return words[i].c_str(); }
++  bool wordEndsWithInsertedHyphen(uint16_t) const { return false; }
++};
++struct PageTextLine {
++  const TextBlock* block;
++  uint16_t tableSelection = UINT16_MAX;
++};
++struct TableFragmentRow {
++  static constexpr uint8_t MAX_SERIALIZED_CELLS = 8;
++};
++struct Page {
++  TextBlock block;
++  bool forEachTextLine(bool (*visit)(const PageTextLine&, void*), void* context) const {
++    return visit({&block}, context);
++  }
++};
++struct Section {
++  int currentPage = 0, pageCount = 4;
++  std::vector<Page> pages = {{{{"unused"}}}, {{{"unrelated"}}}, {{{"alpha"}}}, {{{"beta"}}}};
++  std::vector<int> reads;
++  bool failPage = false;
++  std::unique_ptr<Page> loadPage(int index) {
++    reads.push_back(index);
++    if (failPage) return nullptr;
++    return std::make_unique<Page>(pages.at(index));
++  }
++};
++struct FsFile {
++  void close() {}
++};
++struct ClipStoreStub {
++  std::vector<Clipping> records;
++  std::vector<std::string> texts;
++  size_t reads = 0;
++  bool failRead = false;
++  const auto& getClippings() const { return records; }
++  bool openTextReader(FsFile&) { return !failRead; }
++  bool readClippingText(const Clipping& clip, std::string& text, FsFile&) {
++    ++reads;
++    if (failRead) return false;
++    text = texts.at(&clip - records.data());
++    clip.textFilter.build(text.data(), text.size());
++    return true;
++  }
++  bool cacheResolvedLayoutRange(size_t index, uint16_t page, uint16_t first, uint16_t last, uint32_t signature) {
++    return cacheClippingResolvedLayoutRange(records[index], page, first, last, signature);
++  }
++} CLIPPINGS;
++bool hasEmSpacePrefix(const char* s) { return std::strlen(s) >= 3 && std::memcmp(s, "\xE2\x80\x83", 3) == 0; }
++#include "ClippingFullMatcher.inc"
++uint8_t tableColumnForSelection(uint16_t selection) {
++  return selection == UINT16_MAX ? UINT8_MAX : selection % TableFragmentRow::MAX_SERIALIZED_CELLS;
++}
++class EpubReaderActivity {
++ public:
++  std::unique_ptr<Section> section = std::make_unique<Section>();
++  int currentSpineIndex = 0;
++  uint32_t activeSectionLayoutSignature = 17;
++  void collectClippingPageMatches(const Page&, ClippingPageMatchCache::Entry&, bool);
++};
++#include "ClippingCollector.inc"
++int main() {
++  EpubReaderActivity reader;
++  Clipping clip;
++  clip.spineIndex = 0;
++  clip.pageCount = 1000;
++  clip.wordCount = 2;
++  // 500 imported clips; the matching one is intentionally last so every slice
++  // must resume its real production collector cursor correctly.
++  CLIPPINGS.records.assign(500, clip);
++  CLIPPINGS.texts.assign(500, "different wording");
++  CLIPPINGS.texts.back() = "alpha beta";
++  ClippingPageMatchCache cache;
++  ClippingPageMatchCache::Key key{reader.section.get(), 17, 1, 0, 4};
++  assert(cache.resetFor(key));
++  auto& entry = cache.claim(2);
++  size_t slices = 0;
++  while (!entry.ready) {
++    const auto before = entry.nextClipping;
++    reader.collectClippingPageMatches(reader.section->pages[2], entry, true);
++    assert(entry.nextClipping > before && entry.nextClipping - before <= 8);
++    assert(++slices <= 500);
++  }
++  assert(entry.count == 1 && entry.clippingIndices[0] == 499);
++  assert(entry.matches[0].startWord == 0 && entry.matches[0].endWord == 0);
++  assert(reader.section->currentPage == 0);  // prefetched page != visible page
++  assert(std::find(reader.section->reads.begin(), reader.section->reads.end(), 3) != reader.section->reads.end());
++  ClippingPageMatchCache::Entry synchronous;
++  synchronous.page = 2;
++  reader.collectClippingPageMatches(reader.section->pages[2], synchronous, false);
++  assert(synchronous.ready && synchronous.count == entry.count);
++  assert(synchronous.clippingIndices[0] == entry.clippingIndices[0]);
++  assert(synchronous.matches[0].startWord == entry.matches[0].startWord);
++  const auto textReads = CLIPPINGS.reads, pageReads = reader.section->reads.size();
++  for (int repaint = 0; repaint < 100; ++repaint) {
++    auto& hit = cache.claim(2);
++    if (!hit.ready) reader.collectClippingPageMatches(reader.section->pages[2], hit, false);
++    assert(hit.count == 1);
++  }
++  assert(CLIPPINGS.reads == textReads && reader.section->reads.size() == pageReads);
++  // Cache pages with no matches too; otherwise empty pages retain the delay.
++  auto& empty = cache.claim(1);
++  reader.collectClippingPageMatches(reader.section->pages[1], empty, false);
++  assert(empty.ready && empty.count == 0);
++  assert(cache.find(1)->ready);
++  // Every piece of layout/content identity must invalidate positive and negative results.
++  for (int field = 0; field < 5; ++field) {
++    auto changed = key;
++    if (field == 0) ++changed.layout;
++    if (field == 1) ++changed.revision;
++    if (field == 2) ++changed.spine;
++    if (field == 3) ++changed.pageCount;
++    if (field == 4) changed.section = nullptr;
++    assert(cache.resetFor(changed));
++    assert(cache.find(1) == nullptr && cache.find(2) == nullptr);
++    cache.resetFor(key);
++    cache.claim(1).ready = true;
++    cache.claim(2).ready = true;
++  }
++  // A failed SD read is never frozen into a cached "no highlight" result.
++  CLIPPINGS.failRead = true;
++  ClippingPageMatchCache::Entry failed;
++  failed.page = 2;
++  reader.collectClippingPageMatches(reader.section->pages[2], failed, false);
++  assert(failed.failed && !failed.ready);
++  CLIPPINGS.failRead = false;
++  reader.collectClippingPageMatches(reader.section->pages[2], failed, false);
++  assert(failed.ready && failed.count == 1);
++  reader.section->failPage = true;
++  ClippingPageMatchCache::Entry failedNeighbor;
++  failedNeighbor.page = 2;
++  reader.collectClippingPageMatches(reader.section->pages[2], failedNeighbor, false);
++  assert(failedNeighbor.failed && !failedNeighbor.ready);
++  reader.section->failPage = false;
++  reader.collectClippingPageMatches(reader.section->pages[2], failedNeighbor, false);
++  assert(failedNeighbor.ready && failedNeighbor.count == 1);
++  for (int i = 0; i < 30; ++i) cache.claim(i).ready = true;
++  assert(cache.find(29) && !cache.find(0));
++  std::cout << "500-clipping idle preparation: " << slices
++            << " bounded slices; 100 cached renders: 0 text reads, 0 neighbor loads; invalidation, negative cache, and "
++               "I/O retries passed\n";
++}
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -633,3 +633,4 @@
+ ### crASHink page-turn performance
+
+ - Reuse one clipping-file reader per render, filter impossible highlight matches before SD reads, and collect short boundary candidates in one matching pass. Filters are session-only, conservative, and invalidated after edits.
++- Cache nearby pages' resolved highlights (including empty results) and prepare them in bounded idle slices; invalidate after clipping edits, sync/reloads, chapter or layout changes. Prepared page turns do no clipping-text reads or matching.
