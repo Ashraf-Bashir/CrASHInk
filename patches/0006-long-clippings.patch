@@ -738,3 +738,769 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      const int neighborIndex = section.currentPage + direction;
      if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
      // loadPage leaves currentPage unchanged; reuse this neighbor for later clips.
+
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -404,6 +404,7 @@
+   uint16_t startWord = 0;
+   uint16_t endWord = 0;
+   uint16_t tableSelection = UINT16_MAX;
++  uint16_t matchedTokens = 0;
+   bool startsAtClipStart = false;
+   bool reachesClipEnd = false;
+ };
+@@ -590,6 +591,7 @@
+     return false;
+   }
+
++  match.matchedTokens = matchedTokens;
+   match.startWord = startPageWord;
+   match.endWord = lastWord;
+   match.tableSelection = tableSelection;
+@@ -602,7 +604,7 @@
+ bool findClippingTextInPages(const Pages& page, const std::string& clippingText, ClippingPageMatch& match,
+                              bool* uniqueMatch = nullptr, const uint8_t expectedTableColumn = UINT8_MAX,
+                              const bool allowShortBoundary = false, const uint16_t requiredBoundary = UINT16_MAX,
+-                             uint8_t* boundaryDirections = nullptr) {
++                             uint8_t* boundaryDirections = nullptr, bool* shortBoundaryFound = nullptr) {
+   if (clippingText.empty()) return false;
+
+   const uint16_t tokenCount = countClipTokens(clippingText);
+@@ -638,14 +640,19 @@
+                   .match !=
+                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
+               matchClipRunFromPageWord(page, tokenCount, cursor, token, tokenLen, wordIndex, tokenIndex,
+-                                       minPartialMatch, expectedTableColumn, candidate, allowShortBoundary) &&
++                                       minPartialMatch, expectedTableColumn, candidate, allowShortBoundary || shortBoundaryFound) &&
+               (requiredBoundary == UINT16_MAX ||
+                (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
+-            if (boundaryDirections) {
+-              // Accumulate every candidate, so repeated text cannot hide a
+-              // possible match on the other side of the page break.
+-              if (!candidate.reachesClipEnd) *boundaryDirections |= 1;  // next
+-              if (!candidate.startsAtClipStart) *boundaryDirections |= 2;  // previous
++            const bool reliable = ClippingTextMatcher::isReliableRun(
++                tokenIndex, candidate.reachesClipEnd, candidate.matchedTokens, minPartialMatch);
++            if (!reliable && shortBoundaryFound) {
++              *shortBoundaryFound = true;
++              if (boundaryDirections) {
++                if (!candidate.reachesClipEnd) *boundaryDirections |= 1;
++                if (!candidate.startsAtClipStart) *boundaryDirections |= 2;
++              }
++              ++tokenIndex;
++              continue;
+             }
+             const bool candidateComplete = candidate.startsAtClipStart && candidate.reachesClipEnd;
+             // The first hit is kept, unless a later one covers the whole
+@@ -732,14 +739,12 @@
+   ClippingNeighborPageCache localNeighborCache;
+   auto& neighborCache = sharedNeighborCache ? *sharedNeighborCache : localNeighborCache;
+   const std::string clippingText = trimLeadingClipPunctuation(rawClippingText);
+-  if (findClippingTextInPages(page, clippingText, match, uniqueMatch, expectedTableColumn)) return true;
+-
+-  // Only read a neighbor if this page has an otherwise plausible short fragment.
+-  // A coincidental trailing "and" must agree with text across the page break.
+-  ClippingPageMatch shortMatch;
+   uint8_t boundaryDirections = 0;
+-  if (!findClippingTextInPages(page, clippingText, shortMatch, nullptr, expectedTableColumn, true, UINT16_MAX,
+-                              &boundaryDirections)) return false;
++  bool shortBoundaryFound = false;
++  // Collect reliable runs and short boundary candidates in one traversal.
++  if (findClippingTextInPages(page, clippingText, match, uniqueMatch, expectedTableColumn, false, UINT16_MAX,
++                             &boundaryDirections, &shortBoundaryFound)) return true;
++  if (!shortBoundaryFound) return false;
+
+   const uint16_t currentWordCount = countVisiblePageWords(page);
+   if (currentWordCount == 0) return false;
+@@ -7773,6 +7778,16 @@
+   currentPageClippingTouchTargetCount = 0;
+ #endif
+
++  const auto highlightStartedMs = millis();
++  uint16_t highlightTextReads = 0;
++  uint16_t highlightRejected = 0;
++  clippingPageFilter::Page textFilter;
++  forEachVisiblePageWord(page, [&](const uint16_t, const PageTextLine&, const TextBlock& block, const size_t i) {
++    const char* word = block.wordText(static_cast<uint16_t>(i));
++    textFilter.addWord(word + (hasEmSpacePrefix(word) ? 3 : 0),
++                       block.wordEndsWithInsertedHyphen(static_cast<uint16_t>(i)));
++    return true;
++  });
+   ClippingNeighborPageCache neighborCache;
+   std::array<ClippingPageMatch, CLIPPING_MAX_PAGE_MATCHES> matches;
+   std::array<size_t, CLIPPING_MAX_PAGE_MATCHES> matchClippingIndices;
+@@ -7783,7 +7798,8 @@
+   const uint16_t currentPageCount = canUseStoredRanges ? static_cast<uint16_t>(section->pageCount) : 0;
+   const uint32_t currentClippingLayoutSignature = clippingWordLayoutSignature(activeSectionLayoutSignature);
+   std::string clippingText;
+-  clippingText.reserve(CLIPPING_TEXT_RESERVE);
++  FsFile clippingReader;
++  bool clippingReaderAttempted = false;
+   const auto& clippings = CLIPPINGS.getClippings();
+   for (size_t clippingIndex = 0; clippingIndex < clippings.size(); ++clippingIndex) {
+     const Clipping& clipping = clippings[clippingIndex];
+@@ -7803,9 +7819,20 @@
+     const bool shouldSearchText =
+         legacyWordLayout ? (!matchedStoredRange && pageInStoredRange) : (!storedLayoutMatches || pageInStoredRange);
+     bool matchedText = false;
++    if (!matchedStoredRange && shouldSearchText &&
++        !textFilter.mayMatch(clipping.textFilter, tableColumnForSelection(clipping.tableSelection) != UINT8_MAX)) {
++      ++highlightRejected;
++      continue;
++    }
+     if (!matchedStoredRange && shouldSearchText) {
+       clippingText.clear();
+-      if (CLIPPINGS.readClippingText(clipping, clippingText)) {
++      if (!clippingReaderAttempted) {
++        clippingReaderAttempted = true;
++        CLIPPINGS.openTextReader(clippingReader);
++        clippingText.reserve(CLIPPING_TEXT_RESERVE);
++      }
++      ++highlightTextReads;
++      if (CLIPPINGS.readClippingText(clipping, clippingText, clippingReader)) {
+         bool uniqueTextMatch = false;
+         const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
+         matchedText =
+@@ -7827,6 +7854,13 @@
+         break;
+       }
+     }
++  }
++  clippingReader.close();
++  neighborCache.page.reset();
++  const auto highlightElapsedMs = millis() - highlightStartedMs;
++  if (highlightElapsedMs >= 40) {
++    LOG_DBG("CLIP", "Page highlight matching: %lu ms, %u text reads, %u rejected",
++            static_cast<unsigned long>(highlightElapsedMs), highlightTextReads, highlightRejected);
+   }
+   if (matchCount == 0) {
+     return;
+
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -4,6 +4,8 @@
+ #include <cstdint>
+ #include <string>
+ #include <vector>
++
++#include "clippings/ClippingPageFilter.h"
+
+ inline constexpr size_t CLIPPING_CHAPTER_TITLE_MAX = 48;
+ // Clipping text lives on the SD card rather than in every in-memory clipping
+@@ -30,6 +32,8 @@
+ }
+
+ struct Clipping {
++  // Session-only rejection metadata, rebuilt after editing/reloading. Never serialized.
++  mutable clippingPageFilter::Text textFilter;
+   uint16_t spineIndex = 0;
+   uint16_t startPage = 0;
+   uint16_t endPage = 0;
+@@ -58,6 +62,8 @@
+   uint16_t count = 0;
+ };
+
++class HalFile;
++
+ class ClippingStore {
+  public:
+   enum class AddResult : uint8_t {
+@@ -101,6 +107,8 @@
+   bool readClippingText(size_t index, std::string& out) const;
+   bool readClippingPreview(size_t index, std::string& out) const;
+   bool readClippingText(const Clipping& clipping, std::string& out) const;
++  bool openTextReader(HalFile& reader) const;
++  bool readClippingText(const Clipping& clipping, std::string& out, HalFile& reader) const;
+   // Chapter title saved with the clipping, read from the store file.
+   bool readChapterTitle(size_t index, std::string& out) const;
+
+
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -122,6 +122,7 @@
+   const Clipping previous = clippings[index];
+   const bool previousDirty = dirty;
+   Clipping& clipping = clippings[index];
++  clipping.textFilter = {};
+   clipping.textLength = static_cast<uint16_t>(text.size());
+   size_t words = 1;
+   for (char ch : text) if (ch == ' ') ++words;
+@@ -375,27 +376,31 @@
+   return readClippingText(*clipping, out);
+ }
+
++bool ClippingStore::openTextReader(FsFile& reader) const {
++  return !storeFilePath.empty() && Storage.openFileForRead("CLIP", storeFilePath, reader);
++}
++
+ bool ClippingStore::readClippingText(const Clipping& clipping, std::string& out) const {
++  if (clipping.textLength == 0) { out.clear(); return true; }
++  FsFile reader;
++  if (!openTextReader(reader)) { out.clear(); return false; }
++  return readClippingText(clipping, out, reader);
++}
++
++bool ClippingStore::readClippingText(const Clipping& clipping, std::string& out, FsFile& reader) const {
+   out.clear();
+   if (clipping.textLength == 0) return true;
+-  if (storeFilePath.empty()) return false;
+-
+-  FsFile f;
+-  if (!Storage.openFileForRead("CLIP", storeFilePath, f)) {
+-    return false;
+-  }
+-  if (!f.seek(clipping.textOffset)) {
+-    f.close();
++  if (!reader || !reader.seek(clipping.textOffset)) {
+     LOG_ERR("CLIP", "Failed to seek clipping text at %u: %s", clipping.textOffset, storeFilePath.c_str());
+     return false;
+   }
+   out.resize(clipping.textLength);
+-  const int expected = static_cast<int>(clipping.textLength);
+-  const bool ok = f.read(&out[0], clipping.textLength) == expected;
+-  f.close();
++  const bool ok = reader.read(&out[0], clipping.textLength) == static_cast<int>(clipping.textLength);
+   if (!ok) {
+     out.clear();
+     LOG_ERR("CLIP", "Failed to read clipping text at %u: %s", clipping.textOffset, storeFilePath.c_str());
++  } else if (clipping.textFilter.firstLength == 0) {
++    clipping.textFilter.build(out.data(), out.size());
+   }
+   return ok;
+ }
+
+diff --git a/test/clip_word_store/ClipWordStoreTest.cpp b/test/clip_word_store/ClipWordStoreTest.cpp
+--- a/test/clip_word_store/ClipWordStoreTest.cpp
++++ b/test/clip_word_store/ClipWordStoreTest.cpp
+@@ -392,7 +392,8 @@
+   clipping.pageCount = 10;
+   clipping.layoutSignature = 123;
+
+-  EXPECT_EQ(sizeof(Clipping), 84U);
++  // On-demand chapter titles plus the bounded session filter stay below the old 84-byte record.
++  EXPECT_LE(sizeof(Clipping), 56U);
+   EXPECT_FALSE(clippingCachedRangeReadyOnPage(clipping, 2));
+   EXPECT_TRUE(clippingCachedRangeReadyOnPage(clipping, 3));
+   EXPECT_FALSE(clippingCachedRangeReadyOnPage(clipping, 4));
+
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -49,6 +49,7 @@
+ add_subdirectory(preview_block_locator)
+ add_subdirectory(text_pool)
+ add_subdirectory(clip_word_store)
++add_subdirectory(clipping_page_turn)
+ add_subdirectory(highlight_word_edit)
+ add_subdirectory(clipping_preview)
+ add_subdirectory(dict_layout)
+
+diff --git a/src/clippings/ClippingPageFilter.h b/src/clippings/ClippingPageFilter.h
+new file mode 100644
+--- /dev/null
++++ b/src/clippings/ClippingPageFilter.h
+@@ -0,0 +1,124 @@
++#pragma once
++
++#include <cctype>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++#include "ClippingTextMatcher.h"
++
++// A rejection filter only: collisions and uncertain fragments always fall back
++// to the existing matcher. No text, layout coordinates, or owning pointers.
++namespace clippingPageFilter {
++struct Prefix {
++  uint32_t hash = 2166136261U;
++  uint8_t length = 0;
++  uint8_t shortHashes[2] = {};
++};
++inline bool space(uint32_t cp) {
++  return (cp < 128 && std::isspace(static_cast<unsigned char>(cp))) || cp == 0xA0 || cp == 0x2003 || cp == 0x202F;
++}
++inline uint32_t append(uint32_t hash, uint32_t cp) {
++  return (hash ^ ClippingTextMatcher::foldForMatch(cp)) * 16777619U;
++}
++inline uint8_t shortHash(uint32_t hash) { return static_cast<uint8_t>(hash ^ (hash >> 16)); }
++inline uint64_t hashBit(uint32_t hash) { return uint64_t{1} << ((hash ^ (hash >> 16)) & 63); }
++inline Prefix prefix(const char* text, size_t size) {
++  Prefix result;
++  size_t offset = 0;
++  while (offset < size && result.length < 3) {
++    const auto cp = ClippingTextMatcher::nextCodepoint(text, size, offset);
++    if (!result.length && ClippingTextMatcher::isEdgePunctuation(cp)) continue;
++    result.hash = append(result.hash, cp);
++    if (result.length < 2) result.shortHashes[result.length] = shortHash(result.hash);
++    ++result.length;
++  }
++  return result;
++}
++struct Text {
++  uint64_t continuations = 0;
++  uint32_t firstHash = 0;
++  uint8_t shortHashes[2] = {};
++  uint8_t firstLength = 0;  // 0: not built; 255: cannot safely reject
++  void build(const char* text, size_t size) {
++    *this = {};
++    size_t offset = 0;
++    while (offset < size) {
++      size_t start = offset;
++      auto cp = ClippingTextMatcher::nextCodepoint(text, size, offset);
++      if (space(cp)) continue;
++      size_t end = offset;
++      while (offset < size) {
++        size_t next = offset;
++        cp = ClippingTextMatcher::nextCodepoint(text, size, next);
++        if (space(cp)) break;
++        offset = next;
++        end = offset;
++      }
++      const auto value = prefix(text + start, end - start);
++      // Punctuation-only tokens and embedded NUL text take the original path.
++      if (!value.length || std::memchr(text + start, 0, end - start)) {
++        firstLength = 255;
++        return;
++      }
++      if (!firstLength) {
++        firstHash = value.hash;
++        firstLength = value.length;
++        shortHashes[0] = value.shortHashes[0];
++        shortHashes[1] = value.shortHashes[1];
++      }
++      continuations |= hashBit(value.hash);
++    }
++    if (!firstLength) firstLength = 255;
++  }
++};
++static_assert(sizeof(Text) <= 16, "Per-clipping filter must stay bounded");
++struct Page {
++  uint64_t starts[3][4] = {};
++  uint64_t shortWords[2][4] = {};
++  uint64_t continuationQueries = 0;
++  bool first = true;
++  bool uncertainStart = false;
++  bool uncertainContinuation = false;
++  void addWord(const char* text, bool insertedHyphen) {
++    size_t size = std::strlen(text);
++    if (insertedHyphen && size && text[size - 1] == '-') --size;
++    size_t offset = 0;
++    uint32_t hash = 2166136261U;
++    uint8_t length = 0;
++    uint64_t queries = 0;
++    while (offset < size && length < 3) {
++      const auto cp = ClippingTextMatcher::nextCodepoint(text, size, offset);
++      if (!length && ClippingTextMatcher::isEdgePunctuation(cp)) continue;
++      hash = append(hash, cp);
++      const uint8_t key = shortHash(hash);
++      starts[length++][key / 64] |= uint64_t{1} << (key % 64);
++      queries |= hashBit(hash);
++    }
++    // Short hyphen fragments may precede the rest of a token on another line.
++    const bool uncertain = !length;
++    if (length && length < 3) {
++      const uint8_t key = shortHash(hash);
++      shortWords[length - 1][key / 64] |= uint64_t{1} << (key % 64);
++    }
++    uncertainStart |= uncertain;
++    if (first) {
++      continuationQueries = queries;
++      uncertainContinuation = uncertain || length < 3;
++      first = false;
++    }
++  }
++  bool mayMatch(const Text& text, bool tableColumn) const {
++    // A table-column continuation can start after another column's words.
++    if (tableColumn || text.firstLength == 0 || text.firstLength == 255 || uncertainStart || uncertainContinuation)
++      return true;
++    for (uint8_t i = 0; i < 2 && i + 1 < text.firstLength; ++i) {
++      const auto key = text.shortHashes[i];
++      if (shortWords[i][key / 64] & (uint64_t{1} << (key % 64))) return true;
++    }
++    const uint8_t key = shortHash(text.firstHash);
++    return (starts[text.firstLength - 1][key / 64] & (uint64_t{1} << (key % 64))) ||
++           (continuationQueries & text.continuations);
++  }
++};
++}  // namespace clippingPageFilter
+
+diff --git a/test/clipping_page_turn/ExtractMatcher.py b/test/clipping_page_turn/ExtractMatcher.py
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/ExtractMatcher.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++source = Path(sys.argv[1]).read_text()
++start = source.index('struct ClippingPageMatch {')
++end = source.index('uint16_t countVisiblePageWords(', start)
++Path(sys.argv[2]).write_text(source[start:end])
+
+diff --git a/test/clipping_page_turn/CMakeLists.txt b/test/clipping_page_turn/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/CMakeLists.txt
+@@ -0,0 +1,21 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(MATCHER_SOURCE ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp)
++set(MATCHER_INC ${CMAKE_CURRENT_BINARY_DIR}/ReaderClippingMatcher.inc)
++add_custom_command(OUTPUT ${MATCHER_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractMatcher.py ${MATCHER_SOURCE} ${MATCHER_INC}
++  DEPENDS ${MATCHER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractMatcher.py VERBATIM)
++add_executable(clipping_page_turn_test ClippingPageTurnTest.cpp ${MATCHER_INC})
++target_include_directories(clipping_page_turn_test PRIVATE ${REPO_ROOT}/src ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(clipping_page_turn_test PRIVATE -UNDEBUG)
++add_test(NAME clipping_page_turn COMMAND clipping_page_turn_test)
++set(STORE_INC ${CMAKE_CURRENT_BINARY_DIR}/ClippingStoreReaders.inc)
++set(RECORD_INC ${CMAKE_CURRENT_BINARY_DIR}/ClippingRecord.inc)
++add_custom_command(OUTPUT ${STORE_INC} ${RECORD_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStore.py
++    ${REPO_ROOT}/src/ClippingStore.cpp ${REPO_ROOT}/src/ClippingStore.h ${RECORD_INC} ${STORE_INC}
++  DEPENDS ${REPO_ROOT}/src/ClippingStore.cpp ${REPO_ROOT}/src/ClippingStore.h
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStore.py VERBATIM)
++add_executable(clipping_page_turn_io_test ClippingPageTurnIoTest.cpp ${STORE_INC} ${RECORD_INC})
++target_include_directories(clipping_page_turn_io_test PRIVATE ${REPO_ROOT}/src ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(clipping_page_turn_io_test PRIVATE -UNDEBUG)
++add_test(NAME clipping_page_turn_io COMMAND clipping_page_turn_io_test)
+
+diff --git a/test/clipping_page_turn/ClippingPageTurnTest.cpp b/test/clipping_page_turn/ClippingPageTurnTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/ClippingPageTurnTest.cpp
+@@ -0,0 +1,196 @@
++#include <algorithm>
++#include <cassert>
++#include <cctype>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <random>
++#include <string>
++#include <type_traits>
++#include <vector>
++
++#include "ClippingStore.h"
++#include "clippings/ClippingHighlightGeometry.h"
++#include "clippings/ClippingMatchTracker.h"
++#include "clippings/ClippingPageFilter.h"
++
++// Only the page-storage adapter is simulated. ExtractMatcher.py compiles the
++// production tokenizer and matcher directly, so this test cannot drift to a copy.
++struct TextBlock {
++  std::vector<std::string> words;
++  std::vector<bool> hyphens;
++  uint16_t wordCount() const { return words.size(); }
++  const char* wordText(uint16_t i) const { return words[i].c_str(); }
++  bool wordEndsWithInsertedHyphen(uint16_t i) const { return !hyphens.empty() && hyphens[i]; }
++};
++struct PageTextLine {
++  const TextBlock* block;
++  uint16_t tableSelection = UINT16_MAX;
++};
++struct TableFragmentRow {
++  static constexpr uint8_t MAX_SERIALIZED_CELLS = 8;
++};
++struct Page {
++  TextBlock block;
++  mutable size_t traversals = 0;
++  bool forEachTextLine(bool (*visit)(const PageTextLine&, void*), void* context) const {
++    ++traversals;
++    return visit({&block}, context);
++  }
++};
++bool hasEmSpacePrefix(const char* s) { return std::strlen(s) >= 3 && std::memcmp(s, "\xE2\x80\x83", 3) == 0; }
++#include "ReaderClippingMatcher.inc"
++
++clippingPageFilter::Page filterFor(const Page& page) {
++  clippingPageFilter::Page result;
++  for (size_t i = 0; i < page.block.words.size(); ++i) {
++    const char* s = page.block.wordText(i);
++    result.addWord(s + (hasEmSpacePrefix(s) ? 3 : 0), page.block.wordEndsWithInsertedHyphen(i));
++  }
++  return result;
++}
++clippingPageFilter::Text filterFor(const std::string& text) {
++  clippingPageFilter::Text result;
++  result.build(text.data(), text.size());
++  return result;
++}
++void compare(const Page& page, const std::string& text) {
++  ClippingPageMatch oldMatch, newMatch, shortMatch;
++  bool oldUnique = false, newUnique = false;
++  const bool oldFound = findClippingTextInPages(page, text, oldMatch, &oldUnique);
++  const bool oldShort = !oldFound && findClippingTextInPages(page, text, shortMatch, nullptr, UINT8_MAX, true);
++  bool newShort = false;
++  uint8_t directions = 0;
++  const bool newFound =
++      findClippingTextInPages(page, text, newMatch, &newUnique, UINT8_MAX, false, UINT16_MAX, &directions, &newShort);
++  assert(oldFound == newFound);
++  assert(oldFound || oldShort == newShort);
++  if (oldFound) {
++    assert(oldUnique == newUnique);
++    assert(oldMatch.startWord == newMatch.startWord && oldMatch.endWord == newMatch.endWord);
++    assert(oldMatch.startsAtClipStart == newMatch.startsAtClipStart &&
++           oldMatch.reachesClipEnd == newMatch.reachesClipEnd);
++  }
++  if (oldFound || oldShort) assert(filterFor(page).mayMatch(filterFor(text), false));
++}
++int main() {
++  // First-word matching, continuations, short words, punctuation, UTF-8 folding,
++  // inserted hyphens and table-column bypass must never be rejected.
++  for (const auto& text : {"alpha beta", "alpha", "before alpha beta", "a bcd", "abcd", "ALPHA BETA",
++                           "\xE2\x80\x9C"
++                           "alpha beta",
++                           "alpha beta?",
++                           "alpha\xC2\xA0"
++                           "beta"}) {
++    for (const auto& words : std::vector<std::vector<std::string>>{{"alpha", "beta"},
++                                                                   {"alpha", "beta", "tail"},
++                                                                   {"a", "bcd"},
++                                                                   {"beta"},
++                                                                   {"\"alpha", "beta?"},
++                                                                   {"alp", "ha", "beta"}}) {
++      compare(Page{{words}}, text);
++    }
++  }
++  Page hyphen{{{"a-", "lpha", "beta"}, {true, false, false}}};
++  compare(hyphen, "alpha beta");
++  compare(Page{{{"caf\xC3\xA9", "\xE2\x80\x94", "today"}}}, "CAF\xC3\x89 \xE2\x80\x94 today");
++  assert(filterFor(Page{{{"unrelated"}}}).mayMatch(filterFor("different column"), true));
++  clippingPageFilter::Text unknown;
++  assert(filterFor(Page{{{"unrelated"}}}).mayMatch(unknown, false));
++  auto edited = filterFor("old selection");
++  edited = {};
++  assert(filterFor(Page{{{"new"}}}).mayMatch(edited, false));
++
++  const std::vector<std::string> vocabulary = {"after",    "before",
++                                               "chapter",  "river",
++                                               "mountain", "people",
++                                               "quiet",    "garden",
++                                               "window",   "forest",
++                                               "memory",   "orange",
++                                               "violet",   "yellow",
++                                               "zebra",    "broken",
++                                               "silver",   "eastern",
++                                               "frozen",   "travel",
++                                               "knowing",  "deeply",
++                                               "a",        "an",
++                                               "I",        "the",
++                                               "and",      "but",
++                                               "of",       "to",
++                                               "in",       "is",
++                                               "he",       "we",
++                                               "it",       "on",
++                                               "as",       "be",
++                                               "or",       "\"quoted",
++                                               "quoted?",  "can\xE2\x80\x99t",
++                                               "can't",    "dash\xE2\x80\x94word",
++                                               "dash-word"};
++  std::mt19937 random(4517);
++  for (size_t n = 0; n < 12000; ++n) {
++    Page page;
++    for (size_t j = 0, count = 1 + random() % 25; j < count; ++j)
++      page.block.words.push_back(vocabulary[random() % vocabulary.size()]);
++    std::string text;
++    if (n % 3 == 0) {
++      const auto begin = random() % page.block.words.size();
++      for (size_t j = begin; j < page.block.words.size(); ++j) {
++        if (!text.empty()) text += ' ';
++        text += page.block.words[j];
++      }
++    } else {
++      for (size_t j = 0, count = 1 + random() % 20; j < count; ++j) {
++        if (!text.empty()) text += ' ';
++        text += vocabulary[random() % vocabulary.size()];
++      }
++    }
++    compare(page, text);
++  }
++
++  // A highlight-heavy chapter: 500 clippings, 100 turns. All filters are
++  // warmed once (as on the first render); count would-be SD reads and compare
++  // every result against the unfiltered production matcher.
++  std::vector<std::string> clips;
++  std::vector<clippingPageFilter::Text> filters;
++  for (size_t i = 0; i < 500; ++i) {
++    std::string text;
++    for (size_t j = 0; j < 8; ++j) {
++      if (j) text += ' ';
++      text += vocabulary[random() % 22];
++    }
++    clips.push_back(text);
++    filters.push_back(filterFor(text));
++  }
++  size_t reads = 0, baselineReads = 0, oldTraversals = 0, newTraversals = 0;
++  for (size_t turn = 0; turn < 100; ++turn) {
++    Page page;
++    for (size_t j = 0; j < 24; ++j) page.block.words.push_back(vocabulary[random() % 22]);
++    const auto pageFilter = filterFor(page);
++    for (size_t i = 0; i < clips.size(); ++i) {
++      ++baselineReads;
++      ClippingPageMatch match;
++      bool unique;
++      uint8_t directions = 0;
++      bool shortFound = false;
++      page.traversals = 0;
++      const bool oldFound = findClippingTextInPages(page, clips[i], match, &unique);
++      const bool oldShort = !oldFound && findClippingTextInPages(page, clips[i], match, nullptr, UINT8_MAX, true);
++      oldTraversals += page.traversals;
++      page.traversals = 0;
++      if (pageFilter.mayMatch(filters[i], false)) {
++        ++reads;
++        const bool found = findClippingTextInPages(page, clips[i], match, &unique, UINT8_MAX, false, UINT16_MAX,
++                                                   &directions, &shortFound);
++        assert(found == oldFound);
++        assert(found || shortFound == oldShort);
++      } else
++        assert(!oldFound && !oldShort);
++      newTraversals += page.traversals;
++    }
++  }
++  std::cerr << "reads=" << reads << "/" << baselineReads << " traversals=" << newTraversals << "/" << oldTraversals
++            << "\n";
++  assert(reads < baselineReads * 0.95);
++  assert(newTraversals < oldTraversals * 0.65);
++  std::cout << "SD text reads: " << baselineReads << " -> " << reads << "; page traversals: " << oldTraversals << " -> "
++            << newTraversals << "; 12000 equivalence cases passed\n";
++}
+
+diff --git a/test/clipping_page_turn/ExtractStore.py b/test/clipping_page_turn/ExtractStore.py
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/ExtractStore.py
+@@ -0,0 +1,10 @@
++from pathlib import Path
++import sys
++source = Path(sys.argv[1]).read_text()
++header = Path(sys.argv[2]).read_text()
++record = header[header.index('struct Clipping {'):header.index('struct ClippedBookEntry {')]
++readers = source[source.index('bool ClippingStore::openTextReader('):source.index('bool ClippingStore::saveToFile()')]
++start = source.index('bool ClippingStore::updateClippingText(')
++end = source.index('\n}\n', start) + 3
++Path(sys.argv[3]).write_text(record)
++Path(sys.argv[4]).write_text(readers + source[start:end])
+
+diff --git a/test/clipping_page_turn/ClippingPageTurnIoTest.cpp b/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
+@@ -0,0 +1,102 @@
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <string>
++#include <vector>
++
++#include "clippings/ClippingPageFilter.h"
++#define LOG_ERR(...) \
++  do {               \
++  } while (0)
++constexpr size_t CLIPPING_TEXT_MAX = 60U * 1024U;
++#include "ClippingRecord.inc"
++struct HalFile {
++  static inline unsigned readers = 0, opens = 0;
++  bool opened = false, failSeek = false, shortRead = false;
++  std::string bytes;
++  size_t position = 0;
++  explicit operator bool() const { return opened; }
++  bool seek(size_t offset) {
++    position = offset;
++    return opened && !failSeek && offset <= bytes.size();
++  }
++  int read(char* out, size_t size) {
++    const size_t count = std::min(size, bytes.size() - position);
++    const size_t actual = shortRead && count ? count - 1 : count;
++    std::memcpy(out, bytes.data() + position, actual);
++    position += actual;
++    return actual;
++  }
++  ~HalFile() {
++    if (opened) --readers;
++  }
++};
++using FsFile = HalFile;
++struct StorageStub {
++  bool failOpen = false;
++  std::string bytes;
++  bool openFileForRead(const char*, const std::string&, HalFile& file) {
++    if (failOpen) return false;
++    assert(!file.opened && HalFile::readers == 0);  // same-path reader restriction
++    file.opened = true;
++    file.bytes = bytes;
++    ++HalFile::readers;
++    ++HalFile::opens;
++    return true;
++  }
++} Storage;
++class ClippingStore {
++ public:
++  std::string storeFilePath = "clippings.bin";
++  std::vector<Clipping> clippings;
++  bool dirty = false, failWrite = false;
++  bool writeToFile(const std::string*, size_t) { return !failWrite; }
++  bool openTextReader(FsFile&) const;
++  bool readClippingText(const Clipping&, std::string&) const;
++  bool readClippingText(const Clipping&, std::string&, FsFile&) const;
++  bool updateClippingText(size_t, const std::string&);
++};
++#include "ClippingStoreReaders.inc"
++int main() {
++  ClippingStore store;
++  Storage.bytes = "alpha beta gamma";
++  Clipping clip;
++  clip.textLength = Storage.bytes.size();
++  std::string text;
++  for (int i = 0; i < 500; ++i) assert(store.readClippingText(clip, text));
++  const auto before = HalFile::opens;
++  assert(before == 500 && clip.textFilter.firstLength != 0);
++  {
++    FsFile reader;
++    assert(store.openTextReader(reader));
++    for (int i = 0; i < 500; ++i) assert(store.readClippingText(clip, text, reader));
++    assert(text == Storage.bytes && HalFile::opens == before + 1);
++    clip.textFilter = {};
++    reader.shortRead = true;
++    assert(!store.readClippingText(clip, text, reader));
++    assert(text.empty() && clip.textFilter.firstLength == 0);
++    reader.shortRead = false;
++    reader.failSeek = true;
++    assert(!store.readClippingText(clip, text, reader));
++  }
++  assert(HalFile::readers == 0);
++  Storage.failOpen = true;
++  text = "stale";
++  assert(!store.readClippingText(clip, text) && text.empty());
++  Storage.failOpen = false;
++  assert(store.readClippingText(clip, text));
++  store.clippings.push_back(clip);
++  const auto oldHash = clip.textFilter.firstHash;
++  store.failWrite = true;
++  assert(!store.updateClippingText(0, "new wording"));
++  assert(store.clippings[0].textFilter.firstHash == oldHash);
++  store.failWrite = false;
++  assert(store.updateClippingText(0, "new wording"));
++  assert(store.clippings[0].textFilter.firstLength == 0);
++  Storage.bytes = "new wording";
++  assert(store.readClippingText(store.clippings[0], text));
++  assert(store.clippings[0].textFilter.firstHash != oldHash);
++  std::cout << "500 clipping reads: file opens 500 -> 1; failed I/O, edit invalidation and rollback passed\n";
++}
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -629,3 +629,7 @@
+
+ - Reduce neighboring-page reads when matching saved highlights during page turns.
+ - Place the following context directly below the highlighted text in the editor.
++
++### crASHink page-turn performance
++
++- Reuse one clipping-file reader per render, filter impossible highlight matches before SD reads, and collect short boundary candidates in one matching pass. Filters are session-only, conservative, and invalidated after edits.
