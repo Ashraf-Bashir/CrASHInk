@@ -1,13 +1,15 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -143,6 +143,11 @@
+@@ -143,6 +143,13 @@
 
  ### crASHink patch updates
 
-+- Added: tap saved highlights for on-page edge handles and a nearby Edit button. Dragging hides Edit; releasing saves the resized range while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
++- Added: tap saved highlights for on-page edge handles and a floating pencil/trash toolbar with rounded corners, a subtle shadow and round stem handles. The toolbar uses a shared action list and wraps automatically for future options. Dragging hides the toolbar; releasing saves the resized range while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
 +- Changed: hold briefly (200 ms) to start selection, then drag freely. Only release decides the action: one word opens the dictionary, multiple words save a highlight. Pausing while holding never opens a dictionary popup. Dictionary lookup also works on highlighted words.
 +- Changed: saved clippings open directly in the full editor, with Save, Open, Delete and a top-right close button. Save is disabled when the selection matches the original, including after reversing changes.
++- Changed: successful highlights save silently without the Clipping saved toast or its pause; save errors remain visible.
++- Performance: touch drags coalesce to the latest finger endpoint, invert only words entering or leaving the range, and avoid full-page repaints for large selections. Saved-highlight resizing also reuses the current page, restoring only two small handle regions (512 bytes). Input and release are retained during panel refresh; page advance requires deliberate overshoot, and selection hit boxes stay inside actual words.
 +- Performance: cache nearby words and queue word-control clicks during e-ink refreshes instead of rescanning the chapter for every click.
 +
  - Changed: touchscreen page turns use swipes only; removed tap page-turn settings.
@@ -69,24 +71,109 @@ diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
 diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activities/reader/DictionaryWordSelectActivity.cpp
 --- a/src/activities/reader/DictionaryWordSelectActivity.cpp
 +++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
-@@ -1091,6 +1091,8 @@
-     if (mappedInput.isScreenTouchHeld(dragX, dragY)) {
+@@ -212,6 +212,9 @@
+       finish();
+       return false;
+     }
++    touchDragInput_.reset();
++    touchPageEdgeSince_ = 0;
++    touchPageAwaitMotion_ = false;
+     touchDragLookup_ = navigator.beginTouchMultiSelect();
+     touchDragStartX_ = initialTouchX_;
+     touchDragStartY_ = initialTouchY_;
+@@ -869,8 +872,8 @@
+   if (!nextPageLoaded) {
+     LOG_ERR("DICT", "Failed to load the next reader page for touch selection");
+     // Preserve the valid page-zero selection if the next page cannot be read.
+-    finishTouchLookupOnCurrentPage(prefix, prefixWordCount, currentRequest);
+-    return true;
++    hasNextReaderPage_ = false;
++    return false;
+   }
+   if (!nextPagePrepared) {
+     LOG_ERR("DICT", "Failed to prepare next reader page for touch selection");
+@@ -1080,7 +1083,7 @@
+     return;
+   }
+
+-  if (navigator.handleNavigation(mappedInput, renderer)) {
++  if (!touchDragLookup_ && navigator.handleNavigation(mappedInput, renderer)) {
+     requestUpdate();
+   }
+
+@@ -1088,30 +1091,70 @@
+   if (touchDragLookup_) {
+     int dragX = 0;
+     int dragY = 0;
+-    if (mappedInput.isScreenTouchHeld(dragX, dragY)) {
++    const bool held = mappedInput.isScreenTouchHeld(dragX, dragY);
++    if (held && touchPageAwaitMotion_) {
++      // A page change must not reinterpret the stationary bottom-edge finger
++      // as an endpoint deep in the new page. Wait for deliberate movement.
++      if (!ClipSelectionPaging::hasDraggedFrom(touchPageArrivalX_, touchPageArrivalY_, dragX, dragY)) return;
++      touchPageAwaitMotion_ = false;
++    }
++    touchDragInput_.record(held, dragX, dragY);
++    // The panel can remain busy for hundreds of ms. Keep polling input instead
++    // of blocking here, then apply its latest point before processing release.
++    if (RenderLock::peek()) return;
++    if (touchDragInput_.pointPending) {
++      RenderLock lock(*this);
++      dragX = touchDragInput_.x;
++      dragY = touchDragInput_.y;
        touchDragHasMoved_ =
            touchDragHasMoved_ || ClipSelectionPaging::hasDraggedFrom(touchDragStartX_, touchDragStartY_, dragX, dragY);
-+      // Keep the contact in selection mode until release. A slow start or
-+      // pause during a drag must never open the dictionary under the finger.
-       const int previousIdx = navigator.getCurrentFlatIndex();
+-      const int previousIdx = navigator.getCurrentFlatIndex();
        bool hit = false;
-       if (navigator.selectWordAtPoint(dragX, dragY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &hit)) {
-@@ -1103,7 +1105,6 @@
+-      if (navigator.selectWordAtPoint(dragX, dragY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &hit)) {
++      if (navigator.selectWordAtPoint(dragX, dragY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &hit))
+         requestUpdate();
+-      } else if (hit && touchDragHasMoved_ && navigator.getCurrentFlatIndex() == previousIdx &&
+-                 navigator.getWordAt(previousIdx + 1) == nullptr && continueTouchSelectionOnNextPage()) {
++      touchDragInput_.pointPending = false;
++    }
++    if (!touchDragInput_.released) {
++      // The bottom edge remains usable even after the finger leaves the last
++      // word's small hit box. A short dwell prevents accidental page changes.
++      const int current = navigator.getCurrentFlatIndex();
++      const auto* last = navigator.getWordAt(current);
++      const bool pastEnd =
++          last && (touchDragInput_.y >=
++                       last->screenY + last->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) + 16 ||
++                   (last->isRtl ? touchDragInput_.x <= last->screenX - 16
++                                : touchDragInput_.x >= last->screenX + last->width + 16));
++      const bool atEnd = touchDragHasMoved_ && last && !navigator.getWordAt(current + 1) && pastEnd;
++      if (!atEnd)
++        touchPageEdgeSince_ = 0;
++      else if (!touchPageEdgeSince_)
++        touchPageEdgeSince_ = millis();
++      else if (millis() - touchPageEdgeSince_ >= 180 && !RenderLock::peek() && continueTouchSelectionOnNextPage()) {
++        touchPageArrivalX_ = touchDragInput_.x;
++        touchPageArrivalY_ = touchDragInput_.y;
++        touchPageAwaitMotion_ = true;
++        touchDragInput_.reset();
++        touchPageEdgeSince_ = 0;
+         return;
+       }
+       return;
      }
-
-     touchDragLookup_ = false;
+-
+-    touchDragLookup_ = false;
 -    const size_t wordCount = crossPageLookupWordCount_ + navigator.getLookupSelectionWordCount();
-     const std::string phrase = finishTouchLookupPhrase();
+-    const std::string phrase = finishTouchLookupPhrase();
++    touchDragInput_.reset();
++    touchPageEdgeSince_ = 0;
++    touchPageAwaitMotion_ = false;
++
++    std::string phrase;
++    {
++      RenderLock lock(*this);
++      touchDragLookup_ = false;
++      phrase = finishTouchLookupPhrase();
++    }
      // Several words are a clipping, saved at once without asking; counting
      // words in the joined phrase keeps a hyphen-split word as one word.
-@@ -1111,7 +1112,7 @@
+     if (DictionaryLookupController::phraseWordCount(phrase) >= 2) {
        finishSelectionAsClipping();
        return;
      }
@@ -95,6 +182,66 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
+@@ -1123,13 +1166,16 @@
+     bool touchedWord = false;
+     navigator.selectWordAtPoint(touchX, touchY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &touchedWord);
+     if (touchedWord && navigator.beginTouchMultiSelect()) {
++      touchDragInput_.reset();
++      touchPageEdgeSince_ = 0;
++      touchPageAwaitMotion_ = false;
+       touchDragLookup_ = true;
+       touchDragHasMoved_ = false;
+       touchDragStartX_ = touchX;
+       touchDragStartY_ = touchY;
+-      // Finish this fast refresh before lookup can replace the screen, so the
+-      // touched word always provides visible press feedback on e-ink.
+-      requestUpdateAndWait();
++      // Render asynchronously so the next touch sample can arrive while the
++      // e-ink panel is busy.
++      requestUpdate();
+     }
+     return;
+   }
+@@ -1178,7 +1224,7 @@
+   //   - the controller has nothing pending to draw,
+   //   - we have a current selection.
+   if (nextRenderMode_ == RenderMode::Differential && !controller.isActive() && currIdx >= 0) {
+-    prewarmHighlightGlyphs(currIdx);
++    if (!navigator.isMultiSelecting()) prewarmHighlightGlyphs(currIdx);
+     auto dirty =
+         navigator.renderHighlightDifferential(renderer, lineHeight, prevHighlightIdx_, currIdx, foregroundBlack);
+     if (dirty.has_value()) {
+@@ -1219,7 +1265,7 @@
+         renderer.fillRect(bezelLeft, clearY, clearW, reservedBottomHeight_, false);
+       }
+
+-      prewarmHighlightGlyphs(currIdx);
++      if (!navigator.isMultiSelecting()) prewarmHighlightGlyphs(currIdx);
+
+       auto setup =
+           navigator.renderHighlightDifferential(renderer, lineHeight, /*prevWordIdx=*/-1, currIdx, foregroundBlack);
+diff --git a/src/activities/reader/DictionaryWordSelectActivity.h b/src/activities/reader/DictionaryWordSelectActivity.h
+--- a/src/activities/reader/DictionaryWordSelectActivity.h
++++ b/src/activities/reader/DictionaryWordSelectActivity.h
+@@ -9,6 +9,7 @@
+ #include <vector>
+
+ #include "../Activity.h"
++#include "TouchDragInput.h"
+ #include "util/DictionaryLookupController.h"
+ #include "util/WordSelectNavigator.h"
+
+@@ -132,6 +133,10 @@
+   char dictionaryFontFamilyName_[64] = "";
+   uint8_t dictionaryFontPointSize_ = 0;
+   bool touchDragLookup_ = false;
++  TouchDragInput touchDragInput_;
++  unsigned long touchPageEdgeSince_ = 0;
++  bool touchPageAwaitMotion_ = false;
++  int touchPageArrivalX_ = 0, touchPageArrivalY_ = 0;
+   bool touchDragHasMoved_ = false;
+   int touchDragStartX_ = 0;
+   int touchDragStartY_ = 0;
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
@@ -131,7 +278,39 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    openWordSelect(/*framebufferContainsPage=*/true, touchX, touchY, /*autoLookupInitialWord=*/true);
    return true;
  }
-@@ -7790,11 +7788,40 @@
+@@ -5103,7 +5101,6 @@
+                                                     clippingLayoutSignature](const ActivityResult& result) {
+     MemoryBudget::logHeapShape("clip.child_destroyed");
+     const char* clippingFeedback = nullptr;
+-    bool saved = false;
+     if (!result.isCancelled) {
+       const auto& clip = std::get<ClippingResult>(result.data);
+       if (!clip.text.empty()) {
+@@ -5120,9 +5117,9 @@
+             LOG_ERR("CLIP", "Failed to roll back clipping after export failure");
+           }
+         }
+-        saved = addResult == ClippingStore::AddResult::Added && exported;
++        const bool saved = addResult == ClippingStore::AddResult::Added && exported;
+         clippingFeedback = addResult == ClippingStore::AddResult::LimitReached ? tr(STR_CLIPPING_LIMIT_REACHED)
+-                           : saved                                             ? tr(STR_CLIPPING_SAVED)
++                           : saved                                             ? nullptr
+                                                                                : tr(STR_CLIPPING_FAILED);
+       }
+     }
+@@ -5131,11 +5128,6 @@
+     MemoryBudget::logHeapShape("clip.after_font_release");
+     pendingHeapShapeReaderRedrawStages.fetch_or(HEAP_SHAPE_REDRAW_CLIP, std::memory_order_relaxed);
+     if (clippingFeedback) {
+-#if CROSSINK_APP_CAP_TOUCH
+-      if (saved && mappedInput.hasTouchHardware() && requestUpdateAndWait() != RequestUpdateResult::Rendered) {
+-        LOG_ERR("CLIP", "Could not render saved highlight before clipping toast");
+-      }
+-#endif
+       {
+         RenderLock lock(*this);
+         drawToast(renderer, clippingFeedback);
+@@ -7790,11 +7782,40 @@
    }
 
    if (bestIndex < 0) return false;
@@ -173,7 +352,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
  void EpubReaderActivity::showClippingEditor(const size_t clippingIndex) {
    if (clippingIndex >= CLIPPINGS.clippingCount()) return;
 
-@@ -7804,8 +7831,12 @@
+@@ -7804,8 +7825,12 @@
    auto editor = makeUniqueNoThrow<HighlightEditActivity>(renderer, mappedInput, epub, clippingIndex, hint);
    if (!editor) { LOG_ERR("CLIP", "Cannot allocate highlight editor"); return; }
    pauseReadingPaceTimer("highlight_edit");
@@ -651,6 +830,86 @@ diff --git a/src/activities/reader/HighlightEditActivity.h b/src/activities/read
 +  void openSavedClipping();
    void cancel();
  };
+diff --git a/src/activities/reader/HighlightToolbar.h b/src/activities/reader/HighlightToolbar.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightToolbar.h
+@@ -0,0 +1,75 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <optional>
++
++namespace HighlightToolbar {
++enum class Action { Edit, Delete };
++// Add future actions here; layout, drawing iteration and hit testing share it.
++inline constexpr std::array Actions{Action::Edit, Action::Delete};
++constexpr int CellWidth = 56, CellHeight = 48;
++struct Bounds {
++  int x = 0, y = 0, width = 0, height = 0;
++  bool contains(int px, int py) const {
++    return width > 0 && height > 0 && px >= x && px < x + width && py >= y && py < y + height;
++  }
++};
++struct Layout {
++  Bounds area{};
++  size_t columns = 0, count = 0;
++  static Layout place(int x, int y, int screenWidth, size_t count = Actions.size()) {
++    if (!count) return {};
++    const size_t columns = std::min(count, static_cast<size_t>(std::max(1, screenWidth / CellWidth)));
++    return {
++        {x, y, static_cast<int>(columns) * CellWidth, static_cast<int>((count + columns - 1) / columns) * CellHeight},
++        columns,
++        count};
++  }
++  Bounds button(size_t index) const {
++    if (index >= count || !columns) return {};
++    return {area.x + static_cast<int>(index % columns) * CellWidth,
++            area.y + static_cast<int>(index / columns) * CellHeight, CellWidth, CellHeight};
++  }
++  std::optional<size_t> indexAt(int x, int y) const {
++    if (!columns || !area.contains(x, y)) return std::nullopt;
++    const size_t index = static_cast<size_t>((y - area.y) / CellHeight) * columns + (x - area.x) / CellWidth;
++    return index < count ? std::optional<size_t>{index} : std::nullopt;
++  }
++};
++inline bool overlaps(const Bounds& a, const Bounds& b, int pad = 0) {
++  return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 && a.x < b.x + b.width + pad &&
++         a.x + a.width > b.x - pad && a.y < b.y + b.height + pad && a.y + a.height > b.y - pad;
++}
++inline Layout nearSelection(const Bounds& selection, const Bounds& view, const Bounds& first, const Bounds& last) {
++  Layout result = Layout::place(0, 0, view.width);
++  const int width = result.area.width, height = result.area.height;
++  const int right = std::max(view.x, view.x + view.width - width);
++  const int bottom = std::max(view.y, view.y + view.height - height);
++  const int x = std::clamp(selection.x, view.x, right);
++  const int middleY = std::clamp(selection.y + (selection.height - height) / 2, view.y, bottom);
++  const std::array<std::array<int, 2>, 8> candidates{{{x, selection.y - height - 44},
++                                                      {x, selection.y + selection.height + 44},
++                                                      {selection.x + selection.width + 8, middleY},
++                                                      {selection.x - width - 8, middleY},
++                                                      {view.x, view.y},
++                                                      {right, view.y},
++                                                      {view.x, bottom},
++                                                      {right, bottom}}};
++  for (const bool avoidText : {true, false}) {
++    for (const auto& point : candidates) {
++      result.area.x = point[0];
++      result.area.y = point[1];
++      if (result.area.x < view.x || result.area.y < view.y || result.area.x > right || result.area.y > bottom) continue;
++      if (overlaps(result.area, first, 18) || overlaps(result.area, last, 18)) continue;
++      if (avoidText && overlaps(result.area, selection)) continue;
++      return result;
++    }
++  }
++  // A selection covering the entire viewport has no empty outside area.
++  // Keep every toolbar control on screen even in that constrained case.
++  result.area.x = x;
++  result.area.y = std::clamp(selection.y - height - 44, view.y, bottom);
++  return result;
++}
++}  // namespace HighlightToolbar
 diff --git a/src/activities/reader/HighlightTouchPolicy.h b/src/activities/reader/HighlightTouchPolicy.h
 new file mode 100644
 --- /dev/null
@@ -664,7 +923,7 @@ diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,374 @@
 +#include "OnPageHighlightActivity.h"
 +
 +#include <BidiUtils.h>
@@ -686,6 +945,36 @@ new file mode 100644
 +  return r.width > 0 && r.height > 0 && x >= r.x - pad && x < r.x + r.width + pad && y >= r.y - pad &&
 +         y < r.y + r.height + pad;
 +}
++void disk(const GfxRenderer& renderer, int x, int y, int radius, bool black) {
++  for (int dy = -radius; dy <= radius; ++dy)
++    for (int dx = -radius; dx <= radius; ++dx)
++      if (dx * dx + dy * dy <= radius * radius) renderer.drawPixel(x + dx, y + dy, black);
++}
++
++void toolbarIcon(const GfxRenderer& renderer, const HighlightToolbar::Bounds& button, HighlightToolbar::Action action) {
++  const int x = button.x + (button.width - 24) / 2;
++  const int y = button.y + (button.height - 24) / 2;
++  const auto line = [&](int x1, int y1, int x2, int y2) { renderer.drawLine(x + x1, y + y1, x + x2, y + y2, 2, true); };
++  if (action == HighlightToolbar::Action::Delete) {
++    line(4, 5, 20, 5);
++    line(9, 2, 15, 2);
++    line(9, 2, 9, 5);
++    line(15, 2, 15, 5);
++    line(6, 8, 7, 22);
++    line(7, 22, 17, 22);
++    line(17, 22, 18, 8);
++    line(10, 10, 10, 18);
++    line(14, 10, 14, 18);
++  } else {
++    line(3, 21, 5, 14);
++    line(5, 14, 17, 2);
++    line(17, 2, 22, 7);
++    line(22, 7, 10, 19);
++    line(10, 19, 3, 21);
++    line(14, 5, 19, 10);
++  }
++}
++
 +}  // namespace
 +
 +OnPageHighlightActivity::OnPageHighlightActivity(GfxRenderer& renderer, MappedInputManager& input,
@@ -784,12 +1073,13 @@ new file mode 100644
 +
 +void OnPageHighlightActivity::updateDrag() {
 +  if (!ready || activeEdge < 0) return;
-+  const int x = dragX.load(), y = dragY.load();
-+  size_t best = 0;
++  const int x = dragX.load(), y = dragY.load() + dragOffsetY;
++  size_t best = wordCount;
 +  int64_t distance = INT64_MAX;
 +  for (size_t i = 0; i < wordCount; ++i) {
 +    const auto& r = words[i].rect;
-+    const int dx = x < r.x ? r.x - x : x > r.x + r.width ? x - r.x - r.width : 0;
++    if (!contains(r, x, y)) continue;
++    const int dx = x - r.x - r.width / 2;
 +    const int dy = y < r.y ? r.y - y : y > r.y + r.height ? y - r.y - r.height : 0;
 +    const int64_t d = static_cast<int64_t>(dy) * dy * 16 + static_cast<int64_t>(dx) * dx;
 +    if (d < distance) {
@@ -797,7 +1087,7 @@ new file mode 100644
 +      best = i;
 +    }
 +  }
-+  range.move(activeEdge == 0, words[best].start, words[best].end);
++  if (best < wordCount) range.move(activeEdge == 0, words[best].start, words[best].end);
 +}
 +
 +void OnPageHighlightActivity::saveRange() {
@@ -856,6 +1146,8 @@ new file mode 100644
 +        return dx * dx + dy * dy;
 +      };
 +      activeEdge = first && (!last || distance(firstHandle) <= distance(lastHandle)) ? 0 : 1;
++      const Rect& handle = activeEdge == 0 ? firstHandle : lastHandle;
++      dragOffsetY = (activeEdge == 0 ? firstAnchorY : lastAnchorY) - handle.y - handle.height / 2;
 +      dragX.store(x);
 +      dragY.store(y);
 +      dragging.store(true);
@@ -864,7 +1156,8 @@ new file mode 100644
 +    }
 +  }
 +  unsigned long held = 0;
-+  if (mappedInput.isScreenTouchTapCandidate(x, y, held) && held >= HighlightTouchPolicy::SelectionHoldMs) {
++  if (mappedInput.isScreenTouchTapCandidate(x, y, held) && held >= HighlightTouchPolicy::SelectionHoldMs &&
++      !toolbar.indexAt(x, y).has_value()) {
 +    returnAction(false, x, y);
 +    return;
 +  }
@@ -873,18 +1166,51 @@ new file mode 100644
 +      ignoreOpeningRelease = false;
 +      return;
 +    }
-+    if (contains(editButton, x, y))
-+      returnAction(true);
-+    else if (!contains(firstHandle, x, y, 14) && !contains(lastHandle, x, y, 14))
++    if (const auto item = toolbar.indexAt(x, y)) {
++      switch (HighlightToolbar::Actions[*item]) {
++        case HighlightToolbar::Action::Edit:
++          returnAction(true);
++          break;
++        case HighlightToolbar::Action::Delete: {
++          RenderLock lock(*this);
++          if (CLIPPINGS.removeClippingAt(index))
++            finish();
++          else {
++            failed = true;
++            requestUpdate();
++          }
++          break;
++        }
++      }
++    } else if (!contains(firstHandle, x, y, 14) && !contains(lastHandle, x, y, 14))
 +      finish();
 +  } else
 +    ignoreOpeningRelease = false;
 +}
 +
++void OnPageHighlightActivity::HandleSnapshot::capture(GfxRenderer& renderer, const Rect& handle, int stemY) {
++  rect = Rect{};
++  valid = true;
++  if (!handle.width) return;
++  const int x = std::max(0, handle.x - 4), y = std::max(0, std::min(handle.y, stemY) - 4);
++  const int right = std::min(renderer.getScreenWidth(), handle.x + handle.width + 4);
++  const int bottom = std::min(renderer.getScreenHeight(), std::max(handle.y + handle.height, stemY + 4) + 4);
++  rect = Rect{x, y, right - x, bottom - y};
++  valid = renderer.readFramebufferRegion(x, y, rect.width, rect.height, bytes.data(), bytes.size()) != 0;
++}
++void OnPageHighlightActivity::HandleSnapshot::restore(GfxRenderer& renderer) const {
++  if (valid && rect.width > 0) renderer.writeFramebufferRegion(rect.x, rect.y, rect.width, rect.height, bytes.data());
++}
++
 +void OnPageHighlightActivity::render(RenderLock&&) {
 +  updateDrag();
-+  renderer.clearScreen();
-+  if (page) {
++  const bool incremental = dragging.load() && dragFrameReady && firstSnapshot.valid && lastSnapshot.valid;
++  if (incremental) {
++    lastSnapshot.restore(renderer);
++    firstSnapshot.restore(renderer);
++  } else
++    renderer.clearScreen();
++  if (page && !incremental) {
 +    const GfxRenderer::TextWeightScope weight(renderer, SETTINGS.textWeightOffset());
 +    renderer.setInvertImages(SETTINGS.invertImagesDark != 0);
 +    auto scope = renderer.getFontCacheManager()->createPrewarmScope();
@@ -895,11 +1221,14 @@ new file mode 100644
 +  firstHandle = Rect{};
 +  lastHandle = Rect{};
 +  Rect selection{};
++  int firstStemY = 0, lastStemY = 0;
 +  for (size_t i = 0; ready && i < wordCount; ++i) {
 +    const auto& w = words[i];
-+    if (w.end < range.start || w.start > range.end) continue;
++    const bool selected = w.end >= range.start && w.start <= range.end;
++    const bool wasSelected = incremental && w.end >= paintedRange.start && w.start <= paintedRange.end;
 +    const auto& r = w.rect;
-+    renderer.invertRect(r.x, r.y, r.width, r.height);
++    if (selected != wasSelected) renderer.invertRect(r.x, r.y, r.width, r.height);
++    if (!selected) continue;
 +    if (!selection.width)
 +      selection = r;
 +    else {
@@ -910,54 +1239,79 @@ new file mode 100644
 +      selection.width = right - selection.x;
 +      selection.height = bottom - selection.y;
 +    }
-+    if (range.start >= w.start && range.start <= w.end)
++    if (range.start >= w.start && range.start <= w.end) {
++      firstAnchorY = r.y + r.height / 2;
++      firstStemY = r.y;
 +      firstHandle = Rect{std::clamp(w.rtl ? r.x + r.width - 10 : r.x - 10, 0, renderer.getScreenWidth() - 20),
-+                         r.y + r.height / 2 - 10, 20, 20};
-+    if (range.end >= w.start && range.end <= w.end)
-+      lastHandle = Rect{std::clamp(w.rtl ? r.x - 10 : r.x + r.width - 10, 0, renderer.getScreenWidth() - 20),
-+                        r.y + r.height / 2 - 10, 20, 20};
-+  }
-+  for (const auto& h : {firstHandle, lastHandle}) {
-+    if (!h.width) continue;
-+    renderer.fillRect(h.x, h.y, h.width, h.height, false);
-+    renderer.drawRect(h.x, h.y, h.width, h.height, true);
-+    renderer.fillRect(h.x + 5, h.y + 5, h.width - 10, h.height - 10, true);
-+  }
-+  editButton = Rect{};
-+  if (!dragging.load()) {
-+    const int width = 116, height = 40;
-+    int y = selection.y - height - 24;
-+    if (y < 0) y = selection.y + selection.height + 24;
-+    y = std::clamp(y, 0, std::max(0, renderer.getScreenHeight() - height));
-+    editButton = Rect{std::clamp(selection.x, 0, std::max(0, renderer.getScreenWidth() - width)), y, width, height};
-+    const auto overlapsHandle = [&](const Rect& h) {
-+      return h.width > 0 && editButton.x < h.x + h.width + 18 && editButton.x + width > h.x - 18 &&
-+             editButton.y < h.y + h.height + 18 && editButton.y + height > h.y - 18;
-+    };
-+    for (int corner = 0; (overlapsHandle(firstHandle) || overlapsHandle(lastHandle)) && corner < 4; ++corner) {
-+      editButton.x = (corner & 1) ? renderer.getScreenWidth() - width : 0;
-+      editButton.y = corner < 2 ? 0 : renderer.getScreenHeight() - height;
++                         std::clamp(r.y - 20, 0, renderer.getScreenHeight() - 20), 20, 20};
 +    }
-+    y = editButton.y;
-+    renderer.fillRect(editButton.x, y, width, height, false);
-+    renderer.drawRect(editButton.x, y, width, height, true);
-+    renderer.drawText(UI_10_FONT_ID, editButton.x + 8, y + 8, tr(STR_EDIT));
++    if (range.end >= w.start && range.end <= w.end) {
++      lastAnchorY = r.y + r.height / 2;
++      lastStemY = r.y + r.height;
++      lastHandle = Rect{std::clamp(w.rtl ? r.x - 10 : r.x + r.width - 10, 0, renderer.getScreenWidth() - 20),
++                        std::clamp(r.y + r.height, 0, renderer.getScreenHeight() - 20), 20, 20};
++    }
++  }
++  if (dragging.load()) {
++    firstSnapshot.capture(renderer, firstHandle, firstStemY);
++    lastSnapshot.capture(renderer, lastHandle, lastStemY);
++  }
++  for (const bool last : {false, true}) {
++    const Rect& h = last ? lastHandle : firstHandle;
++    if (!h.width) continue;
++    const int x = h.x + h.width / 2, y = h.y + h.height / 2;
++    const int stemY = last ? lastStemY : firstStemY;
++    renderer.drawLine(x, stemY, x, y, 4, false);
++    renderer.drawLine(x, stemY, x, y, 2, true);
++    disk(renderer, x, y, 9, false);
++    disk(renderer, x, y, 7, true);
++  }
++  toolbar = {};
++  if (!dragging.load()) {
++    int bezelTop, bezelRight, bezelBottom, bezelLeft;
++    renderer.getOrientedViewableTRBL(&bezelTop, &bezelRight, &bezelBottom, &bezelLeft);
++    const HighlightToolbar::Bounds view{bezelLeft + 6, bezelTop + 6,
++                                        renderer.getScreenWidth() - bezelLeft - bezelRight - 12,
++                                        renderer.getScreenHeight() - bezelTop - bezelBottom - 12};
++    toolbar = HighlightToolbar::nearSelection({selection.x, selection.y, selection.width, selection.height}, view,
++                                              {firstHandle.x, firstHandle.y, firstHandle.width, firstHandle.height},
++                                              {lastHandle.x, lastHandle.y, lastHandle.width, lastHandle.height});
++    const int width = toolbar.area.width, height = toolbar.area.height;
++    const auto& card = toolbar.area;
++    // Dithered shadow needs no extra grayscale plane/framebuffer. A white halo
++    // separates the floating card from text in both display polarities.
++    renderer.fillRectDither(card.x + 3, card.y + 4, width, height, Color::LightGray);
++    renderer.fillRoundedRect(card.x - 2, card.y - 2, width + 4, height + 4, 10, Color::White);
++    renderer.fillRoundedRect(card.x, card.y, width, height, 8, Color::White);
++    renderer.drawRoundedRect(card.x, card.y, width, height, 1, 8, true);
++    for (size_t i = 0; i < HighlightToolbar::Actions.size(); ++i) {
++      const auto button = toolbar.button(i);
++      if (i % toolbar.columns != 0)
++        renderer.drawLine(button.x, button.y + 10, button.x, button.y + button.height - 10, 1, true);
++      if (i >= toolbar.columns)
++        renderer.drawLine(button.x + 10, button.y, button.x + button.width - 10, button.y, 1, true);
++      toolbarIcon(renderer, button, HighlightToolbar::Actions[i]);
++    }
 +  }
 +  if (failed) renderer.drawText(SMALL_FONT_ID, 8, renderer.getScreenHeight() - 24, tr(STR_HIGHLIGHT_EDIT_UNAVAILABLE));
++  paintedRange = range;
++  dragFrameReady = dragging.load();
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/reader/OnPageHighlightActivity.h b/src/activities/reader/OnPageHighlightActivity.h
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,62 @@
 +#pragma once
 +#include <Epub.h>
 +#include <Epub/Page.h>
 +
++#include <array>
 +#include <atomic>
 +
 +#include "ChapterXPathResolver.h"
++#include "HighlightToolbar.h"
 +#include "OnPageHighlightModel.h"
 +#include "activities/Activity.h"
 +#include "components/UITheme.h"
@@ -987,9 +1341,21 @@ new file mode 100644
 +  uint16_t spine = 0;
 +  XPathTextLocation original{};
 +  OnPageHighlightRange range{}, saved{};
-+  Rect firstHandle{}, lastHandle{}, editButton{};
++  Rect firstHandle{}, lastHandle{};
++  HighlightToolbar::Layout toolbar{};
++  // Two tiny handle regions (512 bytes total), never a full-page snapshot.
++  struct HandleSnapshot {
++    std::array<uint8_t, 256> bytes{};
++    Rect rect{};
++    bool valid = true;
++    void capture(GfxRenderer& renderer, const Rect& handle, int stemY);
++    void restore(GfxRenderer& renderer) const;
++  } firstSnapshot, lastSnapshot;
++  bool dragFrameReady = false;
++  OnPageHighlightRange paintedRange{};
 +  bool ready = false, failed = false;
 +  int activeEdge = -1;
++  int firstAnchorY = 0, lastAnchorY = 0, dragOffsetY = 0;
 +  std::atomic<bool> dragging{false};
 +  std::atomic<int> dragX{0}, dragY{0};
 +  bool releasePending = false, ignoreOpeningRelease = true;
@@ -1022,6 +1388,28 @@ new file mode 100644
 +    return start != oldStart || end != oldEnd;
 +  }
 +};
+diff --git a/src/activities/reader/TouchDragInput.h b/src/activities/reader/TouchDragInput.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/TouchDragInput.h
+@@ -0,0 +1,17 @@
++#pragma once
++// Main-task-only coalescing: retain the latest contact point and a release
++// while the render task owns the page. No input FIFO or heap allocation.
++struct TouchDragInput {
++  int x = 0, y = 0;
++  bool pointPending = false, released = false;
++  void record(bool held, int px, int py) {
++    if (released) return;
++    if (held) {
++      x = px;
++      y = py;
++      pointPending = true;
++    } else
++      released = true;
++  }
++  void reset() { pointPending = released = false; }
++};
 diff --git a/src/clippings/HighlightDraftState.h b/src/clippings/HighlightDraftState.h
 new file mode 100644
 --- /dev/null
@@ -1052,10 +1440,206 @@ new file mode 100644
 +    return text.size() != originalBytes || fingerprint(text) != originalHash;
 +  }
 +};
+diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
+--- a/src/util/WordSelectNavigator.cpp
++++ b/src/util/WordSelectNavigator.cpp
+@@ -82,6 +82,7 @@
+   wordRepeatActive = false;
+   pendingSnapIdx = -1;
+   snapshot_.clear();
++  touchPaintedLo_ = touchPaintedHi_ = touchPaintedCursor_ = -1;
+ }
+
+ const WordSelectNavigator::WordInfo* WordSelectNavigator::getSelected() const {
+@@ -352,7 +353,8 @@
+   if (hit) *hit = false;
+   if (rows.empty() || words.empty() || lineHeight <= 0) return false;
+
+-  const int horizontalPad = 6;
++  const bool exactEndpoint = inMultiSelectMode && touchDragCursorVisible;
++  const int horizontalPad = exactEndpoint ? 0 : 6;
+
+   int bestIdx = -1;
+   int bestScore = INT_MAX;
+@@ -360,12 +362,12 @@
+   for (int idx = 0; idx < static_cast<int>(words.size()); idx++) {
+     const auto& word = words[idx];
+     const int wordHeight = word.heightOr(lineHeight);
+-    const int verticalPad = std::max(4, wordHeight / 4);
++    const int verticalPad = exactEndpoint ? 0 : std::max(4, wordHeight / 4);
+     const int left = static_cast<int>(word.screenX) - horizontalPad;
+     const int right = static_cast<int>(word.screenX) + static_cast<int>(word.width) + horizontalPad;
+     const int top = static_cast<int>(word.screenY) - verticalPad;
+     const int bottom = static_cast<int>(word.screenY) + wordHeight + verticalPad;
+-    if (x < left || x > right || y < top || y > bottom) continue;
++    if (x < left || x >= right || y < top || y >= bottom) continue;
+
+     const int centerX = static_cast<int>(word.screenX) + static_cast<int>(word.width) / 2;
+     const int centerY = static_cast<int>(word.screenY) + wordHeight / 2;
+@@ -495,8 +497,33 @@
+   std::string().swap(ownedTextPool);
+ }
+
++void WordSelectNavigator::invertTouchRange(const GfxRenderer& renderer, int lineHeight, int lo, int hi, int oldLo,
++                                           int oldHi) const {
++  const auto selected = [](const WordInfo& word, int index, int first, int last) {
++    if (first < 0) return false;
++    const auto inside = [first, last](int i) { return i >= first && i <= last; };
++    return inside(index) || inside(word.continuationOf) || inside(word.continuationIndex);
++  };
++  for (int i = 0; i < static_cast<int>(words.size()); ++i) {
++    const auto* word = getWordAt(i);
++    if (selected(*word, i, lo, hi) == selected(*word, i, oldLo, oldHi)) continue;
++    renderer.invertRect(word->screenX, word->screenY, word->width, word->heightOr(lineHeight));
++  }
++}
++
++void WordSelectNavigator::invertTouchCaret(const GfxRenderer& renderer, int lineHeight, int index) const {
++  const auto* word = getWordAt(index);
++  if (word) renderer.invertRect(word->screenX + word->width + 3, word->screenY, 2, word->heightOr(lineHeight));
++}
++
+ void WordSelectNavigator::renderHighlight(const GfxRenderer& renderer, int lineHeight,
+                                           const bool foregroundBlack) const {
++  if (inMultiSelectMode && touchDragCursorVisible) {
++    const int cursor = getCurrentFlatIndex();
++    invertTouchRange(renderer, lineHeight, std::min(anchorFlatIndex, cursor), std::max(anchorFlatIndex, cursor));
++    invertTouchCaret(renderer, lineHeight, cursor);
++    return;
++  }
+   if (inMultiSelectMode) {
+     const int cursorIdx = getCurrentFlatIndex();
+     const int lo = std::min(anchorFlatIndex, cursorIdx);
+@@ -594,6 +621,24 @@
+     GfxRenderer& renderer, int lineHeight, int prevWordIdx, int currWordIdx, const bool foregroundBlack) {
+   const auto* curr = getWordAt(currWordIdx);
+   if (!curr) return std::nullopt;
++  if (prevWordIdx < 0) touchPaintedLo_ = touchPaintedHi_ = touchPaintedCursor_ = -1;
++  if (inMultiSelectMode && touchDragCursorVisible) {
++    if (anchorFlatIndex < 0) return std::nullopt;
++    const int lo = std::min(anchorFlatIndex, currWordIdx), hi = std::max(anchorFlatIndex, currWordIdx);
++    // XOR only words entering/leaving the range, using their existing page
++    // pixels. No glyph redraw, page repaint, allocation or 4 KiB range snapshot.
++    if (touchPaintedLo_ < 0 && prevWordIdx >= 0 && snapshot_.valid()) snapshot_.restore(renderer);
++    snapshot_.clear();
++    invertTouchCaret(renderer, lineHeight, touchPaintedCursor_);
++    invertTouchRange(renderer, lineHeight, lo, hi, touchPaintedLo_, touchPaintedHi_);
++    invertTouchCaret(renderer, lineHeight, currWordIdx);
++    touchPaintedLo_ = lo;
++    touchPaintedHi_ = hi;
++    touchPaintedCursor_ = currWordIdx;
++    return computeDirtyRect(prevWordIdx, currWordIdx, lineHeight);
++  }
++  if (touchPaintedLo_ >= 0) return std::nullopt;  // mode changed: repaint the page once
++
+   if (curr->continuationIndex >= 0 || curr->continuationOf >= 0) {
+     // Hyphenated wrap — two-word highlight is not yet supported by the
+     // single-snapshot fast path. Caller falls back to full repaint.
+diff --git a/src/util/WordSelectNavigator.h b/src/util/WordSelectNavigator.h
+--- a/src/util/WordSelectNavigator.h
++++ b/src/util/WordSelectNavigator.h
+@@ -195,7 +195,9 @@
+   // unused by current callers; only the optional's .has_value() distinguishes
+   // success from fallback.
+   //
+-  // Multi-word drags reuse the same fixed 4 KB buffer; no extra allocation.
++  // Touch multi-word drags invert only the changed words in place, with no
++  // snapshot size limit or glyph redraw. Other selection modes retain the
++  // fixed 4 KB snapshot path. Neither path allocates.
+   // Returns std::nullopt when the caller must fall back to a full repaint:
+   //   - the new highlight is too large for HighlightSnapshot's buffer
+   //   - the selection has a hyphenated continuation (multi-word fallback for now)
+@@ -327,6 +329,10 @@
+   // renderHighlightDifferential to restore the framebuffer before drawing the
+   // next highlight, so a cursor move repaints only the affected regions.
+   HighlightSnapshot snapshot_;
++  int touchPaintedLo_ = -1, touchPaintedHi_ = -1, touchPaintedCursor_ = -1;
++  void invertTouchRange(const GfxRenderer& renderer, int lineHeight, int lo, int hi, int oldLo = -1,
++                        int oldHi = -1) const;
++  void invertTouchCaret(const GfxRenderer& renderer, int lineHeight, int index) const;
+
+   // Single-word highlight draw. Used by both renderHighlight (for each word it
+   // chooses to highlight) and renderHighlightDifferential.
+diff --git a/test/drag_highlight/DragHighlightTest.cpp b/test/drag_highlight/DragHighlightTest.cpp
+--- a/test/drag_highlight/DragHighlightTest.cpp
++++ b/test/drag_highlight/DragHighlightTest.cpp
+@@ -19,6 +19,14 @@
+   nav.setTouchDragCursorVisible(true);
+   nav.selectWordAtPoint(25, 25, 20);
+   assert(nav.beginTouchMultiSelect());
++  bool hit = true;
++  nav.selectWordAtPoint(79,25,20,&hit); // whitespace just before next word
++  assert(!hit && nav.getCurrentFlatIndex()==0);
++  nav.selectWordAtPoint(85,19,20,&hit); // above its actual line box
++  assert(!hit && nav.getCurrentFlatIndex()==0);
++  nav.selectWordAtPoint(85,25,20,&hit);
++  assert(hit && nav.getCurrentFlatIndex()==1);
++  nav.selectWordAtPoint(25,25,20);
+   GfxRenderer renderer;
+   for (size_t i = 0; i < renderer.pixels.size(); ++i) renderer.pixels[i] = (i % 13) == 0;
+   const auto base = renderer.pixels;
+@@ -57,7 +65,8 @@
+     assert(renderer.pixels == reference.pixels);
+     prev = next;
+   }
+-  // Snapshot capacity is a hard limit: oversized ranges ask for a full repaint.
++  assert(renderer.snapshots == 0);
++  // Large touch ranges never fall back when they exceed snapshot capacity.
+   nav.reset();
+   std::vector<WordSelectNavigator::WordInfo> large(2);
+   large[0].screenX = 20;
+@@ -72,6 +81,23 @@
+   nav.selectWordAtPoint(25, 25, 20);
+   assert(nav.beginTouchMultiSelect());
+   nav.selectWordAtPoint(725, 425, 20);
+-  assert(!nav.renderHighlightDifferential(renderer, 20, -1, 1, true));
++  nav.setTouchDragCursorVisible(true);
++  assert(nav.renderHighlightDifferential(renderer, 20, -1, 1, true));
++  assert(renderer.snapshots == 0);
++  nav.reset();
++  std::vector<WordSelectNavigator::WordInfo> split(3);
++  for (int i=0;i<3;++i) {split[i].screenX=20+i*60;split[i].screenY=20;split[i].width=40;split[i].row=0;}
++  split[0].continuationIndex=1;split[1].continuationOf=0;
++  nav.load(std::move(split),{{20,0,3}},"",false);
++  nav.setTouchDragCursorVisible(true);
++  nav.selectWordAtPoint(145,25,20);assert(nav.beginTouchMultiSelect());
++  renderer.pixels=base;prev=-1;
++  for(int next:{2,0,1,2}) {
++    nav.selectWordAtPoint(25+next*60,25,20);
++    assert(nav.renderHighlightDifferential(renderer,20,prev,next,true));
++    GfxRenderer reference;reference.pixels=base;nav.renderHighlight(reference,20,true);
++    assert(renderer.pixels==reference.pixels);prev=next;
++  }
++  assert(renderer.snapshots==0);
+   std::cout << "Drag differential rendering checks passed\n";
+ }
+diff --git a/test/drag_highlight/stubs/GfxRenderer.h b/test/drag_highlight/stubs/GfxRenderer.h
+--- a/test/drag_highlight/stubs/GfxRenderer.h
++++ b/test/drag_highlight/stubs/GfxRenderer.h
+@@ -11,6 +11,11 @@
+  public:
+   enum class Orientation { Portrait, PortraitInverted, LandscapeClockwise, LandscapeCounterClockwise };
+   mutable std::vector<uint8_t> pixels = std::vector<uint8_t>(800 * 480, 0);
++  mutable unsigned snapshots = 0;
++  void invertRect(int x, int y, int w, int h) const {
++    for (int j=std::max(0,y); j<std::min(480,y+h); ++j)
++      for (int i=std::max(0,x); i<std::min(800,x+w); ++i) pixels[j*800+i]^=1;
++  }
+   Orientation getOrientation() const { return Orientation::Portrait; }
+   void fillRect(int x, int y, int w, int h, bool black = true) const {
+     for (int j = std::max(0, y); j < std::min(480, y + h); ++j)
+@@ -22,6 +27,7 @@
+   template <class... Args>
+   void drawText(Args...) const {}
+   size_t readFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t* out, size_t capacity) const {
++    ++snapshots;
+     size_t stride = (w + 7) / 8, bytes = stride * h;
+     if (bytes > capacity || x + w > 800 || y + h > 480) return 0;
+     std::fill(out, out + bytes, 0);
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 --- a/test/highlight_word_edit/CMakeLists.txt
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -10,3 +10,61 @@
+@@ -10,3 +10,72 @@
  target_compile_definitions(highlight_word_edit_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
  target_compile_options(highlight_word_edit_test PRIVATE -UNDEBUG)
  add_test(NAME highlight_word_edit COMMAND highlight_word_edit_test)
@@ -1114,9 +1698,20 @@ diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/
 +  DEPENDS ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp
 +    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractTouchRelease.py VERBATIM)
 +add_executable(highlight_touch_release_test TouchReleaseTest.cpp ${TOUCH_RELEASE})
-+target_include_directories(highlight_touch_release_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_include_directories(highlight_touch_release_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
 +target_compile_options(highlight_touch_release_test PRIVATE -UNDEBUG)
 +add_test(NAME highlight_touch_release COMMAND highlight_touch_release_test)
++
++set(ONPAGE_RENDER ${CMAKE_CURRENT_BINARY_DIR}/OnPageRender.inc)
++add_custom_command(OUTPUT ${ONPAGE_RENDER}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractOnPageRender.py
++    ${REPO_ROOT}/src/activities/reader/OnPageHighlightActivity.cpp ${ONPAGE_RENDER}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/OnPageHighlightActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractOnPageRender.py VERBATIM)
++add_executable(onpage_highlight_render_test OnPageRenderTest.cpp ${ONPAGE_RENDER})
++target_include_directories(onpage_highlight_render_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
++target_compile_options(onpage_highlight_render_test PRIVATE -UNDEBUG)
++add_test(NAME onpage_highlight_render COMMAND onpage_highlight_render_test)
 diff --git a/test/highlight_word_edit/ExtractBoundaryActions.py b/test/highlight_word_edit/ExtractBoundaryActions.py
 new file mode 100644
 --- /dev/null
@@ -1152,6 +1747,18 @@ new file mode 100644
 +a=text.index('void OnPageHighlightActivity::returnAction(')
 +b=text.index('void OnPageHighlightActivity::render(',a)
 +Path(sys.argv[2]).write_text(text[a:b])
+diff --git a/test/highlight_word_edit/ExtractOnPageRender.py b/test/highlight_word_edit/ExtractOnPageRender.py
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractOnPageRender.py
+@@ -0,0 +1,7 @@
++from pathlib import Path
++import sys
++text=Path(sys.argv[1]).read_text()
++a=text.index('namespace {')
++b=text.index('OnPageHighlightActivity::OnPageHighlightActivity',a)
++c=text.index('void OnPageHighlightActivity::HandleSnapshot::capture')
++Path(sys.argv[2]).write_text(text[a:b]+text[c:])
 diff --git a/test/highlight_word_edit/ExtractTouchRelease.py b/test/highlight_word_edit/ExtractTouchRelease.py
 new file mode 100644
 --- /dev/null
@@ -1421,7 +2028,7 @@ diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/high
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,123 @@
 +#include <algorithm>
 +#include <atomic>
 +#include <cassert>
@@ -1431,6 +2038,7 @@ new file mode 100644
 +#include "ChapterXPathResolver.h"
 +#include "activities/reader/OnPageHighlightModel.h"
 +#include "activities/reader/HighlightTouchPolicy.h"
++#include "activities/reader/HighlightToolbar.h"
 +struct Rect { int x=0,y=0,width=0,height=0; };
 +bool contains(const Rect& r,int x,int y,int pad=0) {
 + return r.width>0&&r.height>0&&x>=r.x-pad&&x<r.x+r.width+pad&&y>=r.y-pad&&y<r.y+r.height+pad;
@@ -1452,7 +2060,8 @@ new file mode 100644
 +};
 +struct HighlightPageAction {bool editor;uint16_t clippingIndex;int x,y;};
 +struct Store {
-+ unsigned writes=0;bool ok=true;std::string text;
++ unsigned writes=0,deletes=0;bool ok=true;std::string text;
++ bool removeClippingAt(size_t) {++deletes;return ok;}
 + bool updateClippingText(size_t,const std::string& value) {++writes;if(ok)text=value;return ok;}
 +} CLIPPINGS;
 +class OnPageHighlightActivity {
@@ -1463,9 +2072,11 @@ new file mode 100644
 + size_t wordCount=5,index=3;uint16_t spine=0;
 + XPathTextLocation original{6,15,25,false};
 + OnPageHighlightRange range{6,15},saved{6,15};
-+ Rect firstHandle{40,0,20,20},lastHandle{130,0,20,20},editButton{200,100,100,40};
++ Rect firstHandle{40,0,20,20},lastHandle{130,0,20,20};
++ HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(200,100,480);
 + bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false;
 + int activeEdge=-1,updates=0;
++ int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0;
 + std::atomic<bool> dragging{false};std::atomic<int> dragX{0},dragY{0};
 + Input mappedInput;
 + HighlightPageAction action{};
@@ -1477,6 +2088,23 @@ new file mode 100644
 +};
 +#include "OnPageActions.inc"
 +int main() {
++ const auto future=HighlightToolbar::Layout::place(20,30,112,5);
++ assert(future.columns==2 && future.area.width==112 && future.area.height==144);
++ for(size_t i=0;i<5;++i) { const auto b=future.button(i); assert(future.indexAt(b.x+28,b.y+24)==i); }
++ assert(!future.indexAt(104,150)); // empty final grid cell
++ assert(!HighlightToolbar::Layout{}.indexAt(0,0));
++
++ const HighlightToolbar::Bounds view{16,24,448,752};
++ const auto top=HighlightToolbar::nearSelection({400,30,60,20},view,{},{});
++ assert(top.area.y>=50 && top.area.x+top.area.width<=464);
++ const auto bottom=HighlightToolbar::nearSelection({20,740,100,20},view,{},{});
++ assert(bottom.area.y+bottom.area.height<740 && bottom.area.y>=24);
++ for(int y:{24,50,350,740,760}) for(int x:{16,200,450}) {
++   auto card=HighlightToolbar::nearSelection({x,y,80,20},view,{},{}).area;
++   assert(card.x>=view.x && card.y>=view.y && card.x+card.width<=view.x+view.width && card.y+card.height<=view.y+view.height);
++ }
++ const auto full=HighlightToolbar::nearSelection(view,view,{},{}).area;
++ assert(full.x>=view.x && full.y>=view.y && full.x+full.width<=464 && full.y+full.height<=776);
 + OnPageHighlightActivity a;
 + a.mappedInput={50,10,true,true,false,false,0};a.loop();
 + assert(a.dragging && a.activeEdge==0 && CLIPPINGS.writes==0);
@@ -1492,9 +2120,28 @@ new file mode 100644
 + shortQuote.firstHandle={40,0,20,20};shortQuote.lastHandle={65,0,20,20};
 + shortQuote.mappedInput={70,10,true,true,false,false,0};shortQuote.loop();
 + assert(shortQuote.dragging && shortQuote.activeEdge==1);
++ OnPageHighlightActivity stem;
++ for(auto& word:stem.words) word.rect.y=100;
++ stem.firstHandle={40,70,20,20};stem.firstAnchorY=110;
++ stem.mappedInput={50,80,true,true,false,false,0};stem.loop();
++ assert(stem.dragging && stem.dragOffsetY==30);
++ stem.updateDrag();assert(stem.range.start==6 && stem.range.end==15);
++ stem.dragX=300;stem.dragY=300;stem.updateDrag();
++ assert(stem.range.start==6 && stem.range.end==15); // margins cannot grow the quote
 + OnPageHighlightActivity edit;
 + edit.mappedInput={220,115,false,false,true,false,0};edit.loop();
 + assert(edit.finished && edit.action.editor && edit.action.clippingIndex==3);
++ OnPageHighlightActivity remove;
++ remove.mappedInput={280,115,false,false,true,false,0};remove.loop();
++ assert(remove.finished && CLIPPINGS.deletes==1 && !remove.action.editor);
++ OnPageHighlightActivity failedDelete;
++ CLIPPINGS.ok=false;
++ failedDelete.mappedInput={280,115,false,false,true,false,0};failedDelete.loop();
++ assert(!failedDelete.finished && failedDelete.failed && CLIPPINGS.deletes==2);
++ CLIPPINGS.ok=true;
++ OnPageHighlightActivity holdButton;
++ holdButton.mappedInput={280,115,false,true,false,false,1000};holdButton.loop();
++ assert(!holdButton.finished && CLIPPINGS.deletes==2);
 + OnPageHighlightActivity dictionary;
 + dictionary.mappedInput={100,10,false,true,false,false,600};dictionary.loop();
 + assert(dictionary.finished && !dictionary.action.editor && dictionary.action.x==100);
@@ -1505,16 +2152,108 @@ new file mode 100644
 + assert(failure.failed && failure.range.start==6 && failure.saved.start==6);
 + std::cout<<"Actual on-page handlers: live drag, one release write, delayed release, Edit, dictionary and failure rollback passed\n";
 +}
+diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word_edit/OnPageRenderTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/OnPageRenderTest.cpp
+@@ -0,0 +1,86 @@
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cassert>
++#include <cstdint>
++#include <iostream>
++#include <memory>
++#include <vector>
++#include "activities/reader/HighlightToolbar.h"
++#include "activities/reader/OnPageHighlightModel.h"
++struct Rect {int x=0,y=0,width=0,height=0;};
++enum class Color {White,LightGray};
++namespace HalDisplay {constexpr int FAST_REFRESH=0;}
++constexpr int UI_10_FONT_ID=0,SMALL_FONT_ID=0;
++#define tr(...) ""
++struct {int invertImagesDark=0;int getReaderFontId() const {return 0;}int textWeightOffset() const {return 0;}} SETTINGS;
++struct RenderLock {};
++struct Scope {void endScanAndPrewarm() {}};
++struct Cache {Scope createPrewarmScope() {return {};}};
++struct GfxRenderer {
++ mutable std::vector<uint8_t> pixels=std::vector<uint8_t>(240*320);
++ Cache cache;
++ struct TextWeightScope {TextWeightScope(GfxRenderer&,int) {}};
++ int getScreenWidth() const {return 240;}int getScreenHeight() const {return 320;}
++ int getLineHeight(int) const {return 20;}
++ void getOrientedViewableTRBL(int* t,int* r,int* b,int* l) const {*t=*r=*b=*l=0;}
++ void clearScreen() {std::fill(pixels.begin(),pixels.end(),0);}
++ void setInvertImages(bool) {}
++ Cache* getFontCacheManager() {return &cache;}
++ void drawPixel(int x,int y,bool black) const {if(x>=0&&x<240&&y>=0&&y<320)pixels[y*240+x]=black;}
++ void fillRect(int x,int y,int w,int h,bool black) const {for(int j=0;j<h;++j)for(int i=0;i<w;++i)drawPixel(x+i,y+j,black);}
++ void invertRect(int x,int y,int w,int h) const {for(int j=std::max(0,y);j<std::min(320,y+h);++j)for(int i=std::max(0,x);i<std::min(240,x+w);++i)pixels[j*240+i]^=1;}
++ void drawLine(int x,int y,int a,int b,int width,bool black) const {
++  const int steps=std::max(std::abs(a-x),std::abs(b-y));
++  for(int i=0;i<=steps;++i)fillRect(x+(a-x)*i/std::max(1,steps),y+(b-y)*i/std::max(1,steps),width,width,black);
++ }
++ void fillRectDither(int x,int y,int w,int h,Color) const {for(int j=0;j<h;++j)for(int i=0;i<w;++i)drawPixel(x+i,y+j,(i+j)%2);}
++ void fillRoundedRect(int x,int y,int w,int h,int,Color) const {fillRect(x,y,w,h,false);}
++ void drawRoundedRect(int x,int y,int w,int h,int,int,bool black) const {drawLine(x,y,x+w-1,y,1,black);drawLine(x,y+h-1,x+w-1,y+h-1,1,black);drawLine(x,y,x,y+h-1,1,black);drawLine(x+w-1,y,x+w-1,y+h-1,1,black);}
++ template<class... T> void drawText(T...) const {}
++ void displayBuffer(int) {}
++ size_t readFramebufferRegion(int x,int y,int w,int h,uint8_t* out,size_t capacity) const {
++  const size_t stride=(w+7)/8,size=stride*h;if(size>capacity||x<0||y<0||x+w>240||y+h>320)return 0;
++  std::fill(out,out+size,0);for(int j=0;j<h;++j)for(int i=0;i<w;++i)if(pixels[(y+j)*240+x+i])out[j*stride+i/8]|=1<<(i%8);return size;
++ }
++ void writeFramebufferRegion(int x,int y,int w,int h,const uint8_t* data) {const size_t stride=(w+7)/8;for(int j=0;j<h;++j)for(int i=0;i<w;++i)drawPixel(x+i,y+j,(data[j*stride+i/8]>>(i%8))&1);}
++};
++struct Page {
++ unsigned renders=0;
++ void render(GfxRenderer& renderer,int,int,int,bool) {++renders;for(size_t i=0;i<renderer.pixels.size();++i)renderer.pixels[i]=(i%17==0);}
++};
++class OnPageHighlightActivity {
++ public:
++ struct Word {Rect rect;uint32_t start,end;bool rtl=false;};
++ GfxRenderer renderer;std::unique_ptr<Page> page=std::make_unique<Page>();
++ Word words[4]={{{20,80,40,20},0,4},{{80,80,40,20},5,9},{{20,120,40,20},10,14},{{80,120,40,20},15,19}};
++ size_t wordCount=4;int left=0,top=0;
++ bool ready=true,failed=false,dragFrameReady=false;
++ int firstAnchorY=0,lastAnchorY=0;
++ Rect firstHandle{},lastHandle{};HighlightToolbar::Layout toolbar{};
++ std::atomic<bool> dragging{true};
++ OnPageHighlightRange range{0,4},paintedRange{};
++ struct HandleSnapshot {
++  std::array<uint8_t,256> bytes{};Rect rect{};bool valid=true;
++  void capture(GfxRenderer&,const Rect&,int);void restore(GfxRenderer&) const;
++ } firstSnapshot,lastSnapshot;
++ void updateDrag() {}
++ void render(RenderLock&&);
++};
++#include "OnPageRender.inc"
++int main() {
++ OnPageHighlightActivity actual;actual.render(RenderLock{});
++ assert(actual.page->renders==2);
++ for(auto range:{OnPageHighlightRange{0,19},{0,9},{5,14},{10,19},{15,19},{0,4}}) {
++  actual.range=range;actual.render(RenderLock{});
++  OnPageHighlightActivity reference;reference.range=range;reference.render(RenderLock{});
++  assert(actual.renderer.pixels==reference.renderer.pixels);
++  assert(actual.page->renders==2); // no page/glyph render during subsequent moves
++ }
++ actual.dragging=false;actual.render(RenderLock{});
++ assert(actual.page->renders==4 && actual.toolbar.count==2);
++ assert(actual.toolbar.area.x>=6 && actual.toolbar.area.y>=6);
++ assert(actual.toolbar.area.x+actual.toolbar.area.width<=234);
++ assert(actual.toolbar.area.y+actual.toolbar.area.height<=314);
++ std::cout<<"Saved highlight drag: incremental pixels match clean redraws, no page renders during movement, floating toolbar on release\n";
++}
 diff --git a/test/highlight_word_edit/TouchReleaseTest.cpp b/test/highlight_word_edit/TouchReleaseTest.cpp
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/TouchReleaseTest.cpp
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,92 @@
 +#include <cassert>
 +#include <cstddef>
 +#include <cstdlib>
 +#include <iostream>
 +#include <string>
++#include "activities/reader/TouchDragInput.h"
 +namespace ClipSelectionPaging {
 +bool hasDraggedFrom(int x,int y,int a,int b) {return std::abs(a-x)>10 || std::abs(b-y)>10;}
 +}
@@ -1524,11 +2263,20 @@ new file mode 100644
 +};
 +struct Renderer {int getLineHeight(int) const {return 20;}};
 +struct {int getReaderFontId() const {return 0;}} SETTINGS;
++struct RenderLock {
++ static inline bool busy=false;
++ template<class T> explicit RenderLock(T&) {}
++ static bool peek() {return busy;}
++};
++unsigned long millis() {static unsigned long time=1;return time++;}
 +struct Navigator {
-+ int current=0;
++ int current=0,selectCalls=0;
++ int screenX=10,width=40;bool isRtl=false;
++ int heightOr(int height) const {return height;}
 + int getCurrentFlatIndex() const {return current;}
-+ bool selectWordAtPoint(int x,int,int,bool* hit) { *hit=true;int old=current;current=x>10?1:0;return old!=current; }
-+ const void* getWordAt(int i) const {return i<2?this:nullptr;}
++ bool selectWordAtPoint(int x,int,int,bool* hit) { ++selectCalls;*hit=true;int old=current;current=x>10?1:0;return old!=current; }
++ int screenY=0;
++ const Navigator* getWordAt(int i) const {return i>=0 && i<2?this:nullptr;}
 +};
 +struct DictionaryLookupController {
 + unsigned lookups=0;std::string text;
@@ -1538,11 +2286,14 @@ new file mode 100644
 +};
 +struct Selection {
 + bool touchDragLookup_=true,touchDragHasMoved_=false;
++ TouchDragInput touchDragInput_;
++ unsigned long touchPageEdgeSince_=0;
++ bool touchPageAwaitMotion_=false;int touchPageArrivalX_=0,touchPageArrivalY_=0;
 + int touchDragStartX_=0,touchDragStartY_=0;
 + Input mappedInput;Renderer renderer;Navigator navigator;DictionaryLookupController controller;
-+ unsigned clips=0,captures=0;
++ unsigned clips=0,captures=0,pageLoads=0;bool pageOk=false;
 + void requestUpdate() {}
-+ bool continueTouchSelectionOnNextPage() {return false;}
++ bool continueTouchSelectionOnNextPage() {++pageLoads;if(pageOk){pageOk=false;navigator.current=0;return true;}return false;}
 + std::string finishTouchLookupPhrase() {return navigator.current?"one two":"one";}
 + void finishSelectionAsClipping() {++clips;}
 + void captureClippingRequest() {++captures;}
@@ -1550,15 +2301,33 @@ new file mode 100644
 +};
 +#include "TouchRelease.inc"
 +int main() {
++ Selection busy;
++ RenderLock::busy=true;
++ busy.mappedInput.x=50;busy.loop();
++ busy.mappedInput.x=0;busy.loop();
++ busy.mappedInput.x=50;busy.loop();
++ assert(busy.navigator.selectCalls==0);
++ busy.mappedInput.held=false;busy.loop();
++ assert(busy.controller.lookups==0 && busy.clips==0 && busy.touchDragInput_.released);
++ RenderLock::busy=false;busy.loop();
++ assert(busy.clips==1 && busy.controller.lookups==0 && busy.navigator.selectCalls==1);
 + Selection slow;
 + // Holding for arbitrarily many input frames never starts dictionary lookup.
 + for(int i=0;i<10000;++i) slow.loop();
 + assert(slow.controller.lookups==0 && slow.clips==0 && slow.touchDragLookup_);
 + slow.mappedInput.x=50;slow.loop();
 + for(int i=0;i<10000;++i) slow.loop();
-+ assert(slow.controller.lookups==0 && slow.clips==0);
++ assert(slow.controller.lookups==0 && slow.clips==0 && slow.pageLoads==0);
 + slow.mappedInput.held=false;slow.loop();
 + assert(slow.clips==1 && slow.controller.lookups==0 && !slow.touchDragLookup_);
++ Selection crossing;crossing.pageOk=true;crossing.mappedInput.x=100;
++ for(int i=0;i<500 && !crossing.touchPageAwaitMotion_;++i) crossing.loop();
++ assert(crossing.touchPageAwaitMotion_ && crossing.navigator.current==0);
++ const auto updates=crossing.navigator.selectCalls;
++ for(int i=0;i<100;++i) crossing.loop();
++ assert(crossing.navigator.current==0 && crossing.navigator.selectCalls==updates);
++ crossing.mappedInput.x=0;crossing.loop();
++ assert(!crossing.touchPageAwaitMotion_ && crossing.navigator.current==0);
 + Selection one;
 + for(int i=0;i<10000;++i) one.loop();
 + one.mappedInput.held=false;one.loop();
