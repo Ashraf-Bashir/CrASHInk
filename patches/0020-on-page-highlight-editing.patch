@@ -1,10 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -143,6 +143,14 @@
+@@ -143,6 +143,16 @@
 
  ### crASHink patch updates
 
++- Fixed: crossing pages during a drag invalidates the old page framebuffer before drawing the new selection.
++- Changed: center the floating toolbar on the selection with an 8-pixel gap, adjusting only to clear visible handles or screen edges.
 +- Added: tap saved highlights for on-page edge handles and a floating pencil/trash toolbar with rounded corners, a subtle shadow and round stem handles. The toolbar uses a shared action list and wraps automatically for future options. Dragging hides the toolbar; releasing saves the resized range while preserving text on other pages. Uncertain text mappings keep the full editor available without guessing a boundary.
 +- Changed: hold briefly (200 ms) to start selection, then drag freely. Only release decides the action: one word opens the dictionary, multiple words save a highlight. Pausing while holding never opens a dictionary popup. Dictionary lookup also works on highlighted words.
 +- Changed: saved clippings open directly in the full editor, with Save, Open, Delete and a top-right close button. Save is disabled when the selection matches the original, including after reversing changes.
@@ -82,7 +84,18 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      touchDragLookup_ = navigator.beginTouchMultiSelect();
      touchDragStartX_ = initialTouchX_;
      touchDragStartY_ = initialTouchY_;
-@@ -869,8 +872,8 @@
+@@ -853,6 +856,10 @@
+       workingSet_.clear();
+       page.reset();
+       page = std::move(nextPage);
++      // A different Page owns different pixels. Never reuse the previous
++      // page's framebuffer or differential cursor state after this swap.
++      framebufferContainsPage_ = false;
++      forceFullRepaintOnNextRender();
+       activePageOffset_ = 1;
+       nextPageFirstWord.clear();
+       nextPagePrepared = buildWorkingSet(/*consumeInitialConfirm=*/false) && selectFirstWordForTouchDrag();
+@@ -869,8 +876,8 @@
    if (!nextPageLoaded) {
      LOG_ERR("DICT", "Failed to load the next reader page for touch selection");
      // Preserve the valid page-zero selection if the next page cannot be read.
@@ -93,7 +106,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
    }
    if (!nextPagePrepared) {
      LOG_ERR("DICT", "Failed to prepare next reader page for touch selection");
-@@ -1080,7 +1083,7 @@
+@@ -1080,7 +1087,7 @@
      return;
    }
 
@@ -102,7 +115,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      requestUpdate();
    }
 
-@@ -1088,30 +1091,87 @@
+@@ -1088,30 +1095,87 @@
    if (touchDragLookup_) {
      int dragX = 0;
      int dragY = 0;
@@ -200,7 +213,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1123,13 +1183,16 @@
+@@ -1123,13 +1187,16 @@
      bool touchedWord = false;
      navigator.selectWordAtPoint(touchX, touchY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &touchedWord);
      if (touchedWord && navigator.beginTouchMultiSelect()) {
@@ -220,7 +233,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      }
      return;
    }
-@@ -1178,7 +1241,7 @@
+@@ -1178,7 +1245,7 @@
    //   - the controller has nothing pending to draw,
    //   - we have a current selection.
    if (nextRenderMode_ == RenderMode::Differential && !controller.isActive() && currIdx >= 0) {
@@ -229,7 +242,7 @@ diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activi
      auto dirty =
          navigator.renderHighlightDifferential(renderer, lineHeight, prevHighlightIdx_, currIdx, foregroundBlack);
      if (dirty.has_value()) {
-@@ -1219,7 +1282,7 @@
+@@ -1219,7 +1286,7 @@
          renderer.fillRect(bezelLeft, clearY, clearW, reservedBottomHeight_, false);
        }
 
@@ -861,7 +874,7 @@ diff --git a/src/activities/reader/HighlightToolbar.h b/src/activities/reader/Hi
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/HighlightToolbar.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,82 @@
 +#pragma once
 +#include <algorithm>
 +#include <array>
@@ -910,22 +923,29 @@ new file mode 100644
 +  const int width = result.area.width, height = result.area.height;
 +  const int right = std::max(view.x, view.x + view.width - width);
 +  const int bottom = std::max(view.y, view.y + view.height - height);
-+  const int x = std::clamp(selection.x, view.x, right);
++  const int x = std::clamp(selection.x + (selection.width - width) / 2, view.x, right);
 +  const int middleY = std::clamp(selection.y + (selection.height - height) / 2, view.y, bottom);
-+  const std::array<std::array<int, 2>, 8> candidates{{{x, selection.y - height - 44},
-+                                                      {x, selection.y + selection.height + 44},
-+                                                      {selection.x + selection.width + 8, middleY},
-+                                                      {selection.x - width - 8, middleY},
-+                                                      {view.x, view.y},
-+                                                      {right, view.y},
-+                                                      {view.x, bottom},
-+                                                      {right, bottom}}};
++  const int aboveHandles = std::min(selection.y, first.width > 0 ? first.y : selection.y);
++  const int belowHandles =
++      std::max(selection.y + selection.height, last.width > 0 ? last.y + last.height : selection.y + selection.height);
++  const std::array<std::array<int, 2>, 12> candidates{{{x, selection.y - height - 8},
++                                                       {x, selection.y + selection.height + 8},
++                                                       {x, aboveHandles - height - 4},
++                                                       {x, belowHandles + 4},
++                                                       {x, view.y},
++                                                       {x, bottom},
++                                                       {selection.x + selection.width + 8, middleY},
++                                                       {selection.x - width - 8, middleY},
++                                                       {view.x, view.y},
++                                                       {right, view.y},
++                                                       {view.x, bottom},
++                                                       {right, bottom}}};
 +  for (const bool avoidText : {true, false}) {
 +    for (const auto& point : candidates) {
 +      result.area.x = point[0];
 +      result.area.y = point[1];
 +      if (result.area.x < view.x || result.area.y < view.y || result.area.x > right || result.area.y > bottom) continue;
-+      if (overlaps(result.area, first, 18) || overlaps(result.area, last, 18)) continue;
++      if (overlaps(result.area, first, 4) || overlaps(result.area, last, 4)) continue;
 +      if (avoidText && overlaps(result.area, selection)) continue;
 +      return result;
 +    }
@@ -933,7 +953,7 @@ new file mode 100644
 +  // A selection covering the entire viewport has no empty outside area.
 +  // Keep every toolbar control on screen even in that constrained case.
 +  result.area.x = x;
-+  result.area.y = std::clamp(selection.y - height - 44, view.y, bottom);
++  result.area.y = std::clamp(selection.y - height - 8, view.y, bottom);
 +  return result;
 +}
 +}  // namespace HighlightToolbar
@@ -1170,7 +1190,7 @@ new file mode 100644
 +  if (mappedInput.wasScreenTouchDown(x, y) || mappedInput.isScreenTouchHeld(x, y)) {
 +    RenderLock lock(*this);
 +    const bool first = contains(firstHandle, x, y, 14), last = contains(lastHandle, x, y, 14);
-+    if (ready && (first || last)) {
++    if (ready && (first || last) && !toolbar.indexAt(x, y)) {
 +      const auto distance = [&](const Rect& h) {
 +        const int64_t dx = x - h.x - h.width / 2;
 +        const int64_t dy = y - h.y - h.height / 2;
@@ -1741,7 +1761,7 @@ diff --git a/test/drag_highlight/stubs/GfxRenderer.h b/test/drag_highlight/stubs
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 --- a/test/highlight_word_edit/CMakeLists.txt
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -10,3 +10,72 @@
+@@ -10,3 +10,83 @@
  target_compile_definitions(highlight_word_edit_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
  target_compile_options(highlight_word_edit_test PRIVATE -UNDEBUG)
  add_test(NAME highlight_word_edit COMMAND highlight_word_edit_test)
@@ -1814,6 +1834,121 @@ diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/
 +target_include_directories(onpage_highlight_render_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
 +target_compile_options(onpage_highlight_render_test PRIVATE -UNDEBUG)
 +add_test(NAME onpage_highlight_render COMMAND onpage_highlight_render_test)
++
++set(DICTIONARY_PAGE_RENDER ${CMAKE_CURRENT_BINARY_DIR}/DictionaryPageRender.inc)
++add_custom_command(OUTPUT ${DICTIONARY_PAGE_RENDER}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractDictionaryPageRender.py
++    ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp ${DICTIONARY_PAGE_RENDER}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractDictionaryPageRender.py VERBATIM)
++add_executable(dictionary_page_render_test DictionaryPageRenderTest.cpp ${DICTIONARY_PAGE_RENDER})
++target_include_directories(dictionary_page_render_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(dictionary_page_render_test PRIVATE -UNDEBUG)
++add_test(NAME dictionary_page_render COMMAND dictionary_page_render_test)
+diff --git a/test/highlight_word_edit/DictionaryPageRenderTest.cpp b/test/highlight_word_edit/DictionaryPageRenderTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/DictionaryPageRenderTest.cpp
+@@ -0,0 +1,99 @@
++#include <algorithm>
++#include <cassert>
++#include <cstddef>
++#include <iostream>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#define LOG_ERR(...) do {} while(0)
++namespace HalDisplay {constexpr int FAST_REFRESH=0;}
++struct Scope {void endScanAndPrewarm() {}};
++struct Cache {Scope createPrewarmScope() {return {};}};
++struct GfxRenderer {
++ int pageId=11;Cache cache;
++ struct TextWeightScope {TextWeightScope(GfxRenderer&,int) {}};
++ struct FrameBufferLoan {FrameBufferLoan(GfxRenderer&) {}void end() {}};
++ void clearScreen(int=0) {pageId=0;}
++ void fillRect(int,int,int,int,bool) {}
++ void getOrientedViewableTRBL(int* a,int* b,int* c,int* d) {*a=*b=*c=*d=0;}
++ int getScreenWidth() const {return 480;}int getScreenHeight() const {return 800;}
++ int getLineHeight(int) const {return 20;}
++ void setInvertImages(bool) {}
++ Cache* getFontCacheManager() {return &cache;}
++ void displayBuffer(int) {}
++};
++struct RenderLock {template<class T>explicit RenderLock(T&) {}};
++namespace ReaderUtils {int readerBackgroundColor() {return 0;}bool readerForegroundBlack() {return true;}}
++struct {int invertImagesDark=0;int getReaderFontId() const {return 0;}int textWeightOffset() const {return 0;}} SETTINGS;
++struct Page {
++ int id;unsigned renders=0;
++ explicit Page(int id):id(id) {}
++ bool hasImages() const {return false;}
++ void prepareImageCaches() {}
++ void render(GfxRenderer& r,int,int,int,bool) {++renders;r.pageId=id;}
++};
++struct DictionaryClippingRequest {};
++bool utf8EndsWithHyphen(const char*,int) {return false;}
++struct Navigator {
++ struct Word {int textLen=3;} word;
++ unsigned deltas=0;
++ bool getLookupSelectionRange(int& a,int& b) const {a=0;b=1;return true;}
++ std::string buildPhrase(int,int) const {return "old words";}
++ const Word* getWordAt(int) const {return &word;}
++ const char* getDisplay(const Word&) const {return "old";}
++ size_t getLookupSelectionWordCount() const {return 2;}
++ void releaseWorkingSet() {}
++ int getCurrentFlatIndex() const {return 0;}
++ bool isMultiSelecting() const {return true;}
++ std::optional<int> renderHighlightDifferential(GfxRenderer&,int,int,int,bool) {++deltas;return 1;}
++ void renderHighlight(GfxRenderer&,int,bool) {}
++};
++namespace DictUtils {template<class... T>void drawWordSelectButtonHints(T&&...) {}}
++class DictionaryWordSelectActivity {
++ public:
++ GfxRenderer renderer;int mappedInput=0;
++ Navigator navigator;
++ struct {void clear() {}} workingSet_;
++ struct {bool isActive() const {return false;}bool render() {return false;}} controller;
++ enum class RenderMode {FullPage,Differential};
++ RenderMode nextRenderMode_=RenderMode::Differential;
++ int prevHighlightIdx_=7;
++ bool framebufferContainsPage_=true;
++ int reservedBottomHeight_=0,marginLeft=20,marginTop=40;
++ int activePageOffset_=0;bool hasNextReaderPage_=true;
++ void* readerContext_=nullptr;
++ std::unique_ptr<Page> (*readerPageLoad_)(void*,int)=[](void*,int offset) {assert(offset==1);return std::make_unique<Page>(22);};
++ std::unique_ptr<Page> page=std::make_unique<Page>(11);
++ std::string nextPageFirstWord="next";
++ bool hasCrossPageSelection_=false,crossPageFirstWordWasMerged_=false;
++ DictionaryClippingRequest crossPageFirstRequest_{};
++ std::string crossPageLookupPrefix_,crossPageMergedFirstWord_;
++ size_t crossPageLookupWordCount_=0;
++ bool captureCurrentClippingRequest(DictionaryClippingRequest&) const {return true;}
++ bool buildWorkingSet(bool) {return true;}
++ bool selectFirstWordForTouchDrag() {return true;}
++ void finishTouchLookupOnCurrentPage(const std::string&,size_t,const DictionaryClippingRequest&) {assert(false);}
++ void forceFullRepaintOnNextRender() {nextRenderMode_=RenderMode::FullPage;prevHighlightIdx_=-1;}
++ void requestUpdate() {}
++ void prewarmHighlightGlyphs(int) {}
++ void clearFrontButtonHintArea() {}
++ bool continueTouchSelectionOnNextPage();
++ void render(RenderLock&&);
++};
++#include "DictionaryPageRender.inc"
++int main() {
++ for(bool staleBackdrop:{false,true}) {
++  DictionaryWordSelectActivity activity;
++  activity.framebufferContainsPage_=staleBackdrop;
++  assert(activity.renderer.pageId==11);
++  assert(activity.continueTouchSelectionOnNextPage());
++  assert(activity.page->id==22 && !activity.framebufferContainsPage_);
++  assert(activity.nextRenderMode_==DictionaryWordSelectActivity::RenderMode::FullPage && activity.prevHighlightIdx_==-1);
++  activity.render(RenderLock{activity});
++  assert(activity.renderer.pageId==22 && activity.page->renders==2);
++  activity.render(RenderLock{activity});
++  assert(activity.renderer.pageId==22 && activity.page->renders==2); // following moves use delta again
++ }
++ std::cout<<"Production page transition/render: new page replaces old text once, then resumes differential selection\n";
++}
 diff --git a/test/highlight_word_edit/ExtractBoundaryActions.py b/test/highlight_word_edit/ExtractBoundaryActions.py
 new file mode 100644
 --- /dev/null
@@ -1827,6 +1962,18 @@ new file mode 100644
 +c=text.index('void HighlightEditActivity::adjust(')
 +d=text.index('void HighlightEditActivity::cancel()',c)
 +Path(sys.argv[2]).write_text(text[a:b]+text[c:d])
+diff --git a/test/highlight_word_edit/ExtractDictionaryPageRender.py b/test/highlight_word_edit/ExtractDictionaryPageRender.py
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractDictionaryPageRender.py
+@@ -0,0 +1,7 @@
++from pathlib import Path
++import sys
++text=Path(sys.argv[1]).read_text()
++a=text.index('bool DictionaryWordSelectActivity::continueTouchSelectionOnNextPage()')
++b=text.index('std::string DictionaryWordSelectActivity::finishTouchLookupPhrase()',a)
++c=text.index('void DictionaryWordSelectActivity::render(')
++Path(sys.argv[2]).write_text(text[a:b]+text[c:])
 diff --git a/test/highlight_word_edit/ExtractEditorActions.py b/test/highlight_word_edit/ExtractEditorActions.py
 new file mode 100644
 --- /dev/null
@@ -1847,7 +1994,7 @@ new file mode 100644
 +import sys
 +text=Path(sys.argv[1]).read_text()
 +a=text.index('void OnPageHighlightActivity::returnAction(')
-+b=text.index('void OnPageHighlightActivity::render(',a)
++b=text.index('void OnPageHighlightActivity::HandleSnapshot::capture',a)
 +Path(sys.argv[2]).write_text(text[a:b])
 diff --git a/test/highlight_word_edit/ExtractOnPageRender.py b/test/highlight_word_edit/ExtractOnPageRender.py
 new file mode 100644
@@ -2130,7 +2277,7 @@ diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/high
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,131 @@
 +#include <algorithm>
 +#include <atomic>
 +#include <cassert>
@@ -2207,6 +2354,10 @@ new file mode 100644
 + }
 + const auto full=HighlightToolbar::nearSelection(view,view,{},{}).area;
 + assert(full.x>=view.x && full.y>=view.y && full.x+full.width<=464 && full.y+full.height<=776);
++ const auto centered=HighlightToolbar::nearSelection({100,350,200,20},view,{90,330,20,20},{290,370,20,20});
++ assert(centered.area.x==144 && centered.area.y==294);
++ const auto shortCard=HighlightToolbar::nearSelection({100,350,40,20},view,{90,330,20,20},{130,370,20,20});
++ assert(shortCard.area.x==64 && shortCard.area.y+shortCard.area.height==326);
 + OnPageHighlightActivity a;
 + a.mappedInput={50,10,true,true,false,false,0};a.loop();
 + assert(a.dragging && a.activeEdge==0 && CLIPPINGS.writes==0);
@@ -2233,6 +2384,10 @@ new file mode 100644
 + OnPageHighlightActivity edit;
 + edit.mappedInput={220,115,false,false,true,false,0};edit.loop();
 + assert(edit.finished && edit.action.editor && edit.action.clippingIndex==3);
++ OnPageHighlightActivity overlap;
++ overlap.firstHandle={205,100,20,20};
++ overlap.mappedInput={220,115,true,true,false,false,0};overlap.loop();assert(!overlap.dragging);
++ overlap.mappedInput={220,115,false,false,true,false,0};overlap.loop();assert(overlap.finished && overlap.action.editor);
 + OnPageHighlightActivity remove;
 + remove.mappedInput={280,115,false,false,true,false,0};remove.loop();
 + assert(remove.finished && CLIPPINGS.deletes==1 && !remove.action.editor);
