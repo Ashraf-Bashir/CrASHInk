@@ -2209,3 +2209,456 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 
  - Reuse one clipping-file reader per render, filter impossible highlight matches before SD reads, and collect short boundary candidates in one matching pass. Filters are session-only, conservative, and invalidated after edits.
 +- Cache nearby pages' resolved highlights (including empty results) and prepare them in bounded idle slices; invalidate after clipping edits, sync/reloads, chapter or layout changes. Prepared page turns do no clipping-text reads or matching.
+
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -120,6 +120,7 @@
+ bool ClippingStore::updateClippingText(const size_t index, const std::string& text) {
+   ++contentRevision_;
+   if (index >= clippings.size() || text.empty() || text.size() > CLIPPING_TEXT_MAX) return false;
++  if (loadFailed_) return false;
+   const Clipping previous = clippings[index];
+   const bool previousDirty = dirty;
+   Clipping& clipping = clippings[index];
+@@ -153,6 +154,7 @@
+     return false;
+   }
+
++  loadFailed_ = false;
+   bookFilePath = filePath;
+   bookTitle = title;
+   bookAuthor = author;
+@@ -164,11 +166,33 @@
+   }
+
+   storeFilePath = storeFilePathForBook(filePath, bookType);
++  const std::string backup = storeFilePath + ".bak";
++  const std::string temporary = storeFilePath + ".tmp";
++  if (!Storage.exists(storeFilePath.c_str()) && Storage.exists(backup.c_str()) &&
++      !Storage.rename(backup.c_str(), storeFilePath.c_str())) {
++    loadFailed_ = true;
++    return false;
++  }
+   if (!Storage.exists(storeFilePath.c_str())) {
++    // A first-save interruption can leave only the temporary file. Validate
++    // it completely before publishing it, or block writes instead of starting
++    // an empty database over an existing clipping history.
++    if (!Storage.exists(temporary.c_str())) return true;
++    if (!readFromFile(temporary, clippings, &fileVersion) ||
++        !Storage.rename(temporary.c_str(), storeFilePath.c_str())) {
++      clippings.clear();
++      loadFailed_ = true;
++      return false;
++    }
+     return true;
+   }
+-
+-  return readFromFile();
++  // A transient SD failure must not expose a prefix of the records as if it
++  // were the full book. Retry once after the first reader has closed.
++  for (int attempt = 0; attempt < 2; ++attempt) {
++    loadFailed_ = false;
++    if (readFromFile()) return true;
++  }
++  return false;
+ }
+
+ void ClippingStore::unload() {
+@@ -189,6 +213,7 @@
+                                                     const uint16_t paragraphIndex, const std::string& text,
+                                                     const uint16_t tableSelection, const uint32_t layoutSignature) {
+   ++contentRevision_;
++  if (loadFailed_) return AddResult::SaveFailed;
+   if (clippings.size() >= CLIPPING_MAX_PER_BOOK) {
+     LOG_ERR("CLIP", "Clipping limit (%u) reached", CLIPPING_MAX_PER_BOOK);
+     return AddResult::LimitReached;
+@@ -244,6 +269,7 @@
+ }
+
+ bool ClippingStore::appendLastToFile(const std::string& text, const char* chapterTitle) {
++  if (loadFailed_) return false;
+   // Only an existing current-format file whose records end exactly where memory
+   // says they do. Everything else takes the atomic full rewrite.
+   if (clippings.size() < 2 || fileVersion != VERSION || storeFilePath.empty()) return false;
+@@ -307,6 +333,7 @@
+ }
+
+ bool ClippingStore::removeClippingAt(const size_t index) {
++  if (loadFailed_) return false;
+   ++contentRevision_;
+   if (index >= clippings.size()) return false;
+   Clipping clipping = std::move(clippings[index]);
+@@ -321,6 +348,7 @@
+ }
+
+ bool ClippingStore::removeClippings(const std::vector<bool>& remove) {
++  if (loadFailed_) return false;
+   ++contentRevision_;
+   if (remove.size() != clippings.size()) return false;
+   std::vector<Clipping> kept;
+@@ -412,6 +440,7 @@
+ }
+
+ bool ClippingStore::saveToFile() {
++  if (loadFailed_) return false;
+   if (!dirty) return true;
+   if (writeToFile()) {
+     dirty = false;
+@@ -424,12 +453,22 @@
+   ++contentRevision_;
+   std::vector<Clipping>().swap(clippings);
+   dirty = false;
++  loadFailed_ = false;
+   if (!storeFilePath.empty() && Storage.exists(storeFilePath.c_str())) {
+     Storage.remove(storeFilePath.c_str());
+   }
+-}
+-
+-bool ClippingStore::readFromFile() { return readFromFile(storeFilePath, clippings, &fileVersion); }
++  for (const char* suffix : {".bak", ".tmp"}) {
++    const std::string leftover = storeFilePath + suffix;
++    if (!storeFilePath.empty() && Storage.exists(leftover.c_str())) Storage.remove(leftover.c_str());
++  }
++}
++
++bool ClippingStore::readFromFile() {
++  if (readFromFile(storeFilePath, clippings, &fileVersion)) return true;
++  clippings.clear();
++  loadFailed_ = true;
++  return false;
++}
+
+ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>& out, uint8_t* versionOut) const {
+   out.clear();
+@@ -497,6 +536,9 @@
+       }
+       clipping.textOffset = static_cast<uint32_t>(f.position());
+       clipping.textLength = static_cast<uint16_t>(std::min<uint32_t>(textLen, CLIPPING_TEXT_MAX));
++      if (clipping.textOffset > f.size() || textLen > f.size() - clipping.textOffset) {
++        f.close(); return false;
++      }
+       if (textLen > 0 && !f.seekCur(textLen)) {
+         f.close();
+         LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
+@@ -514,6 +556,9 @@
+         return false;
+       }
+       clipping.textOffset = static_cast<uint32_t>(f.position());
++      if (clipping.textOffset > f.size() || clipping.textLength > f.size() - clipping.textOffset) {
++        f.close(); return false;
++      }
+       if (clipping.textLength > 0 && !f.seekCur(clipping.textLength)) {
+         f.close();
+         LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
+@@ -529,6 +574,7 @@
+
+ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
+                                 const std::string* sourcePathOverride, const char* replacementTitle) {
++  if (loadFailed_) return false;
+   Storage.mkdir("/.crosspoint");
+   Storage.mkdir(CLIPPINGS_DIR);
+
+
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -98,6 +98,7 @@
+   bool saveToFile();
+   void clearAll();
+
++  bool hasLoadError() const { return loadFailed_; }
+   uint32_t contentRevision() const { return contentRevision_; }
+   bool hasClippings() const { return !clippings.empty(); }
+   size_t clippingCount() const { return clippings.size(); }
+@@ -133,6 +134,7 @@
+   std::string bookTitle;
+   std::string bookAuthor;
+   std::string storeFilePath;
++  bool loadFailed_ = false;
+   uint32_t contentRevision_ = 1;
+   bool dirty = false;
+   // On-disk format of storeFilePath as last loaded or written; appends need VERSION.
+
+diff --git a/test/clipping_page_turn/ClippingPageTurnIoTest.cpp b/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
+--- a/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
++++ b/test/clipping_page_turn/ClippingPageTurnIoTest.cpp
+@@ -52,6 +52,7 @@
+   std::string storeFilePath = "clippings.bin";
+   std::vector<Clipping> clippings;
+   uint32_t contentRevision_ = 1;
++  bool loadFailed_ = false;
+   bool dirty = false, failWrite = false;
+   bool writeToFile(const std::string*, size_t) { return !failWrite; }
+   bool openTextReader(FsFile&) const;
+
+diff --git a/test/clipping_store_safety/CMakeLists.txt b/test/clipping_store_safety/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_store_safety/CMakeLists.txt
+@@ -0,0 +1,10 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(STORE_INC ${CMAKE_CURRENT_BINARY_DIR}/StoreSafety.inc)
++add_custom_command(OUTPUT ${STORE_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStoreSafety.py
++    ${REPO_ROOT}/src/ClippingStore.cpp ${STORE_INC}
++  DEPENDS ${REPO_ROOT}/src/ClippingStore.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStoreSafety.py VERBATIM)
++add_executable(clipping_store_safety_test ClippingStoreSafetyTest.cpp ${STORE_INC})
++target_include_directories(clipping_store_safety_test PRIVATE ${REPO_ROOT}/src ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(clipping_store_safety_test PRIVATE -UNDEBUG)
++add_test(NAME clipping_store_safety COMMAND clipping_store_safety_test)
+
+diff --git a/test/clipping_store_safety/ClippingStoreSafetyTest.cpp b/test/clipping_store_safety/ClippingStoreSafetyTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_store_safety/ClippingStoreSafetyTest.cpp
+@@ -0,0 +1,194 @@
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "ClippingStore.h"
++#define LOG_ERR(...) \
++  do {               \
++  } while (0)
++#define LOG_INF(...) \
++  do {               \
++  } while (0)
++using Bytes = std::vector<uint8_t>;
++std::map<std::string, Bytes> files;
++unsigned writes = 0, appends = 0, openFailures = 0;
++bool failRename = false;
++class HalFile {
++  const Bytes* bytes = nullptr;
++  size_t cursor = 0;
++
++ public:
++  void open(const Bytes& data) {
++    bytes = &data;
++    cursor = 0;
++  }
++  explicit operator bool() const { return bytes; }
++  int read(void* out, size_t count) {
++    const size_t available = bytes && cursor < bytes->size() ? bytes->size() - cursor : 0;
++    const size_t copied = std::min(count, available);
++    if (copied) std::memcpy(out, bytes->data() + cursor, copied);
++    cursor += copied;
++    return copied;
++  }
++  bool seekCur(size_t count) {
++    cursor += count;
++    return true;
++  }  // intentionally allows seeking past EOF
++  size_t position() const { return cursor; }
++  size_t size() const { return bytes ? bytes->size() : 0; }
++  void close() { bytes = nullptr; }
++};
++using FsFile = HalFile;
++struct StorageStub {
++  bool exists(const char* path) const { return files.count(path); }
++  bool rename(const char* from, const char* to) {
++    if (failRename || !files.count(from) || files.count(to)) return false;
++    files[to] = files[from];
++    files.erase(from);
++    return true;
++  }
++  bool remove(const char* path) { return files.erase(path); }
++  bool openFileForRead(const char*, const std::string& path, FsFile& file) {
++    if (openFailures) {
++      --openFailures;
++      return false;
++    }
++    if (!files.count(path)) return false;
++    file.open(files[path]);
++    return true;
++  }
++} Storage;
++namespace serialization {
++template <typename T>
++bool tryReadPod(FsFile& file, T& value) {
++  return file.read(&value, sizeof(value)) == sizeof(value);
++}
++bool tryReadString(FsFile& file, std::string& value) {
++  uint32_t size = 0;
++  if (!tryReadPod(file, size) || size > 4096) return false;
++  value.resize(size);
++  return !size || file.read(value.data(), size) == size;
++}
++}  // namespace serialization
++namespace MemoryBudget {
++struct Heap {
++  uint32_t maxAllocHeap = UINT32_MAX;
++};
++Heap snapshot() { return {}; }
++Heap psramSnapshot() { return {}; }
++}  // namespace MemoryBudget
++std::string storeFilePathForBook(const std::string&, const std::string&) { return "book.bin"; }
++void copyBounded(char* out, size_t size, const char* text) { std::snprintf(out, size, "%s", text); }
++int utf8SafeTruncateBuffer(const char*, int size) { return size; }
++unsigned long millis() { return 1000; }
++bool ClippingStore::writeToFile(const std::string*, size_t, const std::string*, const char*) {
++  ++writes;
++  return true;
++}
++bool ClippingStore::appendLastToFile(const std::string&, const char*) {
++  ++appends;
++  return false;
++}
++#include "StoreSafety.inc"
++template <typename T>
++void pod(Bytes& out, T value) {
++  const auto* begin = reinterpret_cast<const uint8_t*>(&value);
++  out.insert(out.end(), begin, begin + sizeof(value));
++}
++void string(Bytes& out, const std::string& text) {
++  pod<uint32_t>(out, text.size());
++  out.insert(out.end(), text.begin(), text.end());
++}
++Bytes database(uint8_t version) {
++  Bytes result;
++  pod(result, version);
++  pod<uint16_t>(result, 3);
++  string(result, "Book");
++  string(result, "Author");
++  string(result, "book.epub");
++  for (uint16_t chapter = 0; chapter < 3; ++chapter) {
++    pod(result, chapter);                                  // spine
++    for (int i = 0; i < 2; ++i) pod<uint16_t>(result, 0);  // start/end pages
++    pod<uint16_t>(result, 12);                             // page count
++    pod<uint16_t>(result, 1);
++    pod<uint16_t>(result, 3);  // words
++    pod<uint16_t>(result, 3);
++    pod<uint16_t>(result, 0);
++    pod<uint32_t>(result, 42);  // count, paragraph, timestamp
++    if (version >= 3) pod<uint32_t>(result, 17);
++    if (version >= 4) pod<uint16_t>(result, UINT16_MAX);
++    result.insert(result.end(), 48, 0);
++    const std::string text = "chapter " + std::to_string(chapter) + " highlight";
++    if (version == 1)
++      pod<uint32_t>(result, text.size());
++    else
++      pod<uint16_t>(result, text.size());
++    result.insert(result.end(), text.begin(), text.end());
++  }
++  return result;
++}
++void noOverwrite(ClippingStore& store) {
++  const auto before = files;
++  const auto previousWrites = writes, previousAppends = appends;
++  assert(store.hasLoadError() && store.clippingCount() == 0);
++  assert(store.addClipping(2, 0, 0, 1, 0, 1, 2, "Chapter 2", 0, "new highlight", UINT16_MAX, 17) ==
++         ClippingStore::AddResult::SaveFailed);
++  assert(!store.updateClippingText(0, "replacement"));
++  assert(!store.removeClippingAt(0));
++  assert(!store.removeClippings({}));
++  assert(!store.saveToFile());
++  assert(files == before && writes == previousWrites && appends == previousAppends);
++}
++int main() {
++  size_t truncations = 0;
++  for (uint8_t version = 1; version <= 4; ++version) {
++    const auto valid = database(version);
++    files = {{"book.bin", valid}};
++    ClippingStore good;
++    assert(good.loadForBook("book.epub", "Book", "Author", "epub"));
++    assert(good.clippingCount() == 3 && !good.hasLoadError());
++    for (size_t cut = 0; cut < valid.size(); ++cut) {
++      files = {{"book.bin", Bytes(valid.begin(), valid.begin() + cut)}};
++      ClippingStore broken;
++      assert(!broken.loadForBook("book.epub", "Book", "Author", "epub"));
++      noOverwrite(broken);
++      ++truncations;
++    }
++  }
++  const auto valid = database(4);
++  files = {{"book.bin.bak", valid}};
++  ClippingStore backup;
++  assert(backup.loadForBook("book.epub", "Book", "Author", "epub") && backup.clippingCount() == 3);
++  assert(files.at("book.bin") == valid && !files.count("book.bin.bak"));
++  files = {{"book.bin.tmp", valid}};
++  ClippingStore temporary;
++  assert(temporary.loadForBook("book.epub", "Book", "Author", "epub") && temporary.clippingCount() == 3);
++  assert(files.at("book.bin") == valid);
++  files = {{"book.bin.tmp", Bytes(valid.begin(), valid.end() - 1)}};
++  ClippingStore incomplete;
++  assert(!incomplete.loadForBook("book.epub", "Book", "Author", "epub"));
++  noOverwrite(incomplete);
++  files = {{"book.bin.bak", valid}};
++  failRename = true;
++  ClippingStore failedRename;
++  assert(!failedRename.loadForBook("book.epub", "Book", "Author", "epub"));
++  noOverwrite(failedRename);
++  failRename = false;
++  files = {{"book.bin", valid}};
++  openFailures = 1;
++  ClippingStore retried;
++  assert(retried.loadForBook("book.epub", "Book", "Author", "epub") && retried.clippingCount() == 3);
++  files["book.bin.bak"] = valid;
++  files["book.bin.tmp"] = valid;
++  retried.clearAll();
++  assert(files.empty() && !retried.hasLoadError());
++  std::cout << truncations
++            << " truncated-file cases blocked destructive writes; v1-v4 loads, backup/temp recovery, and transient "
++               "read retry passed\n";
++}
+
+diff --git a/test/clipping_store_safety/ExtractStoreSafety.py b/test/clipping_store_safety/ExtractStoreSafety.py
+new file mode 100644
+--- /dev/null
++++ b/test/clipping_store_safety/ExtractStoreSafety.py
+@@ -0,0 +1,14 @@
++from pathlib import Path
++import sys
++source = Path(sys.argv[1]).read_text()
++def function(signature):
++    start = source.index(signature)
++    end = source.index('\n}', start) + 3
++    return source[start:end]
++constants = source[source.index('constexpr uint8_t LEGACY_VERSION'):source.index('struct ClippingFileHeader')]
++methods = [
++ 'bool ClippingStore::loadForBook(', 'bool ClippingStore::readFromFile() {',
++ 'bool ClippingStore::readFromFile(const std::string& path,', 'bool ClippingStore::saveToFile()',
++ 'bool ClippingStore::updateClippingText(', 'ClippingStore::AddResult ClippingStore::addClipping(',
++ 'bool ClippingStore::removeClippingAt(', 'bool ClippingStore::removeClippings(', 'void ClippingStore::clearAll()']
++Path(sys.argv[2]).write_text(constants + '\n'.join(function(method) for method in methods))
+
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -50,6 +50,7 @@
+ add_subdirectory(text_pool)
+ add_subdirectory(clip_word_store)
+ add_subdirectory(clipping_page_turn)
++add_subdirectory(clipping_store_safety)
+ add_subdirectory(highlight_word_edit)
+ add_subdirectory(clipping_preview)
+ add_subdirectory(dict_layout)
+
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -1020,3 +1020,5 @@
+ STR_READEST_POSITION_NUMBERS_FORMAT: "%sChapter page %d/%d | Book %d%%"
+ STR_READEST_GO_TO_FORMAT: "Go to %d%%"
+ STR_READEST_KEEP_AT_FORMAT: "Keep %d%%"
++
++STR_CLIPPINGS_LOAD_FAILED: "Could not load highlights. Reopen the book to retry."
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -134,6 +134,8 @@
+
+ - Compare Here/Xteink and There/Readest by chapter, chapter page/total and book percentage, marking estimates; decision buttons include their percentage. Failed local reads stop highlight sync, and missing remote notes are not treated as explicit deletions.
+
++- Reject partial/truncated clipping loads and block writes after load errors. Recover complete backup/temp files left by interrupted saves, and retry a transient load failure without discarding history.
++
+ ## [v1.6.0] - 2026-09-21
+
+ ### Added

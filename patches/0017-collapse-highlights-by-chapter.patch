@@ -495,3 +495,431 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 
  - Readest position sync translates original chapter coordinates through the optimizer source map when the cloud EPUB is unavailable; converted books without a map leave the device position unchanged.
 
+
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
+--- a/src/activities/reader/EpubReaderClippingListActivity.cpp
++++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
+@@ -8,6 +8,9 @@
+ #include <cstdio>
+
+ #include "MappedInputManager.h"
++#include "HighlightEditActivity.h"
++#include "ClippingListPaging.h"
++#include "components/DisclosureIcon.h"
+ #include "ReaderUtils.h"
+ #include "activities/ActivityResult.h"
+ #include "activities/home/FileBrowserActionActivity.h"
+@@ -191,7 +194,7 @@
+   return title.empty() ? tr(STR_UNKNOWN_CHAPTER) : title;
+ }
+
+-void EpubReaderClippingListActivity::activateRow(bool longPress, bool ignoreInitialConfirmRelease) {
++void EpubReaderClippingListActivity::activateRow(bool /*longPress*/, bool ignoreInitialConfirmRelease) {
+   RenderLock lock(*this);
+   if (listNav.selected < 0 || listNav.selected >= static_cast<int>(chapterGroups.rows.size())) return;
+   if (chapterGroups.header(listNav.selected)) {
+@@ -204,10 +207,7 @@
+     return;
+   }
+   selectedClipping = static_cast<size_t>(chapterGroups.rows[listNav.selected]);
+-  if (longPress)
+-    showClippingActionMenu(ignoreInitialConfirmRelease);
+-  else
+-    openSelectedDetail();
++  showClippingActionMenu(ignoreInitialConfirmRelease);
+ }
+
+ void EpubReaderClippingListActivity::onEnter() {
+@@ -327,6 +327,27 @@
+   requestUpdate();
+ }
+
++void EpubReaderClippingListActivity::editSelectedClipping() {
++  const Clipping* clipping = CLIPPINGS.clippingAt(selectedClipping);
++  if (!clipping || !book) return;
++  const float hint = clipping->pageCount > 1 ? static_cast<float>(clipping->startPage) / (clipping->pageCount - 1) : 0;
++  // The parent list remains on the activity stack and owns (or borrows from
++  // its reader parent) this Epub until the editor closes. Aliasing an empty
++  // shared_ptr borrows it without allocating another ownership control block.
++  std::shared_ptr<Epub> borrowed(std::shared_ptr<Epub>{}, book);
++  auto editor = makeUniqueNoThrow<HighlightEditActivity>(renderer, mappedInput, std::move(borrowed), selectedClipping, hint);
++  if (!editor) return;
++  startActivityForResult(std::move(editor), [this](const ActivityResult&) {
++    detailMode = false;
++    detailText.clear();
++    detailLines.clear();
++    rebuildGroups();
++    listNav.selected = std::min<int>(listNav.selected, std::max(0, static_cast<int>(chapterGroups.rows.size()) - 1));
++    listNav.follow(static_cast<int>(chapterGroups.rows.size()));
++    requestUpdate();
++  });
++}
++
+ void EpubReaderClippingListActivity::showClippingActionMenu(const bool ignoreInitialConfirmRelease) {
+   if (selectedClipping >= CLIPPINGS.clippingCount()) return;
+
+@@ -340,12 +361,16 @@
+   const uint16_t selectedStartWordIndex = clippingToEdit->startWordIndex;
+   const uint32_t selectedTimestamp = clippingToEdit->timestamp;
+   std::vector<FileBrowserActionActivity::MenuItem> items;
+-  items.reserve(1);
++  items.reserve(3);
++  items.push_back({FileBrowserAction::OpenInBook, StrId::STR_OPEN_IN_BOOK});
++  items.push_back({FileBrowserAction::EditHighlight, StrId::STR_EDIT_HIGHLIGHT});
+   items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
+
++  auto menu = makeUniqueNoThrow<FileBrowserActionActivity>(renderer, mappedInput, title, std::move(items),
++                                                            ignoreInitialConfirmRelease);
++  if (!menu) { requestUpdate(); return; }
+   startActivityForResult(
+-      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, title, std::move(items),
+-                                                  ignoreInitialConfirmRelease),
++      std::move(menu),
+       [this, selectedSpineIndex, selectedStartPage, selectedStartWordIndex,
+        selectedTimestamp](const ActivityResult& result) {
+         longPressConfirmHandled = false;
+@@ -355,7 +380,7 @@
+         }
+
+         const auto* actionResult = std::get_if<FileBrowserActionResult>(&result.data);
+-        if (!actionResult || static_cast<FileBrowserAction>(actionResult->action) != FileBrowserAction::Delete) {
++        if (!actionResult) {
+           requestUpdate();
+           return;
+         }
+@@ -366,12 +391,56 @@
+           if (clipping->spineIndex == selectedSpineIndex && clipping->startPage == selectedStartPage &&
+               clipping->startWordIndex == selectedStartWordIndex && clipping->timestamp == selectedTimestamp) {
+             selectedClipping = static_cast<int>(i);
+-            deleteSelectedClipping();
++            switch (static_cast<FileBrowserAction>(actionResult->action)) {
++              case FileBrowserAction::OpenInBook: jumpToSelectedClipping(); break;
++              case FileBrowserAction::EditHighlight: editSelectedClipping(); break;
++              case FileBrowserAction::Delete: deleteSelectedClipping(); break;
++              default: requestUpdate(); break;
++            }
+             return;
+           }
+         }
+         requestUpdate();
+       });
++}
++
++Rect EpubReaderClippingListActivity::listPageButton(const bool next) const {
++  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
++  return Rect{next ? safe.x + safe.width - 50 : safe.x + 6, safe.y + safe.height - 50, 44, 44};
++}
++
++void EpubReaderClippingListActivity::turnListPage(const bool next) {
++  const ClippingListPaging paging{static_cast<int>(chapterGroups.rows.size()), visibleRows, listNav.top};
++  const int top = paging.destination(next);
++  if (top == listNav.top) return;
++  listNav.top = top;
++  listNav.selected = top;
++  listNav.follow(static_cast<int>(chapterGroups.rows.size()));
++  requestUpdate();
++}
++
++void EpubReaderClippingListActivity::renderListFooter() {
++  if (CLIPPINGS.hasLoadError()) return;
++  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
++  const ClippingListPaging paging{static_cast<int>(chapterGroups.rows.size()), visibleRows, listNav.top};
++  char count[48];
++  snprintf(count, sizeof(count), tr(STR_CLIPPINGS_COUNT_FORMAT), static_cast<unsigned>(CLIPPINGS.clippingCount()));
++  renderer.drawText(UI_10_FONT_ID, safe.x + (safe.width - renderer.getTextWidth(UI_10_FONT_ID, count)) / 2,
++                    safe.y + safe.height - 82, count);
++  const int y = safe.y + safe.height - 28 - renderer.getLineHeight(UI_10_FONT_ID) / 2;
++  char page[48];
++  snprintf(page, sizeof(page), tr(STR_CLIPPINGS_PAGE_FORMAT), paging.page(), paging.pages());
++  renderer.drawText(UI_10_FONT_ID, safe.x + (safe.width - renderer.getTextWidth(UI_10_FONT_ID, page)) / 2, y, page);
++  for (const bool forward : {false, true}) {
++    const auto rect = listPageButton(forward);
++    if ((forward && paging.page() == paging.pages()) || (!forward && paging.page() == 1)) continue;
++    renderer.drawRect(rect.x, rect.y, rect.width, rect.height, true);
++    const int center = rect.x + rect.width / 2;
++    const int direction = forward ? 1 : -1;
++    const int x[] = {center - direction * 4, center + direction * 5, center - direction * 4};
++    const int yy[] = {rect.y + 14, rect.y + 22, rect.y + 30};
++    renderer.fillPolygon(x, yy, 3, true);
++  }
+ }
+
+ void EpubReaderClippingListActivity::loop() {
+@@ -490,6 +559,13 @@
+     return;
+   }
+
++  for (const bool next : {false, true}) {
++    const auto rect = listPageButton(next);
++    if (mappedInput.wasTapInRect(rect.x, rect.y, rect.width, rect.height)) {
++      turnListPage(next);
++      return;
++    }
++  }
+   if (uiReady) {
+     const fui::InputSnapshot snap = touchSnapshotFrom(mappedInput);
+     if (snap.touchPressed || snap.touchReleased) {
+@@ -548,14 +624,23 @@
+   screen.setContentMargin(fui::Insets{
+       static_cast<int16_t>(safe.y + metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput)),
+       static_cast<int16_t>(renderer.getScreenWidth() - safe.x - safe.width),
+-      static_cast<int16_t>(renderer.getScreenHeight() - safe.y - safe.height), static_cast<int16_t>(safe.x)});
++      static_cast<int16_t>(renderer.getScreenHeight() - safe.y - safe.height + 88), static_cast<int16_t>(safe.x)});
+   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+   const size_t count = chapterGroups.rows.size();
++  if (CLIPPINGS.hasLoadError()) {
++    screen.centeredText(tr(STR_CLIPPINGS_LOAD_FAILED), screen.theme().bodyText);
++    return;
++  }
+   if (count == 0) {
+     screen.centeredText(tr(STR_NO_CLIPPINGS), screen.theme().bodyText);
+     return;
+   }
+   fui::ListProps props;
++  props.labelText = screen.theme().bodyText;
++  props.labelText.maxLines = 2;
++  props.rowPaddingY = 8;
++  props.rowHeight = std::max<int16_t>(uiListRowHeight(screen.theme(), UiListRowType::WithSubtitle),
++                                     2 * uiTarget.lineHeight(props.labelText.font) + 16);
+   props.action = ACTION_ROW;
+   props.inputMask = static_cast<uint16_t>(fui::InputTouch | fui::InputLongPress);
+   const fui::Rect bounds = screen.body();
+@@ -570,11 +655,12 @@
+     if (chapterGroups.header(i)) {
+       const auto group = static_cast<size_t>(-chapterGroups.rows[i] - 1);
+       const auto& entry = chapterGroups.groups[group];
+-      uiLabels[slot] = entry.open ? "[-] " : "[+] ";
+-      uiLabels[slot] += groupTitle(group);
++      uiLabels[slot] = groupTitle(group);
++      item.icon = disclosureIcon::bitmap(0, true, entry.open, props.rowHeight);
+       uiChapterTitles[slot] = std::to_string(entry.count);
+       item.value = uiChapterTitles[slot].c_str();
+     } else {
++      item.icon = disclosureIcon::bitmap(1, false, false, props.rowHeight);
+       CLIPPINGS.readClippingPreview(static_cast<size_t>(chapterGroups.rows[i]), uiLabels[slot]);
+     }
+     item.label = uiLabels[slot].c_str();
+@@ -705,10 +791,11 @@
+     }
+     app.render();
+   } while (listNav.consumeRebuildNeeded());
++  renderListFooter();
+   uiReady = true;
+
+   const auto labels =
+-      mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), CLIPPINGS.clippingCount() == 0 ? "" : tr(STR_OPEN),
++      mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), CLIPPINGS.clippingCount() == 0 ? "" : tr(STR_SELECT),
+                             tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, true);
+   renderer.displayBuffer();
+
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.h b/src/activities/reader/EpubReaderClippingListActivity.h
+--- a/src/activities/reader/EpubReaderClippingListActivity.h
++++ b/src/activities/reader/EpubReaderClippingListActivity.h
+@@ -12,6 +12,7 @@
+
+ #include "ClippingStore.h"
+ #include "HighlightChapterGroups.h"
++#include "components/UITheme.h"
+ #include "activities/Activity.h"
+ #include "util/ButtonNavigator.h"
+
+@@ -31,6 +32,10 @@
+   HighlightChapterGroups chapterGroups;
+   size_t selectedClipping = 0;
+   void rebuildGroups();
++  void editSelectedClipping();
++  Rect listPageButton(bool next) const;
++  void turnListPage(bool next);
++  void renderListFooter();
+   void activateRow(bool longPress = false, bool ignoreInitialConfirmRelease = false);
+   std::string groupTitle(size_t index) const;
+   std::string detailText;
+
+diff --git a/src/activities/home/FileBrowserActionActivity.h b/src/activities/home/FileBrowserActionActivity.h
+--- a/src/activities/home/FileBrowserActionActivity.h
++++ b/src/activities/home/FileBrowserActionActivity.h
+@@ -31,6 +31,8 @@
+   Rename = 18,
+   ReadingStats = 19,
+   ToggleBookStatsTracking = 20,
++  OpenInBook = 21,
++  EditHighlight = 22,
+ };
+
+ class FileBrowserActionActivity final : public Activity {
+
+diff --git a/src/components/DisclosureIcon.h b/src/components/DisclosureIcon.h
+new file mode 100644
+--- /dev/null
++++ b/src/components/DisclosureIcon.h
+@@ -0,0 +1,45 @@
++#pragma once
++#include <FreeInkUICore.h>
++
++#include <array>
++#include <cstdint>
++
++// Mask bitmaps reserve real layout space for indentation. Text-leading spaces
++// are deliberately unsuitable: FreeInkUI trims them when wrapping labels.
++namespace disclosureIcon {
++constexpr unsigned BASE = 16, STEP = 12, DEPTH = 4, HEIGHT = 16, BYTES = 128;
++using Bits = std::array<uint8_t, BYTES>;
++constexpr Bits make(unsigned depth, bool expanded, bool leaf) {
++  Bits bits{};
++  for (auto& byte : bits) byte = 255;
++  const unsigned stride = (BASE + STEP * depth + 7) / 8;
++  if (!leaf) {
++    for (int y = 0; y < 11; ++y) {
++      for (int x = 0; x < 9; ++x) {
++        const int distance = y > 5 ? y - 5 : 5 - y;
++        const bool ink = expanded ? (y < 9 && (x > 4 ? x - 4 : 4 - x) <= (8 - y) / 2) : x <= (5 - distance) * 8 / 5;
++        if (ink) {
++          const unsigned px = depth * STEP + 3 + x, py = 2 + y;
++          bits[py * stride + px / 8] &= static_cast<uint8_t>(~(1U << (7 - px % 8)));
++        }
++      }
++    }
++  }
++  return bits;
++}
++constexpr auto arrows(bool expanded) {
++  std::array<Bits, DEPTH + 1> result{};
++  for (unsigned depth = 0; depth <= DEPTH; ++depth) result[depth] = make(depth, expanded, false);
++  return result;
++}
++inline constexpr auto right = arrows(false);
++inline constexpr auto down = arrows(true);
++inline constexpr auto blank = make(0, false, true);
++inline freeink::ui::BitmapRef bitmap(unsigned depth, bool branch, bool expanded, unsigned rowHeight) {
++  const unsigned limit = rowHeight > BASE ? (rowHeight - BASE) / STEP : 0;
++  if (depth > DEPTH) depth = DEPTH;
++  if (depth > limit) depth = limit;
++  return {branch ? (expanded ? down[depth].data() : right[depth].data()) : blank.data(),
++          static_cast<uint16_t>(BASE + depth * STEP), HEIGHT, freeink::ui::BitmapFormat::Mask1};
++}
++}  // namespace disclosureIcon
+
+diff --git a/src/activities/reader/ClippingListPaging.h b/src/activities/reader/ClippingListPaging.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/ClippingListPaging.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include <algorithm>
++
++struct ClippingListPaging {
++  int total, rows, top;
++  int pageRows() const { return std::max(1, rows); }
++  int pages() const { return std::max(1, (total + pageRows() - 1) / pageRows()); }
++  int page() const { return std::min(pages(), (std::max(0, top) + pageRows() - 1) / pageRows() + 1); }
++  int destination(bool next) const {
++    return std::max(0, std::min(std::max(0, top) + (next ? pageRows() : -pageRows()), std::max(0, total - pageRows())));
++  }
++};
+
+diff --git a/test/highlight_chapter_groups/CMakeLists.txt b/test/highlight_chapter_groups/CMakeLists.txt
+--- a/test/highlight_chapter_groups/CMakeLists.txt
++++ b/test/highlight_chapter_groups/CMakeLists.txt
+@@ -2,3 +2,5 @@
+ target_include_directories(highlight_chapter_groups_test PRIVATE ${REPO_ROOT}/src)
+ target_compile_options(highlight_chapter_groups_test PRIVATE -UNDEBUG)
+ add_test(NAME highlight_chapter_groups COMMAND highlight_chapter_groups_test)
++target_include_directories(highlight_chapter_groups_test PRIVATE
++  ${REPO_ROOT}/freeink-sdk/libs/ui/FreeInkUI/include)
+
+diff --git a/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp b/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp
+--- a/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp
++++ b/test/highlight_chapter_groups/HighlightChapterGroupsTest.cpp
+@@ -1,14 +1,59 @@
+ #include <cassert>
+ #include <iostream>
++
++#include "activities/reader/ClippingListPaging.h"
+ #include "activities/reader/HighlightChapterGroups.h"
++#include "components/DisclosureIcon.h"
+ int main() {
+   HighlightChapterGroups groups;
+-  groups.build({{4,2},{1,0},{4,3},{2,1}});
+-  assert(groups.groups.size()==3&&groups.rows.size()==3);
+-  groups.toggle(0);assert(groups.rows[1]==0);
+-  groups.toggle(2);assert(groups.rows[3]==1);
+-  groups.build({{1,0},{4,1}});assert(groups.groups[0].open&&groups.rows[1]==0);
+-  assert(groups.groups.size()==2);
+-  groups.build({});assert(groups.rows.empty());
++  groups.build({{4, 2}, {1, 0}, {4, 3}, {2, 1}});
++  assert(groups.groups.size() == 3 && groups.rows.size() == 3);
++  groups.toggle(0);
++  assert(groups.rows[1] == 0);
++  groups.toggle(2);
++  assert(groups.rows[3] == 1);
++  groups.build({{1, 0}, {4, 1}});
++  assert(groups.groups[0].open && groups.rows[1] == 0);
++  assert(groups.groups.size() == 2);
++  groups.build({});
++  assert(groups.rows.empty());
++  for (int total = 0; total <= 300; ++total) {
++    for (int rows = 1; rows <= 20; ++rows) {
++      ClippingListPaging pager{total, rows, 0};
++      assert(pager.page() == 1);
++      int moves = 0;
++      while (pager.destination(true) != pager.top) {
++        const int before = pager.top;
++        pager.top = pager.destination(true);
++        assert(pager.top > before && pager.top - before <= rows);
++        assert(pager.page() >= 1 && pager.page() <= pager.pages());
++        assert(++moves < 400);
++      }
++      assert(pager.page() == pager.pages());
++      while (pager.top > 0) {
++        const int before = pager.top;
++        pager.top = pager.destination(false);
++        assert(pager.top < before && before - pager.top <= rows);
++      }
++      assert(pager.page() == 1);
++    }
++  }
++  for (unsigned depth = 0; depth <= 8; ++depth) {
++    for (unsigned rowHeight : {32U, 48U, 64U, 80U}) {
++      const auto collapsed = disclosureIcon::bitmap(depth, true, false, rowHeight);
++      const auto expanded = disclosureIcon::bitmap(depth, true, true, rowHeight);
++      const auto leaf = disclosureIcon::bitmap(depth, false, false, rowHeight);
++      assert(collapsed.width <= rowHeight && collapsed.width == expanded.width && leaf.width == collapsed.width);
++      unsigned rightPixels = 0, downPixels = 0, leafPixels = 0;
++      freeink::ui::forEachBitmapPixel({0, 0, static_cast<int16_t>(collapsed.width), 16}, collapsed,
++                                      freeink::ui::BitmapMode::Contain, [&](int16_t, int16_t) { ++rightPixels; });
++      freeink::ui::forEachBitmapPixel({0, 0, static_cast<int16_t>(expanded.width), 16}, expanded,
++                                      freeink::ui::BitmapMode::Contain, [&](int16_t, int16_t) { ++downPixels; });
++      freeink::ui::forEachBitmapPixel({0, 0, static_cast<int16_t>(leaf.width), 16}, leaf,
++                                      freeink::ui::BitmapMode::Contain, [&](int16_t, int16_t) { ++leafPixels; });
++      assert(rightPixels > 20 && downPixels > 20 && leafPixels == 0);
++    }
++  }
++  assert(disclosureIcon::bitmap(1, false, false, 64).width > disclosureIcon::bitmap(0, true, false, 64).width);
+   std::cout << "Highlight chapter group checks passed\n";
+ }
+
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -1030,3 +1030,7 @@
+ STR_READEST_KEEP_AT_FORMAT: "Keep %d%%"
+
+ STR_CLIPPINGS_LOAD_FAILED: "Could not load highlights. Reopen the book to retry."
++
++STR_OPEN_IN_BOOK: "Open in book"
++STR_CLIPPINGS_COUNT_FORMAT: "%u clippings"
++STR_CLIPPINGS_PAGE_FORMAT: "Page %d/%d"
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -147,6 +147,8 @@
+
+ - Reject partial/truncated clipping loads and block writes after load errors. Recover complete backup/temp files left by interrupted saves, and retry a transient load failure without discarding history.
+
++- Use right/down disclosure icons and indent highlight children. Tapping a clipping offers Open in book, Edit highlight and immediate Delete. The footer shows the full clipping count, current/total list pages and previous/next controls.
++
+ ## [v1.6.0] - 2026-09-21
+
+ ### Added

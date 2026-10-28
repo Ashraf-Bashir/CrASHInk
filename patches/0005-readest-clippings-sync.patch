@@ -6316,22 +6316,23 @@ diff --git a/src/activities/reader/ReadestPositionPreviewActivity.cpp b/src/acti
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/ReadestPositionPreviewActivity.cpp
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,86 @@
 +#include "ReadestPositionPreviewActivity.h"
 +
 +#include <I18n.h>
 +
++#include <algorithm>
 +#include <cstdio>
 +
 +#include "components/TouchHeaderBackButton.h"
 +#include "fontIds.h"
 +
 +ReadestPositionPreviewActivity::ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input,
-+                                                               std::string chapter, std::string opening, int percent)
++                                                               Position here, Position there, std::string opening)
 +    : Activity("ReadestPositionPreview", renderer, input),
-+      chapter(std::move(chapter)),
-+      opening(std::move(opening)),
-+      percent(percent) {}
++      here(std::move(here)),
++      there(std::move(there)),
++      opening(std::move(opening)) {}
 +void ReadestPositionPreviewActivity::onEnter() {
 +  Activity::onEnter();
 +  requestUpdate();
@@ -6373,16 +6374,30 @@ new file mode 100644
 +  const int line = renderer.getLineHeight(UI_10_FONT_ID) + 6;
 +  const int y = header.y + header.height + 12;
 +  const Rect text{safe.x + 12, y, safe.width - 24, button(true).y - y - 12};
-+  char percentText[24];
-+  snprintf(percentText, sizeof(percentText), "%d%%", percent);
-+  renderer.drawText(UI_12_FONT_ID, text.x, y, percentText, true, EpdFontFamily::BOLD);
-+  UITheme::drawCenteredWrappedText(renderer, text, UI_10_FONT_ID, y + line * 2, chapter.c_str(), 2, true);
-+  UITheme::drawCenteredWrappedText(renderer, text, UI_10_FONT_ID, y + line * 5,
-+                                   opening.empty() ? tr(STR_READEST_PREVIEW_NO_TEXT) : opening.c_str(), 4, false);
++  int nextY = y;
++  for (const bool remote : {false, true}) {
++    const auto& position = remote ? there : here;
++    renderer.drawText(UI_12_FONT_ID, text.x, nextY, remote ? tr(STR_READEST_THERE) : tr(STR_READEST_HERE), true,
++                      EpdFontFamily::BOLD);
++    nextY += line;
++    const std::string title = renderer.truncatedText(UI_10_FONT_ID, position.chapter.c_str(), text.width);
++    renderer.drawText(UI_10_FONT_ID, text.x, nextY, title.c_str());
++    nextY += line;
++    char numbers[96];
++    snprintf(numbers, sizeof(numbers), tr(STR_READEST_POSITION_NUMBERS_FORMAT), position.approximate ? "~ " : "",
++             std::min(std::max(1, position.pages), std::max(1, position.page + 1)), std::max(1, position.pages),
++             position.percent);
++    renderer.drawText(UI_10_FONT_ID, text.x, nextY, numbers);
++    nextY += line + 8;
++  }
++  UITheme::drawCenteredWrappedText(renderer, text, UI_10_FONT_ID, nextY + 6,
++                                   opening.empty() ? tr(STR_READEST_PREVIEW_NO_TEXT) : opening.c_str(), 3, false);
 +  for (bool go : {true, false}) {
 +    const Rect rect = button(go);
 +    renderer.drawRect(rect.x, rect.y, rect.width, rect.height, true);
-+    const char* label = go ? tr(STR_READEST_GO_THERE) : tr(STR_READEST_KEEP_HERE);
++    char label[64];
++    snprintf(label, sizeof(label), go ? tr(STR_READEST_GO_TO_FORMAT) : tr(STR_READEST_KEEP_AT_FORMAT),
++             go ? there.percent : here.percent);
 +    renderer.drawText(UI_10_FONT_ID, rect.x + (rect.width - renderer.getTextWidth(UI_10_FONT_ID, label)) / 2,
 +                      rect.y + (rect.height - renderer.getLineHeight(UI_10_FONT_ID)) / 2, label);
 +  }
@@ -6392,24 +6407,31 @@ diff --git a/src/activities/reader/ReadestPositionPreviewActivity.h b/src/activi
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/ReadestPositionPreviewActivity.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,27 @@
 +#pragma once
 +#include "activities/Activity.h"
 +#include "components/UITheme.h"
 +
 +class ReadestPositionPreviewActivity final : public Activity {
 + public:
-+  ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input, std::string chapter,
-+                                 std::string opening, int percent);
++  struct Position {
++    std::string chapter;
++    int page = 0;
++    int pages = 1;
++    int percent = 0;
++    bool approximate = false;
++  };
++  ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input, Position here, Position there,
++                                 std::string opening);
 +  void onEnter() override;
 +  void loop() override;
 +  void render(RenderLock&&) override;
 +  bool preventAutoSleep() override { return true; }
 +
 + private:
-+  std::string chapter;
++  Position here;
++  Position there;
 +  std::string opening;
-+  int percent;
 +  Rect button(bool go) const;
 +  void choose(bool go);
 +};
@@ -6533,3 +6555,247 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 +
 +- Reduce neighboring-page reads when matching saved highlights during page turns.
 +- Place the following context directly below the highlighted text in the editor.
+
+diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
+--- a/src/activities/reader/ReadestSyncActivity.cpp
++++ b/src/activities/reader/ReadestSyncActivity.cpp
+@@ -500,7 +500,11 @@
+     std::string text;
+     for (size_t i = 0; i < local.size(); ++i) {
+       text.clear();
+-      if (CLIPPINGS.readClippingText(i, text)) local[i].keyHash = keyHashFor(text);
++      if (!CLIPPINGS.readClippingText(i, text)) {
++        fail(tr(STR_READEST_READ_CLIPPINGS_FAILED));
++        return false;  // A failed read is not an intentional local deletion.
++      }
++      local[i].keyHash = keyHashFor(text);
+       const Clipping* clipping = CLIPPINGS.clippingAt(i);
+       local[i].pulledStyle = clipping && clipping->layoutSignature == 0 && clipping->pageCount == VIRTUAL_PAGE_COUNT;
+     }
+@@ -553,7 +557,13 @@
+     if (link.localHash.empty()) link.localHash = link.keyHash;
+     const int ri = findRemote(link.id);
+     const int li = claimLocal(link.localHash);
+-    if (ri < 0 || remote[static_cast<size_t>(ri)].deleted) {
++    if (ri < 0) {
++      // Missing from a response is not an explicit Readest tombstone.
++      if (li >= 0) local[static_cast<size_t>(li)].claimed = true;
++      nextLinks.push_back(link);
++      continue;
++    }
++    if (remote[static_cast<size_t>(ri)].deleted) {
+       if (li >= 0) local[static_cast<size_t>(li)].remove = true;  // deleted in Readest
+       if (ri >= 0) remoteHandled[static_cast<size_t>(ri)] = true;
+       continue;
+@@ -884,8 +894,14 @@
+       std::string chapter = toc >= 0 ? epub->getTocItem(toc).title : tr(STR_UNKNOWN_CHAPTER);
+
+       const float percent = remote.fraction >= 0 ? remote.fraction : remotePct;
+-      auto preview = makeUniqueNoThrow<ReadestPositionPreviewActivity>(renderer, mappedInput, std::move(chapter),
+-                                                                       std::move(remoteOpening), percentOf(percent));
++      const int localToc = epub->getTocIndexForSpineIndex(local.spineIndex);
++      ReadestPositionPreviewActivity::Position here{
++          localToc >= 0 ? epub->getTocItem(localToc).title : tr(STR_UNKNOWN_CHAPTER), local.pageNumber,
++          local.totalPages, percentOf(localKo.percentage), !progress.hasPageCount};
++      ReadestPositionPreviewActivity::Position there{
++          std::move(chapter), remotePos.pageNumber, remotePos.totalPages, percentOf(percent), true};
++      auto preview = makeUniqueNoThrow<ReadestPositionPreviewActivity>(renderer, mappedInput, std::move(here),
++                                                                       std::move(there), std::move(remoteOpening));
+       if (!preview) {
+         LOG_ERR("RDS", "Cannot allocate sync position preview");
+         return tr(STR_READEST_POS_UNAVAILABLE);
+
+diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
+--- a/src/readest/ReadestClient.cpp
++++ b/src/readest/ReadestClient.cpp
+@@ -521,7 +521,7 @@
+     const char* type = note["type"] | "";
+     if (std::strcmp(type, "annotation") != 0 && std::strcmp(type, "excerpt") != 0) continue;
+     const char* text = note["text"] | "";
+-    if (text[0] == '\0') continue;
++    if (text[0] == '\0' && note["deleted_at"].isNull()) continue;
+     ReadestNote item;
+     item.id = note["id"] | "";
+     item.cfi = note["cfi"] | "";
+
+diff --git a/test/readest_highlight_safety/CMakeLists.txt b/test/readest_highlight_safety/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/readest_highlight_safety/CMakeLists.txt
+@@ -0,0 +1,10 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(SYNC_INC ${CMAKE_CURRENT_BINARY_DIR}/HighlightSyncSafety.inc)
++add_custom_command(OUTPUT ${SYNC_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractSync.py
++    ${REPO_ROOT}/src/activities/reader/ReadestSyncActivity.cpp ${SYNC_INC}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/ReadestSyncActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractSync.py VERBATIM)
++add_executable(readest_highlight_safety_test ReadestHighlightSafetyTest.cpp ${SYNC_INC})
++target_include_directories(readest_highlight_safety_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(readest_highlight_safety_test PRIVATE -UNDEBUG)
++add_test(NAME readest_highlight_safety COMMAND readest_highlight_safety_test)
+
+diff --git a/test/readest_highlight_safety/ExtractSync.py b/test/readest_highlight_safety/ExtractSync.py
+new file mode 100644
+--- /dev/null
++++ b/test/readest_highlight_safety/ExtractSync.py
+@@ -0,0 +1,14 @@
++from pathlib import Path
++import sys
++source = Path(sys.argv[1]).read_text()
++start = source.index('bool ReadestSyncActivity::syncHighlights(')
++end = source.index('  // 2. Readest highlights not seen before.',start)
++Path(sys.argv[2]).write_text(source[start:end] + '''
++  removed.clear(); claimed.clear();
++  for (const auto& clip : local) { removed.push_back(clip.remove); claimed.push_back(clip.claimed); }
++  keptLinks = nextLinks;
++  tombstones = toTombstone.size();
++  pulls = toPull.size();
++  return true;
++}
++''')
+
+diff --git a/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
+@@ -0,0 +1,100 @@
++#include <cassert>
++#include <cstdint>
++#include <iostream>
++#include <string>
++#include <vector>
++constexpr uint16_t VIRTUAL_PAGE_COUNT = 1000;
++enum StringId { STR_READEST_PULLING, STR_READEST_READ_CLIPPINGS_FAILED };
++const char* tr(StringId) { return "status"; }
++struct ReadestBook {};
++struct HighlightCounts {};
++struct ReadestNote {
++  std::string id, text;
++  bool deleted = false;
++};
++struct PulledText {
++  std::string keyHash;
++};
++namespace ReadestLinks {
++constexpr int KEY_VERSION = 3;
++struct Link {
++  std::string id, keyHash, localHash;
++};
++std::vector<Link> fixture;
++bool load(const std::string&, std::vector<Link>& out, int& version) {
++  out = fixture;
++  version = 3;
++  return true;
++}
++}  // namespace ReadestLinks
++struct Clipping {
++  uint32_t layoutSignature = 0;
++  uint16_t pageCount = 1000;
++};
++struct Store {
++  std::vector<std::string> texts;
++  bool readFails = false;
++  Clipping clip;
++  size_t clippingCount() const { return texts.size(); }
++  const Clipping* clippingAt(size_t) const { return &clip; }
++  bool readClippingText(size_t i, std::string& out) const {
++    out = texts.at(i);
++    return !readFails;
++  }
++} CLIPPINGS;
++class ReadestClient {
++ public:
++  enum Error { OK, Failed };
++  std::vector<ReadestNote> notes;
++  Error pullNotes(const ReadestBook&, std::vector<ReadestNote>& out) {
++    out = notes;
++    return OK;
++  }
++  static const char* errorString(Error) { return "error"; }
++};
++std::string keyHashFor(const std::string& text) { return text; }
++class ReadestSyncActivity {
++ public:
++  ReadestClient client;
++  std::string localHash = "book";
++  bool failed = false;
++  std::vector<bool> removed, claimed;
++  std::vector<ReadestLinks::Link> keptLinks;
++  size_t tombstones = 0, pulls = 0;
++  void setStatus(const char*) {}
++  void fail(const char*) { failed = true; }
++  bool locatePulledText(const ReadestNote&, PulledText&) { return false; }
++  bool syncHighlights(const ReadestBook&, HighlightCounts&);
++};
++#include "HighlightSyncSafety.inc"
++int main() {
++  ReadestLinks::fixture = {{"i", "intro", "intro"}, {"1", "chapter1", "chapter1"}, {"2", "chapter2", "chapter2"}};
++  CLIPPINGS.texts = {"intro", "chapter1", "chapter2"};
++  ReadestBook book;
++  HighlightCounts counts;
++  ReadestSyncActivity partial;
++  partial.client.notes = {{"2", "chapter2", false}};
++  assert(partial.syncHighlights(book, counts));
++  assert(partial.keptLinks.size() == 3 && partial.tombstones == 0);
++  for (bool removed : partial.removed) assert(!removed);
++  for (bool claimed : partial.claimed) assert(claimed);
++  ReadestSyncActivity empty;
++  assert(empty.syncHighlights(book, counts));
++  assert(empty.keptLinks.size() == 3 && empty.tombstones == 0);
++  for (bool removed : empty.removed) assert(!removed);
++  ReadestSyncActivity explicitDelete;
++  explicitDelete.client.notes = {{"i", "", true}, {"1", "chapter1", false}, {"2", "chapter2", false}};
++  assert(explicitDelete.syncHighlights(book, counts));
++  assert(explicitDelete.removed[0] && !explicitDelete.removed[1] && !explicitDelete.removed[2]);
++  CLIPPINGS.readFails = true;
++  ReadestSyncActivity unreadable;
++  unreadable.client.notes = explicitDelete.client.notes;
++  assert(!unreadable.syncHighlights(book, counts) && unreadable.failed);
++  assert(unreadable.removed.empty() && unreadable.tombstones == 0);
++  CLIPPINGS.readFails = false;
++  ReadestSyncActivity edited;
++  edited.client.notes = {{"i", "updated intro", false}, {"1", "chapter1", false}, {"2", "chapter2", false}};
++  assert(edited.syncHighlights(book, counts) && edited.removed[0] && edited.pulls == 1);
++  std::cout << "Partial/empty remote responses preserve earlier chapters; explicit tombstones apply; local read "
++               "failures stop sync\n";
++}
+
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -107,6 +107,7 @@
+
+ add_subdirectory(library_recent_order)
+ add_subdirectory(readest_text_confidence)
++add_subdirectory(readest_highlight_safety)
+ add_subdirectory(scalable_fonts)
+
+ add_subdirectory(glyph_bitmap)
+
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -1013,3 +1013,10 @@
+ STR_READEST_KEEP_HERE: "Keep here"
+ STR_READEST_POSITION_KEPT: "Kept this device's position"
+ STR_READEST_PREVIEW_NO_TEXT: "Exact opening text unavailable"
++
++STR_READEST_READ_CLIPPINGS_FAILED: "Could not read highlights; sync stopped"
++STR_READEST_HERE: "Here (Xteink)"
++STR_READEST_THERE: "There (Readest)"
++STR_READEST_POSITION_NUMBERS_FORMAT: "%sChapter page %d/%d | Book %d%%"
++STR_READEST_GO_TO_FORMAT: "Go to %d%%"
++STR_READEST_KEEP_AT_FORMAT: "Keep %d%%"
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -132,6 +132,8 @@
+
+ - Delete in the highlight editor now acts immediately without an extra confirmation.
+
++- Compare Here/Xteink and There/Readest by chapter, chapter page/total and book percentage, marking estimates; decision buttons include their percentage. Failed local reads stop highlight sync, and missing remote notes are not treated as explicit deletions.
++
+ ## [v1.6.0] - 2026-09-21
+
+ ### Added
