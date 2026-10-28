@@ -695,3 +695,46 @@ index 05d272ce..bc37181f 100644
    static constexpr char separator[] = "\n==========\n";
  
    std::string buffer;
+
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -601,7 +601,8 @@
+ template <typename Pages>
+ bool findClippingTextInPages(const Pages& page, const std::string& clippingText, ClippingPageMatch& match,
+                              bool* uniqueMatch = nullptr, const uint8_t expectedTableColumn = UINT8_MAX,
+-                             const bool allowShortBoundary = false, const uint16_t requiredBoundary = UINT16_MAX) {
++                             const bool allowShortBoundary = false, const uint16_t requiredBoundary = UINT16_MAX,
++                             uint8_t* boundaryDirections = nullptr) {
+   if (clippingText.empty()) return false;
+
+   const uint16_t tokenCount = countClipTokens(clippingText);
+@@ -640,6 +641,12 @@
+                                        minPartialMatch, expectedTableColumn, candidate, allowShortBoundary) &&
+               (requiredBoundary == UINT16_MAX ||
+                (candidate.startWord < requiredBoundary && candidate.endWord >= requiredBoundary))) {
++            if (boundaryDirections) {
++              // Accumulate every candidate, so repeated text cannot hide a
++              // possible match on the other side of the page break.
++              if (!candidate.reachesClipEnd) *boundaryDirections |= 1;  // next
++              if (!candidate.startsAtClipStart) *boundaryDirections |= 2;  // previous
++            }
+             const bool candidateComplete = candidate.startsAtClipStart && candidate.reachesClipEnd;
+             // The first hit is kept, unless a later one covers the whole
+             // clipping: a full match always beats a partial run.
+@@ -730,11 +737,14 @@
+   // Only read a neighbor if this page has an otherwise plausible short fragment.
+   // A coincidental trailing "and" must agree with text across the page break.
+   ClippingPageMatch shortMatch;
+-  if (!findClippingTextInPages(page, clippingText, shortMatch, nullptr, expectedTableColumn, true)) return false;
++  uint8_t boundaryDirections = 0;
++  if (!findClippingTextInPages(page, clippingText, shortMatch, nullptr, expectedTableColumn, true, UINT16_MAX,
++                              &boundaryDirections)) return false;
+
+   const uint16_t currentWordCount = countVisiblePageWords(page);
+   if (currentWordCount == 0) return false;
+   for (const int direction : {1, -1}) {
++    if (!(boundaryDirections & (direction > 0 ? 1 : 2))) continue;
+     const int neighborIndex = section.currentPage + direction;
+     if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
+     // loadPage leaves currentPage unchanged; reuse this neighbor for later clips.

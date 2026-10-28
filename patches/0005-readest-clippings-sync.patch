@@ -6456,3 +6456,80 @@ new file mode 100644
 +  assert(!ChapterXPathResolver::hasUniqueExactText(nullptr, "test"));
 +  std::cout << "Readest text confidence checks passed\n";
 +}
+
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -710,9 +710,28 @@
+   return i < text.size() ? text.substr(i) : text;
+ }
+
++// Reuse one adjacent page across all clipping checks in this render. Release
++// it before loading another so peak memory remains one neighboring page.
++struct ClippingNeighborPageCache {
++  int index = -1;
++  std::unique_ptr<Page> page;
++
++  Page* load(Section& section, const int requestedIndex) {
++    if (index != requestedIndex) {
++      page.reset();
++      index = requestedIndex;
++      page = section.loadPage(requestedIndex);
++    }
++    return page.get();
++  }
++};
++
+ bool findClippingTextOnPage(Section& section, const Page& page, const std::string& rawClippingText,
+                             ClippingPageMatch& match, bool* uniqueMatch = nullptr,
+-                            const uint8_t expectedTableColumn = UINT8_MAX) {
++                            const uint8_t expectedTableColumn = UINT8_MAX,
++                            ClippingNeighborPageCache* sharedNeighborCache = nullptr) {
++  ClippingNeighborPageCache localNeighborCache;
++  auto& neighborCache = sharedNeighborCache ? *sharedNeighborCache : localNeighborCache;
+   const std::string clippingText = trimLeadingClipPunctuation(rawClippingText);
+   if (findClippingTextInPages(page, clippingText, match, uniqueMatch, expectedTableColumn)) return true;
+
+@@ -726,9 +745,8 @@
+   for (const int direction : {1, -1}) {
+     const int neighborIndex = section.currentPage + direction;
+     if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
+-    // Keep at most one temporary neighboring page, and release it on each attempt.
+-    // loadPage scopes its reader or reuses the build handle; currentPage is unchanged.
+-    auto neighbor = section.loadPage(neighborIndex);
++    // loadPage leaves currentPage unchanged; reuse this neighbor for later clips.
++    const auto* neighbor = neighborCache.load(section, neighborIndex);
+     if (!neighbor) {
+       LOG_ERR("CLIP", "Could not verify clipping across page %d", neighborIndex);
+       continue;
+@@ -7744,6 +7762,7 @@
+   currentPageClippingTouchTargetCount = 0;
+ #endif
+
++  ClippingNeighborPageCache neighborCache;
+   std::array<ClippingPageMatch, CLIPPING_MAX_PAGE_MATCHES> matches;
+   std::array<size_t, CLIPPING_MAX_PAGE_MATCHES> matchClippingIndices;
+   uint16_t matchCount = 0;
+@@ -7779,7 +7798,8 @@
+         bool uniqueTextMatch = false;
+         const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
+         matchedText =
+-            findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn);
++            findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn,
++                                   &neighborCache);
+         const bool coversStoredBoundaries = (currentPage != clipping.startPage || match.startsAtClipStart) &&
+                                             (currentPage != clipping.endPage || match.reachesClipEnd);
+         if (matchedText && uniqueTextMatch && coversStoredBoundaries && legacyWordLayout) {
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -637,3 +637,8 @@
+ - Power-button shortcut conflicts outside the reader so reader-only actions fall back to `Confirm` while Sleep, Refresh, Screenshot, Sync Progress, and File Transfer remain real power actions.
+ - Potential crash when using `Go to %` in EPUBs.
+ - Potential crash when entering sleep with Page Overlay enabled if the cached EPUB page data is invalid.
++
++### crASHink reading fixes
++
++- Reduce neighboring-page reads when matching saved highlights during page turns.
++- Place the following context directly below the highlighted text in the editor.
