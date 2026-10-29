@@ -970,7 +970,7 @@ diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,431 @@
 +#include "OnPageHighlightActivity.h"
 +
 +#include <BidiUtils.h>
@@ -983,6 +983,7 @@ new file mode 100644
 +
 +#include "ClippingStore.h"
 +#include "HighlightTouchPolicy.h"
++#include "HighlightWordSlices.h"
 +#include "PageWordGeometry.h"
 +#include "ReaderUtils.h"
 +#include "SelectionGap.h"
@@ -1002,7 +1003,7 @@ new file mode 100644
 +void toolbarIcon(const GfxRenderer& renderer, const HighlightToolbar::Bounds& button, HighlightToolbar::Action action) {
 +  const int x = button.x + (button.width - 24) / 2;
 +  const int y = button.y + (button.height - 24) / 2;
-+  const auto line = [&](int x1, int y1, int x2, int y2) { renderer.drawLine(x + x1, y + y1, x + x2, y + y2, 2, true); };
++  const auto line = [&](int x1, int y1, int x2, int y2) { renderer.drawLine(x + x1, y + y1, x + x2, y + y2, 3, true); };
 +  if (action == HighlightToolbar::Action::Delete) {
 +    line(4, 5, 20, 5);
 +    line(9, 2, 15, 2);
@@ -1067,14 +1068,40 @@ new file mode 100644
 +      text += token;
 +      text += ' ';
 +    } else {
-+      auto& word = words[wordCount++];
 +      const auto geometry = pageWordGeometry(renderer, SETTINGS.getReaderFontId(), line, block, i);
-+      word.rect = Rect{left + line.xPos + geometry.xOffset, top + line.yPos, geometry.width,
-+                       line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(SETTINGS.getReaderFontId())};
-+      word.row = row;
-+      word.rtl = (BidiUtils::detectParagraphLevel(token.c_str(), block.getBlockStyle().isRtl ? 1 : 0) & 1) != 0;
-+      word.start = original.total;  // running relative page position, rebased below
-+      word.end = word.start + length - 1;
++      const int font = block.resolvedFontId(renderer, SETTINGS.getReaderFontId());
++      const auto style = static_cast<EpdFontFamily::Style>(block.wordStyle(i) & ~EpdFontFamily::UNDERLINE);
++      const bool rtl = (BidiUtils::detectParagraphLevel(token.c_str(), block.getBlockStyle().isRtl ? 1 : 0) & 1) != 0;
++      const int rawX = block.wordXpos(i);
++      // Reuse the token's own buffer to measure prefixes; no extra strings or
++      // per-frame glyph measurements are needed while the handles move.
++      const auto advance = [&](size_t bytes) {
++        if (!bytes) return 0;
++        const char old = token[bytes];
++        token[bytes] = '\0';
++        const int width = renderer.getTextAdvanceX(font, token.c_str(), style);
++        token[bytes] = old;
++        return width;
++      };
++      forEachHighlightWordSlice(token, original.total, saved.start, saved.end,
++          [](std::string_view glyph) { return ChapterXPathResolver::strictTextLength(std::string(glyph)); },
++          [&](size_t first, size_t end, uint32_t start, uint32_t last) {
++            auto& word = words[wordCount++];
++            const int from = advance(first), to = advance(end);
++            const int fullWidth = advance(token.size());
++            const int pieceLeft = rtl ? fullWidth - to : from;
++            const int pieceRight = rtl ? fullWidth - from : to;
++            const int x = first == 0 && end == token.size() ? geometry.xOffset
++                              : std::max(geometry.xOffset, rawX + pieceLeft);
++            const int right = first == 0 && end == token.size() ? geometry.xOffset + geometry.width
++                              : std::min(geometry.xOffset + geometry.width, rawX + pieceRight);
++            word.rect = Rect{left + line.xPos + x, top + line.yPos, std::max(0, right - x),
++                             line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(SETTINGS.getReaderFontId())};
++            word.row = row;
++            word.rtl = rtl;
++            word.start = start;
++            word.end = last;
++          });
 +      original.total += length;
 +    }
 +  }
@@ -1102,7 +1129,8 @@ new file mode 100644
 +    return false;
 +  // Activity-lifetime page geometry: <=1024 words (~28 KiB), too large for
 +  // the task stack. Fallible and allocated once, never while dragging/rendering.
-+  words = makeUniqueNoThrow<Word[]>(wordCount);
++  // The two saved endpoints can each split one layout word.
++  words = makeUniqueNoThrow<Word[]>(wordCount + 2);
 +  if (!words) {
 +    LOG_ERR("CLIP", "Cannot allocate on-page word geometry");
 +    return false;
@@ -1124,7 +1152,7 @@ new file mode 100644
 +
 +void OnPageHighlightActivity::updateDrag() {
 +  if (!ready || activeEdge < 0) return;
-+  const int x = dragX.load(), y = dragY.load() + dragOffsetY;
++  const int x = dragX.load() + dragOffsetX, y = dragY.load() + dragOffsetY;
 +  size_t best = wordCount;
 +  int64_t distance = INT64_MAX;
 +  for (size_t i = 0; i < wordCount; ++i) {
@@ -1204,6 +1232,16 @@ new file mode 100644
 +      activeEdge = first && (!last || distance(firstHandle) <= distance(lastHandle)) ? 0 : 1;
 +      const Rect& handle = activeEdge == 0 ? firstHandle : lastHandle;
 +      dragOffsetY = (activeEdge == 0 ? firstAnchorY : lastAnchorY) - handle.y - handle.height / 2;
++      // Anchor inside the selected edge, even when two word pieces touch.
++      // Merely grabbing a handle must not select the neighboring piece.
++      dragOffsetX = handle.x + handle.width / 2 - x;
++      for (size_t i = 0; i < wordCount; ++i) {
++        const auto& word = words[i];
++        if ((activeEdge == 0 && range.start == word.start) || (activeEdge == 1 && range.end == word.end)) {
++          dragOffsetX += (activeEdge == 0) != word.rtl ? 1 : -1;
++          break;
++        }
++      }
 +      dragX.store(x);
 +      dragY.store(y);
 +      dragging.store(true);
@@ -1346,12 +1384,8 @@ new file mode 100644
 +                                              {lastHandle.x, lastHandle.y, lastHandle.width, lastHandle.height});
 +    const int width = toolbar.area.width, height = toolbar.area.height;
 +    const auto& card = toolbar.area;
-+    // Bold black icons on a white card remain clear on e-ink. A white halo
-+    // separates the floating card from text in both display polarities.
-+    renderer.fillRoundedRect(card.x + 3, card.y + 4, width, height, 8, Color::Black);
-+    renderer.fillRoundedRect(card.x - 2, card.y - 2, width + 4, height + 4, 10, Color::White);
++    // One flat white surface, without a shadow or stacked outline.
 +    renderer.fillRoundedRect(card.x, card.y, width, height, 8, Color::White);
-+    renderer.drawRoundedRect(card.x, card.y, width, height, 1, 8, true);
 +    for (size_t i = 0; i < HighlightToolbar::Actions.size(); ++i) {
 +      const auto button = toolbar.button(i);
 +      if (i % toolbar.columns != 0)
@@ -1361,7 +1395,7 @@ new file mode 100644
 +      toolbarIcon(renderer, button, HighlightToolbar::Actions[i]);
 +    }
 +    // Counteract output inversion only for the floating controls.
-+    renderer.preserveImagePolarity(card.x - 2, card.y - 2, width + 7, height + 8);
++    renderer.preserveImagePolarity(card.x, card.y, width, height);
 +  }
 +  if (failed) renderer.drawText(SMALL_FONT_ID, 8, renderer.getScreenHeight() - 24, tr(STR_HIGHLIGHT_EDIT_UNAVAILABLE));
 +  paintedRange = range;
@@ -1428,7 +1462,7 @@ new file mode 100644
 +  OnPageHighlightRange paintedRange{};
 +  bool ready = false, failed = false;
 +  int activeEdge = -1;
-+  int firstAnchorY = 0, lastAnchorY = 0, dragOffsetY = 0;
++  int firstAnchorY = 0, lastAnchorY = 0, dragOffsetY = 0, dragOffsetX = 0;
 +  std::atomic<bool> dragging{false};
 +  std::atomic<int> dragX{0}, dragY{0};
 +  bool releasePending = false, ignoreOpeningRelease = true;
@@ -2287,7 +2321,7 @@ diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/high
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,148 @@
 +#include <algorithm>
 +#include <atomic>
 +#include <cassert>
@@ -2325,7 +2359,7 @@ new file mode 100644
 +} CLIPPINGS;
 +class OnPageHighlightActivity {
 + public:
-+ struct Word {Rect rect;uint32_t start,end;};
++ struct Word {Rect rect;uint32_t start,end;bool rtl=false;};
 + std::shared_ptr<Epub> book=std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>before alpha bravo after tail</p></body></html>"});
 + Word words[5]={{{0,0,40,20},0,5},{{50,0,40,20},6,10},{{100,0,40,20},11,15},{{150,0,40,20},16,20},{{200,0,40,20},21,24}};
 + size_t wordCount=5,index=3;uint16_t spine=0;
@@ -2335,7 +2369,7 @@ new file mode 100644
 + HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(200,100,480);
 + bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false,closeAfterAdjustment=false;
 + int activeEdge=-1,updates=0;
-+ int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0;
++ int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0,dragOffsetX=0;
 + std::atomic<bool> dragging{false};std::atomic<int> dragX{0},dragY{0};
 + Input mappedInput;
 + HighlightPageAction action{};
@@ -2368,6 +2402,16 @@ new file mode 100644
 + assert(centered.area.x==132 && centered.area.y==284);
 + const auto shortCard=HighlightToolbar::nearSelection({100,350,40,20},view,{90,330,20,20},{130,370,20,20});
 + assert(shortCard.area.x==52 && shortCard.area.y+shortCard.area.height==326);
++ // Adjacent pieces share a pixel boundary: grabbing/releasing the end
++ // handle must not extend the saved selection into the next piece.
++ OnPageHighlightActivity touching;
++ touching.words[0].rect={0,0,40,20};touching.words[1].rect={40,0,40,20};
++ touching.range=touching.saved={0,5};touching.firstHandle={};touching.lastHandle={30,20,20,20};
++ const auto writesAtTouch=CLIPPINGS.writes;
++ touching.mappedInput={40,30,true,true,false,false,0};touching.loop();
++ assert(touching.activeEdge==1 && touching.dragOffsetX==-1);
++ touching.mappedInput.held=false;touching.mappedInput.down=false;touching.loop();
++ assert(touching.range.end==5 && CLIPPINGS.writes==writesAtTouch);
 + OnPageHighlightActivity a;
 + a.mappedInput={50,10,true,true,false,false,0};a.loop();
 + assert(a.dragging && a.activeEdge==0 && CLIPPINGS.writes==0);
@@ -2430,7 +2474,7 @@ diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word
 new file mode 100644
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageRenderTest.cpp
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,131 @@
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -2440,6 +2484,7 @@ new file mode 100644
 +#include <memory>
 +#include <vector>
 +#include "activities/reader/HighlightToolbar.h"
++#include "activities/reader/HighlightWordSlices.h"
 +#include "activities/reader/SelectionGap.h"
 +#include "activities/reader/OnPageHighlightModel.h"
 +struct Rect {int x=0,y=0,width=0,height=0;};
@@ -2529,9 +2574,33 @@ new file mode 100644
 + light.dragging=false;dark.dragging=false;dark.renderer.dark=true;
 + light.render(RenderLock{});dark.render(RenderLock{});
 + const auto card=light.toolbar.area;
-+ for(int y=card.y-2;y<card.y+card.height+6;++y)
-+   for(int x=card.x-2;x<card.x+card.width+5;++x)
++ for(int y=card.y;y<card.y+card.height;++y)
++   for(int x=card.x;x<card.x+card.width;++x)
 +     assert(light.renderer.pixels[y*240+x] == (dark.renderer.pixels[y*240+x]^1));
++ // A joined layout token is split at the saved end, before the dash.
++ OnPageHighlightActivity joined;
++ joined.wordCount=0;joined.range={0,6};
++ forEachHighlightWordSlice("selling—some",0,0,6,
++   [](std::string_view){return 1U;},
++   [&](size_t first,size_t end,uint32_t start,uint32_t last) {
++     auto& w=joined.words[joined.wordCount++];
++     w={Rect{20+int(first)*4,80,int(end-first)*4,20},start,last,false,0};
++   });
++ assert(joined.wordCount==2 && joined.words[0].end==6 && joined.words[1].start==7);
++ joined.render(RenderLock{});
++ assert(joined.lastHandle.x+10==48); // end handle is immediately after selling
++ for(int y=84;y<96;++y)for(int x=49;x<74;++x) {
++   const size_t pixel=y*240+x;
++   assert(joined.renderer.pixels[pixel] == (pixel%17==0)); // dash/some untouched
++ }
++ size_t pieces=0;
++ forEachHighlightWordSlice("before—selling—after",100,107,113,
++   [](std::string_view){return 1U;},
++   [&](size_t,size_t,uint32_t start,uint32_t end) {
++     if(pieces==1)assert(start==107 && end==113);
++     ++pieces;
++   });
++ assert(pieces==3);
 + const auto renderCount=actual.page->renders;
 + actual.closeAfterAdjustment=true;actual.render(RenderLock{});
 + assert(actual.page->renders==renderCount); // pending repaint cannot flash a popup
@@ -2663,3 +2732,35 @@ diff --git a/test/koreader_xpath_resolver/stubs/Epub.h b/test/koreader_xpath_res
      for (int spineIndex = 0; spineIndex < getSpineItemsCount(); spineIndex++) {
        if (itemHref != getSpineItem(spineIndex).href) continue;
        const auto& contents = spineContents[spineIndex];
+diff --git a/src/activities/reader/HighlightWordSlices.h b/src/activities/reader/HighlightWordSlices.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightWordSlices.h
+@@ -0,0 +1,27 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <string_view>
++
++// Split a layout word at the saved selection's exact chapter boundaries.
++// At most two extra pieces per page, allocated only during editor setup.
++// Each UTF-8 glyph stays intact, including strict-match ligature expansion.
++template <typename Length, typename Emit>
++void forEachHighlightWordSlice(std::string_view text, uint32_t wordStart, uint32_t selectionStart,
++                               uint32_t selectionEnd, Length&& strictLength, Emit&& emit) {
++  size_t firstByte = 0;
++  uint32_t firstPosition = wordStart, position = wordStart;
++  for (size_t byte = 0; byte < text.size();) {
++    if (position > firstPosition &&
++        (position == selectionStart || (selectionEnd != UINT32_MAX && position == selectionEnd + 1))) {
++      emit(firstByte, byte, firstPosition, position - 1);
++      firstByte = byte;
++      firstPosition = position;
++    }
++    size_t next = byte + 1;
++    while (next < text.size() && (static_cast<unsigned char>(text[next]) & 0xC0) == 0x80) ++next;
++    position += strictLength(text.substr(byte, next - byte));
++    byte = next;
++  }
++  if (position > firstPosition) emit(firstByte, text.size(), firstPosition, position - 1);
++}
