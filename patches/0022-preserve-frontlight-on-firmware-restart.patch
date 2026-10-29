@@ -1,0 +1,79 @@
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1455,7 +1455,7 @@
+   // current light state rather than applying wake or schedule policy.
+   const bool wasLightOnBeforeSleep =
+       isSilentReboot && isValidSilentTarget && hasRestartFrontlight ? restartFrontlightOn : SETTINGS.frontlightOn != 0;
+-  const bool preserveLightAcrossRestart = FrontlightSchedule::shouldPreserveLightAcrossRestart(isSilentReboot);
++  const bool preserveLightAcrossRestart = FrontlightSchedule::shouldPreserveLightAcrossRestart(isSilentReboot, rawResetReason == ESP_RST_SW);
+   bool restoreLightOn = FrontlightSchedule::shouldRestoreLightOnStart(
+       preserveLightAcrossRestart, SETTINGS.frontlightRestoreOnWake != 0, wasLightOnBeforeSleep);
+   if (FrontlightSchedule::shouldApplyOnWakeSchedule(preserveLightAcrossRestart, SETTINGS.frontlightRestoreOnWake != 0,
+diff --git a/src/util/FrontlightSchedule.h b/src/util/FrontlightSchedule.h
+--- a/src/util/FrontlightSchedule.h
++++ b/src/util/FrontlightSchedule.h
+@@ -24,7 +24,9 @@
+
+ // A silent restart is an internal recovery step, so it must preserve the
+ // current frontlight state instead of applying wake or schedule policy.
+-constexpr bool shouldPreserveLightAcrossRestart(const bool isSilentReboot) { return isSilentReboot; }
++constexpr bool shouldPreserveLightAcrossRestart(const bool isSilentReboot, const bool isSoftwareRestart = false) {
++  return isSilentReboot || isSoftwareRestart;
++}
+
+ constexpr bool shouldRestoreLightOnStart(const bool preserveLightAcrossRestart, const bool restoreOnWake,
+                                          const bool wasLightOnBeforeSleep) {
+diff --git a/src/activities/settings/SdFirmwareUpdateActivity.cpp b/src/activities/settings/SdFirmwareUpdateActivity.cpp
+--- a/src/activities/settings/SdFirmwareUpdateActivity.cpp
++++ b/src/activities/settings/SdFirmwareUpdateActivity.cpp
+@@ -1,6 +1,7 @@
+ #include "SdFirmwareUpdateActivity.h"
+
+ #include <Arduino.h>
++#include <CrossInkHalFrontlight.h>
+ #include <GfxRenderer.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+@@ -179,6 +180,13 @@
+     return;
+   }
+
++  // Snapshot live levels once before reboot; never write during flash progress.
++  if (Frontlight.present()) {
++    SETTINGS.frontlightBrightness = Frontlight.brightness();
++    SETTINGS.frontlightWarmth = Frontlight.warmth();
++    SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
++    activityManager.persistGlobalSettings();
++  }
+   LOG_INF("FW", "SD firmware update complete, restarting");
+   {
+     RenderLock lock(*this);
+diff --git a/test/frontlight_schedule/FrontlightScheduleTest.cpp b/test/frontlight_schedule/FrontlightScheduleTest.cpp
+--- a/test/frontlight_schedule/FrontlightScheduleTest.cpp
++++ b/test/frontlight_schedule/FrontlightScheduleTest.cpp
+@@ -74,3 +74,12 @@
+   EXPECT_EQ(FrontlightSchedule::minutesFromTimeOfDay(afternoon.hour12, afternoon.minute, afternoon.isPm),
+             timeOfDay(16, 43));
+ }
++
++TEST(FrontlightSchedule, FirmwareRestartPreservesLightWithoutApplyingWakeSchedule) {
++  const bool preserve = FrontlightSchedule::shouldPreserveLightAcrossRestart(false, true);
++  EXPECT_TRUE(preserve);
++  EXPECT_TRUE(FrontlightSchedule::shouldRestoreLightOnStart(preserve, false, true));
++  EXPECT_FALSE(FrontlightSchedule::shouldRestoreLightOnStart(preserve, true, false));
++  EXPECT_FALSE(FrontlightSchedule::shouldApplyOnWakeSchedule(preserve, false, true));
++  EXPECT_FALSE(FrontlightSchedule::shouldPreserveLightAcrossRestart(false, false));
++}
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+
+ ### Fixed
++
++- SD firmware restarts retain the current frontlight levels and on/off state instead of applying wake scheduling. Highlight controls stay black on white in dark mode.
+
+ - Saved highlights stop at the selected text before a joined dash; the floating Edit/Delete toolbar has larger high-contrast icons.
+
