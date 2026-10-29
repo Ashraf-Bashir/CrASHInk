@@ -1,0 +1,271 @@
+diff --git a/src/clippings/ClippingTextMatcher.h b/src/clippings/ClippingTextMatcher.h
+--- a/src/clippings/ClippingTextMatcher.h
++++ b/src/clippings/ClippingTextMatcher.h
+@@ -15,6 +15,8 @@
+ struct TokenFragmentResult {
+   TokenFragmentMatch match = TokenFragmentMatch::MISMATCH;
+   size_t tokenBytes = 0;
++  size_t wordByteStart = 0;
++  size_t wordByteEnd = 0;
+ };
+
+ // A complete clipping can be short. A partial run needs enough words to avoid
+@@ -167,6 +169,7 @@
+       wordOffset = next;
+     }
+   }
++  const size_t wordByteStart = wordOffset;
+   while (wordOffset < wordLen && matchedTokenBytes < tokenAvailable) {
+     if (isNonBreakingSpace(word, wordLen, wordOffset) && tokenFrom[matchedTokenBytes] == ' ') {
+       wordOffset += 2;
+@@ -184,6 +187,7 @@
+     matchedTokenBytes = nextToken;
+   }
+
++  const size_t wordByteEnd = wordOffset;
+   if (wordOffset != wordLen && clipEnd && !endsWithInsertedHyphen && matchedTokenBytes == tokenAvailable) {
+     // The saved text ends before trailing punctuation of this word.
+     size_t rest = wordOffset;
+@@ -194,7 +198,11 @@
+         break;
+       }
+     }
+-    if (onlyPunctuation) wordOffset = wordLen;
++    // An em/en dash may join the next word in a single layout token.
++    // Accept the saved endpoint before it, but retain its exact byte boundary.
++    size_t next = wordOffset;
++    const uint32_t cp = nextCodepoint(word, wordLen, next);
++    if (onlyPunctuation || cp == 0x2014 || cp == 0x2013) wordOffset = wordLen;
+   }
+
+   if (wordOffset != wordLen) {
+@@ -206,7 +214,7 @@
+     return {};
+   }
+   return {completesToken ? TokenFragmentMatch::COMPLETES_TOKEN : TokenFragmentMatch::CONTINUES_TOKEN,
+-          matchedTokenBytes};
++          matchedTokenBytes, wordByteStart, wordByteEnd};
+ }
+
+ inline TokenFragmentMatch matchTokenFragment(const char* word, const bool endsWithInsertedHyphen, const char* token,
+diff --git a/src/clippings/ClippingPageMatchCache.h b/src/clippings/ClippingPageMatchCache.h
+--- a/src/clippings/ClippingPageMatchCache.h
++++ b/src/clippings/ClippingPageMatchCache.h
+@@ -13,6 +13,8 @@
+     uint16_t endWord = 0;
+     uint16_t tableSelection = UINT16_MAX;
+     uint16_t matchedTokens = 0;
++    uint16_t startByte = 0;
++    uint16_t endByte = UINT16_MAX;
+     bool startsAtClipStart = false;
+     bool reachesClipEnd = false;
+   };
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -559,6 +559,8 @@
+           return false;
+         }
+
++        if (wordIndex == startPageWord) match.startByte = fragmentResult.wordByteStart;
++        match.endByte = fragmentResult.wordByteEnd;
+         lastWord = wordIndex;
+         if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::CONTINUES_TOKEN) {
+           tokenOffset += fragmentResult.tokenBytes;
+@@ -766,10 +768,12 @@
+     if (nextPage) {
+       match.endWord = currentWordCount - 1;
+       match.reachesClipEnd = false;
++      match.endByte = UINT16_MAX;
+     } else {
+       match.startWord = 0;
+       match.endWord -= boundary;
+       match.startsAtClipStart = false;
++      match.startByte = 0;
+     }
+     return true;
+   }
+@@ -803,6 +807,8 @@
+   match.startWord = startWord;
+   match.endWord = endWord;
+   match.tableSelection = clipping.tableSelection;
++  match.startsAtClipStart = currentPage == clipping.startPage;
++  match.reachesClipEnd = currentPage == clipping.endPage;
+   return true;
+ }
+
+@@ -7973,6 +7979,42 @@
+         entry.failed = true;
+       }
+     }
++    if (matchedStoredRange && match.reachesClipEnd) {
++      forEachVisiblePageWord(page, [&](const uint16_t index, const PageTextLine&, const TextBlock& block, const size_t i) {
++        if (index != match.endWord) return true;
++        const char* word = block.wordText(static_cast<uint16_t>(i));
++        const char* visible = word + (hasEmSpacePrefix(word) ? 3 : 0);
++        if (!std::strstr(visible, "—") && !std::strstr(visible, "–")) return false;
++        if (!clippingReaderAttempted) {
++          clippingReaderAttempted = true;
++          CLIPPINGS.openTextReader(clippingReader);
++          clippingText.reserve(CLIPPING_TEXT_RESERVE);
++        }
++        clippingText.clear();
++        ++highlightTextReads;
++        if (!CLIPPINGS.readClippingText(clipping, clippingText, clippingReader)) {
++          entry.failed = true;
++          return false;
++        }
++        const char* cursor = clippingText.c_str();
++        const char* token = nullptr;
++        const char* lastToken = nullptr;
++        size_t length = 0, lastLength = 0;
++        while (nextClipToken(cursor, token, length)) { lastToken = token; lastLength = length; }
++        // A layout hyphen can split the final saved token across lines.
++        for (size_t offset = 0; lastToken && offset < lastLength;) {
++          const auto result = matchPageWordToToken(block, static_cast<uint16_t>(i), lastToken, lastLength,
++                                                   offset, match.startWord == match.endWord, true);
++          if (result.match == ClippingTextMatcher::TokenFragmentMatch::COMPLETES_TOKEN) {
++            match.endByte = result.wordByteEnd;
++            if (match.startWord == match.endWord) match.startByte = result.wordByteStart;
++            break;
++          }
++          ClippingTextMatcher::nextCodepoint(lastToken, lastLength, offset);
++        }
++        return false;
++      });
++    }
+     if (matchedStoredRange || matchedText) {
+       matches[matchCount] = match;
+       matchClippingIndices[matchCount] = clippingIndex;
+@@ -8060,7 +8102,7 @@
+     const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
+     const int skipX = hasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", textStyle) : 0;
+     const PageWordGeometry geometry = pageWordGeometry(renderer, fontId, line, block, wordIndex);
+-    const int wordX = orientedMarginLeft + line.xPos + geometry.xOffset + skipX;
++    int wordX = orientedMarginLeft + line.xPos + geometry.xOffset + skipX;
+     const int wordY = orientedMarginTop + line.yPos;
+     int wordW = geometry.width - skipX;
+     const int wordH = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
+@@ -8079,6 +8121,27 @@
+         wordW = nextWordX - wordX;
+       }
+     }
++    const auto& matched = matches[matchIndex];
++    const size_t visibleLength = std::strlen(visibleText);
++    const size_t startByte = pageWordIndex == matched.startWord ? matched.startByte : 0;
++    const size_t endByte = pageWordIndex == matched.endWord ? matched.endByte : UINT16_MAX;
++    // No allocation in the repaint path. Unusually long layout words retain
++    // their existing geometry; normal boundary words use measured font advances.
++    char prefix[256];
++    const auto advanceTo = [&](size_t bytes) {
++      std::memcpy(prefix, visibleText, bytes);
++      prefix[bytes] = '\0';
++      return renderer.getTextAdvanceX(lineFontId, prefix, textStyle);
++    };
++    if (visibleLength < sizeof(prefix) && (startByte > 0 || endByte < visibleLength)) {
++      const int startAdvance = advanceTo(std::min(startByte, visibleLength));
++      const int endAdvance = advanceTo(std::min(endByte, visibleLength));
++      const bool rtl = BidiUtils::detectParagraphLevel(visibleText, block.getBlockStyle().isRtl ? 1 : 0) & 1;
++      const int left = rtl ? geometry.width - skipX - endAdvance : startAdvance;
++      const int right = rtl ? geometry.width - skipX - startAdvance : endAdvance;
++      wordW = std::max(0, std::min(wordW, right) - left);
++      wordX += left;
++    }
+     if (wordW > 0) {
+       const ClippingHighlightGeometry::WordRect currentHighlight{pageWordIndex, wordX, wordY, wordW, wordH};
+       ClippingHighlightGeometry::GapRect gap;
+@@ -8093,10 +8156,11 @@
+       // A saved clipping always uses black text on its light-gray marker.
+       // The ordinary reader foreground is white in dark mode, which makes the
+       // text fade into this marker.
+-      if (line.clipWidth > 0 && line.clipHeight > 0) {
+-        renderer.beginTextClip(orientedMarginLeft + line.clipX, orientedMarginTop + line.clipY, line.clipWidth,
+-                               line.clipHeight);
+-      }
++      const int clipLeft = line.clipWidth > 0 ? std::max(wordX, orientedMarginLeft + line.clipX) : wordX;
++      const int clipTop = line.clipHeight > 0 ? std::max(wordY, orientedMarginTop + line.clipY) : wordY;
++      const int clipRight = line.clipWidth > 0 ? std::min(wordX + wordW, orientedMarginLeft + line.clipX + line.clipWidth) : wordX + wordW;
++      const int clipBottom = line.clipHeight > 0 ? std::min(wordY + wordH, orientedMarginTop + line.clipY + line.clipHeight) : wordY + wordH;
++      renderer.beginTextClip(clipLeft, clipTop, std::max(0, clipRight - clipLeft), std::max(0, clipBottom - clipTop));
+       // Match TextBlock::render()'s Focus Reading split. The prewarm pass
+       // loaded the leading run as bold, so redrawing it as regular here can
+       // miss the glyph bitmap for SD-card fonts and show replacement marks.
+@@ -8111,11 +8175,9 @@
+               [&](const int runX, const char* runText, const EpdFontFamily::Style runStyle) {
+                 renderer.drawText(lineFontId, runX, wordY, runText, true, runStyle, baseDir);
+               })) {
+-        renderer.drawText(lineFontId, wordX, wordY, visibleText, true, textStyle);
+-      }
+-      if (line.clipWidth > 0 && line.clipHeight > 0) {
+-        renderer.endTextClip();
+-      }
++        renderer.drawText(lineFontId, orientedMarginLeft + line.xPos + geometry.xOffset + skipX, wordY, visibleText, true, textStyle);
++      }
++      renderer.endTextClip();
+ #if CROSSINK_APP_CAP_TOUCH
+       if (matchIndex >= 0 && matchIndex < static_cast<int>(clippingBounds.size())) {
+         auto& bounds = clippingBounds[matchIndex];
+diff --git a/test/clipping_page_turn/ClippingPageTurnTest.cpp b/test/clipping_page_turn/ClippingPageTurnTest.cpp
+--- a/test/clipping_page_turn/ClippingPageTurnTest.cpp
++++ b/test/clipping_page_turn/ClippingPageTurnTest.cpp
+@@ -76,6 +76,22 @@
+   if (oldFound || oldShort) assert(filterFor(page).mayMatch(filterFor(text), false));
+ }
+ int main() {
++  {
++    Page joined;
++    joined.block.words = {"We", "were", "all", "in", "the", "business", "of", "selling—some"};
++    ClippingPageMatch match;
++    assert(findClippingTextInPages(joined, "We were all in the business of selling", match));
++    assert(match.startWord == 0 && match.endWord == 7 && match.endByte == 7);
++    assert(match.reachesClipEnd);
++    assert(findClippingTextInPages(joined, "selling", match));
++    assert(match.endByte == 7);
++    assert(!findClippingTextInPages(joined, "sell", match));
++    joined.block.words = {"selling–some"};
++    assert(findClippingTextInPages(joined, "selling", match) && match.endByte == 7);
++    joined.block.words = {"selling—some"};
++    assert(findClippingTextInPages(joined, "selling—some", match) && match.endByte == 14);
++  }
++
+   // First-word matching, continuations, short words, punctuation, UTF-8 folding,
+   // inserted hyphens and table-column bypass must never be rejected.
+   for (const auto& text : {"alpha beta", "alpha", "before alpha beta", "a bcd", "abcd", "ALPHA BETA",
+diff --git a/test/clipping_page_turn/ClippingPageCacheTest.cpp b/test/clipping_page_turn/ClippingPageCacheTest.cpp
+--- a/test/clipping_page_turn/ClippingPageCacheTest.cpp
++++ b/test/clipping_page_turn/ClippingPageCacheTest.cpp
+@@ -87,6 +87,22 @@
+ };
+ #include "ClippingCollector.inc"
+ int main() {
++  {
++    EpubReaderActivity joined;
++    joined.section->pages[0].block.words = {"We", "were", "selling—some"};
++    Clipping stored;
++    stored.spineIndex = 0; stored.pageCount = 4;
++    stored.startPage = stored.endPage = 0;
++    stored.startWordIndex = 0; stored.endWordIndex = 2;
++    stored.layoutSignature = clippingWordLayoutSignature(17);
++    CLIPPINGS.records = {stored}; CLIPPINGS.texts = {"We were selling"};
++    ClippingPageMatchCache::Entry result; result.page = 0;
++    joined.collectClippingPageMatches(joined.section->pages[0], result, false);
++    assert(result.ready && result.count == 1 && result.matches[0].endByte == 7);
++    assert(result.matches[0].endWord == 2);
++    assert(CLIPPINGS.texts[0] == "We were selling");
++  }
++  CLIPPINGS.reads = 0;
+   EpubReaderActivity reader;
+   Clipping clip;
+   clip.spineIndex = 0;
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+
+ ### Fixed
++
++- Saved highlights stop at the selected text before a joined dash; the floating Edit/Delete toolbar has larger high-contrast icons.
+
+ - The EPUB contents index collapses parent chapters, opens the current chapter's ancestors, and supports holding a parent to navigate to it.
+
