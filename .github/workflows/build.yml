@@ -6,6 +6,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      PLATFORMIO_BUILD_CACHE_DIR: ${{ github.workspace }}/.pio-build-cache
     steps:
       - name: Checkout patches
         uses: actions/checkout@v4
@@ -31,9 +33,23 @@ jobs:
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
-          path: ~/.platformio
-          key: ${{ runner.os }}-platformio-${{ hashFiles('source/platformio.ini') }}
-          restore-keys: ${{ runner.os }}-platformio-
+          # Cache downloaded tools, not the Python-version-specific virtualenv.
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-platformio-tools-v2-${{ hashFiles('source/platformio.ini') }}
+          restore-keys: ${{ runner.os }}-platformio-tools-v2-
+
+      - name: Cache compiled objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PLATFORMIO_BUILD_CACHE_DIR }}
+          # Each run saves an updated cache; restore unchanged objects from the
+          # latest compatible build. Source/flag changes are checked by SCons.
+          key: ${{ runner.os }}-x4-pro-objects-v1-${{ hashFiles('source/platformio.ini') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-x4-pro-objects-v1-${{ hashFiles('source/platformio.ini') }}-
 
       - name: Install PlatformIO
         run: pip install platformio
@@ -53,8 +69,9 @@ jobs:
           cd source
           VERSION="${{ steps.get-release.outputs.version }}"
           STAMP=$(TZ=Europe/Amsterdam date +%Y%m%d%H%M)
-          # Shown on the boot screen (see the CrASHink boot patch).
-          export PLATFORMIO_BUILD_FLAGS="-DCRASHINK_BUILD=\\\"${VERSION}.${STAMP}\\\""
+          # Only BootActivity includes this header; the changing timestamp
+          # must not invalidate every library/compiler command.
+          printf '#pragma once\n#define CRASHINK_BUILD "%s.%s"\n' "$VERSION" "$STAMP" > src/CrASHinkBuild.h
           pio run -e x4-pro
           mkdir -p ../builds
           cp .pio/build/x4-pro/firmware.bin "../builds/crASHink-${VERSION}.${STAMP}-x4pro.bin"
