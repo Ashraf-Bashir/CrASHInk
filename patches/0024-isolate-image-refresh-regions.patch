@@ -1,0 +1,255 @@
+diff --git a/lib/Epub/Epub/Page.h b/lib/Epub/Epub/Page.h
+--- a/lib/Epub/Epub/Page.h
++++ b/lib/Epub/Epub/Page.h
+@@ -222,6 +222,22 @@
+       return element->getTag() == TAG_PageImage &&
+              static_cast<const PageImage&>(*element).getImageBlock().needsDecode();
+     });
++  }
++
++  // Visit individual image rectangles without collecting/merging them. The
++  // space between separate inline images can contain readable page text.
++  template <typename Callback>
++  bool forEachImageRect(Callback&& visit) const {
++    bool found = false;
++    for (const auto& element : elements) {
++      if (element->getTag() != TAG_PageImage) continue;
++      const auto& image = static_cast<const PageImage&>(*element);
++      const auto& block = image.getImageBlock();
++      if (block.getWidth() <= 0 || block.getHeight() <= 0) continue;
++      visit(image.xPos, image.yPos, block.getWidth(), block.getHeight());
++      found = true;
++    }
++    return found;
+   }
+
+   // Total area of all images on the page, in pixels (overlaps counted twice; good enough for a size test).
+diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlock.cpp
+--- a/lib/Epub/Epub/blocks/ImageBlock.cpp
++++ b/lib/Epub/Epub/blocks/ImageBlock.cpp
+@@ -464,10 +464,8 @@
+ }
+
+ void ImageBlock::renderPlaceholder(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) const {
+-  renderer.fillRect(x, y, width, height, foregroundBlack);
+-  if (width > 2 && height > 2) {
+-    renderer.fillRect(x + 1, y + 1, width - 2, height - 2, !foregroundBlack);
+-  }
++  // Reserve only the image's background while decoding; no temporary outline.
++  if (width > 0 && height > 0) renderer.fillRect(x, y, width, height, !foregroundBlack);
+ }
+
+ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) {
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -7657,15 +7657,13 @@
+   if (pageHasImages && !deferImageLoading) {
+     // Keep the legacy blank/base sequence unless the controller can transition
+     // directly to the complete image base.
+-    int16_t imgX, imgY, imgW, imgH;
+-    if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
+-      const bool directImageBase = renderer.shouldSkipImageBlanking();
+-      // UC8179's base waveform transitions directly from the displayed page.
+-      // Keep blanking for other controllers and for a pending strong cleanup.
+-      const bool blankImage = !directImageBase || cleanImageBasePending;
+-      if (blankImage) {
+-        renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
+-      }
++    const bool directImageBase = renderer.shouldSkipImageBlanking();
++    // UC8179 can transition directly to the complete base. Other panels and
++    // strong cleanup still blank images, but must never blank intervening text.
++    const bool blankImage = !directImageBase || cleanImageBasePending;
++    if (page->forEachImageRect([&](int16_t x, int16_t y, int16_t width, int16_t height) {
++          if (blankImage) renderer.fillRect(x + orientedMarginLeft, y + orientedMarginTop, width, height, false);
++        })) {
+       if (cleanImageBasePending) {
+         renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
+         cleanImageBasePending = false;
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -123,3 +123,5 @@
+ add_subdirectory(readest_source_position)
+
+ add_subdirectory(clipping_list_visibility)
++
++add_subdirectory(image_refresh_regions)
+diff --git a/test/epub_grayscale/EpubGrayscaleTest.cpp b/test/epub_grayscale/EpubGrayscaleTest.cpp
+--- a/test/epub_grayscale/EpubGrayscaleTest.cpp
++++ b/test/epub_grayscale/EpubGrayscaleTest.cpp
+@@ -224,6 +224,19 @@
+   ASSERT_TRUE(renderFromCache(r, "large.pxc", 0, 0, 479, 789));
+   EXPECT_EQ(r.bw, reference(r, 479, 789, 0, 0, 0, r.height));
+   EXPECT_EQ(retainedPxcCapacity, 39u);
++}
++
++TEST_F(EpubGrayscaleTest, PendingImageUsesBackgroundWithoutBorder) {
++  for (bool foreground : {false, true}) {
++    for (int size : {1, 2, 21}) {
++      GfxRenderer renderer;
++      ImageBlock block("pending.jpg", "", size, size);
++      block.renderPlaceholder(renderer, 7, 11, foreground);
++      ASSERT_EQ(renderer.placeholderRects.size(), 1u);
++      const std::array<int,5> expected{7,11,size,size,foreground?0:1};
++      EXPECT_EQ(renderer.placeholderRects[0], expected);
++    }
++  }
+ }
+
+ TEST_F(EpubGrayscaleTest, ImageBlockPreservesScanAndFailureFallback) {
+diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs/GfxRenderer.h
+--- a/test/epub_grayscale/stubs/GfxRenderer.h
++++ b/test/epub_grayscale/stubs/GfxRenderer.h
+@@ -2,6 +2,7 @@
+ #include <FontCacheManager.h>
+
+ #include <algorithm>
++#include <array>
+ #include <cassert>
+ #include <cstdint>
+ #include <cstring>
+@@ -19,6 +20,7 @@
+   RenderMode mode = BW;
+   bool supported = true, inverted = false, active = false;
+   int origin = 0, rows = 0, placeholders = 0;
++  std::vector<std::array<int,5>> placeholderRects;
+   uint8_t* target = nullptr;
+   std::vector<uint8_t> bw, lsb, msb;
+   std::vector<std::string> events;
+@@ -67,8 +69,9 @@
+     events.push_back("cleanup");
+   }
+   FontCacheManager* getFontCacheManager() { return &fonts; }
++  bool invertImages() const { return false; }
+   void preserveImagePolarity(int, int, int, int) {}
+-  void fillRect(int, int, int, int, bool) { ++placeholders; }
++  void fillRect(int x, int y, int w, int h, bool black) { ++placeholders; placeholderRects.push_back({x,y,w,h,black?1:0}); }
+   bool glyphIntersectsStrip(int x0, int y0, int x1, int y1) const {
+     if (!active) return true;
+     int lo, hi;
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+
+ ### Fixed
++
++- Image refresh blanks each image separately, keeping text between inline images visible while images are prepared for display. Pending images use an empty background instead of a temporary box border.
+
+ - Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
+
+diff --git a/test/image_refresh_regions/ImageRefreshRegionsTest.cpp b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
+@@ -0,0 +1,76 @@
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <iostream>
++#include <memory>
++#include <vector>
++constexpr int TAG_PageLine=1,TAG_PageImage=2;
++struct Block {int16_t width,height;int16_t getWidth()const{return width;}int16_t getHeight()const{return height;}};
++struct Element {int16_t xPos=0,yPos=0;virtual ~Element()=default;virtual int getTag()const{return TAG_PageLine;}};
++struct PageImage:Element {
++ Block block;
++ PageImage(int x,int y,int w,int h):block{int16_t(w),int16_t(h)}{xPos=x;yPos=y;}
++ int getTag()const override{return TAG_PageImage;}
++ const Block& getImageBlock()const{return block;}
++};
++struct Page {
++ std::vector<std::unique_ptr<Element>>elements;
++ #include "ImageRects.inc"
++ int imageArea()const{int area=0;forEachImageRect([&](int,int,int w,int h){area+=w*h;});return area;}
++};
++namespace HalDisplay {enum {FAST_REFRESH=1,HALF_REFRESH=2};}
++struct Renderer {
++ bool direct=false;int width=100,height=160;
++ std::vector<uint8_t>pixels=std::vector<uint8_t>(width*height);
++ std::vector<std::vector<uint8_t>>frames;
++ std::vector<int>modes;
++ bool shouldSkipImageBlanking()const{return direct;}
++ int getScreenWidth()const{return width;}int getScreenHeight()const{return height;}
++ void fillRect(int x,int y,int w,int h,bool state){
++  for(int py=std::max(0,y);py<std::min(height,y+h);++py)
++   for(int px=std::max(0,x);px<std::min(width,x+w);++px)pixels[py*width+px]=state;
++ }
++ void displayBuffer(int mode){frames.push_back(pixels);modes.push_back(mode);}
++ void displayGrayscaleBase(int mode){displayBuffer(mode);}
++};
++struct Reader {
++ Renderer renderer;std::unique_ptr<Page>page=std::make_unique<Page>();
++ bool pageHasImages=true,deferImageLoading=false,cleanImageBasePending=false;
++ int pagesUntilFullRefresh=3,orientedMarginLeft=3,orientedMarginTop=5,compositions=0;
++ std::vector<uint8_t>composed;
++ void composePageBuffer(){++compositions;renderer.pixels=composed;}
++ int manualScreenRefreshMode(){return HalDisplay::HALF_REFRESH;}
++ void renderImageBase();
++};
++#include "ImageRefresh.inc"
++int main(){
++ for(bool direct:{false,true})for(bool cleanup:{false,true}){
++  Reader reader;reader.renderer.direct=direct;reader.cleanImageBasePending=cleanup;
++  reader.page->elements.push_back(std::make_unique<PageImage>(8,10,8,8));
++  reader.page->elements.push_back(std::make_unique<Element>()); // text is not an image region
++  reader.page->elements.push_back(std::make_unique<PageImage>(11,100,8,8));
++  reader.page->elements.push_back(std::make_unique<PageImage>(50,80,0,8));
++  for(size_t i=0;i<reader.renderer.pixels.size();++i)reader.renderer.pixels[i]=(i%3!=0);
++  reader.composed=reader.renderer.pixels;
++  reader.renderImageBase();
++  assert(reader.renderer.pixels==reader.composed);
++  assert(reader.compositions==int(!direct||cleanup));
++  assert(reader.pagesUntilFullRefresh==3&&!reader.cleanImageBasePending);
++  for(const auto& frame:reader.renderer.frames)for(int y=0;y<160;++y)for(int x=0;x<100;++x){
++   const bool image1=x>=11&&x<19&&y>=15&&y<23;
++   const bool image2=x>=14&&x<22&&y>=105&&y<113;
++   if(!image1&&!image2)assert(frame[y*100+x]==reader.composed[y*100+x]);
++  }
++  assert(reader.renderer.frames.back()==reader.composed);
++ }
++ Reader clipped;
++ clipped.page->elements.push_back(std::make_unique<PageImage>(-10,-10,12,12));
++ clipped.page->elements.push_back(std::make_unique<PageImage>(96,156,20,20));
++ clipped.composed=clipped.renderer.pixels;clipped.renderImageBase();
++ assert(clipped.compositions==1);
++ Reader large;large.page->elements.push_back(std::make_unique<PageImage>(0,0,80,100));
++ large.composed=large.renderer.pixels;large.renderImageBase();assert(large.pagesUntilFullRefresh==1);
++ Page empty;empty.elements.push_back(std::make_unique<Element>());
++ int count=0;assert(!empty.forEachImageRect([&](int,int,int,int){++count;}));assert(count==0);
++ std::cout<<"Separate image regions preserve every intervening text pixel in all base/cleanup modes\n";
++}
+diff --git a/test/image_refresh_regions/CMakeLists.txt b/test/image_refresh_regions/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/image_refresh_regions/CMakeLists.txt
+@@ -0,0 +1,12 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(IMAGE_RECTS ${CMAKE_CURRENT_BINARY_DIR}/ImageRects.inc)
++set(IMAGE_REFRESH ${CMAKE_CURRENT_BINARY_DIR}/ImageRefresh.inc)
++add_custom_command(OUTPUT ${IMAGE_RECTS} ${IMAGE_REFRESH}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractImageRefresh.py
++    ${REPO_ROOT}/lib/Epub/Epub/Page.h ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp ${IMAGE_RECTS} ${IMAGE_REFRESH}
++  DEPENDS ${REPO_ROOT}/lib/Epub/Epub/Page.h ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractImageRefresh.py VERBATIM)
++add_executable(image_refresh_regions_test ImageRefreshRegionsTest.cpp ${IMAGE_RECTS} ${IMAGE_REFRESH})
++target_include_directories(image_refresh_regions_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(image_refresh_regions_test PRIVATE -UNDEBUG)
++add_test(NAME image_refresh_regions COMMAND image_refresh_regions_test)
+diff --git a/test/image_refresh_regions/ExtractImageRefresh.py b/test/image_refresh_regions/ExtractImageRefresh.py
+new file mode 100644
+--- /dev/null
++++ b/test/image_refresh_regions/ExtractImageRefresh.py
+@@ -0,0 +1,10 @@
++from pathlib import Path
++import sys
++header=Path(sys.argv[1]).read_text()
++a=header.index("  template <typename Callback>\n  bool forEachImageRect(")
++b=header.index("  // Total area of all images",a)
++Path(sys.argv[3]).write_text(header[a:b])
++source=Path(sys.argv[2]).read_text()
++a=source.index("  if (pageHasImages && !deferImageLoading) {",source.index("  const bool overlapRefresh ="))
++b=source.index("  } else if (needsAnyGrayscale)",a)
++Path(sys.argv[4]).write_text("void Reader::renderImageBase() {\n"+source[a:b]+"  }\n}\n")
