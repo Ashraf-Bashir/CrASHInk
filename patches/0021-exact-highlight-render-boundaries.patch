@@ -63,6 +63,24 @@ diff --git a/src/clippings/ClippingPageMatchCache.h b/src/clippings/ClippingPage
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -509,7 +509,7 @@
+                               const char* startToken, const size_t startTokenLen, const uint16_t startPageWord,
+                               const uint16_t startClipToken, const uint16_t minPartialMatch,
+                               const uint8_t expectedTableColumn, ClippingPageMatch& match,
+-                              const bool allowShortBoundary = false) {
++                              const bool allowShortBoundary = false, const size_t startTokenOffset = 0) {
+   // A run that starts inside the clipping can only be the continuation of a
+   // clipping that began on an earlier page, so it has to start at the first
+   // word of this page. A tail that merely repeats mid-page is a coincidence.
+@@ -527,7 +527,7 @@
+
+   uint16_t matchedTokens = 0;
+   uint16_t lastWord = startPageWord;
+-  size_t tokenOffset = 0;
++  size_t tokenOffset = startTokenOffset;
+   bool reachedClipEnd = false;
+   bool stoppedByMismatch = false;
+   uint16_t tableSelection = UINT16_MAX;
 @@ -559,6 +559,8 @@
            return false;
          }
@@ -72,7 +90,99 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
          lastWord = wordIndex;
          if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::CONTINUES_TOKEN) {
            tokenOffset += fragmentResult.tokenBytes;
-@@ -766,10 +768,12 @@
+@@ -574,7 +576,7 @@
+         return true;
+       });
+
+-  if (matchedTokens == 0) {
++  if (matchedTokens == 0 && !(allowShortBoundary && tokenOffset > startTokenOffset && !stoppedByMismatch)) {
+     return false;
+   }
+
+@@ -591,8 +593,9 @@
+   match.startWord = startPageWord;
+   match.endWord = lastWord;
+   match.tableSelection = tableSelection;
+-  match.startsAtClipStart = startClipToken == 0;
++  match.startsAtClipStart = startClipToken == 0 && startTokenOffset == 0;
+   match.reachesClipEnd = reachedClipEnd;
++  if (!reachedClipEnd) match.endByte = UINT16_MAX;
+   return true;
+ }
+
+@@ -730,6 +733,56 @@
+   }
+ };
+
++bool findHyphenatedClippingContinuation(Section& section, const Page& page, const std::string& text,
++                                        ClippingPageMatch& match, ClippingNeighborPageCache& neighborCache,
++                                        const int currentPage) {
++  if (currentPage <= 0) return false;
++  const TextBlock* firstBlock = nullptr;
++  uint16_t firstWord = 0;
++  forEachVisiblePageWord(page, [&](uint16_t, const PageTextLine&, const TextBlock& block, size_t word) {
++    firstBlock = &block;
++    firstWord = static_cast<uint16_t>(word);
++    return false;
++  });
++  if (!firstBlock) return false;
++  const uint16_t tokenCount = countClipTokens(text);
++  const char* cursor = text.c_str();
++  const char* token = nullptr;
++  size_t tokenLength = 0;
++  uint16_t tokenIndex = 0;
++  while (nextClipToken(cursor, token, tokenLength)) {
++    size_t offset = 0;
++    while (offset < tokenLength) {
++      ClippingTextMatcher::nextCodepoint(token, tokenLength, offset);
++      if (offset >= tokenLength) break;
++      if (matchPageWordToToken(*firstBlock, firstWord, token, tokenLength, offset, false, tokenIndex + 1 == tokenCount)
++              .match == ClippingTextMatcher::TokenFragmentMatch::MISMATCH)
++        continue;
++      const Page* previous = neighborCache.load(section, currentPage - 1);
++      if (!previous) return false;
++      const TextBlock* lastBlock = nullptr;
++      uint16_t lastWord = 0;
++      forEachVisiblePageWord(*previous, [&](uint16_t, const PageTextLine&, const TextBlock& block, size_t word) {
++        lastBlock = &block;
++        lastWord = static_cast<uint16_t>(word);
++        return true;
++      });
++      if (!lastBlock || !lastBlock->wordEndsWithInsertedHyphen(lastWord)) return false;
++      const auto prefix = matchPageWordToToken(*lastBlock, lastWord, token, tokenLength, 0, tokenIndex == 0, false);
++      if (prefix.match != ClippingTextMatcher::TokenFragmentMatch::CONTINUES_TOKEN || prefix.tokenBytes != offset)
++        continue;
++      ClippingPageMatch candidate;
++      if (matchClipRunFromPageWord(page, tokenCount, cursor, token, tokenLength, 0, tokenIndex,
++                                   std::min<uint16_t>(tokenCount, 3), UINT8_MAX, candidate, true, offset)) {
++        match = candidate;
++        return true;
++      }
++    }
++    ++tokenIndex;
++  }
++  return false;
++}
++
+ bool findClippingTextOnPage(Section& section, const Page& page, const std::string& rawClippingText,
+                             ClippingPageMatch& match, bool* uniqueMatch = nullptr,
+                             const uint8_t expectedTableColumn = UINT8_MAX,
+@@ -742,6 +795,14 @@
+   // Collect reliable runs and short boundary candidates in one traversal.
+   if (findClippingTextInPages(page, clippingText, match, uniqueMatch, expectedTableColumn, false, UINT16_MAX,
+                              &boundaryDirections, &shortBoundaryFound)) return true;
++  // A page can begin with the suffix of a word hyphenated on the previous
++  // page ("com-" / "plete"). It cannot match any token from offset zero.
++  if (expectedTableColumn == UINT8_MAX &&
++      findHyphenatedClippingContinuation(section, page, clippingText, match, neighborCache,
++                                         requestedPage >= 0 ? requestedPage : section.currentPage)) {
++    if (uniqueMatch) *uniqueMatch = false; // contextual continuation, not a whole-quote location
++    return true;
++  }
+   if (!shortBoundaryFound) return false;
+
+   const uint16_t currentWordCount = countVisiblePageWords(page);
+@@ -766,10 +827,12 @@
      if (nextPage) {
        match.endWord = currentWordCount - 1;
        match.reachesClipEnd = false;
@@ -85,7 +195,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      }
      return true;
    }
-@@ -803,6 +807,8 @@
+@@ -803,6 +866,8 @@
    match.startWord = startWord;
    match.endWord = endWord;
    match.tableSelection = clipping.tableSelection;
@@ -94,7 +204,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    return true;
  }
 
-@@ -7973,6 +7979,42 @@
+@@ -7973,6 +8038,42 @@
          entry.failed = true;
        }
      }
@@ -137,7 +247,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      if (matchedStoredRange || matchedText) {
        matches[matchCount] = match;
        matchClippingIndices[matchCount] = clippingIndex;
-@@ -8060,7 +8102,7 @@
+@@ -8060,7 +8161,7 @@
      const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
      const int skipX = hasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", textStyle) : 0;
      const PageWordGeometry geometry = pageWordGeometry(renderer, fontId, line, block, wordIndex);
@@ -146,7 +256,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      const int wordY = orientedMarginTop + line.yPos;
      int wordW = geometry.width - skipX;
      const int wordH = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
-@@ -8079,6 +8121,27 @@
+@@ -8079,6 +8180,27 @@
          wordW = nextWordX - wordX;
        }
      }
@@ -174,7 +284,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      if (wordW > 0) {
        const ClippingHighlightGeometry::WordRect currentHighlight{pageWordIndex, wordX, wordY, wordW, wordH};
        ClippingHighlightGeometry::GapRect gap;
-@@ -8093,10 +8156,11 @@
+@@ -8093,10 +8215,11 @@
        // A saved clipping always uses black text on its light-gray marker.
        // The ordinary reader foreground is white in dark mode, which makes the
        // text fade into this marker.
@@ -190,7 +300,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
        // Match TextBlock::render()'s Focus Reading split. The prewarm pass
        // loaded the leading run as bold, so redrawing it as regular here can
        // miss the glyph bitmap for SD-card fonts and show replacement marks.
-@@ -8111,11 +8175,9 @@
+@@ -8111,11 +8234,9 @@
                [&](const int runX, const char* runText, const EpdFontFamily::Style runStyle) {
                  renderer.drawText(lineFontId, runX, wordY, runText, true, runStyle, baseDir);
                })) {
@@ -234,7 +344,19 @@ diff --git a/test/clipping_page_turn/ClippingPageTurnTest.cpp b/test/clipping_pa
 diff --git a/test/clipping_page_turn/ClippingPageCacheTest.cpp b/test/clipping_page_turn/ClippingPageCacheTest.cpp
 --- a/test/clipping_page_turn/ClippingPageCacheTest.cpp
 +++ b/test/clipping_page_turn/ClippingPageCacheTest.cpp
-@@ -87,6 +87,22 @@
+@@ -24,9 +24,10 @@
+ unsigned long millis() { return ticks++; }
+ struct TextBlock {
+   std::vector<std::string> words;
++  std::vector<bool> hyphens;
+   uint16_t wordCount() const { return words.size(); }
+   const char* wordText(uint16_t i) const { return words[i].c_str(); }
+-  bool wordEndsWithInsertedHyphen(uint16_t) const { return false; }
++  bool wordEndsWithInsertedHyphen(uint16_t i) const { return !hyphens.empty() && hyphens[i]; }
+ };
+ struct PageTextLine {
+   const TextBlock* block;
+@@ -87,6 +88,68 @@
  };
  #include "ClippingCollector.inc"
  int main() {
@@ -253,6 +375,52 @@ diff --git a/test/clipping_page_turn/ClippingPageCacheTest.cpp b/test/clipping_p
 +    assert(result.matches[0].endWord == 2);
 +    assert(CLIPPINGS.texts[0] == "We were selling");
 +  }
++  {
++    EpubReaderActivity continuation;
++    continuation.section->pages[0].block.words = {"Did", "I", "make", "smart", "notes", "for", "myself?", "Once", "you", "have", "your", "main", "point", "and", "a", "few", "examples", "or", "subpoints", "in", "mind,", "write", "them", "down", "on", "a", "small", "note", "card", "using", "as", "few", "words", "as", "possible", "and", "no", "com-"};
++    auto& before = continuation.section->pages[0].block;
++    before.hyphens.assign(before.words.size(),false);before.hyphens.back()=true;
++    continuation.section->pages[1].block.words = {"plete", "sentences.", "Know", "that", "notes", "have", "only", "one", "purpose:", "to", "remind", "you", "of", "the", "points", "you", "need", "to", "make", "and", "the", "details", "you", "might", "otherwise", "forget,", "like", "statistics"};
++    continuation.section->pages[2].block.words = {"or", "names.", "Nothing", "else", "belongs", "in", "your", "notes.", "Afterward"};
++    const std::string quote="Did I make smart notes for myself? Once you have your main point and a few examples or subpoints in mind, write them down on a small note card using as few words as possible and no complete sentences. Know that notes have only one purpose: to remind you of the points you need to make and the details you might otherwise forget, like statistics or names. Nothing else belongs in your notes.";
++    Clipping clip;clip.spineIndex=0;clip.pageCount=1000;clip.wordCount=80;
++    CLIPPINGS.records={clip};CLIPPINGS.texts={quote};
++    CLIPPINGS.records[0].textFilter.build(quote.data(),quote.size());
++    for(int page=0;page<3;++page) {
++      ClippingPageMatchCache::Entry result;result.page=page;
++      continuation.collectClippingPageMatches(continuation.section->pages[page],result,false);
++      assert(result.ready && result.count==1 && result.matches[0].startWord==0);
++      assert(result.matches[0].endWord==(page==2?7:continuation.section->pages[page].block.words.size()-1));
++      assert(page==2 || result.matches[0].endByte==UINT16_MAX);
++    }
++    // A suffix alone is not enough: authored hyphens/unrelated previous words
++    // must not turn a coincidental page-start fragment into a highlight.
++    before.hyphens.back()=false;
++    ClippingPageMatchCache::Entry unrelated;unrelated.page=1;
++    continuation.collectClippingPageMatches(continuation.section->pages[1],unrelated,false);
++    assert(unrelated.ready && unrelated.count==0);
++    before.hyphens.back()=true;before.words.back()="other-";
++    ClippingPageMatchCache::Entry wrongPrefix;wrongPrefix.page=1;
++    continuation.collectClippingPageMatches(continuation.section->pages[1],wrongPrefix,false);
++    assert(wrongPrefix.ready && wrongPrefix.count==0);
++    assert(CLIPPINGS.texts[0]==quote && continuation.section->currentPage==0);
++  }
++  // A quote can consist of just the word crossing the boundary, including UTF-8.
++  for (const auto& parts : std::vector<std::array<std::string,3>>{
++         {"com-","plete","complete"}, {"COM-","PLETE","complete"}, {"caf-","éine","caféine"}}) {
++    EpubReaderActivity single;
++    single.section->pages[0].block.words={parts[0]};single.section->pages[0].block.hyphens={true};
++    single.section->pages[1].block.words={parts[1],"unselected"};
++    Clipping clip;clip.spineIndex=0;clip.pageCount=1000;clip.wordCount=1;
++    CLIPPINGS.records={clip};CLIPPINGS.texts={parts[2]};
++    CLIPPINGS.records[0].textFilter.build(parts[2].data(),parts[2].size());
++    for(int page=0;page<2;++page) {
++      ClippingPageMatchCache::Entry result;result.page=page;
++      single.collectClippingPageMatches(single.section->pages[page],result,false);
++      assert(result.ready&&result.count==1&&result.matches[0].startWord==0&&result.matches[0].endWord==0);
++      assert(page==1||result.matches[0].endByte==UINT16_MAX);
++    }
++  }
 +  CLIPPINGS.reads = 0;
    EpubReaderActivity reader;
    Clipping clip;
@@ -265,7 +433,29 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 
  ### Fixed
 +
-+- Saved highlights stop at the selected text before a joined dash; the floating Edit/Delete toolbar has larger high-contrast icons.
++- Saved highlights stop at the selected text before a joined dash; the floating Edit/Delete toolbar has larger high-contrast icons. Highlights also continue across page breaks inside hyphenated words, without changing saved clipping text.
 
  - The EPUB contents index collapses parent chapters, opens the current chapter's ancestors, and supports holding a parent to navigate to it.
 
+diff --git a/src/clippings/ClippingPageFilter.h b/src/clippings/ClippingPageFilter.h
+--- a/src/clippings/ClippingPageFilter.h
++++ b/src/clippings/ClippingPageFilter.h
+@@ -68,6 +68,18 @@
+         shortHashes[1] = value.shortHashes[1];
+       }
+       continuations |= hashBit(value.hash);
++      // The first visible word may be a layout-hyphenated suffix. Include
++      // internal UTF-8 boundaries so the rejection filter cannot hide a valid
++      // continuation before the neighboring-page verifier gets to inspect it.
++      size_t suffix = start;
++      while (suffix < end) {
++        ClippingTextMatcher::nextCodepoint(text, end, suffix);
++        if (suffix >= end) break;
++        size_t peek = suffix;
++        if (ClippingTextMatcher::isEdgePunctuation(ClippingTextMatcher::nextCodepoint(text, end, peek))) continue;
++        const auto tail = prefix(text + suffix, end - suffix);
++        if (tail.length == 3) continuations |= hashBit(tail.hash);
++      }
+     }
+     if (!firstLength) firstLength = 255;
+   }
