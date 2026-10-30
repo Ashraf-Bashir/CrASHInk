@@ -1,0 +1,492 @@
+diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
+--- a/src/activities/reader/OnPageHighlightActivity.cpp
++++ b/src/activities/reader/OnPageHighlightActivity.cpp
+@@ -55,14 +55,17 @@
+
+ OnPageHighlightActivity::OnPageHighlightActivity(GfxRenderer& renderer, MappedInputManager& input,
+                                                  std::shared_ptr<Epub> book, std::unique_ptr<Page> page,
+-                                                 size_t clippingIndex, int left, int top, float hint)
++                                                 size_t clippingIndex, int left, int top, float hint,
++                                                 void* readerContext, PageLoader pageLoader)
+     : Activity("OnPageHighlight", renderer, input),
+       book(std::move(book)),
+       page(std::move(page)),
+       index(clippingIndex),
+       left(left),
+       top(top),
+-      hint(hint) {}
++      hint(hint),
++      readerContext(readerContext),
++      pageLoader(pageLoader) {}
+
+ void OnPageHighlightActivity::onEnter() {
+   Activity::onEnter();
+@@ -151,8 +154,8 @@
+   XPathTextLocation pageLocation;
+   if (!ChapterXPathResolver::locateText(book, spine, text, hint, pageLocation) || pageLocation.loose) return false;
+   const uint32_t pageLength = ChapterXPathResolver::strictTextLength(text);
+-  if (pageLocation.end - pageLocation.start + 1 != pageLength || range.end < pageLocation.start ||
+-      range.start > pageLocation.end)
++  if (pageLocation.end - pageLocation.start + 1 != pageLength ||
++      (!dragging.load() && (range.end < pageLocation.start || range.start > pageLocation.end)))
+     return false;
+   // Activity-lifetime page geometry: <=1024 words (~28 KiB), too large for
+   // the task stack. Fallible and allocated once, never while dragging/rendering.
+@@ -169,7 +172,62 @@
+   original.total = pageLocation.start;
+   const bool ok = page->forEachTextLine(visitor, &context);
+   original.total = total;
++  if (ok && wordCount) {
++    int first = words[0].rect.y, last = first;
++    for (size_t i = 0; i < wordCount; ++i) {
++      first = std::min(first, words[i].rect.y);
++      last = std::max(last, words[i].rect.y + words[i].rect.height);
++    }
++    firstTextY.store(first);
++    lastTextBottom.store(last);
++  }
+   return ok;
++}
++
++bool OnPageHighlightActivity::turnPage(const int direction) {
++  if (!pageLoader || !readerContext || !ready || activeEdge < 0 || (direction != -1 && direction != 1)) return false;
++  float nextHint = hint;
++  auto next = pageLoader(readerContext, pageOffset + direction, nextHint);
++  if (!next) return false;  // chapter boundary or read failure: preserve the draft
++  auto previousPage = std::move(page);
++  auto previousWords = std::move(words);
++  const size_t previousCount = wordCount;
++  const auto previousRow = buildRow;
++  const float previousHint = hint;
++  const int previousTop = firstTextY.load(), previousBottom = lastTextBottom.load();
++  page = std::move(next);
++  hint = nextHint;
++  wordCount = 0;
++  buildRow = 0;
++  // Keep the previous geometry until this page has an exact chapter mapping.
++  // At most two bounded geometry arrays during a page change; no framebuffer.
++  bool valid = buildWords() && wordCount > 0;
++  if (valid) {
++    const auto& boundary = words[direction > 0 ? 0 : wordCount - 1];
++    auto candidate = range;
++    valid = candidate.move(activeEdge == 0, boundary.start, boundary.end) ||
++            (candidate.start == range.start && candidate.end == range.end &&
++             (activeEdge == 0 ? boundary.start == range.start : boundary.end == range.end));
++    if (valid) range = candidate;
++  }
++  if (!valid) {
++    page = std::move(previousPage);
++    words = std::move(previousWords);
++    wordCount = previousCount;
++    buildRow = previousRow;
++    hint = previousHint;
++    firstTextY.store(previousTop);
++    lastTextBottom.store(previousBottom);
++    LOG_ERR("CLIP", "Cannot map adjacent page for highlight adjustment");
++    return false;
++  }
++  pageOffset += direction;
++  dragOffsetX = dragOffsetY = 0;
++  dragFrameReady = false;  // paint the NEW page text before any differential selection
++  firstSnapshot = {};
++  lastSnapshot = {};
++  waitForPageMotion.store(true);
++  return true;
+ }
+
+ void OnPageHighlightActivity::returnAction(bool editor, int x, int y) {
+@@ -178,7 +236,7 @@
+ }
+
+ void OnPageHighlightActivity::updateDrag() {
+-  if (!ready || activeEdge < 0) return;
++  if (!ready || activeEdge < 0 || waitForPageMotion.load()) return;
+   const int x = dragX.load() + dragOffsetX, y = dragY.load() + dragOffsetY;
+   size_t best = wordCount;
+   int64_t distance = INT64_MAX;
+@@ -218,9 +276,17 @@
+   if (dragging.load()) {
+     if (mappedInput.isScreenTouchHeld(x, y)) {
+       if (x != dragX.load() || y != dragY.load()) {
++        waitForPageMotion.store(false);
+         dragX.store(x);
+         dragY.store(y);
+         requestUpdate();
++      }
++      const int direction =
++          dragPaging.track(x, y, firstTextY.load(), lastTextBottom.load(), renderer.getScreenHeight(), millis());
++      if (direction && !RenderLock::peek()) {
++        RenderLock lock(*this);
++        if (turnPage(direction)) requestUpdate();
++        dragPaging.turned(x, y);  // do not retry failed/boundary reads until movement
+       }
+       return;
+     }
+@@ -238,6 +304,7 @@
+       requestUpdate();
+     else {
+       closeAfterAdjustment = true;
++      setResult(HighlightPageAction{false, static_cast<uint16_t>(index), 0, 0, pageOffset, true});
+       finish();
+     }
+     return;
+@@ -271,6 +338,8 @@
+       }
+       dragX.store(x);
+       dragY.store(y);
++      dragPaging.begin(x, y);
++      waitForPageMotion.store(false);
+       dragging.store(true);
+       requestUpdate();  // hide Edit as soon as a handle is touched
+       return;
+diff --git a/src/activities/reader/OnPageHighlightActivity.h b/src/activities/reader/OnPageHighlightActivity.h
+--- a/src/activities/reader/OnPageHighlightActivity.h
++++ b/src/activities/reader/OnPageHighlightActivity.h
+@@ -6,6 +6,7 @@
+ #include <atomic>
+
+ #include "ChapterXPathResolver.h"
++#include "HighlightDragPaging.h"
+ #include "HighlightToolbar.h"
+ #include "OnPageHighlightModel.h"
+ #include "activities/Activity.h"
+@@ -13,8 +14,10 @@
+
+ class OnPageHighlightActivity final : public Activity {
+  public:
++  using PageLoader = std::unique_ptr<Page> (*)(void*, int, float&);
+   OnPageHighlightActivity(GfxRenderer& renderer, MappedInputManager& input, std::shared_ptr<Epub> book,
+-                          std::unique_ptr<Page> page, size_t clippingIndex, int left, int top, float hint);
++                          std::unique_ptr<Page> page, size_t clippingIndex, int left, int top, float hint,
++                          void* readerContext = nullptr, PageLoader pageLoader = nullptr);
+   void onEnter() override;
+   void loop() override;
+   void render(RenderLock&&) override;
+@@ -35,6 +38,13 @@
+   uint16_t buildRow = 0;
+   int left, top;
+   float hint;
++  void* readerContext = nullptr;
++  PageLoader pageLoader = nullptr;
++  int pageOffset = 0;
++  HighlightDragPaging dragPaging;
++  std::atomic<bool> waitForPageMotion{false};
++  std::atomic<int> firstTextY{0}, lastTextBottom{0};
++  bool turnPage(int direction);
+   uint16_t spine = 0;
+   XPathTextLocation original{};
+   OnPageHighlightRange range{}, saved{};
+diff --git a/src/activities/reader/HighlightDragPaging.h b/src/activities/reader/HighlightDragPaging.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/HighlightDragPaging.h
+@@ -0,0 +1,40 @@
++#pragma once
++#include <cstdint>
++
++// Main-loop-only dwell state. One page per deliberate edge approach; after a
++// turn, wait for fresh movement so a stationary finger cannot skip text.
++struct HighlightDragPaging {
++  int x = 0, y = 0, direction = 0;
++  uint32_t entered = 0;
++  bool moved = false, waiting = false;
++  void begin(int px, int py) {
++    x = px;
++    y = py;
++    direction = 0;
++    entered = 0;
++    moved = false;
++    waiting = false;
++  }
++  void turned(int px, int py) {
++    begin(px, py);
++    waiting = true;
++  }
++  int track(int px, int py, int textTop, int textBottom, int screenHeight, uint32_t now) {
++    const bool motion = px != x || py != y;
++    x = px;
++    y = py;
++    if (waiting && !motion) return 0;
++    if (motion) {
++      moved = true;
++      waiting = false;
++    }
++    if (!moved) return 0;
++    const int target = py < 48 || py < textTop - 8 ? -1 : py >= screenHeight - 48 || py > textBottom + 8 ? 1 : 0;
++    if (target != direction) {
++      direction = target;
++      entered = now;
++      return 0;
++    }
++    return target && static_cast<uint32_t>(now - entered) >= 200 ? target : 0;
++  }
++};
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -7807,12 +7807,31 @@
+   if (!page) return;
+   // One modal page and <=28 KiB geometry, owned only during adjustment. The
+   // object itself is small; allocation must remain fallible on C3 devices.
+-  auto editor = makeUniqueNoThrow<OnPageHighlightActivity>(renderer, mappedInput, epub, std::move(page),
+-      clippingIndex, layout.marginLeft, layout.marginTop, hint);
++  auto editor = makeUniqueNoThrow<OnPageHighlightActivity>(
++      renderer, mappedInput, epub, std::move(page), clippingIndex, layout.marginLeft, layout.marginTop, hint, this,
++      [](void* context, int offset, float& pageHint) -> std::unique_ptr<Page> {
++        auto* self = static_cast<EpubReaderActivity*>(context);
++        if (!self->section) return nullptr;
++        const int target = self->section->currentPage + offset;
++        if (target < 0 || target >= self->section->pageCount) return nullptr;
++        pageHint = self->section->pageCount > 1 ? static_cast<float>(target) / (self->section->pageCount - 1) : -1.0f;
++        return self->section->loadPage(target);
++      });
+   if (!editor) { LOG_ERR("CLIP", "Cannot allocate on-page highlight editor"); return; }
+   pauseReadingPaceTimer("highlight_handles");
+   startActivityForResult(std::move(editor), [this](const ActivityResult& result) {
+     if (const auto* action = std::get_if<HighlightPageAction>(&result.data)) {
++      if (action->adjusted) {
++        {
++          RenderLock lock(*this);
++          if (section && section->pageCount > 0)
++            section->currentPage = std::clamp(section->currentPage + action->pageOffset, 0, section->pageCount - 1);
++          pagesUntilFullRefresh = 1;
++        }
++        resumeReadingPaceTimer("highlight_handles_return");
++        requestUpdate();
++        return;
++      }
+       if (action->editor) { showClippingEditor(action->clippingIndex); return; }
+       openWordSelect(false, action->x, action->y, true);
+       return;
+diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
+--- a/src/activities/ActivityResult.h
++++ b/src/activities/ActivityResult.h
+@@ -132,6 +132,8 @@
+   bool editor = false;
+   uint16_t clippingIndex = UINT16_MAX;
+   int x = 0, y = 0;
++  int pageOffset = 0;
++  bool adjusted = false;
+ };
+
+ using ResultVariant =
+diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
+--- a/test/highlight_word_edit/CMakeLists.txt
++++ b/test/highlight_word_edit/CMakeLists.txt
+@@ -90,3 +90,13 @@
+ target_include_directories(dictionary_page_render_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+ target_compile_options(dictionary_page_render_test PRIVATE -UNDEBUG)
+ add_test(NAME dictionary_page_render COMMAND dictionary_page_render_test)
++
++set(ONPAGE_PAGING ${CMAKE_CURRENT_BINARY_DIR}/OnPagePaging.inc)
++add_custom_command(OUTPUT ${ONPAGE_PAGING}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractOnPagePaging.py
++    ${REPO_ROOT}/src/activities/reader/OnPageHighlightActivity.cpp ${ONPAGE_PAGING}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/OnPageHighlightActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractOnPagePaging.py VERBATIM)
++add_executable(onpage_highlight_paging_test OnPagePagingTest.cpp ${ONPAGE_PAGING})
++target_include_directories(onpage_highlight_paging_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
++target_compile_options(onpage_highlight_paging_test PRIVATE -UNDEBUG)
++add_test(NAME onpage_highlight_paging COMMAND onpage_highlight_paging_test)
+diff --git a/test/highlight_word_edit/ExtractOnPagePaging.py b/test/highlight_word_edit/ExtractOnPagePaging.py
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractOnPagePaging.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++a=s.index("bool OnPageHighlightActivity::turnPage(")
++b=s.index("void OnPageHighlightActivity::returnAction(",a)
++Path(sys.argv[2]).write_text(s[a:b])
+diff --git a/test/highlight_word_edit/OnPagePagingTest.cpp b/test/highlight_word_edit/OnPagePagingTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/highlight_word_edit/OnPagePagingTest.cpp
+@@ -0,0 +1,79 @@
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cassert>
++#include <cstdint>
++#include <memory>
++#include <iostream>
++#include "activities/reader/HighlightDragPaging.h"
++#include "activities/reader/OnPageHighlightModel.h"
++#define LOG_ERR(...) do {} while(0)
++struct Page {int number;};
++class OnPageHighlightActivity {
++ public:
++ struct Rect {int y=20,height=20;};
++ struct Word {Rect rect;uint32_t start=0,end=0;};
++ using PageLoader=std::unique_ptr<Page>(*)(void*,int,float&);
++ std::unique_ptr<Page> page=std::make_unique<Page>(Page{1});
++ std::unique_ptr<Word[]> words=std::make_unique<Word[]>(2);
++ size_t wordCount=2;unsigned buildRow=0;float hint=0.25f;
++ bool ready=true,dragFrameReady=true, failMapping=false;
++ int activeEdge=1,pageOffset=0;int dragOffsetX=4,dragOffsetY=5;
++ std::atomic<int>firstTextY{20},lastTextBottom{80};std::atomic<bool>waitForPageMotion{false};
++ struct Snapshot{int oldPixels=7;}firstSnapshot,lastSnapshot;
++ OnPageHighlightRange range{0,19};
++ void* readerContext=this;
++ PageLoader pageLoader=+[](void*,int offset,float& hint)->std::unique_ptr<Page>{
++   const int index=1+offset;
++   if(index<0||index>4)return nullptr;
++   hint=index/4.0f;return std::make_unique<Page>(Page{index});
++ };
++ bool buildWords(){
++   words=std::make_unique<Word[]>(2);wordCount=2;
++   words[0].start=page->number*10;words[0].end=page->number*10+4;
++   words[1].start=page->number*10+5;words[1].end=page->number*10+9;
++   firstTextY=30;lastTextBottom=90;return !failMapping;
++ }
++ bool turnPage(int);
++};
++#include "OnPagePaging.inc"
++int main(){
++ HighlightDragPaging dwell;dwell.begin(100,200);
++ assert(dwell.track(100,200,60,700,800,0)==0);
++ assert(dwell.track(100,780,60,700,800,10)==0);
++ assert(dwell.track(100,780,60,700,800,209)==0);
++ assert(dwell.track(100,780,60,700,800,210)==1);
++ dwell.turned(100,780);
++ assert(dwell.track(100,780,60,700,800,1000)==0); // no skipped pages while stationary
++ assert(dwell.track(101,780,60,700,800,1001)==0);
++ assert(dwell.track(101,780,60,700,800,1201)==1);
++ dwell.begin(100,200);
++ assert(dwell.track(100,20,60,700,800,40)==0);
++ assert(dwell.track(100,20,60,700,800,240)==-1);
++ assert(dwell.track(100,200,60,700,800,241)==0); // leave edge, cancel turn
++ dwell.begin(100,200);
++ assert(dwell.track(100,710,60,700,800,0xFFFFFFF0U)==0);
++ assert(dwell.track(100,710,60,700,800,0xC0U)==1); // timer wrap
++ OnPageHighlightActivity edit;
++ assert(edit.turnPage(1));
++ assert(edit.page->number==2&&edit.pageOffset==1&&edit.range.end==24);
++ assert(edit.waitForPageMotion&&!edit.dragFrameReady&&edit.dragOffsetX==0&&edit.dragOffsetY==0);
++ edit.waitForPageMotion=false;
++ assert(edit.turnPage(1)&&edit.range.end==34); // more than two pages
++ assert(edit.turnPage(-1)&&edit.range.end==29); // shorten to previous page
++ assert(edit.turnPage(-1)&&edit.range.end==19);
++ assert(edit.turnPage(-1)&&edit.range.end==9);
++ const auto oldPage=edit.page.get();const auto oldWords=edit.words.get();
++ assert(!edit.turnPage(-1)); // chapter boundary: no draft/page changes
++ assert(edit.page.get()==oldPage&&edit.words.get()==oldWords&&edit.range.end==9);
++ edit.failMapping=true;
++ assert(!edit.turnPage(1)&&edit.page.get()==oldPage&&edit.words.get()==oldWords&&edit.range.end==9);
++ edit.failMapping=false;edit.activeEdge=0;edit.range={10,49};
++ assert(edit.turnPage(1)&&edit.range.start==10); // first endpoint, forward shortening
++ assert(edit.turnPage(1)&&edit.range.start==20);
++ assert(edit.turnPage(-1)&&edit.range.start==15); // extend first endpoint backwards
++ edit.range={18,19};
++ const int oldOffset=edit.pageOffset;
++ assert(!edit.turnPage(1)&&edit.pageOffset==oldOffset&&edit.range.start==18&&edit.range.end==19); // never reverse
++ std::cout<<"Forward/backward paging, exact endpoints, rollback and edge dwell passed\n";
++}
+diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
+--- a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
++++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
+@@ -1,3 +1,5 @@
++static unsigned long nowMs=0;
++static unsigned long millis(){return nowMs;}
+ #include <algorithm>
+ #include <atomic>
+ #include <cassert>
+@@ -8,6 +10,7 @@
+ #include "activities/reader/OnPageHighlightModel.h"
+ #include "activities/reader/HighlightTouchPolicy.h"
+ #include "activities/reader/HighlightToolbar.h"
++#include "activities/reader/HighlightDragPaging.h"
+ struct Rect { int x=0,y=0,width=0,height=0; };
+ bool contains(const Rect& r,int x,int y,int pad=0) {
+  return r.width>0&&r.height>0&&x>=r.x-pad&&x<r.x+r.width+pad&&y>=r.y-pad&&y<r.y+r.height+pad;
+@@ -27,7 +30,7 @@
+  template<class T> explicit RenderLock(T&) {}
+  static bool peek() {return busy;}
+ };
+-struct HighlightPageAction {bool editor;uint16_t clippingIndex;int x,y;};
++struct HighlightPageAction {bool editor;uint16_t clippingIndex;int x,y;int pageOffset=0;bool adjusted=false;};
+ struct Store {
+  unsigned writes=0,deletes=0;bool ok=true;std::string text;
+  bool removeClippingAt(size_t) {++deletes;return ok;}
+@@ -45,6 +48,11 @@
+  HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(200,100,480);
+  bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false,closeAfterAdjustment=false;
+  int activeEdge=-1,updates=0;
++ int pageOffset=0;HighlightDragPaging dragPaging;
++ std::atomic<bool> waitForPageMotion{false};std::atomic<int>firstTextY{0},lastTextBottom{100};
++ int turnAttempts=0,lastTurnDirection=0;
++ bool turnPage(int direction) {++turnAttempts;lastTurnDirection=direction;return false;}
++ struct Renderer {int getScreenHeight() const{return 800;}} renderer;
+  int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0,dragOffsetX=0;
+  std::atomic<bool> dragging{false};std::atomic<int> dragX{0},dragY{0};
+  Input mappedInput;
+@@ -88,6 +96,19 @@
+  assert(touching.activeEdge==1 && touching.dragOffsetX==-1);
+  touching.mappedInput.held=false;touching.mappedInput.down=false;touching.loop();
+  assert(touching.range.end==5 && CLIPPINGS.writes==writesAtTouch);
++ // The real held-touch loop starts edge dwell while the panel is busy,
++ // then performs one bounded attempt when the render lock becomes available.
++ for(int direction:{-1,1}) {
++   OnPageHighlightActivity paging;paging.dragging=true;paging.activeEdge=1;
++   paging.dragPaging.begin(100,200);
++   paging.mappedInput={100,direction>0?780:20,false,true,false,false,0};
++   nowMs=10;RenderLock::busy=true;paging.loop();
++   nowMs=210;paging.loop();assert(paging.turnAttempts==0);
++   RenderLock::busy=false;paging.loop();
++   assert(paging.turnAttempts==1&&paging.lastTurnDirection==direction);
++   nowMs=1000;paging.loop();assert(paging.turnAttempts==1);
++ }
++ nowMs=0;
+  OnPageHighlightActivity a;
+  a.mappedInput={50,10,true,true,false,false,0};a.loop();
+  assert(a.dragging && a.activeEdge==0 && CLIPPINGS.writes==0);
+@@ -100,7 +121,7 @@
+  RenderLock::busy=false;a.loop();
+  assert(!a.dragging && CLIPPINGS.writes==1 && CLIPPINGS.text=="before alpha bravo");
+  assert(a.saved.start==0 && a.saved.end==15);
+- assert(a.finished && a.closeAfterAdjustment && !a.action.editor && a.updates==beforeReleaseUpdates);
++ assert(a.finished && a.closeAfterAdjustment && a.action.adjusted && !a.action.editor && a.updates==beforeReleaseUpdates);
+  OnPageHighlightActivity unchanged;
+  const auto writesBefore=CLIPPINGS.writes;
+  unchanged.mappedInput={50,10,true,true,false,false,0};unchanged.loop();
+diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word_edit/OnPageRenderTest.cpp
+--- a/test/highlight_word_edit/OnPageRenderTest.cpp
++++ b/test/highlight_word_edit/OnPageRenderTest.cpp
+@@ -50,8 +50,8 @@
+  void writeFramebufferRegion(int x,int y,int w,int h,const uint8_t* data) {const size_t stride=(w+7)/8;for(int j=0;j<h;++j)for(int i=0;i<w;++i)drawPixel(x+i,y+j,(data[j*stride+i/8]>>(i%8))&1);}
+ };
+ struct Page {
+- unsigned renders=0;
+- void render(GfxRenderer& renderer,int,int,int,bool) {++renders;for(size_t i=0;i<renderer.pixels.size();++i)renderer.pixels[i]=(i%17==0);}
++ unsigned renders=0;unsigned pattern=17;
++ void render(GfxRenderer& renderer,int,int,int,bool) {++renders;for(size_t i=0;i<renderer.pixels.size();++i)renderer.pixels[i]=(i%pattern==0);}
+ };
+ class OnPageHighlightActivity {
+  public:
+@@ -124,6 +124,14 @@
+      ++pieces;
+    });
+  assert(pieces==3);
++ // Paging resets differential paint and must render the actual new text.
++ OnPageHighlightActivity swapped;swapped.render(RenderLock{});
++ swapped.page=std::make_unique<Page>();swapped.page->pattern=19;
++ swapped.dragFrameReady=false;swapped.render(RenderLock{});
++ assert(swapped.page->renders==2);
++ for(int y=180;y<200;++y)for(int x=0;x<240;++x) {
++   const size_t pixel=y*240+x;assert(swapped.renderer.pixels[pixel]==(pixel%19==0));
++ }
+  const auto renderCount=actual.page->renders;
+  actual.closeAfterAdjustment=true;actual.render(RenderLock{});
+  assert(actual.page->renders==renderCount); // pending repaint cannot flash a popup
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+
+ ### Fixed
++
++- Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
+
+ - SD firmware restarts retain the current frontlight levels and on/off state instead of applying wake scheduling. Highlight controls stay black on white in dark mode. On-page drag editing respects exact highlight endpoints and uses a flat toolbar with thicker icons.
+
