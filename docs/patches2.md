@@ -1,10 +1,10 @@
 # Reorganized patch series: patches2
 
-`patches2/` is the candidate ten-patch series. `patches/` remains the active,
-unchanged series, and `.github/workflows/build.yml` still builds from `patches/`.
-No build workflow was dispatched for this reorganization.
+`patches2/` is the active ten-patch series used by `.github/workflows/build.yml`.
+`patches/` retains the original 26 patches as an unchanged reference.
+The pipeline switch does not dispatch a build automatically.
 
-Apply every candidate patch once, in filename order, to clean upstream source.
+Apply every patch in `patches2/` once, in filename order, to clean upstream source.
 Build after the entire series is applied. These patches share settings and reader
 integration code; they are not independent feature switches. Do not apply both
 folders to the same source tree.
@@ -14,7 +14,7 @@ folders to the same source tree.
 The table lists the main feature migrations. Shared hunks were reconciled against
 the final source rather than concatenating old patch files.
 
-| Candidate patch | Original patches / extracted changes |
+| Active patch | Original patches / extracted changes |
 | --- | --- |
 | `0000-settings-page.patch` | Shared settings navigation and CrASHink tab from `0000-status-icon-layout.patch`, `0005-readest-clippings-sync.patch`, and `0012-negative-spacing-and-margins.patch`. Also preserves the existing logo and boot build-version support from old 0000. |
 | `0001-status-icons.patch` | Icon layout from `0000-status-icon-layout.patch`; `0003-frontlight-status-indicator.patch`; `0004-touchscreen-status-indicator.patch`; `0011-highlighter-status-icon.patch`; Readest icon drawing from `0005-readest-clippings-sync.patch`. |
@@ -69,5 +69,5 @@ checks passed. No source fixes were needed.
 - OTA partition headroom: 789,888 bytes.
 
 This verifies firmware compilation, not on-device behavior or library-opening
-timing. The active GitHub workflow still uses `patches/`; it was not changed or
-dispatched for this check.
+timing. The firmware check was completed before switching the workflow to
+`patches2/`. No GitHub workflow was dispatched for that check or the pipeline switch.
