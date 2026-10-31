@@ -1,0 +1,1056 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -128,6 +128,13 @@
+ STR_CAT_CONTROLS: "Controls"
+ STR_CAT_SYSTEM: "System"
+ STR_CAT_CRASHINK: "CrASHink"
++STR_STATUS_BAR_ICONS: "Status Bar Icons"
++STR_ICON_FRONTLIGHT: "Frontlight shortcut"
++STR_ICON_TOUCHSCREEN: "Touchscreen toggle"
++STR_ICON_READEST: "Readest sync (R)"
++STR_ICON_HIGHLIGHTER: "Highlighter"
++STR_MOVE_UP: "Move up"
++STR_MOVE_DOWN: "Move down"
+ STR_SLEEP_SCREEN: "Sleep Screen"
+ STR_SLEEP_SCREEN_WALLPAPER: "Wallpaper"
+ STR_QUICK_RESUME_TIMEOUT: "Quick Resume on Timeout"
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -21,6 +21,7 @@
+
+ #include "I18nKeys.h"
+ #include "QuickActions.h"
++#include "StatusIconRow.h"
+ #include "SettingsList.h"
+ #include "fontIds.h"
+ #include "util/FrontlightSchedule.h"
+@@ -501,6 +502,11 @@
+     quickActionSlotsJson.add(action);
+   }
+   doc["quickActionsTrigger"] = quickActionsTrigger;
++  JsonArray statusIconOrderJson = doc["statusIconOrder"].to<JsonArray>();
++  for (const uint8_t slot : statusIconOrder) {
++    statusIconOrderJson.add(slot);
++  }
++  doc["statusIconHidden"] = statusIconHidden;
+   doc["language"] = (language < getLanguageCount()) ? LANGUAGE_CODES[language] : "EN";
+   if (keyboardLayouts != 0) doc["keyboardLayouts"] = keyboardLayouts;
+   doc["tiltPageTurnDirectionSchema"] = TILT_DIRECTION_SCHEMA_CURRENT;
+@@ -876,6 +882,36 @@
+       }
+     }
+   }
++  {
++    const JsonArrayConst statusIconOrderJson = doc["statusIconOrder"].as<JsonArrayConst>();
++    uint8_t loadedOrder[StatusIconRow::Count];
++    StatusIconRow::resetOrder(loadedOrder);
++    if (!statusIconOrderJson.isNull() && statusIconOrderJson.size() <= StatusIconRow::Count) {
++      // A saved order from before an icon existed lists fewer slots: keep that
++      // order and put the newer icons after it.
++      uint8_t seen = 0;
++      uint8_t n = 0;
++      bool ok = true;
++      for (JsonVariantConst v : statusIconOrderJson) {
++        const uint8_t slot = v | static_cast<uint8_t>(0xFF);
++        if (slot >= StatusIconRow::Count || (seen & (1u << slot))) {
++          ok = false;
++          break;
++        }
++        seen |= static_cast<uint8_t>(1u << slot);
++        loadedOrder[n++] = slot;
++      }
++      if (ok) {
++        for (uint8_t s = 0; s < StatusIconRow::Count; ++s) {
++          if (!(seen & (1u << s))) loadedOrder[n++] = s;
++        }
++      } else {
++        StatusIconRow::resetOrder(loadedOrder);
++      }
++    }
++    std::copy(loadedOrder, loadedOrder + StatusIconRow::Count, statusIconOrder);
++    statusIconHidden = (doc["statusIconHidden"] | static_cast<uint8_t>(0)) & StatusIconRow::kAllMask;
++  }
+   const uint8_t persistedQuickActionsTrigger =
+       doc["quickActionsTrigger"] | static_cast<uint8_t>(QuickActions::Trigger::None);
+   const bool unavailableHomeTrigger =
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -662,6 +662,10 @@
+   // adjacent so old settings files simply retain their default-initialized tail.
+   uint8_t quickActionSlots[5] = {IGNORE, IGNORE, IGNORE, IGNORE, IGNORE};
+   uint8_t quickActionsTrigger = 0;
++  // Status bar icons (see StatusIconRow.h): left to right order, and which are switched off
++  // (stored inverted so an icon added later starts out shown).
++  uint8_t statusIconOrder[4] = {0, 1, 2, 3};
++  uint8_t statusIconHidden = 0;
+   // Tilt-based page turning on devices with a supported IMU (X3 and Sticky).
+   uint8_t tiltPageTurn = TILT_OFF;
+   uint8_t tiltPageTurnDirection = TILT_LEFT_RIGHT;
+diff --git a/src/StatusIconRow.h b/src/StatusIconRow.h
+new file mode 100644
+--- /dev/null
++++ b/src/StatusIconRow.h
+@@ -0,0 +1,113 @@
++#pragma once
++
++#include <cstdint>
++
++// Layout of the small icons at the left of the reader's top status bar
++// (frontlight shortcut, touchscreen toggle, Readest sync, highlighter, and
++// whatever gets added later). Pure arithmetic with no hardware access, so the
++// drawing code and the tap tests always agree on where each icon is.
++//
++// Icons are placed left to right in the order the user chose in
++// CrASHink > Status Bar Icons. An icon takes room only while it is shown: one
++// the user turned off, or one the device cannot use right now, is skipped and
++// the icons after it close up. Nothing keeps a blank slot.
++//
++// To add an icon: append a Slot before Count, give it a name string in
++// StatusIconsActivity, and draw it at Layout::x(slot) when Layout::visible(slot).
++// Saved orders that lack the new slot are repaired automatically, and the new
++// icon starts enabled at the end of the row.
++namespace StatusIconRow {
++
++enum Slot : uint8_t { Lamp = 0, Touch = 1, Readest = 2, Highlighter = 3, Count = 4 };
++
++constexpr int kIconSize = 20;
++constexpr int kGap = 8;
++// Extra room in front of icons drawn with no built-in blank margin (the R box
++// and the highlighter), so gaps look even next to the bitmap icons.
++constexpr int kVisualPad = 6;
++// How far past the last icon a tap still counts as a tap on it.
++constexpr int kEdgeTap = 24;
++constexpr uint8_t kAllMask = static_cast<uint8_t>((1u << Count) - 1u);
++
++inline bool needsVisualPad(const uint8_t slot) { return slot == Readest || slot == Highlighter; }
++
++// True when order holds every slot exactly once.
++inline bool isValidOrder(const uint8_t* order) {
++  uint8_t seen = 0;
++  for (uint8_t i = 0; i < Count; ++i) {
++    if (order[i] >= Count || (seen & (1u << order[i]))) return false;
++    seen |= static_cast<uint8_t>(1u << order[i]);
++  }
++  return seen == kAllMask;
++}
++
++inline void resetOrder(uint8_t* order) {
++  for (uint8_t i = 0; i < Count; ++i) order[i] = i;
++}
++
++// Makes any stored order usable: an invalid one becomes the default order.
++inline void sanitizeOrder(uint8_t* order) {
++  if (!isValidOrder(order)) resetOrder(order);
++}
++
++struct Layout {
++  uint8_t order[Count] = {0, 1, 2, 3};
++  uint8_t enabledMask = kAllMask;    // what the user switched on
++  uint8_t availableMask = kAllMask;  // what the device can show right now
++  int leftX = 0;
++
++  bool visible(const uint8_t slot) const {
++    return slot < Count && (enabledMask & availableMask & (1u << slot)) != 0;
++  }
++
++  // Left edge of the slot's icon, or -1 when it is not shown.
++  int x(const uint8_t slot) const {
++    if (!visible(slot)) return -1;
++    int cursor = leftX;
++    bool first = true;
++    for (uint8_t i = 0; i < Count; ++i) {
++      const uint8_t s = order[i];
++      if (!visible(s)) continue;
++      if (!first && needsVisualPad(s)) cursor += kVisualPad;
++      if (s == slot) return cursor;
++      cursor += kIconSize + kGap;
++      first = false;
++    }
++    return -1;
++  }
++
++  // Horizontal tap zone of a shown icon. The zones of neighbouring icons meet
++  // in the middle of the gap between them, the first starts at the screen edge
++  // and the last reaches kEdgeTap past its icon, so they never overlap.
++  // Returns false when the icon is not shown.
++  bool hitRange(const uint8_t slot, int& left, int& right) const {
++    if (!visible(slot)) return false;
++    int prevRight = -1;
++    int nextLeft = -1;
++    bool seenSelf = false;
++    for (uint8_t i = 0; i < Count; ++i) {
++      const uint8_t s = order[i];
++      if (!visible(s)) continue;
++      if (s == slot) {
++        seenSelf = true;
++      } else if (!seenSelf) {
++        prevRight = x(s) + kIconSize;
++      } else if (nextLeft < 0) {
++        nextLeft = x(s);
++      }
++    }
++    const int self = x(slot);
++    left = prevRight < 0 ? 0 : prevRight + (self - prevRight) / 2;
++    const int selfRight = self + kIconSize;
++    right = nextLeft < 0 ? selfRight + kEdgeTap : selfRight + (nextLeft - selfRight) / 2;
++    return true;
++  }
++
++  bool hits(const uint8_t slot, const int touchX) const {
++    int left = 0;
++    int right = 0;
++    return hitRange(slot, left, right) && touchX >= left && touchX < right;
++  }
++};
++
++}  // namespace StatusIconRow
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -184,6 +184,7 @@
+       SETTINGS.frontlightOn = 1;
+       activity.onExternalFrontlightChange();
+       if (persist && (brightness != previousBrightness || !previousOn)) activityManager.persistGlobalSettings();
++      if (persist && !previousOn) activityManager.requestUpdate();
+       return true;
+     }
+     case CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH:
+@@ -194,11 +195,12 @@
+       const int delta = action == CrossPointSettings::TWO_FINGER_SWIPE_INCREASE_WARMTH ? lightAmount : -lightAmount;
+       const uint8_t warmth = static_cast<uint8_t>(std::clamp(static_cast<int>(Frontlight.warmth()) + delta, 0, 100));
+       Frontlight.setWarmth(warmth);
++      Frontlight.setOn(true);
+       SETTINGS.frontlightWarmth = warmth;
+-      SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
++      SETTINGS.frontlightOn = 1;
+       activity.onExternalFrontlightChange();
+-      if (persist && (warmth != previousWarmth || Frontlight.isOn() != previousOn))
+-        activityManager.persistGlobalSettings();
++      if (persist && (warmth != previousWarmth || !previousOn)) activityManager.persistGlobalSettings();
++      if (persist && !previousOn) activityManager.requestUpdate();
+       return true;
+     }
+     case CrossPointSettings::TWO_FINGER_SWIPE_NEXT_CHAPTER:
+@@ -223,7 +225,11 @@
+
+ #if CROSSINK_APP_CAP_TOUCH
+ void finishLiveLightSwipe(LiveLightSwipeState& state, ActivityManager& activityManager) {
+-  if (state.changed) activityManager.persistGlobalSettings();
++  if (state.changed) {
++    activityManager.persistGlobalSettings();
++    // Refresh the status-bar lamp icon if the swipe switched the light on or off.
++    if (Frontlight.isOn() != state.initialOn) activityManager.requestUpdate();
++  }
+   state = {};
+ }
+
+@@ -238,9 +244,9 @@
+   const int target = SwipeAdjustment::targetValue(state.initialValue, sign > 0, amount);
+   const int current = brightness ? Frontlight.brightness() : Frontlight.warmth();
+   const int difference = sign * (target - current);
+-  if (difference != 0 || (brightness && amount > 0 && !Frontlight.isOn()))
++  if (difference != 0 || (amount > 0 && !Frontlight.isOn()))
+     applyConfiguredSwipeAction(activity, activityManager, state.action, difference, false);
+-  if (brightness && amount == 0 && Frontlight.isOn() != state.initialOn) {
++  if (amount == 0 && Frontlight.isOn() != state.initialOn) {
+     Frontlight.setOn(state.initialOn);
+     SETTINGS.frontlightOn = state.initialOn ? 1 : 0;
+     activity.onExternalFrontlightChange();
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -4,6 +4,7 @@
+ #include <Epub.h>
+ #include <FsHelpers.h>
+ #include <GfxRenderer.h>
++#include <HalFrontlight.h>
+ #include <HalDisplay.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+@@ -1383,6 +1384,30 @@
+
+   if (quickActionsPopup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
+
++  // Tapping the lamp in the top status row toggles the frontlight, as in the reader.
++  {
++    int tapX = 0;
++    int tapY = 0;
++    if (mappedInput.wasScreenTapped(tapX, tapY) &&
++        GUI.isFrontlightIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), tapX, tapY)) {
++      const bool lightOn = !Frontlight.isOn();
++      Frontlight.setOn(lightOn);
++      SETTINGS.frontlightOn = lightOn ? 1 : 0;
++      activityManager.persistGlobalSettings();
++      requestUpdate();
++      return;
++    }
++    // The hand next to it toggles the reader touchscreen. Touch always works
++    // here, so unlike in the reader it can switch it back on as well.
++    if (mappedInput.wasScreenTapped(tapX, tapY) &&
++        GUI.isTouchscreenIndicatorHit(renderer, UITheme::getTopStatusBarY(renderer), tapX, tapY)) {
++      SETTINGS.disableReaderTouchscreen = SETTINGS.disableReaderTouchscreen ? 0 : 1;
++      activityManager.persistGlobalSettings();
++      requestUpdate();
++      return;
++    }
++  }
++
+   if (coverGridUi) {
+     const int touched = coverGridUi->selectedAction(mappedInput);
+     if (coverGridUi->app.invalidated()) requestUpdate();
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -8,6 +8,7 @@
+ #include <FontCacheManager.h>
+ #include <FsHelpers.h>
+ #include <GfxRenderer.h>
++#include <HalFrontlight.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+ #include <Logging.h>
+@@ -2832,6 +2833,33 @@
+
+   const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput,
+                                                       epub && ReaderUtils::isRtlBookLanguage(epub->getLanguage()));
++  if (touch.tapped && GUI.isFrontlightIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                    touch.y)) {
++    const bool lightOn = !Frontlight.isOn();
++    Frontlight.setOn(lightOn);
++    // Save it like the other light toggles do, so restarts (e.g. into Wi-Fi
++    // mode for a sync) restore the light the user actually sees.
++    SETTINGS.frontlightOn = lightOn ? 1 : 0;
++    activityManager.persistGlobalSettings();
++    requestUpdate();
++    return;
++  }
++  // Highlighter status bar button: start highlight mode, same as Create Clipping.
++  // Checked before the R and hand icons, whose hit zones would otherwise reach over it.
++  if (touch.tapped && GUI.isHighlightIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                   touch.y)) {
++    executeReaderQuickAction(CrossPointSettings::LONG_MENU_CREATE_CLIPPING);
++    return;
++  }
++  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                     touch.y)) {
++    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
++    // hit while the touchscreen is off, so no separate guard is needed here.
++    SETTINGS.disableReaderTouchscreen = 1;
++    activityManager.persistGlobalSettings();
++    requestUpdate();
++    return;
++  }
+   const int bottomTapHeight =
+       automaticPageTurnActive
+           ? std::max(UITheme::getStatusBarHeight(),
+diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
+--- a/src/activities/reader/TxtReaderActivity.cpp
++++ b/src/activities/reader/TxtReaderActivity.cpp
+@@ -3,6 +3,7 @@
+ #include <BidiUtils.h>
+ #include <FontCacheManager.h>
+ #include <GfxRenderer.h>
++#include <HalFrontlight.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+ #include <Memory.h>
+@@ -203,6 +204,26 @@
+   if (handlePinchFontResize()) return;
+ #endif
+   const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
++  if (touch.tapped && GUI.isFrontlightIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                    touch.y)) {
++    const bool lightOn = !Frontlight.isOn();
++    Frontlight.setOn(lightOn);
++    // Save it like the other light toggles do, so restarts (e.g. into Wi-Fi
++    // mode for a sync) restore the light the user actually sees.
++    SETTINGS.frontlightOn = lightOn ? 1 : 0;
++    activityManager.persistGlobalSettings();
++    requestUpdate();
++    return;
++  }
++  if (touch.tapped && GUI.isTouchscreenIndicatorTap(renderer, UITheme::getTopStatusBarY(renderer), touch.x,
++                                                     touch.y)) {
++    // Disable-only: isTouchscreenIndicatorTap already refuses to report a
++    // hit while the touchscreen is off, so no separate guard is needed here.
++    SETTINGS.disableReaderTouchscreen = 1;
++    activityManager.persistGlobalSettings();
++    requestUpdate();
++    return;
++  }
+   if (touch.tapped &&
+       (ReaderUtils::isBottomStatusBarTap(renderer, touch.y, UITheme::getInstance().getStatusBarHeight()) ||
+        ReaderUtils::isTopStatusBarTap(renderer, touch.y,
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -1225,6 +1225,9 @@
+         break;
+       case SettingAction::QuickActions:
+         startActivityForResult(std::make_unique<QuickActionsActivity>(renderer, mappedInput), resultHandler);
++        break;
++      case SettingAction::StatusIcons:
++        startActivityForResult(std::make_unique<StatusIconsActivity>(renderer, mappedInput), resultHandler);
+         break;
+       case SettingAction::ReaderFontOptions:
+       case SettingAction::ReaderPageLayout:
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -31,6 +31,7 @@
+   ReaderPageLayout,
+   ScreenMargin,
+   QuickActions,
++  StatusIcons,
+   ControlsPowerButton,
+   ControlsHomeButton,
+   ControlsFrontButtons,
+@@ -221,6 +222,7 @@
+ inline bool settingShowsNavigationCaret(const SettingInfo& setting) {
+   return setting.type == SettingType::SUBMENU || setting.action == SettingAction::CustomiseStatusBar ||
+          setting.action == SettingAction::DisplayStatusBar || setting.action == SettingAction::QuickActions ||
++         setting.action == SettingAction::StatusIcons ||
+          setting.action == SettingAction::TtfRendering;
+ }
+
+diff --git a/src/activities/settings/StatusIconsActivity.cpp b/src/activities/settings/StatusIconsActivity.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/activities/settings/StatusIconsActivity.cpp
+@@ -0,0 +1,95 @@
++#include "StatusIconsActivity.h"
++
++#include <I18n.h>
++
++#include <algorithm>
++#include <string>
++#include <vector>
++
++#include "CrossPointSettings.h"
++
++namespace {
++constexpr StrId slotLabels[StatusIconRow::Count] = {StrId::STR_ICON_FRONTLIGHT, StrId::STR_ICON_TOUCHSCREEN,
++                                                    StrId::STR_ICON_READEST, StrId::STR_ICON_HIGHLIGHTER};
++}  // namespace
++
++void StatusIconsActivity::onEnter() {
++  Activity::onEnter();
++  popup.setDismissOnOutsideTouchDown(true);
++  std::copy_n(SETTINGS.statusIconOrder, draftOrder.size(), draftOrder.begin());
++  StatusIconRow::sanitizeOrder(draftOrder.data());
++  draftHidden = SETTINGS.statusIconHidden;
++  showOverview(0);
++}
++
++void StatusIconsActivity::showOverview(const int selectedRow) {
++  std::vector<std::string> rows;
++  rows.reserve(StatusIconRow::Count);
++  for (uint8_t i = 0; i < StatusIconRow::Count; ++i) {
++    const uint8_t slot = draftOrder[i];
++    const bool shown = (draftHidden & (1u << slot)) == 0;
++    rows.emplace_back(std::to_string(i + 1) + ". " + I18N.get(slotLabels[slot]) + ": " +
++                      I18N.get(shown ? StrId::STR_ON : StrId::STR_OFF));
++  }
++  popup.showConfirmed(
++      StrId::STR_STATUS_BAR_ICONS, rows, selectedRow, [this](int selected) { editRow(selected); },
++      [this] { saveDraft(); }, [this] { finish(); });
++  requestUpdate();
++}
++
++void StatusIconsActivity::editRow(const int row) {
++  if (row < 0 || row >= StatusIconRow::Count) return;
++  const uint8_t slot = draftOrder[row];
++  const bool shown = (draftHidden & (1u << slot)) == 0;
++  enum Choice : uint8_t { Toggle, Up, Down };
++  std::vector<std::string> labels;
++  std::vector<Choice> choices;
++  labels.emplace_back(I18N.get(shown ? StrId::STR_HIDE : StrId::STR_SHOW));
++  choices.push_back(Toggle);
++  if (row > 0) {
++    labels.emplace_back(I18N.get(StrId::STR_MOVE_UP));
++    choices.push_back(Up);
++  }
++  if (row + 1 < StatusIconRow::Count) {
++    labels.emplace_back(I18N.get(StrId::STR_MOVE_DOWN));
++    choices.push_back(Down);
++  }
++  popup.show(slotLabels[slot], labels, 0, [this, row, slot, choices](int selected) {
++    if (selected < 0 || static_cast<size_t>(selected) >= choices.size()) return;
++    int newRow = row;
++    switch (choices[selected]) {
++      case Toggle:
++        draftHidden ^= static_cast<uint8_t>(1u << slot);
++        break;
++      case Up:
++        std::swap(draftOrder[row], draftOrder[row - 1]);
++        newRow = row - 1;
++        break;
++      case Down:
++        std::swap(draftOrder[row], draftOrder[row + 1]);
++        newRow = row + 1;
++        break;
++    }
++    showOverview(newRow);
++  });
++  popup.setCancelCallback([this, row] { showOverview(row); });
++}
++
++void StatusIconsActivity::saveDraft() {
++  std::copy(draftOrder.begin(), draftOrder.end(), SETTINGS.statusIconOrder);
++  SETTINGS.statusIconHidden = draftHidden;
++  SETTINGS.saveToFile();
++  finish();
++}
++
++void StatusIconsActivity::loop() {
++  if (popup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
++    finish();
++  }
++}
++
++void StatusIconsActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  popup.processRender(renderer, mappedInput);
++}
+diff --git a/src/activities/settings/StatusIconsActivity.h b/src/activities/settings/StatusIconsActivity.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/settings/StatusIconsActivity.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <array>
++
++#include "StatusIconRow.h"
++#include "activities/Activity.h"
++#include "components/OptionPopup.h"
++
++// CrASHink > Status Bar Icons: switch each small icon at the left of
++// the reader's top status bar on or off, and choose their left-to-right order.
++class StatusIconsActivity final : public Activity {
++  OptionPopup popup;
++  std::array<uint8_t, StatusIconRow::Count> draftOrder{};
++  uint8_t draftHidden = 0;
++  void showOverview(int selectedRow);
++  void editRow(int row);
++  void saveDraft();
++
++ public:
++  StatusIconsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
++      : Activity("StatusIcons", renderer, mappedInput) {}
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++};
+diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
+--- a/src/components/themes/BaseTheme.cpp
++++ b/src/components/themes/BaseTheme.cpp
+@@ -3,6 +3,7 @@
+ #include <FreeInkUIGfxRenderer.h>
+ #include <GfxRenderer.h>
+ #include <HalClock.h>
++#include <HalFrontlight.h>
+ #include <HalGPIO.h>
+ #include <HalPowerManager.h>
+ #include <HalStorage.h>
+@@ -19,6 +20,7 @@
+ #include "DeviceCapabilities.h"
+ #include "I18n.h"
+ #include "RecentBooksStore.h"
++#include "StatusIconRow.h"
+ #include "activities/reader/BookReadingStats.h"
+ #include "components/HeaderDate.h"
+ #include "components/TouchActionButtons.h"
+@@ -32,6 +34,76 @@
+ namespace {
+ constexpr int homeMenuMargin = 20;
+ constexpr int homeMarginTop = 30;
++
++// Status-bar-sized (20x20), sideways version of icon_lightbulb_28 /
++// icon_lightbulb_off_28 (frontlightHeaderIcons.h): downsampled to 20px and
++// rotated so the bulb head points right and the screw base points left, then
++// flipped top-to-bottom to correct for how it actually looked on real
++// hardware (the previous, unflipped revision rendered upside down).
++constexpr int frontlightStatusIconSize = 20;
++
++// Where each small status bar icon goes: the user's order and on/off choices
++// (Settings > CrASHink Settings > Status Bar Icons) applied to what this device
++// can show right now. Icons that are not shown take no room (see StatusIconRow.h).
++StatusIconRow::Layout statusIconLayout(const int leftX) {
++  StatusIconRow::Layout layout;
++  std::copy_n(SETTINGS.statusIconOrder, static_cast<size_t>(StatusIconRow::Count), layout.order);
++  StatusIconRow::sanitizeOrder(layout.order);
++  layout.enabledMask = static_cast<uint8_t>(~SETTINGS.statusIconHidden) & StatusIconRow::kAllMask;
++  layout.availableMask = 0;
++  if (Frontlight.present()) layout.availableMask |= 1u << StatusIconRow::Lamp;
++  if (gpio.hasTouch()) {
++    layout.availableMask |= 1u << StatusIconRow::Touch;
++    if (!SETTINGS.disableReaderTouchscreen) {
++      layout.availableMask |= (1u << StatusIconRow::Readest) | (1u << StatusIconRow::Highlighter);
++    }
++  }
++  layout.leftX = leftX;
++  return layout;
++}
++
++// Right edge of the last icon that is currently shown, or leftX when none is.
++int statusIconRowRight(const int leftX) {
++  const auto layout = statusIconLayout(leftX);
++  int right = leftX;
++  for (uint8_t slot = 0; slot < StatusIconRow::Count; ++slot) {
++    if (layout.visible(slot)) right = std::max(right, layout.x(slot) + StatusIconRow::kIconSize);
++  }
++  return right;
++}
++constexpr uint8_t icon_lightbulb_h_bits[] = {
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0xFF,
++    0xFF, 0xC0, 0x7F, 0xFF, 0x1E, 0x3F, 0xF3, 0x3F, 0x3F, 0xB3, 0xFF, 0x9F, 0xB3, 0xFF, 0xDF,
++    0xB3, 0xFF, 0xDF, 0xB3, 0xFF, 0x9F, 0xF3, 0x3F, 0x3F, 0xFF, 0x1E, 0x3F, 0xFF, 0xC0, 0x7F,
++    0xFF, 0xF0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
++constexpr uint8_t icon_lightbulb_off_h_bits[] = {
++    0xFF, 0xFF, 0xFF, 0x9F, 0xFF, 0xFF, 0x8F, 0xFF, 0xFF, 0xC7, 0xFF, 0xFF, 0xE3, 0xF0, 0xFF,
++    0xF1, 0xC0, 0x7F, 0xF8, 0xFE, 0x3F, 0xF2, 0x7F, 0x3F, 0xB2, 0x3F, 0x9F, 0xB3, 0x1F, 0x9F,
++    0xB3, 0x8F, 0xDF, 0xB3, 0xC7, 0x9F, 0xF3, 0x33, 0x9F, 0xFF, 0x11, 0xFF, 0xFF, 0xC0, 0xFF,
++    0xFF, 0xF0, 0x7F, 0xFF, 0xFE, 0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x9F, 0xFF, 0xFF, 0xFF};
++
++// Status-bar-sized (20x20) hand glyph, drawn from scratch (not derived from
++// an existing icon) rather than reusing the settings-menu tablet icon
++// (icon_device_tablet_24 / icon_device_tablet_off_24, EpubReaderMenuActivity),
++// because that icon is meant to be read at menu-row size with a label next to
++// it, not alone at a glance in the status bar. Packed with the same
++// convention as icon_lightbulb_h_bits above (top-to-bottom row order
++// reversed to render upright on real hardware, per the same fix that
++// corrected the lamp icon).
++constexpr int touchStatusIconSize = 20;
++constexpr uint8_t icon_hand_bits[] = {
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF8, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xC0, 0x00, 0x7F,
++    0xC0, 0x00, 0x7F, 0xC0, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xFC, 0x92, 0x7F,
++    0xFC, 0x92, 0x7F, 0xFC, 0x92, 0x7F, 0xFC, 0x93, 0xFF, 0xFF, 0x93, 0xFF, 0xFF, 0x9F, 0xFF,
++    0xFF, 0x9F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
++// Same hand, with a diagonal strike through it - "touch is off" needs no
++// separate label, the same way the lightbulb-off icon's strike-through
++// already says "off" on its own.
++constexpr uint8_t icon_hand_off_bits[] = {
++    0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x88, 0x00, 0x7F, 0xC0, 0x00, 0x7F, 0xC0, 0x00, 0x7F,
++    0xC0, 0x00, 0x7F, 0xC0, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xF8, 0x00, 0x7F, 0xFC, 0x12, 0x7F,
++    0xFC, 0x82, 0x7F, 0xFC, 0x82, 0x7F, 0xFC, 0x83, 0xFF, 0xFF, 0x91, 0xFF, 0xFF, 0x98, 0xFF,
++    0xFF, 0x9C, 0x7F, 0xFF, 0xFE, 0x3F, 0xFF, 0xFF, 0x1F, 0xFF, 0xFF, 0x8F, 0xFF, 0xFF, 0xCF};
+
+ }  // namespace
+
+@@ -120,6 +192,187 @@
+   const Rect iconRect{rect.x, y, rect.width, rect.height};
+   drawBatteryOutline(renderer, rect.x, y, rect.width, rect.height, foregroundBlack);
+   fillBatteryIcon(renderer, iconRect, percentage, foregroundBlack);
++}
++
++void BaseTheme::drawFrontlightStatusIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  // Pinned to the top-left corner, positioned entirely independently of the
++  // clock (centered) and battery (wherever its own header/status-bar logic
++  // puts it) so neither is affected.
++  //
++  // A single lamp icon, not a percentage readout: based on the exact same
++  // icon_lightbulb_28 / icon_lightbulb_off_28 the frontlight panel already
++  // draws next to its own "Brightness NN%" label (FrontlightPanelActivity),
++  // rather than hand-drawn glyphs, but rotated 90deg (head right, base left)
++  // and shrunk to 20px so it lies flat in the horizontal status bar row
++  // instead of standing upright at panel size, then flipped top-to-bottom to
++  // match how it actually renders on real hardware. A pair of 7px custom
++  // icons plus tiny percentage text was tried first and was illegible at
++  // status-bar size, and an upright 14px version of this same icon was
++  // still too small to read; 20px, laid on its side, is the size/orientation
++  // that stays legible in that thin row. The lightbulb-off variant already
++  // reads as "off" (a strike-through) on its own, so no separate number is
++  // needed to say whether the light is lit.
++  //
++  // Reads Frontlight.isOn() live on every call, the same way
++  // FrontlightPanelActivity::loop() re-syncs its own bulb icon from
++  // Frontlight.isOn() every frame (so a power-button light toggle, which
++  // can happen while any screen is open, is picked up here too).
++  if (!Frontlight.present()) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int iconY = baseTopY + (statusBarHeight - frontlightStatusIconSize) / 2;
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  if (!layout.visible(StatusIconRow::Lamp)) {
++    return;
++  }
++  const int x = layout.x(StatusIconRow::Lamp);
++
++  const uint8_t* bits = Frontlight.isOn() ? icon_lightbulb_h_bits : icon_lightbulb_off_h_bits;
++  if (darkMode) {
++    renderer.drawIconInverted(bits, x, iconY, frontlightStatusIconSize);
++  } else {
++    renderer.drawIcon(bits, x, iconY, frontlightStatusIconSize);
++  }
++}
++
++bool BaseTheme::isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  if (!Frontlight.present()) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++
++  // Generous hit box, not the icon's own tight bounds: the whole top status
++  // bar row's height, and a horizontal zone that runs to the middle of the
++  // gap to the neighbouring icons (or well past the last one), since a 20px
++  // glyph is a hard target to hit precisely with a finger. Follows the user's
++  // icon order, so it stays right when icons are moved or hidden.
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  int hitLeft = 0;
++  int hitRight = 0;
++  if (!layout.hitRange(StatusIconRow::Lamp, hitLeft, hitRight)) {
++    return false;
++  }
++  const int hitTop = baseTopY;
++  const int hitBottom = baseTopY + statusBarHeight;
++
++  return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
++}
++
++void BaseTheme::drawTouchscreenIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  // Sits immediately to the right of the frontlight lamp icon, in the same
++  // top status bar row - drawn from drawReaderStatusBar() right after
++  // drawFrontlightStatusIndicator() so it shares that function's placement
++  // guarantees (renders every time, independent of clock/battery settings).
++  //
++  // Shows whether the reader touchscreen (SETTINGS.disableReaderTouchscreen)
++  // is currently usable: a plain hand when it is, the same hand with a
++  // diagonal strike through it when it's been turned off. Only relevant on
++  // touch hardware, so it's skipped entirely on button-only devices.
++  if (!gpio.hasTouch()) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int iconY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  if (!layout.visible(StatusIconRow::Touch)) {
++    return;
++  }
++  const int x = layout.x(StatusIconRow::Touch);
++
++  const uint8_t* bits = SETTINGS.disableReaderTouchscreen ? icon_hand_off_bits : icon_hand_bits;
++  if (darkMode) {
++    renderer.drawIconInverted(bits, x, iconY, touchStatusIconSize);
++  } else {
++    renderer.drawIcon(bits, x, iconY, touchStatusIconSize);
++  }
++}
++
++bool BaseTheme::isTouchscreenIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  // Only meaningful while the touchscreen is currently on: this only answers
++  // "was the tap on the indicator" for the disable direction. Re-enabling it
++  // by tapping isn't handled here (or anywhere) - once
++  // SETTINGS.disableReaderTouchscreen is set, MappedInputManager stops
++  // reporting taps in the reader at all (touchInputEnabled() reads that same
++  // setting), so a tap could never reach this check in the first place; it
++  // can only be turned back on through the button shortcut (or a tap on the
++  // home screen, which uses isTouchscreenIndicatorHit directly).
++  if (SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++  return isTouchscreenIndicatorHit(renderer, topY, touchX, touchY);
++}
++
++bool BaseTheme::isTouchscreenIndicatorHit(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  // Pure hit test on the hand icon, whatever the touchscreen state.
++  if (!gpio.hasTouch()) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  // Zone from the middle of the gap before this icon (or the screen edge) to the
++  // middle of the gap after it, so it follows the user's icon order.
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  int hitLeft = 0;
++  int hitRight = 0;
++  if (!layout.hitRange(StatusIconRow::Touch, hitLeft, hitRight)) {
++    return false;
++  }
++  const int hitTop = baseTopY;
++  const int hitBottom = baseTopY + statusBarHeight;
++
++  return touchX >= hitLeft && touchX < hitRight && touchY >= hitTop && touchY < hitBottom;
+ }
+
+ Rect BaseTheme::buttonMenuTouchTarget(const Rect rowRect, const Rect menuRect, const bool isLastItem,
+@@ -870,6 +1123,20 @@
+     renderer.fillRect(marginLeft + bookmarkOffset, barY, filled, progressHeight, foregroundBlack);
+   }
+   int bookmarkReserve = 0;
++  if (top) {
++    // crASHink status icons (lamp, touch, ...) live at the left of the top bar;
++    // keep the text items clear of them.
++    const int iconsLeft = marginLeft + metrics.statusBarHorizontalMargin;
++    const int iconsRight = statusIconRowRight(iconsLeft);
++    if (iconsRight > iconsLeft) {
++      const int rowTop = edgeY + progressSpace;
++      drawFrontlightStatusIndicator(renderer, rowTop, content.darkMode);
++      drawTouchscreenIndicator(renderer, rowTop, content.darkMode);
++      drawReadestIndicator(renderer, rowTop, content.darkMode);
++      drawHighlightIndicator(renderer, rowTop, content.darkMode);
++      bookmarkReserve = std::max(0, iconsRight - std::max(marginLeft, StatusBarMetrics::sideInset)) + 4;
++    }
++  }
+   if (!top && content.bookmarked) {
+     constexpr int bookmarkWidth = ReaderStatusBarConfig::BOOKMARK_WIDTH;
+     constexpr int bookmarkHeight = ReaderStatusBarConfig::BOOKMARK_HEIGHT;
+@@ -998,6 +1265,135 @@
+       drawItem(centerItem, centeredX, width, false);
+     }
+   }
++}
++
++void BaseTheme::drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  if (!layout.visible(StatusIconRow::Readest)) {
++    return;
++  }
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int boxY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
++  const int boxX = layout.x(StatusIconRow::Readest);
++
++  // Drawn with text and a rectangle rather than a packed bitmap, so it stays
++  // upright in every orientation without a hand-rotated glyph table.
++  renderer.drawRect(boxX, boxY, touchStatusIconSize, touchStatusIconSize, !darkMode);
++  const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, "R", EpdFontFamily::BOLD);
++  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
++  renderer.drawText(SMALL_FONT_ID, boxX + (touchStatusIconSize - textWidth) / 2,
++                    boxY + (touchStatusIconSize - lineHeight) / 2, "R", !darkMode, EpdFontFamily::BOLD);
++}
++
++bool BaseTheme::isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++
++  // Runs from the middle of the gap before the R box to the middle of the gap
++  // after it (or well past it when it is last), following the user's icon order.
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  int hitLeft = 0;
++  int hitRight = 0;
++  if (!layout.hitRange(StatusIconRow::Readest, hitLeft, hitRight)) {
++    return false;
++  }
++  return touchX >= hitLeft && touchX < hitRight && touchY >= baseTopY && touchY < baseTopY + statusBarHeight;
++}
++
++void BaseTheme::drawHighlightIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  if (!layout.visible(StatusIconRow::Highlighter)) {
++    return;
++  }
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++  const int iconY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
++  const int iconX = layout.x(StatusIconRow::Highlighter);
++
++  // A highlighter pen laid over the stroke it just marked, drawn from shapes
++  // (not a packed bitmap) so it stays upright in every orientation.
++  const bool ink = !darkMode;
++  renderer.drawLine(iconX + 15, iconY + 2, iconX + 9, iconY + 8, 4, ink);  // barrel
++  const int nibX[3] = {iconX + 6, iconX + 11, iconX + 4};
++  const int nibY[3] = {iconY + 7, iconY + 11, iconY + 14};
++  renderer.fillPolygon(nibX, nibY, 3, ink);                                 // chisel tip
++  renderer.fillRect(iconX + 2, iconY + 17, 16, 2, ink);                     // the highlight stroke
++}
++
++bool BaseTheme::isHighlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const {
++  if (!gpio.hasTouch() || SETTINGS.disableReaderTouchscreen) {
++    return false;
++  }
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int statusBarHeight = std::max(UITheme::getStatusBarHeight(), metrics.statusBarVerticalMargin);
++  if (statusBarHeight <= 0) {
++    return false;
++  }
++
++  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
++  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
++                                   &orientedMarginLeft);
++  (void)orientedMarginRight;
++  (void)orientedMarginBottom;
++
++  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
++
++  // Runs from the middle of the gap before this icon to the middle of the gap
++  // after it (or well past it when it is last), following the user's icon order.
++  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  int hitLeft = 0;
++  int hitRight = 0;
++  if (!layout.hitRange(StatusIconRow::Highlighter, hitLeft, hitRight)) {
++    return false;
++  }
++  return touchX >= hitLeft && touchX < hitRight && touchY >= baseTopY && touchY < baseTopY + statusBarHeight;
+ }
+
+ void BaseTheme::drawDisplayStatusBar(const GfxRenderer& renderer, const int topY) const {
+diff --git a/src/components/themes/BaseTheme.h b/src/components/themes/BaseTheme.h
+--- a/src/components/themes/BaseTheme.h
++++ b/src/components/themes/BaseTheme.h
+@@ -269,6 +269,63 @@
+                         bool foregroundBlack = true) const;  // Right aligned (UI headers)
+   virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
+                                bool foregroundBlack = true) const;
++  // Frontlight on/off indicator, pinned to the top-left corner: reuses the
++  // same lightbulb / lightbulb-off icon the frontlight panel already draws
++  // next to its "Brightness" label, downscaled to status-bar size, instead
++  // of a percentage readout. Reads Frontlight.isOn() live on every call
++  // (not the settings copy, which only syncs when the frontlight panel
++  // closes), so it always reflects the current state. Deliberately
++  // independent of the clock/battery layout: called from
++  // drawReaderStatusBar() when it draws the top bar, which is also the status
++  // bar every non-reader screen shows.
++  void drawFrontlightStatusIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  // Hit-test for the indicator above: shares its geometry (same topY
++  // argument) so the tappable zone always matches where the icon is drawn,
++  // padded out generously since the icon itself is only 20px and hard to
++  // hit precisely with a finger. Callers that want the indicator tappable
++  // check this on a tap before falling through to their own tap handling
++  // (page turn, status bar hide, ...), and on a hit call
++  // Frontlight.setOn(!Frontlight.isOn()) + requestUpdate() themselves - this
++  // only answers "was the tap on the indicator", it does not toggle the
++  // light or consume the touch itself, since callers differ in what "handle
++  // this touch" means for them.
++  bool isFrontlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // Touchscreen on/off indicator, drawn immediately to the right of the
++  // frontlight lamp icon in the same top status bar row: a plain hand when
++  // SETTINGS.disableReaderTouchscreen is off, the same hand with a diagonal
++  // strike through it when it's on - the strike alone says "off", no
++  // separate label needed, the same way the lightbulb-off icon works.
++  // Touch-hardware only (gpio.hasTouch()); skipped entirely on button-only
++  // devices. Called from drawReaderStatusBar() right after
++  // drawFrontlightStatusIndicator(), so it renders on the same terms as the
++  // lamp icon.
++  void drawTouchscreenIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  // Hit-test for the indicator above, tappable only in the disable
++  // direction: true only while the touchscreen is currently on. Once
++  // SETTINGS.disableReaderTouchscreen is set, MappedInputManager stops
++  // reporting taps in the reader at all (touchInputEnabled() gates on that
++  // same setting), so a tap can never reach this check while it's off -
++  // turning it back on is a button-shortcut-only action, not something this
++  // hit-test needs to handle. Splits the row's tappable width with
++  // isFrontlightIndicatorTap rather than overlapping it. Callers check this
++  // on a tap and, on a hit, set SETTINGS.disableReaderTouchscreen = 1 and
++  // call requestUpdate() themselves.
++  bool isTouchscreenIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // Hit test on the hand icon regardless of the current touchscreen state
++  // (for screens where touch always works, e.g. home).
++  bool isTouchscreenIndicatorHit(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // "R" (Readest sync) button, drawn right of the touchscreen hand in the
++  // reader's top status bar only. Tapping it runs Sync Readest, exactly like
++  // the reader menu entry. Hidden when the touchscreen is off (it could not be
++  // tapped) and on non-touch hardware. Called from drawReaderStatusBar() with
++  // the other status icons.
++  void drawReadestIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  bool isReadestIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
++  // Highlighter button, drawn right of the R (Readest sync) button in the
++  // reader's top status bar only. Tapping it starts highlight mode, exactly
++  // like Create Clipping. Same visibility rules as the R button.
++  void drawHighlightIndicator(const GfxRenderer& renderer, int topY, bool darkMode) const;
++  bool isHighlightIndicatorTap(const GfxRenderer& renderer, int topY, int touchX, int touchY) const;
+   // Button hint labels use three states: non-empty labels draw an active hint,
+   // an empty string clears an inactive slot, and nullptr preserves the existing
+   // background without drawing or registering a target.
