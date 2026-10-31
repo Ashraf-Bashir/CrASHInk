@@ -50,7 +50,24 @@ requires the documented order.
 clipping storage/list/rendering/editing, cross-page adjustment, Readest sync,
 chapter index, grayscale/image refresh and frontlight behavior.
 
-Native verification is run against a separate checkout materialized from the
-candidate tree, not against an already-patched working directory. Firmware and
-on-device timing have not been re-tested as part of this source-equivalent
-reorganization.
+Native verification was run against a separate checkout materialized from the
+candidate tree, not against an already-patched working directory.
+
+## X4 Pro firmware build
+
+A full `pio run -e x4-pro` from the candidate source succeeded on 2026-10-31.
+Compilation, linking, image generation, touch-gate audit and OTA partition-size
+checks passed. No source fixes were needed.
+
+- PlatformIO Core: 6.2.0; Espressif platform: 55.3.37.
+- Target: ESP32-S3 / X4 Pro, with the pinned SDK above.
+- Clean candidate build duration: 217.42 seconds (local verification, not a
+  GitHub Actions timing measurement).
+- Static RAM: 104,660 / 327,680 bytes (31.9%).
+- Program flash: 5,763,209 / 6,553,600 bytes (87.9%).
+- Generated firmware image: 5,763,712 bytes.
+- OTA partition headroom: 789,888 bytes.
+
+This verifies firmware compilation, not on-device behavior or library-opening
+timing. The active GitHub workflow still uses `patches/`; it was not changed or
+dispatched for this check.
