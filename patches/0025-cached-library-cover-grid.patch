@@ -7,7 +7,7 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 -### Fixed
 +### Added
 +
-+- Library settings offer a cover grid for the full library, with 3, 4, or 5 books per row, on-demand SD thumbnail caching, and bounded numeric paging. A metadata-only change check runs after the library appears and offers an optional Refresh when files differ.
++- Library settings offer a cover grid for the full library, with 3, 4, or 5 books per row, on-demand SD thumbnail caching, and bounded numeric paging. A metadata-only change check runs after the library appears and offers an optional Refresh when files differ. Display settings group All books, Recently opened, Books per row, and List grouping together, with explanations and inactive controls dimmed.
 +
 +### Fixed
 +
@@ -75,13 +75,25 @@ diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.
  STR_LIBRARY_RECENTLY_OPENED_VIEW: "Recently Opened View"
  STR_LIBRARY_EXPANDED: "Expanded"
  STR_LIBRARY_SHOW_FILES: "Show Files"
-@@ -1037,3 +1039,6 @@
+@@ -1037,3 +1039,18 @@
  STR_CLIPPINGS_PAGE_FORMAT: "Page %d/%d"
 
  STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT: "Highlight %u (preview unavailable)"
 +
 +STR_LIBRARY_CHANGED_REFRESH: "Library may have changed · Refresh"
 +STR_LIBRARY_CHECK_FAILED_REFRESH: "Could not check library · Refresh"
++
++STR_LIBRARY_ALL_BOOKS_VIEW: "All books"
++STR_LIBRARY_RECENT_VIEW: "Recently opened"
++STR_LIBRARY_COVERS: "Covers"
++STR_LIBRARY_LIST_GROUPING: "List grouping"
++STR_LIBRARY_GROUPED: "Grouped"
++STR_LIBRARY_UNGROUPED: "Plain"
++STR_LIBRARY_BOOK_DETAILS: "Book details"
++STR_LIBRARY_ALL_BOOKS_VIEW_HELP: "All sorts except Recently opened"
++STR_LIBRARY_RECENT_VIEW_HELP: "Only the Recently opened sort"
++STR_LIBRARY_COVERS_PER_ROW_HELP: "Shared by both cover views"
++STR_LIBRARY_LIST_GROUPING_HELP: "List headings follow the chosen sort"
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
@@ -506,52 +518,220 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
 diff --git a/src/activities/library/LibrarySettingsActivity.cpp b/src/activities/library/LibrarySettingsActivity.cpp
 --- a/src/activities/library/LibrarySettingsActivity.cpp
 +++ b/src/activities/library/LibrarySettingsActivity.cpp
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,29 @@
 
  namespace {
  constexpr fui::ActionId ACTION_ROW = 1;
 -constexpr int ROW_COUNT = 10;
-+constexpr int ROW_COUNT = 12;
++enum SettingsRow {
++  LibraryView,
++  RecentView,
++  CoversPerRow,
++  ListGrouping,
++  UseMetadata,
++  ShowSeries,
++  ShowGenre,
++  ShowFinished,
++  ShowEpub,
++  ShowXtc,
++  ShowTxt,
++  ShowMarkdown,
++  ROW_COUNT
++};
++
++bool rowEnabled(const int row) {
++  if (row == CoversPerRow)
++    return SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_GRID ||
++           SETTINGS.recentBooksView == CrossPointSettings::RECENT_BOOKS_GRID;
++  if (row == ListGrouping) return SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_LIST;
++  return row >= 0 && row < ROW_COUNT;
++}
  }  // namespace
 
  LibrarySettingsActivity::LibrarySettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-@@ -61,6 +61,14 @@
-       break;
-     case 9:
-       SETTINGS.libraryShowMarkdown = !SETTINGS.libraryShowMarkdown;
-+      break;
-+    case 10:
+@@ -29,37 +51,46 @@
+ }
+
+ void LibrarySettingsActivity::toggle(const int row) {
++  if (!rowEnabled(row)) return;
+   switch (row) {
+-    case 0:
+-      SETTINGS.libraryUseMetadata = !SETTINGS.libraryUseMetadata;
+-      break;
+-    case 1:
+-      SETTINGS.libraryListExpanded = !SETTINGS.libraryListExpanded;
+-      break;
+-    case 2:
++    case LibraryView:
 +      SETTINGS.libraryView = SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_GRID
 +                                 ? CrossPointSettings::RECENT_BOOKS_LIST
 +                                 : CrossPointSettings::RECENT_BOOKS_GRID;
 +      break;
-+    case 11:
++    case RecentView:
+       SETTINGS.recentBooksView = SETTINGS.recentBooksView == CrossPointSettings::RECENT_BOOKS_GRID
+                                      ? CrossPointSettings::RECENT_BOOKS_LIST
+                                      : CrossPointSettings::RECENT_BOOKS_GRID;
+       break;
+-    case 3:
++    case CoversPerRow:
 +      SETTINGS.libraryGridDensity = (SETTINGS.libraryGridDensity + 1) % 3;
++      break;
++    case ListGrouping:
++      SETTINGS.libraryListExpanded = !SETTINGS.libraryListExpanded;
++      break;
++    case UseMetadata:
++      SETTINGS.libraryUseMetadata = !SETTINGS.libraryUseMetadata;
++      break;
++    case ShowSeries:
++      SETTINGS.libraryShowSeries = !SETTINGS.libraryShowSeries;
++      break;
++    case ShowGenre:
++      SETTINGS.libraryShowGenre = !SETTINGS.libraryShowGenre;
++      break;
++    case ShowFinished:
+       SETTINGS.libraryHideFinishedBooks = !SETTINGS.libraryHideFinishedBooks;
+       break;
+-    case 4:
+-      SETTINGS.libraryShowSeries = !SETTINGS.libraryShowSeries;
+-      break;
+-    case 5:
+-      SETTINGS.libraryShowGenre = !SETTINGS.libraryShowGenre;
+-      break;
+-    case 6:
++    case ShowEpub:
+       SETTINGS.libraryShowEpub = !SETTINGS.libraryShowEpub;
+       break;
+-    case 7:
++    case ShowXtc:
+       SETTINGS.libraryShowXtc = !SETTINGS.libraryShowXtc;
+       break;
+-    case 8:
++    case ShowTxt:
+       SETTINGS.libraryShowTxt = !SETTINGS.libraryShowTxt;
+       break;
+-    case 9:
++    case ShowMarkdown:
+       SETTINGS.libraryShowMarkdown = !SETTINGS.libraryShowMarkdown;
        break;
      default:
-       return;
-@@ -146,11 +154,20 @@
-       StrId::STR_LIBRARY_USE_METADATA,   StrId::STR_LIBRARY_LIST_VIEW, StrId::STR_LIBRARY_RECENTLY_OPENED_VIEW,
-       StrId::STR_LIBRARY_FINISHED_BOOKS, StrId::STR_LIBRARY_SERIES,    StrId::STR_LIBRARY_GENRE,
-       StrId::STR_LIBRARY_EPUBS,          StrId::STR_LIBRARY_XTC_XTCH,  StrId::STR_LIBRARY_TXT,
+@@ -142,49 +173,76 @@
+ }
+
+ void LibrarySettingsActivity::provideRow(void*, const uint16_t row, fui::ListItem& item) {
+-  static constexpr StrId labels[] = {
+-      StrId::STR_LIBRARY_USE_METADATA,   StrId::STR_LIBRARY_LIST_VIEW, StrId::STR_LIBRARY_RECENTLY_OPENED_VIEW,
+-      StrId::STR_LIBRARY_FINISHED_BOOKS, StrId::STR_LIBRARY_SERIES,    StrId::STR_LIBRARY_GENRE,
+-      StrId::STR_LIBRARY_EPUBS,          StrId::STR_LIBRARY_XTC_XTCH,  StrId::STR_LIBRARY_TXT,
 -      StrId::STR_LIBRARY_MARKDOWN};
-+      StrId::STR_LIBRARY_MARKDOWN,       StrId::STR_LIBRARY_VIEW,      StrId::STR_LIBRARY_BOOKS_PER_ROW};
++  static constexpr StrId labels[] = {StrId::STR_LIBRARY_ALL_BOOKS_VIEW,
++                                     StrId::STR_LIBRARY_RECENT_VIEW,
++                                     StrId::STR_LIBRARY_BOOKS_PER_ROW,
++                                     StrId::STR_LIBRARY_LIST_GROUPING,
++                                     StrId::STR_LIBRARY_USE_METADATA,
++                                     StrId::STR_LIBRARY_SERIES,
++                                     StrId::STR_LIBRARY_GENRE,
++                                     StrId::STR_LIBRARY_FINISHED_BOOKS,
++                                     StrId::STR_LIBRARY_EPUBS,
++                                     StrId::STR_LIBRARY_XTC_XTCH,
++                                     StrId::STR_LIBRARY_TXT,
++                                     StrId::STR_LIBRARY_MARKDOWN};
++  if (row >= ROW_COUNT) return;
    item.label = I18N.get(labels[row]);
    item.actionValue = static_cast<int16_t>(row);
-   if (row == 1) {
-     item.value = SETTINGS.libraryListExpanded ? tr(STR_LIBRARY_EXPANDED) : tr(STR_COMPACT);
-+    return;
-+  }
-+  if (row == 11) {
-+    static constexpr const char* columns[] = {"3", "4", "5"};
-+    item.value = columns[SETTINGS.libraryGridDensity < 3 ? SETTINGS.libraryGridDensity : 0];
-+    return;
-+  }
-+  if (row == 10) {
-+    item.value = SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_GRID ? tr(STR_GRID_VIEW) : tr(STR_LIST_VIEW);
-     return;
+-  if (row == 1) {
+-    item.value = SETTINGS.libraryListExpanded ? tr(STR_LIBRARY_EXPANDED) : tr(STR_COMPACT);
+-    return;
+-  }
+-  if (row == 2) {
+-    item.value =
+-        SETTINGS.recentBooksView == CrossPointSettings::RECENT_BOOKS_GRID ? tr(STR_GRID_VIEW) : tr(STR_LIST_VIEW);
+-    return;
++  item.enabled = rowEnabled(row);
++  if (row == LibraryView) item.sectionHeading = tr(STR_CAT_DISPLAY);
++  if (row == UseMetadata) item.sectionHeading = tr(STR_LIBRARY_BOOK_DETAILS);
++  if (row == ShowEpub) item.sectionHeading = tr(STR_LIBRARY_SHOW_FILES);
++  switch (row) {
++    case LibraryView:
++      item.value =
++          SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_GRID ? tr(STR_LIBRARY_COVERS) : tr(STR_LIST_VIEW);
++      item.subtitle = tr(STR_LIBRARY_ALL_BOOKS_VIEW_HELP);
++      return;
++    case RecentView:
++      item.value = SETTINGS.recentBooksView == CrossPointSettings::RECENT_BOOKS_GRID ? tr(STR_LIBRARY_COVERS)
++                                                                                     : tr(STR_LIST_VIEW);
++      item.subtitle = tr(STR_LIBRARY_RECENT_VIEW_HELP);
++      return;
++    case CoversPerRow: {
++      static constexpr const char* columns[] = {"3", "4", "5"};
++      item.value = columns[SETTINGS.libraryGridDensity < 3 ? SETTINGS.libraryGridDensity : 0];
++      item.subtitle = tr(STR_LIBRARY_COVERS_PER_ROW_HELP);
++      return;
++    }
++    case ListGrouping:
++      item.value = SETTINGS.libraryListExpanded ? tr(STR_LIBRARY_GROUPED) : tr(STR_LIBRARY_UNGROUPED);
++      item.subtitle = tr(STR_LIBRARY_LIST_GROUPING_HELP);
++      return;
++    default:
++      break;
    }
-   if (row == 2) {
+   item.toggle = true;
+   switch (row) {
+-    case 0:
++    case UseMetadata:
+       item.toggleChecked = SETTINGS.libraryUseMetadata;
+       break;
+-    case 3:
+-      item.sectionHeading = tr(STR_CAT_DISPLAY);
++    case ShowSeries:
++      item.toggleChecked = SETTINGS.libraryShowSeries;
++      break;
++    case ShowGenre:
++      item.toggleChecked = SETTINGS.libraryShowGenre;
++      break;
++    case ShowFinished:
+       item.toggleChecked = !SETTINGS.libraryHideFinishedBooks;
+       break;
+-    case 4:
+-      item.toggleChecked = SETTINGS.libraryShowSeries;
+-      break;
+-    case 5:
+-      item.toggleChecked = SETTINGS.libraryShowGenre;
+-      break;
+-    case 6:
+-      item.sectionHeading = tr(STR_LIBRARY_SHOW_FILES);
++    case ShowEpub:
+       item.toggleChecked = SETTINGS.libraryShowEpub;
+       break;
+-    case 7:
++    case ShowXtc:
+       item.toggleChecked = SETTINGS.libraryShowXtc;
+       break;
+-    case 8:
++    case ShowTxt:
+       item.toggleChecked = SETTINGS.libraryShowTxt;
+       break;
+-    case 9:
++    case ShowMarkdown:
+       item.toggleChecked = SETTINGS.libraryShowMarkdown;
++      break;
++    default:
+       break;
+   }
+ }
+@@ -205,10 +263,12 @@
+   props.selectedIndex = showSelection ? selection : -1;
+   props.action = ACTION_ROW;
+   props.inputMask = fui::InputTouch;
+-  props.rowHeight = 44;
++  props.rowHeight = 60;
+   props.rowGap = 0;
+   props.labelText = props.valueText = props.headerText = screen.theme().bodyText;
+   props.headerText.bold = true;
++  props.subtitleText = screen.theme().smallText;
++  props.subtitleText.maxLines = 1;
+   props.rtl = (I18N.getLanguage() == Language::AR || I18N.getLanguage() == Language::HE);
+   props.rowStyles = screen.theme().listRow;
+   props.rowStyles.selected.background = fui::Paint::dither(fui::Color::LightGray);
 diff --git a/lib/LibraryIndex/LibraryBuilder.cpp b/lib/LibraryIndex/LibraryBuilder.cpp
 --- a/lib/LibraryIndex/LibraryBuilder.cpp
 +++ b/lib/LibraryIndex/LibraryBuilder.cpp
@@ -1329,11 +1509,32 @@ new file mode 100644
 +  EXPECT_EQ(library.changeProbe.steps, 0);
 +  EXPECT_EQ(library.scans, 0);
 +}
+diff --git a/test/library_thumbnails/ExtractLibrarySettings.py b/test/library_thumbnails/ExtractLibrarySettings.py
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/ExtractLibrarySettings.py
+@@ -0,0 +1,16 @@
++import pathlib, re, sys
++source = (pathlib.Path(sys.argv[1]) / 'src/activities/library/LibrarySettingsActivity.cpp').read_text()
++def block(signature):
++    start = source.index(signature)
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++enum = block('enum SettingsRow') + ';'
++methods = '\n\n'.join(block(s) for s in ['bool rowEnabled(', 'void LibrarySettingsActivity::toggle(', 'void LibrarySettingsActivity::provideRow('])
++keys = sorted(set(re.findall(r'STR_\w+', methods)))
++translations = 'enum class StrId { ' + ', '.join(keys) + ' };\n'
++translations += 'struct { const char* get(StrId id) const { static const char* labels[] = {' + ', '.join('"'+key+'"' for key in keys) + '}; return labels[static_cast<int>(id)]; } } I18N;\n'
++pathlib.Path(sys.argv[2]).write_text(translations + enum + '\n' + methods)
 diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
 new file mode 100644
 --- /dev/null
 +++ b/test/library_thumbnails/CMakeLists.txt
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,18 @@
 +find_package(Python3 REQUIRED COMPONENTS Interpreter)
 +set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
 +add_custom_command(OUTPUT ${EXTRACTED}
@@ -1343,6 +1544,15 @@ new file mode 100644
 +target_include_directories(LibraryThumbnailsTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 +target_link_libraries(LibraryThumbnailsTest PRIVATE crosspoint_test_common GTest::gtest_main)
 +gtest_discover_tests(LibraryThumbnailsTest)
++
++set(SETTINGS_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryDisplaySettings.inc)
++add_custom_command(OUTPUT ${SETTINGS_EXTRACTED}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySettings.py ${REPO_ROOT} ${SETTINGS_EXTRACTED}
++  DEPENDS ExtractLibrarySettings.py ${REPO_ROOT}/src/activities/library/LibrarySettingsActivity.cpp)
++add_executable(LibraryDisplaySettingsTest LibraryDisplaySettingsTest.cpp ${SETTINGS_EXTRACTED})
++target_include_directories(LibraryDisplaySettingsTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_link_libraries(LibraryDisplaySettingsTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(LibraryDisplaySettingsTest)
 diff --git a/test/library_thumbnails/ExtractLibraryThumbnails.py b/test/library_thumbnails/ExtractLibraryThumbnails.py
 new file mode 100644
 --- /dev/null
@@ -1364,3 +1574,79 @@ new file mode 100644
 +    'int gridColumns(', 'int gridPageSize(', 'std::string gridThumbPath(', 'bool LibraryActivity::gridEnabled(',
 +    'void LibraryActivity::loadGridPageCovers(', 'bool LibraryActivity::loadGridCover(',
 +    'void LibraryActivity::refreshIndexIfNeeded(', 'void LibraryActivity::pollLibraryChanges(']))
+diff --git a/test/library_thumbnails/LibraryDisplaySettingsTest.cpp b/test/library_thumbnails/LibraryDisplaySettingsTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/LibraryDisplaySettingsTest.cpp
+@@ -0,0 +1,71 @@
++#include <gtest/gtest.h>
++
++#include <cstdint>
++#define LOG_ERR(...) ((void)0)
++#define tr(key) #key
++struct CrossPointSettings {
++  enum { RECENT_BOOKS_LIST, RECENT_BOOKS_GRID };
++  uint8_t libraryView = 0, recentBooksView = 0, libraryGridDensity = 0, libraryListExpanded = 1;
++  uint8_t libraryUseMetadata = 1, libraryShowSeries = 1, libraryShowGenre = 1, libraryHideFinishedBooks = 0;
++  uint8_t libraryShowEpub = 1, libraryShowXtc = 1, libraryShowTxt = 1, libraryShowMarkdown = 1;
++  int saves = 0;
++  bool saveToFile() {
++    ++saves;
++    return true;
++  }
++} SETTINGS;
++namespace fui {
++struct ListItem {
++  const char* label = nullptr;
++  const char* value = nullptr;
++  const char* subtitle = nullptr;
++  const char* sectionHeading = nullptr;
++  int16_t actionValue = -1;
++  bool enabled = true, toggle = false, toggleChecked = false;
++};
++}  // namespace fui
++struct LibrarySettingsActivity {
++  int paints = 0;
++  void requestUpdate() { ++paints; }
++  void toggle(int row);
++  static void provideRow(void*, uint16_t row, fui::ListItem& item);
++};
++#include "LibraryDisplaySettings.inc"
++TEST(LibraryDisplaySettings, ViewControlsAreIndependentAndKeepSavedDensityAndGrouping) {
++  SETTINGS = {};
++  SETTINGS.libraryGridDensity = 2;
++  SETTINGS.libraryListExpanded = 0;
++  LibrarySettingsActivity screen;
++  screen.toggle(LibraryView);
++  EXPECT_EQ(SETTINGS.libraryView, CrossPointSettings::RECENT_BOOKS_GRID);
++  EXPECT_EQ(SETTINGS.recentBooksView, CrossPointSettings::RECENT_BOOKS_LIST);
++  EXPECT_EQ(SETTINGS.libraryGridDensity, 2);
++  EXPECT_EQ(SETTINGS.libraryListExpanded, 0);
++  EXPECT_EQ(SETTINGS.libraryUseMetadata, 1);
++  screen.toggle(RecentView);
++  screen.toggle(LibraryView);
++  EXPECT_EQ(SETTINGS.recentBooksView, CrossPointSettings::RECENT_BOOKS_GRID);
++  EXPECT_EQ(SETTINGS.libraryView, CrossPointSettings::RECENT_BOOKS_LIST);
++}
++TEST(LibraryDisplaySettings, DimmedControlsCannotChangePreferencesThroughTouchOrButtons) {
++  SETTINGS = {};
++  LibrarySettingsActivity screen;
++  fui::ListItem density;
++  screen.provideRow(nullptr, CoversPerRow, density);
++  EXPECT_FALSE(density.enabled);
++  screen.toggle(CoversPerRow);
++  EXPECT_EQ(SETTINGS.libraryGridDensity, 0);
++  EXPECT_EQ(SETTINGS.saves, 0);
++  screen.toggle(RecentView);
++  density = {};
++  screen.provideRow(nullptr, CoversPerRow, density);
++  EXPECT_TRUE(density.enabled);
++  screen.toggle(CoversPerRow);
++  EXPECT_EQ(SETTINGS.libraryGridDensity, 1);
++  screen.toggle(LibraryView);
++  fui::ListItem grouping;
++  screen.provideRow(nullptr, ListGrouping, grouping);
++  EXPECT_FALSE(grouping.enabled);
++  screen.toggle(ListGrouping);
++  EXPECT_EQ(SETTINGS.libraryListExpanded, 1);
++}
