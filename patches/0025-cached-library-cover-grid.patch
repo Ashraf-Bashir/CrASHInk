@@ -1,0 +1,864 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,12 @@
+ ## [Unreleased]
+
+-### Fixed
++### Added
++
++- Library settings offer a cover grid for the full library, with 3, 4, or 5 books per row, on-demand SD thumbnail caching, and bounded numeric paging.
++
++### Fixed
++
++- Library opens its saved index without an unconditional cold-boot scan and caches folder offsets for book lookups. Transfers and on-device file changes still refresh the index; use Refresh after copying books directly to the SD card.
+
+ - Image refresh blanks each image separately, keeping text between inline images visible while images are prepared for display. Pending images use an empty background instead of a temporary box border.
+
+diff --git a/docs/data-cache.md b/docs/data-cache.md
+--- a/docs/data-cache.md
++++ b/docs/data-cache.md
+@@ -4,6 +4,8 @@
+ ---
+
+ # Data Cache
++
++Library settings allow 3, 4, or 5 books per row (9, 16, or 25 covers per page). Cover grid thumbnails are generated only for visible EPUB/XTC books and reused from their existing per-book disk caches. Books without covers use a placeholder; confirmed missing EPUB covers are remembered in `library-cover-missing`. Text files use a placeholder. Library opens the saved index on startup; after directly editing the SD card, use Library → Refresh. Transfers and on-device file changes invalidate the index automatically. No cache format change or cache deletion is needed.
+
+ CrossInk caches data aggressively on the SD card to minimize RAM use. The ESP32-C3 has about 380 KB of usable RAM, so rebuilding every book structure in memory on every open would be too expensive.
+
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -642,6 +642,9 @@
+   uint8_t librarySortMethod = 4;
+   uint8_t librarySortDescending = 1;
+   uint8_t libraryListExpanded = 1;
++  uint8_t libraryView = RECENT_BOOKS_LIST;
++  // 0/1/2 selects 3/4/5 covers per row.
++  uint8_t libraryGridDensity = 0;
+   uint8_t libraryShowSeries = 1;
+   uint8_t libraryShowGenre = 1;
+   uint8_t libraryShowEpub = 1;
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -475,6 +475,8 @@
+   doc["librarySortMethod"] = librarySortMethod;
+   doc["librarySortDescending"] = librarySortDescending;
+   doc["libraryListExpanded"] = libraryListExpanded;
++  doc["libraryView"] = libraryView;
++  doc["libraryGridDensity"] = libraryGridDensity;
+   doc["recentBooksView"] = recentBooksView;
+   doc["libraryShowSeries"] = libraryShowSeries;
+   doc["libraryShowGenre"] = libraryShowGenre;
+@@ -676,6 +678,10 @@
+   readLibraryChoice("librarySortMethod", librarySortMethod, 7);
+   readLibraryChoice("librarySortDescending", librarySortDescending, 2);
+   readLibraryChoice("libraryListExpanded", libraryListExpanded, 2);
++  libraryView = RECENT_BOOKS_LIST;
++  readLibraryChoice("libraryView", libraryView, RECENT_BOOKS_VIEW_COUNT);
++  libraryGridDensity = 0;
++  readLibraryChoice("libraryGridDensity", libraryGridDensity, 3);
+   // A missing or corrupt legacy choice uses List, even if this object loaded another document earlier.
+   recentBooksView = RECENT_BOOKS_LIST;
+   readLibraryChoice("recentBooksView", recentBooksView, RECENT_BOOKS_VIEW_COUNT);
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -933,6 +933,8 @@
+ STR_LIBRARY_SETTINGS: "Library Settings"
+ STR_LIBRARY_FINISHED_BOOKS: "Finished Books"
+ STR_LIBRARY_LIST_VIEW: "List View"
++STR_LIBRARY_VIEW: "Library view"
++STR_LIBRARY_BOOKS_PER_ROW: "Books per row"
+ STR_LIBRARY_RECENTLY_OPENED_VIEW: "Recently Opened View"
+ STR_LIBRARY_EXPANDED: "Expanded"
+ STR_LIBRARY_SHOW_FILES: "Show Files"
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -45,8 +45,11 @@
+ constexpr int HEADER_CONTROL_SIZE = 44;
+ constexpr int HEADER_CONTROL_GAP = 10;
+ constexpr int FOOTER_HEIGHT = 28;
+-constexpr int GRID_COLUMNS = 3;
+-constexpr int GRID_PAGE_SIZE = 9;
++int gridColumns() { return 3 + (SETTINGS.libraryGridDensity < 3 ? SETTINGS.libraryGridDensity : 0); }
++int gridPageSize() {
++  const int columns = gridColumns();
++  return columns * columns;
++}
+ constexpr int GRID_GAP = 8;
+ constexpr int GRID_SELECTION_PADDING = 4;
+ constexpr int GRID_SELECTION_OUTLINE_GAP = 2;
+@@ -63,6 +66,16 @@
+   const auto it =
+       std::find_if(books.begin(), books.end(), [&path](const RecentBook& book) { return book.path == path; });
+   return it == books.end() ? nullptr : &*it;
++}
++
++std::string gridThumbPath(const RecentBook& book, const int width, const int height) {
++  const RecentBook* recent = recentBookForPath(book.path);
++  if (recent && !recent->coverBmpPath.empty()) return UITheme::getCoverThumbPath(recent->coverBmpPath, width, height);
++  if (FsHelpers::hasEpubExtension(book.path))
++    return Epub::cachePathForFilePath(book.path, "/.crosspoint") + "/thumb_" + std::to_string(width) + "x" +
++           std::to_string(height) + ".bmp";
++  if (FsHelpers::hasXtcExtension(book.path)) return Xtc(book.path, "/.crosspoint").getThumbBmpPath(width, height);
++  return {};
+ }
+
+ bool hasValidGridThumb(const std::string& path, const int width, const int height) {
+@@ -88,6 +101,7 @@
+       app(uiTarget, uiTarget.deviceContext()) {}
+
+ void LibraryActivity::onEnter() {
++  const unsigned long openedAt = millis();
+   pendingInput.clear();
+   inputOverflow = false;
+   touchTracking = false;
+@@ -111,11 +125,13 @@
+     app.on(ACTION_ROW, &LibraryActivity::onRowEvent, this);
+     app.on(ACTION_CONTROL, &LibraryActivity::onControlEvent, this);
+     app.setScreen(&LibraryActivity::listScreen, this);
+-    // The index survives a firmware reflash, but its first boot reconciliation
+-    // can still take time. Show feedback whenever that scan is due.
++    // Validate the saved snapshot before drawing. Only a missing, incompatible
++    // or explicitly invalidated index needs a scan; ordinary opens reuse it.
+     scanCancelledThisVisit = false;
+-    initialScanPending = sort != Sort::RecentlyRead &&
+-                         (library::libraryIndexNeedsRefresh() || !Storage.exists(library::libraryIndexPath()));
++    initialScanPending =
++        sort != Sort::RecentlyRead &&
++        (library::libraryIndexNeedsRefresh() || (!index.isOpen() && !index.open(library::libraryIndexPath())) ||
++         index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0));
+   }
+
+   // Paint the scan message before the main task starts reading the card.
+@@ -133,6 +149,8 @@
+     ignoreConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
+     requestUpdate();
+   }
++  LOG_INF("LIB", "Library ready in %lums (%d books, %s)", millis() - openedAt, rowCount(),
++          gridEnabled() ? "grid" : "list");
+ }
+
+ void LibraryActivity::onExit() {
+@@ -358,7 +376,8 @@
+ }
+
+ bool LibraryActivity::gridEnabled() const {
+-  return sort == Sort::RecentlyRead && SETTINGS.recentBooksView == CrossPointSettings::RECENT_BOOKS_GRID;
++  const uint8_t view = sort == Sort::RecentlyRead ? SETTINGS.recentBooksView : SETTINGS.libraryView;
++  return view == CrossPointSettings::RECENT_BOOKS_GRID;
+ }
+
+ void LibraryActivity::loadGridProgress() {
+@@ -566,7 +585,7 @@
+   listNav.top = topIndex;
+   listNav.follow(rowCount());
+   topIndex = listNav.top;
+-  gridPageStart = ((selection - CONTROL_COUNT) / GRID_PAGE_SIZE) * GRID_PAGE_SIZE;
++  gridPageStart = ((selection - CONTROL_COUNT) / gridPageSize()) * gridPageSize();
+   loadedGridPageStart = -1;
+   nextGridCoverRow = -1;
+   gridProgressRow = -1;
+@@ -917,9 +936,9 @@
+        (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Right))) {
+     if (mappedInput.hasTouchHardware()) showSelection = false;
+     if (gridEnabled()) {
+-      const int lastPage = rowCount() > 0 ? ((rowCount() - 1) / GRID_PAGE_SIZE) * GRID_PAGE_SIZE : 0;
++      const int lastPage = rowCount() > 0 ? ((rowCount() - 1) / gridPageSize()) * gridPageSize() : 0;
+       const bool nextPage = swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Left;
+-      gridPageStart = std::clamp(gridPageStart + (nextPage ? GRID_PAGE_SIZE : -GRID_PAGE_SIZE), 0, lastPage);
++      gridPageStart = std::clamp(gridPageStart + (nextPage ? gridPageSize() : -gridPageSize()), 0, lastPage);
+       if (rowCount() > 0) selection = CONTROL_COUNT + gridPageStart;
+       loadedGridPageStart = -1;
+       nextGridCoverRow = -1;
+@@ -957,7 +976,7 @@
+     selection = next;
+     if (gridEnabled()) {
+       if (selection >= CONTROL_COUNT) {
+-        const int nextPage = ((selection - CONTROL_COUNT) / GRID_PAGE_SIZE) * GRID_PAGE_SIZE;
++        const int nextPage = ((selection - CONTROL_COUNT) / gridPageSize()) * gridPageSize();
+         if (nextPage != gridPageStart) {
+           loadedGridPageStart = -1;
+           nextGridCoverRow = -1;
+@@ -976,7 +995,7 @@
+   if (mappedInput.hasTouchHardware()) {
+     if (input.type == Type::Next) move(ButtonNavigator::nextIndex(selection, count));
+     if (input.type == Type::Previous) move(ButtonNavigator::previousIndex(selection, count));
+-    const int page = gridEnabled() ? GRID_PAGE_SIZE : listNav.pageRowsFor(rowCount());
++    const int page = gridEnabled() ? gridPageSize() : listNav.pageRowsFor(rowCount());
+     if (input.type == Type::NextPage) move(ButtonNavigator::nextPageIndex(selection, count, page));
+     if (input.type == Type::PreviousPage) move(ButtonNavigator::previousPageIndex(selection, count, page));
+   } else if (rowCount() > 0) {
+@@ -985,7 +1004,7 @@
+     const auto moveBook = [&](const int next) { move(CONTROL_COUNT + next); };
+     if (input.type == Type::Next) moveBook(ButtonNavigator::nextIndex(row, bookCount));
+     if (input.type == Type::Previous) moveBook(ButtonNavigator::previousIndex(row, bookCount));
+-    const int page = gridEnabled() ? GRID_PAGE_SIZE : listNav.pageRowsFor(bookCount);
++    const int page = gridEnabled() ? gridPageSize() : listNav.pageRowsFor(bookCount);
+     if (input.type == Type::NextPage) moveBook(ButtonNavigator::nextPageIndex(row, bookCount, page));
+     if (input.type == Type::PreviousPage) moveBook(ButtonNavigator::previousPageIndex(row, bookCount, page));
+   }
+@@ -1254,14 +1273,14 @@
+ void LibraryActivity::buildGrid(UiApp::ScreenType& screen) {
+   const auto& metrics = UITheme::getInstance().getMetrics();
+   const int count = rowCount();
+-  const int pageCount = (count + GRID_PAGE_SIZE - 1) / GRID_PAGE_SIZE;
++  const int pageCount = (count + gridPageSize() - 1) / gridPageSize();
+   const auto title = screen.take(fui::LayoutAnchor::Top,
+                                  static_cast<int16_t>(uiTarget.lineHeight(screen.theme().bodyText.font) + GRID_GAP));
+   fui::Rect pageIndicator{};
+   if (pageCount > 1) pageIndicator = screen.take(fui::LayoutAnchor::Bottom, 16, GRID_GAP);
+   const fui::Rect area = screen.body();
+-  const int16_t cellWidth = std::max<int16_t>(1, (area.width - 2 * GRID_GAP) / GRID_COLUMNS);
+-  const int16_t cellHeight = std::max<int16_t>(1, (area.height - 2 * GRID_GAP) / GRID_COLUMNS);
++  const int16_t cellWidth = std::max<int16_t>(1, (area.width - (gridColumns() - 1) * GRID_GAP) / gridColumns());
++  const int16_t cellHeight = std::max<int16_t>(1, (area.height - (gridColumns() - 1) * GRID_GAP) / gridColumns());
+   const int16_t coverHeight =
+       std::max<int16_t>(1, std::min<int16_t>(cellHeight - 2 * GRID_SELECTION_OUTER_INSET,
+                                              (cellWidth - 2 * GRID_SELECTION_OUTER_INSET) * 3 / 2));
+@@ -1275,7 +1294,7 @@
+   }
+
+   const int selectedRow = selection - CONTROL_COUNT;
+-  if (selectedRow >= gridPageStart && selectedRow < gridPageStart + GRID_PAGE_SIZE && selectedRow < count &&
++  if (selectedRow >= gridPageStart && selectedRow < gridPageStart + gridPageSize() && selectedRow < count &&
+       readBook(selectedRow, rowScratch)) {
+     const bool hasProgress = gridProgressRow == selectedRow && RecentBookProgress::hasPercent(gridProgress);
+     subtitleScratch.clear();
+@@ -1302,11 +1321,11 @@
+           subtitleScratch.c_str(), style);
+   }
+
+-  const int visible = std::min(GRID_PAGE_SIZE, count - gridPageStart);
++  const int visible = std::min(gridPageSize(), count - gridPageStart);
+   for (int slot = 0; slot < visible; ++slot) {
+     const int row = gridPageStart + slot;
+-    const int col = slot % GRID_COLUMNS;
+-    const int line = slot / GRID_COLUMNS;
++    const int col = slot % gridColumns();
++    const int line = slot / gridColumns();
+     const fui::Rect cell{static_cast<int16_t>(area.x + col * (cellWidth + GRID_GAP)),
+                          static_cast<int16_t>(area.y + line * (cellHeight + GRID_GAP)), cellWidth, cellHeight};
+     const int16_t x = static_cast<int16_t>(cell.x + (cell.width - coverWidth) / 2);
+@@ -1314,9 +1333,8 @@
+     bool drawn = false;
+     const bool available = readBook(row, rowScratch);
+     if (available) {
+-      const RecentBook* recent = recentBookForPath(rowScratch.path);
+-      if (recent && !recent->coverBmpPath.empty()) {
+-        const std::string path = UITheme::getCoverThumbPath(recent->coverBmpPath, coverWidth, coverHeight);
++      const std::string path = gridThumbPath(rowScratch, coverWidth, coverHeight);
++      if (!path.empty()) {
+         if (!path.empty() && Storage.exists(path.c_str())) {
+           FsFile file;
+           if (Storage.openFileForRead("LIB", path, file)) {
+@@ -1331,7 +1349,16 @@
+     if (!drawn) {
+       renderer.fillRoundedRect(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
+       if (coverWidth >= 36 && coverHeight >= 36)
+-        drawLucideIcon(renderer, icon_book_marked_32, x + (coverWidth - 32) / 2, y + (coverHeight - 32) / 2);
++        drawLucideIcon(renderer, icon_book_marked_32, x + (coverWidth - 32) / 2, y + coverHeight / 4 - 16);
++      if (available) {
++        auto style = screen.theme().bodyText;
++        style.align = fui::TextAlign::Center;
++        style.maxLines = 3;
++        uiTarget.text(
++            fui::Rect{static_cast<int16_t>(x + 4), static_cast<int16_t>(y + coverHeight / 2),
++                      static_cast<int16_t>(std::max(1, coverWidth - 8)), static_cast<int16_t>(coverHeight / 2 - 4)},
++            rowScratch.title.c_str(), style);
++      }
+     }
+     renderer.maskRoundedRectOutsideCorners(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
+     renderer.drawRoundedRect(x, y, coverWidth, coverHeight, 2, GRID_COVER_CORNER_RADIUS, true);
+@@ -1348,23 +1375,18 @@
+   }
+
+   if (pageCount > 1) {
+-    constexpr int dotSize = 6;
+-    constexpr int dotGap = 8;
+-    const int dotsWidth = pageCount * dotSize + (pageCount - 1) * dotGap;
+-    const int startX = pageIndicator.x + (pageIndicator.width - dotsWidth) / 2;
+-    for (int page = 0; page < pageCount; ++page) {
+-      const int x = startX + page * (dotSize + dotGap);
+-      if (page == gridPageStart / GRID_PAGE_SIZE)
+-        renderer.fillRect(x, pageIndicator.y + 4, dotSize, dotSize, true);
+-      else
+-        renderer.drawRect(x, pageIndicator.y + 4, dotSize, dotSize, true);
+-    }
++    // Numeric paging stays bounded even with thousands of books.
++    char label[32];
++    snprintf(label, sizeof(label), "%d / %d", gridPageStart / gridPageSize() + 1, pageCount);
++    auto style = screen.theme().bodyText;
++    style.align = fui::TextAlign::Center;
++    uiTarget.text(pageIndicator, label, style);
+   }
+ }
+
+ void LibraryActivity::loadGridPageCovers() {
+   if (!gridEnabled() || gridCoverWidth <= 0 || gridCoverHeight <= 0 || gridPageStart == loadedGridPageStart) return;
+-  const int pageEnd = std::min(gridPageStart + GRID_PAGE_SIZE, rowCount());
++  const int pageEnd = std::min(gridPageStart + gridPageSize(), rowCount());
+   if (nextGridCoverRow < 0) nextGridCoverRow = gridPageStart;
+   if (nextGridCoverRow < pageEnd && loadGridCover(nextGridCoverRow++)) requestUpdate();
+   if (nextGridCoverRow >= pageEnd) {
+@@ -1376,36 +1398,37 @@
+ bool LibraryActivity::loadGridCover(const int row) {
+   RecentBook book;
+   if (!readBook(row, book)) return false;
++  if (!FsHelpers::hasEpubExtension(book.path) && !FsHelpers::hasXtcExtension(book.path)) return false;
+   const RecentBook* recent = recentBookForPath(book.path);
+-  if (!recent || recent->coverState == RecentBook::CoverState::Missing) return false;
+-  if (!FsHelpers::hasEpubExtension(book.path) && !FsHelpers::hasXtcExtension(book.path)) return false;
+-  const std::string thumbPath = UITheme::getCoverThumbPath(recent->coverBmpPath, gridCoverWidth, gridCoverHeight);
++  if (recent && recent->coverState == RecentBook::CoverState::Missing) return false;
++  const std::string thumbPath = gridThumbPath(book, gridCoverWidth, gridCoverHeight);
+   if (hasValidGridThumb(thumbPath, gridCoverWidth, gridCoverHeight)) return false;
+   if (FsHelpers::hasEpubExtension(book.path)) {
+     Epub epub(book.path, "/.crosspoint");
++    const std::string missingPath = epub.getCachePath() + "/library-cover-missing";
++    if (Storage.exists(missingPath.c_str())) return false;
+     if (!epub.load(true, true, Epub::XLocationLoadMode::Skip)) {
+       LOG_ERR("LIB", "Cannot load EPUB cover for %s", book.path.c_str());
+       return false;
+     }
+     if (epub.generateThumbBmp(gridCoverWidth, gridCoverHeight, &renderer, SETTINGS.getReaderFontId())) {
+-      if (!RECENT_BOOKS.updateBook(book.path, recent->title, recent->author, epub.getThumbBmpPath(),
+-                                   recent->coverState))
++      if (recent &&
++          !RECENT_BOOKS.updateBook(book.path, book.title, book.author, epub.getThumbBmpPath(), recent->coverState))
+         LOG_ERR("LIB", "Cannot update EPUB cover path for %s", book.path.c_str());
+       return true;
+     }
+     if (!epub.hasCoverImage()) {
+-      if (!RECENT_BOOKS.updateBook(book.path, recent->title, recent->author, "", RecentBook::CoverState::Missing))
+-        LOG_ERR("LIB", "Cannot mark missing EPUB cover for %s", book.path.c_str());
++      FsFile marker;
++      if (Storage.openFileForWrite("LIB", missingPath, marker))
++        marker.close();
++      else
++        LOG_ERR("LIB", "Cannot cache missing cover for %s", book.path.c_str());
+     }
+     return false;
+   }
+   Xtc xtc(book.path, "/.crosspoint");
+-  if (!xtc.load()) {
+-    LOG_ERR("LIB", "Cannot load XTC cover for %s", book.path.c_str());
+-    return false;
+-  }
+-  if (!xtc.generateThumbBmp(gridCoverWidth, gridCoverHeight)) return false;
+-  if (!RECENT_BOOKS.updateBook(book.path, recent->title, recent->author, xtc.getThumbBmpPath(), recent->coverState))
++  if (!xtc.load() || !xtc.generateThumbBmp(gridCoverWidth, gridCoverHeight)) return false;
++  if (recent && !RECENT_BOOKS.updateBook(book.path, book.title, book.author, xtc.getThumbBmpPath(), recent->coverState))
+     LOG_ERR("LIB", "Cannot update XTC cover path for %s", book.path.c_str());
+   return true;
+ }
+diff --git a/src/activities/library/LibrarySettingsActivity.cpp b/src/activities/library/LibrarySettingsActivity.cpp
+--- a/src/activities/library/LibrarySettingsActivity.cpp
++++ b/src/activities/library/LibrarySettingsActivity.cpp
+@@ -10,7 +10,7 @@
+
+ namespace {
+ constexpr fui::ActionId ACTION_ROW = 1;
+-constexpr int ROW_COUNT = 10;
++constexpr int ROW_COUNT = 12;
+ }  // namespace
+
+ LibrarySettingsActivity::LibrarySettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+@@ -61,6 +61,14 @@
+       break;
+     case 9:
+       SETTINGS.libraryShowMarkdown = !SETTINGS.libraryShowMarkdown;
++      break;
++    case 10:
++      SETTINGS.libraryView = SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_GRID
++                                 ? CrossPointSettings::RECENT_BOOKS_LIST
++                                 : CrossPointSettings::RECENT_BOOKS_GRID;
++      break;
++    case 11:
++      SETTINGS.libraryGridDensity = (SETTINGS.libraryGridDensity + 1) % 3;
+       break;
+     default:
+       return;
+@@ -146,11 +154,20 @@
+       StrId::STR_LIBRARY_USE_METADATA,   StrId::STR_LIBRARY_LIST_VIEW, StrId::STR_LIBRARY_RECENTLY_OPENED_VIEW,
+       StrId::STR_LIBRARY_FINISHED_BOOKS, StrId::STR_LIBRARY_SERIES,    StrId::STR_LIBRARY_GENRE,
+       StrId::STR_LIBRARY_EPUBS,          StrId::STR_LIBRARY_XTC_XTCH,  StrId::STR_LIBRARY_TXT,
+-      StrId::STR_LIBRARY_MARKDOWN};
++      StrId::STR_LIBRARY_MARKDOWN,       StrId::STR_LIBRARY_VIEW,      StrId::STR_LIBRARY_BOOKS_PER_ROW};
+   item.label = I18N.get(labels[row]);
+   item.actionValue = static_cast<int16_t>(row);
+   if (row == 1) {
+     item.value = SETTINGS.libraryListExpanded ? tr(STR_LIBRARY_EXPANDED) : tr(STR_COMPACT);
++    return;
++  }
++  if (row == 11) {
++    static constexpr const char* columns[] = {"3", "4", "5"};
++    item.value = columns[SETTINGS.libraryGridDensity < 3 ? SETTINGS.libraryGridDensity : 0];
++    return;
++  }
++  if (row == 10) {
++    item.value = SETTINGS.libraryView == CrossPointSettings::RECENT_BOOKS_GRID ? tr(STR_GRID_VIEW) : tr(STR_LIST_VIEW);
+     return;
+   }
+   if (row == 2) {
+diff --git a/lib/LibraryIndex/LibraryBuilder.cpp b/lib/LibraryIndex/LibraryBuilder.cpp
+--- a/lib/LibraryIndex/LibraryBuilder.cpp
++++ b/lib/LibraryIndex/LibraryBuilder.cpp
+@@ -1830,7 +1830,9 @@
+ }
+
+ namespace {
+-std::atomic<bool> indexDirty{true};
++// A valid persisted index is the startup snapshot. Real file mutations still
++// invalidate it; direct SD-card edits are picked up with Library > Refresh.
++std::atomic<bool> indexDirty{false};
+ }
+
+ void invalidateLibraryIndex() { indexDirty.store(true, std::memory_order_relaxed); }
+diff --git a/lib/LibraryIndex/LibraryBuilder.h b/lib/LibraryIndex/LibraryBuilder.h
+--- a/lib/LibraryIndex/LibraryBuilder.h
++++ b/lib/LibraryIndex/LibraryBuilder.h
+@@ -114,7 +114,7 @@
+ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, bool readMetadata = false,
+                        const BuildCallbacks* callbacks = nullptr);
+
+-// Starts dirty on cold boots to reconcile external card edits. File-changing
++// Starts with the saved index on cold boots; Refresh reconciles external SD edits. File-changing
+ // activities must invalidate before returning to Library. A successful scan
+ // clears only changes known when it started; failures and allocation-starved
+ // builds remain retryable. Results a rescan would repeat, such as skipped
+diff --git a/lib/LibraryIndex/LibraryIndexFile.h b/lib/LibraryIndex/LibraryIndexFile.h
+--- a/lib/LibraryIndex/LibraryIndexFile.h
++++ b/lib/LibraryIndex/LibraryIndexFile.h
+@@ -10,6 +10,7 @@
+ #include <HalStorage.h>
+
+ #include <cstdint>
++#include <memory>
+ #include <string>
+
+ #include "LibraryFormat.h"
+@@ -117,6 +118,10 @@
+   bool readAt(uint32_t offset, void* dst, size_t len);
+   bool readBlobField(const ClixRecord& record, uint8_t field, std::string& out);
+
++  // Fixed 512-byte sparse folder cache, built once per open. No heap growth
++  // with library size, and repeated book lookups avoid walking from folder zero.
++  std::unique_ptr<uint32_t[]> folderCheckpoints;
++  uint16_t folderStride = 0;
+   HalFile file;
+   ClixHeader head{};
+   bool opened = false;
+diff --git a/lib/LibraryIndex/LibraryIndexFile.cpp b/lib/LibraryIndex/LibraryIndexFile.cpp
+--- a/lib/LibraryIndex/LibraryIndexFile.cpp
++++ b/lib/LibraryIndex/LibraryIndexFile.cpp
+@@ -48,6 +48,8 @@
+ void LibraryIndexFile::close() {
+   if (file.isOpen()) file.close();
+   opened = false;
++  folderStride = 0;
++  folderCheckpoints.reset();
+ }
+
+ bool LibraryIndexFile::readAt(const uint32_t offset, void* dst, const size_t len) {
+@@ -294,7 +296,22 @@
+ }
+
+ bool LibraryIndexFile::readPath(const ClixRecord& record, std::string& out) {
+-  return readPath(record, out, nullptr, 0);
++  if (!opened || record.folderId >= head.folderCount) return false;
++  if (!folderCheckpoints) {
++    // 512 bytes, allocated once per open on first path lookup, not on the small
++    // task stack. Shared by all following lookups and released by close().
++    folderCheckpoints = makeUniqueNoThrow<uint32_t[]>(FOLDER_CHECKPOINT_COUNT);
++    if (!folderCheckpoints) {
++      LOG_ERR("LIBIDX", "Cannot allocate folder lookup cache");
++      return false;
++    }
++  }
++  if (folderStride == 0) {
++    uint16_t candidateStride = 0;
++    if (!buildFolderCheckpoints(folderCheckpoints.get(), candidateStride)) return false;
++    folderStride = candidateStride;
++  }
++  return readPath(record, out, folderCheckpoints.get(), folderStride);
+ }
+
+ bool LibraryIndexFile::buildFolderCheckpoints(uint32_t* offsets, uint16_t& stride) {
+diff --git a/test/library_index_file/LibraryIndexFileTest.cpp b/test/library_index_file/LibraryIndexFileTest.cpp
+--- a/test/library_index_file/LibraryIndexFileTest.cpp
++++ b/test/library_index_file/LibraryIndexFileTest.cpp
+@@ -299,3 +299,52 @@
+   ASSERT_TRUE(index.open("/library.clx"));
+   EXPECT_FALSE(index.readDisplayText(record, title, author));
+ }
++
++TEST(LibraryIndexFile, OrdinaryPathLookupsReuseFolderCheckpointsAndResetOnReopen) {
++  library::ClixHeader header{};
++  std::memcpy(header.magic, library::CLIX_MAGIC, sizeof(header.magic));
++  header.formatVersion = library::CLIX_FORMAT_VERSION;
++  header.foldVersion = library::CLIX_FOLD_VERSION;
++  header.bookCount = 1;
++  header.folderCount = 1024;
++  std::vector<uint8_t> folders;
++  for (int i = 0; i < header.folderCount; ++i) {
++    const std::string path = "/f" + std::to_string(i);
++    folders.push_back(static_cast<uint8_t>(path.size()));
++    folders.insert(folders.end(), path.begin(), path.end());
++  }
++  library::layoutSections(header, folders.size(), 1);
++  std::vector<uint8_t> bytes(header.selfSize, 0);
++  std::memcpy(bytes.data(), &header, sizeof(header));
++  std::memcpy(bytes.data() + header.folderStart, folders.data(), folders.size());
++  bytes[header.nameStart] = 'b';
++  Storage.setFile("/folders.clx", bytes);
++  library::LibraryIndexFile index;
++  ASSERT_TRUE(index.open("/folders.clx"));
++  library::ClixRecord record{};
++  record.folderId = 1023;
++  record.nameLen = 1;
++  // readName's blob starts after the stored path hash.
++  header.nameLen = sizeof(uint64_t) + 1;
++  library::layoutSections(header, folders.size(), header.nameLen);
++  bytes.resize(header.selfSize);
++  std::memcpy(bytes.data(), &header, sizeof(header));
++  std::memcpy(bytes.data() + header.folderStart, folders.data(), folders.size());
++  bytes[header.nameStart + sizeof(uint64_t)] = 'b';
++  index.close();
++  Storage.setFile("/folders.clx", bytes);
++  ASSERT_TRUE(index.open("/folders.clx"));
++  std::string path;
++  ASSERT_TRUE(index.readPath(record, path));
++  EXPECT_EQ(path, "/f1023/b");
++  HalFile::readCalls = 0;
++  for (int i = 0; i < 9; ++i) ASSERT_TRUE(index.readPath(record, path));
++  // At most stride(8) folder lengths + folder text + filename per lookup,
++  // rather than 1024 folder lengths each time.
++  EXPECT_LE(HalFile::readCalls, 9u * 11u);
++  index.close();
++  ASSERT_TRUE(index.open("/folders.clx"));
++  HalFile::readCalls = 0;
++  ASSERT_TRUE(index.readPath(record, path));
++  EXPECT_GE(HalFile::readCalls, 1024u);
++}
+diff --git a/test/library_index_file/stubs/HalStorage.h b/test/library_index_file/stubs/HalStorage.h
+--- a/test/library_index_file/stubs/HalStorage.h
++++ b/test/library_index_file/stubs/HalStorage.h
+@@ -23,6 +23,7 @@
+   bool isOpen() const { return hasImpl && open; }
+   int read(void* dst, size_t len) {
+     if (!isOpen() || !data || position + len > data->size()) return 0;
++    ++readCalls;
+     std::memcpy(dst, data->data() + position, len);
+     position += len;
+     return static_cast<int>(len);
+@@ -34,6 +35,7 @@
+     return true;
+   }
+
++  static inline size_t readCalls = 0;
+   static void resetInvalidCloseCount() { invalidCloses = 0; }
+   static int invalidCloseCount() { return invalidCloses; }
+
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -125,3 +125,5 @@
+ add_subdirectory(clipping_list_visibility)
+
+ add_subdirectory(image_refresh_regions)
++
++add_subdirectory(library_thumbnails)
+diff --git a/test/library_thumbnails/LibraryThumbnailsTest.cpp b/test/library_thumbnails/LibraryThumbnailsTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/LibraryThumbnailsTest.cpp
+@@ -0,0 +1,249 @@
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++#define LOG_ERR(...) ((void)0)
++struct RecentBook {
++  enum class CoverState { Unknown, Missing };
++  std::string path, title, author, coverBmpPath;
++  CoverState coverState = CoverState::Unknown;
++};
++std::vector<RecentBook> recents;
++const RecentBook* recentBookForPath(const std::string& path) {
++  for (auto& book : recents)
++    if (book.path == path) return &book;
++  return nullptr;
++}
++struct CrossPointSettings {
++  enum { RECENT_BOOKS_LIST, RECENT_BOOKS_GRID };
++  int libraryView = 0, recentBooksView = 0, libraryUseMetadata = 1, libraryGridDensity = 0;
++  int getReaderFontId() const { return 0; }
++} SETTINGS;
++namespace FsHelpers {
++bool hasEpubExtension(const std::string& path) { return path.ends_with(".epub"); }
++bool hasXtcExtension(const std::string& path) { return path.ends_with(".xtc"); }
++}  // namespace FsHelpers
++namespace UITheme {
++std::string getCoverThumbPath(const std::string& path, int width, int height) {
++  return path + "/" + std::to_string(width) + "x" + std::to_string(height);
++}
++}  // namespace UITheme
++std::set<std::string> files;
++int loads = 0, generations = 0, updates = 0;
++bool coverExists = true, loadSucceeds = true;
++struct FsFile {
++  void close() {}
++};
++struct StorageMock {
++  bool exists(const char* path) { return files.contains(path); }
++  bool openFileForWrite(const char*, const std::string& path, FsFile&) {
++    files.insert(path);
++    return true;
++  }
++} Storage;
++struct Epub {
++  enum class XLocationLoadMode { Skip };
++  std::string cache;
++  Epub(const std::string& path, const std::string& dir) : cache(cachePathForFilePath(path, dir)) {}
++  static std::string cachePathForFilePath(const std::string& path, const std::string& dir) { return dir + path; }
++  const std::string& getCachePath() const { return cache; }
++  bool load(bool, bool, XLocationLoadMode) {
++    ++loads;
++    return loadSucceeds;
++  }
++  bool generateThumbBmp(int w, int h, const int*, int) {
++    ++generations;
++    if (!coverExists) return false;
++    files.insert(cache + "/thumb_" + std::to_string(w) + "x" + std::to_string(h) + ".bmp");
++    return true;
++  }
++  bool hasCoverImage() const { return coverExists; }
++  std::string getThumbBmpPath() const { return cache; }
++};
++struct Xtc {
++  std::string cache;
++  Xtc(const std::string& path, const std::string& dir) : cache(dir + path) {}
++  std::string getThumbBmpPath(int w, int h) const {
++    return cache + "/thumb_" + std::to_string(w) + "x" + std::to_string(h) + ".bmp";
++  }
++  std::string getThumbBmpPath() const { return cache; }
++  bool load() {
++    ++loads;
++    return loadSucceeds;
++  }
++  bool generateThumbBmp(int w, int h) {
++    ++generations;
++    files.insert(getThumbBmpPath(w, h));
++    return true;
++  }
++};
++struct RecentsMock {
++  bool updateBook(const std::string&, const std::string&, const std::string&, const std::string&,
++                  RecentBook::CoverState) {
++    ++updates;
++    return true;
++  }
++} RECENT_BOOKS;
++bool hasValidGridThumb(const std::string& path, int, int) { return files.contains(path); }
++
++namespace library {
++bool dirty = false;
++bool libraryIndexNeedsRefresh() { return dirty; }
++const char* libraryIndexPath() { return "/library.idx"; }
++}  // namespace library
++struct FakeIndex {
++  struct Header {
++    uint8_t metadataEnabled = 1;
++  } head;
++  bool opened = false, valid = true;
++  void close() { opened = false; }
++  bool isOpen() const { return opened; }
++  bool open(const char*) { return opened = valid; }
++  bool openForReconciliation(const char*) { return opened = valid; }
++  const Header& header() const { return head; }
++};
++struct LibraryActivity {
++  enum class Sort { RecentlyRead, Title };
++  Sort sort = Sort::Title;
++  FakeIndex index;
++  bool scanFailed = false, uiReady = false, scanCancelledThisVisit = false;
++  int scans = 0, filters = 0;
++  void applyFilter() { ++filters; }
++  void rebuildIndex(bool) {
++    ++scans;
++    library::dirty = false;
++    index.opened = true;
++    applyFilter();
++  }
++  void refreshIndexIfNeeded(bool showScanning = false);
++  int gridCoverWidth = 100, gridCoverHeight = 150, gridPageStart = 0, loadedGridPageStart = -1, nextGridCoverRow = -1;
++  int renderer = 0, paints = 0;
++  std::vector<RecentBook> books;
++  int rowCount() const { return books.size(); }
++  bool readBook(int row, RecentBook& book) {
++    if (row < 0 || row >= rowCount()) return false;
++    book = books[row];
++    return true;
++  }
++  void requestUpdate() { ++paints; }
++  bool gridEnabled() const;
++  void loadGridPageCovers();
++  bool loadGridCover(int row);
++};
++#include "LibraryThumbnailMethods.inc"
++struct LibraryThumbnails : testing::Test {
++  LibraryActivity library;
++  void SetUp() override {
++    SETTINGS = {};
++    SETTINGS.libraryView = CrossPointSettings::RECENT_BOOKS_GRID;
++    recents.clear();
++    files.clear();
++    loads = generations = updates = 0;
++    coverExists = loadSucceeds = true;
++    for (int i = 0; i < 20; ++i) {
++      RecentBook b;
++      b.path = "/book" + std::to_string(i) + ".epub";
++      library.books.push_back(b);
++    }
++  }
++};
++TEST_F(LibraryThumbnails, GridIsConfigurableIndependentlyOfRecentlyRead) {
++  EXPECT_TRUE(library.gridEnabled());
++  library.sort = LibraryActivity::Sort::RecentlyRead;
++  EXPECT_FALSE(library.gridEnabled());
++  SETTINGS.recentBooksView = CrossPointSettings::RECENT_BOOKS_GRID;
++  EXPECT_TRUE(library.gridEnabled());
++  SETTINGS.libraryView = CrossPointSettings::RECENT_BOOKS_LIST;
++  library.sort = LibraryActivity::Sort::Title;
++  EXPECT_FALSE(library.gridEnabled());
++}
++TEST_F(LibraryThumbnails, GeneratesOnlyVisiblePageWithoutChangingRecentBooks) {
++  for (int i = 0; i < 30; ++i) library.loadGridPageCovers();
++  EXPECT_EQ(generations, 9);
++  EXPECT_EQ(loads, 9);
++  EXPECT_EQ(updates, 0);
++  EXPECT_TRUE(recents.empty());
++  EXPECT_EQ(library.loadedGridPageStart, 0);
++  library.gridPageStart = 18;
++  library.nextGridCoverRow = -1;
++  for (int i = 0; i < 10; ++i) library.loadGridPageCovers();
++  EXPECT_EQ(generations, 11);
++}
++TEST_F(LibraryThumbnails, ReopeningReusesDiskThumbnailsWithoutParsingBooks) {
++  for (int i = 0; i < 9; ++i) library.loadGridPageCovers();
++  library.loadedGridPageStart = -1;
++  library.nextGridCoverRow = -1;
++  loads = generations = 0;
++  for (int i = 0; i < 9; ++i) library.loadGridPageCovers();
++  EXPECT_EQ(loads, 0);
++  EXPECT_EQ(generations, 0);
++}
++TEST_F(LibraryThumbnails, MissingCoversAreCachedButFailuresRemainRetryable) {
++  coverExists = false;
++  EXPECT_FALSE(library.loadGridCover(0));
++  EXPECT_EQ(loads, 1);
++  EXPECT_FALSE(library.loadGridCover(0));
++  EXPECT_EQ(loads, 1);
++  files.clear();
++  loadSucceeds = false;
++  EXPECT_FALSE(library.loadGridCover(1));
++  EXPECT_FALSE(library.loadGridCover(1));
++  EXPECT_EQ(loads, 3);
++}
++TEST_F(LibraryThumbnails, TextFilesUsePlaceholderAndXtcUsesThumbnailCache) {
++  library.books[0].path = "/note.txt";
++  EXPECT_FALSE(library.loadGridCover(0));
++  EXPECT_EQ(loads, 0);
++  library.books[0].path = "/book.xtc";
++  EXPECT_TRUE(library.loadGridCover(0));
++  EXPECT_FALSE(library.loadGridCover(0));
++  EXPECT_EQ(generations, 1);
++}
++TEST_F(LibraryThumbnails, ListViewNeverGeneratesCovers) {
++  SETTINGS.libraryView = CrossPointSettings::RECENT_BOOKS_LIST;
++  for (int i = 0; i < 20; ++i) library.loadGridPageCovers();
++  EXPECT_EQ(loads, 0);
++  EXPECT_EQ(generations, 0);
++}
++
++TEST_F(LibraryThumbnails, ValidSavedIndexDoesNotRescanOnLibraryVisits) {
++  library::dirty = false;
++  library.refreshIndexIfNeeded();
++  library.index.close();
++  library.refreshIndexIfNeeded();
++  EXPECT_EQ(library.scans, 0);
++  EXPECT_EQ(library.filters, 2);
++}
++TEST_F(LibraryThumbnails, FileMutationMissingIndexAndMetadataChangeStillScan) {
++  library::dirty = true;
++  library.refreshIndexIfNeeded();
++  EXPECT_EQ(library.scans, 1);
++  library.index.close();
++  library.index.valid = false;
++  library.refreshIndexIfNeeded();
++  EXPECT_EQ(library.scans, 2);
++  library.index.valid = true;
++  library.index.head.metadataEnabled = 0;
++  library.refreshIndexIfNeeded();
++  EXPECT_EQ(library.scans, 3);
++}
++
++TEST_F(LibraryThumbnails, DensityControlsVisibleCoverCountAndBoundsInvalidSettings) {
++  for (int density = 0; density < 3; ++density) {
++    SETTINGS.libraryGridDensity = density;
++    EXPECT_EQ(gridColumns(), 3 + density);
++    EXPECT_EQ(gridPageSize(), (3 + density) * (3 + density));
++    library.loadedGridPageStart = -1;
++    library.nextGridCoverRow = -1;
++    files.clear();
++    loads = generations = 0;
++    for (int i = 0; i < 40; ++i) library.loadGridPageCovers();
++    EXPECT_EQ(generations, std::min(20, gridPageSize()));
++  }
++  SETTINGS.libraryGridDensity = 99;
++  EXPECT_EQ(gridColumns(), 3);
++  EXPECT_EQ(gridPageSize(), 9);
++}
+diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/CMakeLists.txt
+@@ -0,0 +1,9 @@
++find_package(Python3 REQUIRED COMPONENTS Interpreter)
++set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
++add_custom_command(OUTPUT ${EXTRACTED}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryThumbnails.py ${REPO_ROOT} ${EXTRACTED}
++  DEPENDS ExtractLibraryThumbnails.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp)
++add_executable(LibraryThumbnailsTest LibraryThumbnailsTest.cpp ${EXTRACTED})
++target_include_directories(LibraryThumbnailsTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_link_libraries(LibraryThumbnailsTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(LibraryThumbnailsTest)
+diff --git a/test/library_thumbnails/ExtractLibraryThumbnails.py b/test/library_thumbnails/ExtractLibraryThumbnails.py
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/ExtractLibraryThumbnails.py
+@@ -0,0 +1,16 @@
++import pathlib, sys
++root = pathlib.Path(sys.argv[1])
++source = (root / 'src/activities/library/LibraryActivity.cpp').read_text()
++def method(signature):
++    start = source.index(signature)
++    brace = source.index('{', start)
++    depth = 1
++    end = brace + 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++pathlib.Path(sys.argv[2]).write_text('\n\n'.join(method(s) for s in [
++    'int gridColumns(', 'int gridPageSize(', 'std::string gridThumbPath(', 'bool LibraryActivity::gridEnabled(',
++    'void LibraryActivity::loadGridPageCovers(', 'bool LibraryActivity::loadGridCover(',
++    'void LibraryActivity::refreshIndexIfNeeded(']))
