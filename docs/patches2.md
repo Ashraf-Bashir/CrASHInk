@@ -32,18 +32,19 @@ shared settings-page patch supplies navigation and layout. Later patches extend
 common files where their feature needs integration; this is intentional and
 requires the documented order.
 
-## Equivalence verification
+## Initial consolidation equivalence verification
 
 - Original patch repository revision: `066e2075f74fc13a6b8368a052654c0678dfaa87`.
 - Upstream baseline: CrossInk v1.6.1,
   `9914146eeae7b46b300f475a16c32426fc02ec1f`.
 - Pinned FreeInk SDK: `699370183fa3a0e33c9cb83a36f701bbb6022095`.
-- Both the 26 original patches and the 10 candidate patches apply cleanly from
+- At consolidation commit `a2b02aee`, the 26 original patches and 10 candidate patches applied cleanly from
   that baseline and produce Git tree
   `16d6526e9270f5223a741b1bd2d57cb1ff50661e`.
 - Equality covers the entire indexed source tree, including file contents,
   additions/deletions, executable modes and submodule references. No firmware
-  behavior change is intended or introduced by regrouping.
+  behavior change was introduced by regrouping. Later library enhancements are
+  maintained only in active patch `0009-library.patch`; the archived folder is frozen.
 - All 26 original patch files remain byte-for-byte unchanged.
 
 **Native result:** all 29 selected test executables passed, covering the library,
@@ -53,7 +54,7 @@ chapter index, grayscale/image refresh and frontlight behavior.
 Native verification was run against a separate checkout materialized from the
 candidate tree, not against an already-patched working directory.
 
-## X4 Pro firmware build
+## Initial X4 Pro firmware build
 
 A full `pio run -e x4-pro` from the candidate source succeeded on 2026-10-31.
 Compilation, linking, image generation, touch-gate audit and OTA partition-size
@@ -71,3 +72,33 @@ checks passed. No source fixes were needed.
 This verifies firmware compilation, not on-device behavior or library-opening
 timing. The firmware check was completed before switching the workflow to
 `patches2/`. No GitHub workflow was dispatched for that check or the pipeline switch.
+
+## Current library behavior
+
+The active library patch keeps a 3 × 3 grid with centered, tightly spaced columns.
+Cover mode puts Sort by and Reverse order in the ⋮ menu and combines book count
+and page into one compact footer. Status changes do not resize the cover grid.
+
+Completed view membership/counts persist in disposable SD snapshots. Interrupted
+filters save their processed position on exit and resume rather than rereading
+books already checked. Completion changes, file changes and index refreshes
+invalidate the relevant cached result; ordinary reading-time/page-count stats
+saves do not. A fresh view may need one filter pass before its full cache exists.
+
+Cover pixels reuse Home's optional PSRAM cache. Visible cover results repaint as
+a batch; background preloading does not repaint the page. Missing covers show a
+book outline and title. **⋮ → Refresh covers on this page** retries the visible
+nine covers, removing their thumbnail/source-image/negative caches without
+rebuilding the book index or clearing saved view counts.
+
+Latest verification: 115 native tests passed, including zero book-record reads on
+warm filter restore, interrupted-filter resume, cache integrity/invalidation,
+cover batching, worker lifecycle, swipe cancellation and stats persistence.
+The updated X4 Pro firmware compiled, linked and passed the OTA size check.
+
+## Direct firmware downloads
+
+The build workflow uses `actions/upload-artifact@v7` with `archive: false` and a
+single `.bin` file. New runs provide the versioned firmware file directly in
+Artifacts, without a ZIP wrapper. Existing older run artifacts are unchanged.
+See [GitHub's direct-artifact download announcement](https://github.blog/changelog/2026-02-26-github-actions-now-supports-uploading-and-downloading-non-zipped-artifacts/).
