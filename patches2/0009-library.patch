@@ -1,10 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -1,5 +1,16 @@
+@@ -1,5 +1,18 @@
  ## [Unreleased]
 
 +### Added
++
++- Home cover grid browses all retained opened books from a compact SD ordering, without the old 18-book ceiling. It reuses Library thumbnail identities, cover pixels and the background conversion worker; visible covers load first and later history pages prepare while idle. Existing recent entries migrate automatically.
 +
 +- Library cover view uses the same three-column cover component, proportions and frames as Home, without book-name labels. Cover conversion runs on a low-priority disk-only worker, preparing visible books first and then other pages while idle. Swipes cancel taps before paging; holding a cover keeps the existing book menu. Display settings separate All books, Recently opened and List grouping. Library filters progress after the first paint instead of blocking entry; index reads reuse SD sectors rather than issuing a small read per folder.
 +
@@ -53,7 +55,7 @@ diff --git a/docs/data-cache.md b/docs/data-cache.md
 diff --git a/docs/file-formats.md b/docs/file-formats.md
 --- a/docs/file-formats.md
 +++ b/docs/file-formats.md
-@@ -1159,3 +1159,19 @@
+@@ -1159,3 +1159,45 @@
  move to the desired position. Equal timestamps leave both sides unchanged.
  Older firmware cannot read version 2; retain the firmware and progress backup
  before downgrading. TXT/XTC progress formats are unchanged.
@@ -73,6 +75,32 @@ diff --git a/docs/file-formats.md b/docs/file-formats.md
 +counts, versions, lengths, truncation or checksum mismatch cause a cache miss.
 +Writes use a temporary file and rename; interruption safely falls back to refiltering.
 +This does not change the EPUB, stats or Library index binary format.
++
++
++## Opened-book ordering (OPB1, version 1)
++
++Home cover browsing uses `/.crosspoint/opened.idx`, newest opened first, plus
++`opened.paths`. No book contents, titles, authors or cover pixels are duplicated
++in these files. The normal library cover cache remains the source of thumbnails.
++
++The little-endian packed index header is 20 bytes: magic u32 `0x3142504f`,
++version u16 (1), entry stride u16 (20), entry count u32, revision u64. Each
++20-byte entry stores complete-path FNV-1a hash u64, path payload offset u32 and
++last-opening order u64. Opening order is a persistent monotonic counter, so
++sorting does not depend on the device clock being set. The newest-first index
++supports direct seeks to a page; opening Home does not walk the whole history.
++
++The append-only path file stores u16 byte length followed by UTF-8 path bytes
++(1–511 bytes). Paths are hash-checked when read. Reopening reuses the existing
++path payload and moves its small index entry to the front. Metadata refreshes
++of the current book do not rewrite the ordering. Rename keeps its position;
++removal drops only that entry. No fixed history-book count is imposed.
++
++Updates stream the small index through `opened.tmp`, sync it, rotate the old
++index to `opened.bak`, then publish. The old snapshot can be recovered if a
++write/rename is interrupted. An unpublished path tail is harmless. Legacy recent
++entries seed one complete snapshot, preserving order; later history comes from
++actual opens. History already evicted by older firmware cannot be recovered.
 diff --git a/lib/Epub/Epub.cpp b/lib/Epub/Epub.cpp
 --- a/lib/Epub/Epub.cpp
 +++ b/lib/Epub/Epub.cpp
@@ -611,6 +639,285 @@ new file mode 100644
 +                   uint16_t processed = UINT16_MAX);
 +void invalidateViewCache();
 +}  // namespace library
+diff --git a/lib/LibraryIndex/OpenedBooks.cpp b/lib/LibraryIndex/OpenedBooks.cpp
+new file mode 100644
+--- /dev/null
++++ b/lib/LibraryIndex/OpenedBooks.cpp
+@@ -0,0 +1,242 @@
++#include "OpenedBooks.h"
++
++#include <Logging.h>
++
++#include <cstring>
++#include <limits>
++
++namespace library {
++namespace {
++constexpr char INDEX[] = "/.crosspoint/opened.idx";
++constexpr char BACKUP[] = "/.crosspoint/opened.bak";
++constexpr char TEMP[] = "/.crosspoint/opened.tmp";
++constexpr char PATHS[] = "/.crosspoint/opened.paths";
++constexpr uint32_t MAGIC = 0x3142504f;  // OPB1
++#pragma pack(push, 1)
++struct Header {
++  uint32_t magic = MAGIC;
++  uint16_t version = 1, stride = 20;
++  uint32_t count = 0;
++  uint64_t revision = 0;
++};
++struct Entry {
++  uint64_t hash = 0;
++  uint32_t offset = 0;
++  uint64_t opened = 0;
++};
++#pragma pack(pop)
++static_assert(sizeof(Header) == 20 && sizeof(Entry) == 20);
++uint64_t hashPath(const std::string& path) {
++  uint64_t hash = 14695981039346656037ULL;
++  for (unsigned char c : path) {
++    hash ^= c;
++    hash *= 1099511628211ULL;
++  }
++  return hash;
++}
++bool header(FsFile& file, Header& h) {
++  return file.seekSet(0) && file.read(&h, sizeof(h)) == sizeof(h) && h.magic == MAGIC && h.version == 1 &&
++         h.stride == sizeof(Entry) && file.fileSize() == sizeof(h) + static_cast<uint64_t>(h.count) * sizeof(Entry);
++}
++bool openIndex(FsFile& file, Header& h, bool* backup = nullptr) {
++  if (backup) *backup = false;
++  if (Storage.openFileForRead("HIST", INDEX, file)) {
++    if (header(file, h)) return true;
++    file.close();
++  }
++  if (Storage.openFileForRead("HIST", BACKUP, file)) {
++    if (header(file, h)) {
++      if (backup) *backup = true;
++      return true;
++    }
++    file.close();
++  }
++  return false;
++}
++bool entryAt(FsFile& file, uint32_t row, Entry& entry) {
++  return file.seekSet(sizeof(Header) + static_cast<uint64_t>(row) * sizeof(Entry)) &&
++         file.read(&entry, sizeof(entry)) == sizeof(entry);
++}
++bool readPath(const Entry& entry, std::string& path) {
++  FsFile file;
++  if (!Storage.openFileForRead("HIST", PATHS, file)) return false;
++  uint16_t length = 0;
++  bool ok = file.seekSet(entry.offset) && file.read(&length, sizeof(length)) == sizeof(length) && length > 0 &&
++            length < 512 && static_cast<uint64_t>(entry.offset) + sizeof(length) + length <= file.fileSize();
++  if (ok) {
++    path.resize(length);
++    ok = file.read(path.data(), length) == length && path.front() == '/' && path.find('\0') == std::string::npos &&
++         hashPath(path) == entry.hash;
++  }
++  file.close();
++  if (!ok) path.clear();
++  return ok;
++}
++bool appendPath(const std::string& path, Entry& entry) {
++  FsFile file = Storage.open(PATHS, O_WRONLY | O_CREAT | O_APPEND);
++  if (!file) return false;
++  const uint64_t offset = file.fileSize();
++  const uint16_t length = path.size();
++  const bool ok = offset <= UINT32_MAX - sizeof(length) - length && file.seekSet(offset) &&
++                  file.write(&length, sizeof(length)) == sizeof(length) && file.write(path.data(), length) == length &&
++                  file.sync();
++  file.close();
++  entry.hash = hashPath(path);
++  entry.offset = static_cast<uint32_t>(offset);
++  return ok;
++}
++bool publish(bool recovered) {
++  if (recovered) {
++    if (Storage.exists(INDEX) && !Storage.remove(INDEX)) return false;
++    if (!Storage.rename(BACKUP, INDEX)) return false;
++  }
++  // Preserve the last complete snapshot until the replacement is synced and
++  // renamed. A failed rename rolls back; startup can also read the backup.
++  if (Storage.exists(INDEX)) {
++    if (Storage.exists(BACKUP) && !Storage.remove(BACKUP)) return false;
++    if (!Storage.rename(INDEX, BACKUP)) return false;
++  }
++  if (!Storage.rename(TEMP, INDEX)) {
++    if (!Storage.exists(INDEX) && Storage.exists(BACKUP)) Storage.rename(BACKUP, INDEX);
++    return false;
++  }
++  return true;
++}
++enum class Change { Touch, Remove, Rename };
++bool change(const std::string& path, Change mode, const std::string& replacement = {}) {
++  if (path.empty() || path.front() != '/' || path.size() >= 512 ||
++      (mode == Change::Rename && (replacement.empty() || replacement.front() != '/' || replacement.size() >= 512)))
++    return false;
++  FsFile old;
++  Header h;
++  bool recovered = false;
++  const bool foundIndex = openIndex(old, h, &recovered);
++  if (!foundIndex && (Storage.exists(INDEX) || Storage.exists(BACKUP))) {
++    LOG_ERR("HIST", "Cannot read opened-book ordering; preserving files");
++    return false;
++  }
++  if (!foundIndex) h = Header{};
++  const uint64_t hash = hashPath(path);
++  Entry selected;
++  uint32_t selectedRow = UINT32_MAX;
++  std::string check;
++  check.reserve(511);  // One reusable path, bounded independently of history size.
++  if (h.count && !old.seekSet(sizeof(Header))) {
++    old.close();
++    return false;
++  }
++  for (uint32_t row = 0; row < h.count; ++row) {
++    Entry entry;
++    if (old.read(&entry, sizeof(entry)) != sizeof(entry)) {
++      old.close();
++      return false;
++    }
++    if (entry.hash == hash) {
++      if (!readPath(entry, check)) {
++        old.close();
++        return false;
++      }
++      if (check == path) {
++        selected = entry;
++        selectedRow = row;
++        break;
++      }
++    }
++  }
++  if (mode != Change::Touch && selectedRow == UINT32_MAX) {
++    old.close();
++    return true;
++  }
++  // Metadata refreshes for the current book do not rewrite history.
++  if (mode == Change::Touch && selectedRow == 0) {
++    old.close();
++    return true;
++  }
++  if (h.revision == UINT64_MAX || (mode == Change::Touch && selectedRow == UINT32_MAX && h.count == UINT32_MAX)) {
++    old.close();
++    return false;
++  }
++  if ((mode == Change::Touch && selectedRow == UINT32_MAX) || mode == Change::Rename) {
++    if (!appendPath(mode == Change::Rename ? replacement : path, selected)) {
++      old.close();
++      return false;
++    }
++  }
++  Header next = h;
++  ++next.revision;
++  if (mode == Change::Touch) {
++    selected.opened = next.revision;
++    if (selectedRow == UINT32_MAX) ++next.count;
++  } else if (mode == Change::Remove)
++    --next.count;
++  FsFile out;
++  if (!Storage.openFileForWrite("HIST", TEMP, out)) {
++    old.close();
++    return false;
++  }
++  bool ok = out.write(&next, sizeof(next)) == sizeof(next);
++  if (mode == Change::Touch) ok = ok && out.write(&selected, sizeof(selected)) == sizeof(selected);
++  if (h.count) ok = ok && old.seekSet(sizeof(Header));
++  for (uint32_t row = 0; row < h.count && ok; ++row) {
++    Entry entry;
++    ok = old.read(&entry, sizeof(entry)) == sizeof(entry);
++    if (row == selectedRow && mode != Change::Rename) continue;
++    if (row == selectedRow) entry = selected;
++    if (ok) ok = out.write(&entry, sizeof(entry)) == sizeof(entry);
++  }
++  ok = ok && out.sync();
++  out.close();
++  old.close();
++  if (!ok) {
++    Storage.remove(TEMP);
++    return false;
++  }
++  return publish(recovered);
++}
++}  // namespace
++bool OpenedBooks::seed(uint32_t count, PathAt pathAt, const void* context) {
++  if (exists()) return true;
++  if (!pathAt) return false;
++  FsFile out;
++  if (!Storage.openFileForWrite("HIST", TEMP, out)) return false;
++  Header h;
++  h.count = count;
++  h.revision = count;
++  bool ok = out.write(&h, sizeof(h)) == sizeof(h);
++  for (uint32_t row = 0; row < count && ok; ++row) {
++    const auto& path = pathAt(row, context);
++    Entry entry;
++    ok = !path.empty() && path.front() == '/' && path.size() < 512 && appendPath(path, entry);
++    entry.opened = count - row;
++    if (ok) ok = out.write(&entry, sizeof(entry)) == sizeof(entry);
++  }
++  ok = ok && out.sync();
++  out.close();
++  if (!ok) {
++    Storage.remove(TEMP);
++    return false;
++  }
++  return publish(false);
++}
++bool OpenedBooks::exists() { return Storage.exists(INDEX) || Storage.exists(BACKUP); }
++bool OpenedBooks::open() {
++  close();
++  Header h;
++  if (!openIndex(index, h)) return false;
++  rows = h.count;
++  return true;
++}
++void OpenedBooks::close() {
++  index.close();
++  rows = 0;
++}
++bool OpenedBooks::read(uint32_t row, std::string& path) {
++  Entry entry;
++  return row < rows && entryAt(index, row, entry) && readPath(entry, path);
++}
++bool OpenedBooks::touch(const std::string& path) { return change(path, Change::Touch); }
++bool OpenedBooks::remove(const std::string& path) { return change(path, Change::Remove); }
++bool OpenedBooks::rename(const std::string& before, const std::string& after) {
++  return change(before, Change::Rename, after);
++}
++}  // namespace library
+diff --git a/lib/LibraryIndex/OpenedBooks.h b/lib/LibraryIndex/OpenedBooks.h
+new file mode 100644
+--- /dev/null
++++ b/lib/LibraryIndex/OpenedBooks.h
+@@ -0,0 +1,27 @@
++#pragma once
++#include <HalStorage.h>
++
++#include <cstdint>
++#include <string>
++
++namespace library {
++// A disk-backed, newest-first ordering. Only identities/order live here; covers
++// stay in the normal library cache and book contents are never copied.
++class OpenedBooks {
++ public:
++  bool open();
++  void close();
++  uint32_t count() const { return rows; }
++  bool read(uint32_t row, std::string& path);
++  static bool exists();
++  using PathAt = const std::string& (*)(uint32_t row, const void* context);
++  static bool seed(uint32_t count, PathAt pathAt, const void* context);
++  static bool touch(const std::string& path);
++  static bool remove(const std::string& path);
++  static bool rename(const std::string& before, const std::string& after);
++
++ private:
++  FsFile index;
++  uint32_t rows = 0;
++};
++}  // namespace library
 diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
 --- a/src/CrossPointSettings.cpp
 +++ b/src/CrossPointSettings.cpp
@@ -642,6 +949,97 @@ diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
    uint8_t libraryShowSeries = 1;
    uint8_t libraryShowGenre = 1;
    uint8_t libraryShowEpub = 1;
+diff --git a/src/RecentBooksStore.cpp b/src/RecentBooksStore.cpp
+--- a/src/RecentBooksStore.cpp
++++ b/src/RecentBooksStore.cpp
+@@ -4,6 +4,7 @@
+ #include <FsHelpers.h>
+ #include <HalStorage.h>
+ #include <Logging.h>
++#include <OpenedBooks.h>
+ #include <Serialization.h>
+ #include <Xtc.h>
+
+@@ -63,6 +64,8 @@
+                                        const std::string& coverBmpPath, const RecentBook::CoverState coverState) {
+   ensureLoaded();
+
++  if (!library::OpenedBooks::touch(path)) LOG_ERR("RBS", "Cannot save opened-book order");
++
+   // No-op write suppression adapted from Sichroteph/YACP commit
+   // 20af8aee8d3e1d560456753b08d1f52e5488621f (MIT), preserving CrossInk's
+   // cover-state metadata.
+@@ -119,11 +122,10 @@
+ bool RecentBooksStore::removeByPath(const std::string& path) {
+   ensureLoaded();
+
++  if (!library::OpenedBooks::remove(path)) LOG_ERR("RBS", "Cannot remove opened-book history");
+   auto it =
+       std::find_if(recentBooks.begin(), recentBooks.end(), [&](const RecentBook& book) { return book.path == path; });
+-  if (it == recentBooks.end()) {
+-    return false;
+-  }
++  if (it == recentBooks.end()) return false;
+   recentBooks.erase(it);
+   if (!saveToFile()) {
+     LOG_ERR("RBS", "Failed to persist removal of recent book: %s", path.c_str());
+@@ -135,6 +137,7 @@
+                                   const std::string& oldCachePath, const std::string& newCachePath) {
+   ensureLoaded();
+
++  if (!library::OpenedBooks::rename(oldPath, newPath)) return false;
+   auto it = std::find_if(recentBooks.begin(), recentBooks.end(),
+                          [&](const RecentBook& book) { return book.path == oldPath; });
+   if (it == recentBooks.end()) {
+@@ -147,6 +150,7 @@
+   }
+   if (!saveToFile()) {
+     *it = original;
++    if (!library::OpenedBooks::rename(newPath, oldPath)) LOG_ERR("RBS", "Cannot roll back opened-book path");
+     LOG_ERR("RBS", "Failed to persist recent book path update: %s -> %s", oldPath.c_str(), newPath.c_str());
+     return false;
+   }
+@@ -192,6 +196,7 @@
+ bool RecentBooksStore::loadFromFile() {
+   const bool hasStoreFile = Storage.exists(getFilePath());
+   if (PersistableStore<RecentBooksStore>::loadFromFile()) {
++    seedOpenedHistory();
+     return true;
+   }
+   if (hasStoreFile) {
+@@ -201,6 +206,7 @@
+   if (Storage.exists(RECENT_BOOKS_FILE_BIN)) {
+     if (loadFromBinaryFile()) {
+       saveToFile();
++      seedOpenedHistory();
+       Storage.rename(RECENT_BOOKS_FILE_BIN, RECENT_BOOKS_FILE_BAK);
+       LOG_DBG("RBS", "Migrated recent.bin to recent.json");
+       return true;
+@@ -275,3 +281,13 @@
+
+   return true;
+ }
++
++void RecentBooksStore::seedOpenedHistory() {
++  if (!library::OpenedBooks::seed(
++          recentBooks.size(),
++          [](uint32_t row, const void* context) -> const std::string& {
++            return static_cast<const RecentBooksStore*>(context)->recentBooks[row].path;
++          },
++          this))
++    LOG_ERR("RBS", "Cannot migrate opened-book history");
++}
+diff --git a/src/RecentBooksStore.h b/src/RecentBooksStore.h
+--- a/src/RecentBooksStore.h
++++ b/src/RecentBooksStore.h
+@@ -25,6 +25,7 @@
+   RecentBooksStore() = default;
+   ~RecentBooksStore() = default;
+   bool loadFromBinaryFile();
++  void seedOpenedHistory();
+
+   friend class PersistableStore<RecentBooksStore>;
+
 diff --git a/src/activities/Activity.h b/src/activities/Activity.h
 --- a/src/activities/Activity.h
 +++ b/src/activities/Activity.h
@@ -691,33 +1089,212 @@ diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActi
  #include <HalStorage.h>
  #include <I18n.h>
  #include <Memory.h>
-@@ -556,6 +556,7 @@
+@@ -37,6 +37,7 @@
+ #include "RecentBooksStore.h"
+ #include "SavedItemsHomeActivity.h"
+ #include "SilentRestart.h"
++#include "components/BookCoverCache.h"
+ #include "components/UITheme.h"
+ #include "components/themes/dashboard/DashboardTheme.h"
+ #include "components/themes/lyra/LyraCarouselTheme.h"
+@@ -556,9 +557,33 @@
    const auto& books = RECENT_BOOKS.getBooks();
    recentBooks.reserve(coverGridUi ? maxBooks : std::min(static_cast<int>(books.size()), maxBooks));
 
-+  int eligible = 0;
++  if (coverGridUi && openedBooks.open()) {
++    openedBookCount = openedBooks.count();
++    const uint32_t first = 1u + static_cast<uint32_t>(recentGridPage) * 6u;
++    for (int slot = 0; slot < maxBooks; ++slot) {
++      const uint32_t row = slot == 0 ? 0 : first + slot - 1;
++      if (row >= openedBookCount) break;
++      RecentBook book;
++      if (!openedBooks.read(row, book.path)) break;
++      const auto hot =
++          std::find_if(books.begin(), books.end(), [&book](const RecentBook& item) { return item.path == book.path; });
++      if (hot != books.end())
++        book = *hot;
++      else {
++        const auto slash = book.path.find_last_of('/');
++        book.title = book.path.substr(slash == std::string::npos ? 0 : slash + 1);
++        const auto dot = book.title.find_last_of('.');
++        if (dot != std::string::npos && dot != 0) book.title.resize(dot);
++      }
++      recentBooks.push_back(std::move(book));
++    }
++    openedBooks.close();
++    return;
++  }
++  openedBookCount = books.size();
    for (const RecentBook& storedBook : books) {
      // Limit to maximum number of recent books
-     if (recentBooks.size() >= maxBooks) {
-@@ -567,6 +568,7 @@
-       continue;
+-    if (recentBooks.size() >= maxBooks) {
++    if (recentBooks.size() >= static_cast<size_t>(maxBooks)) {
+       break;
      }
 
-+    if (coverGridUi && eligible++ > 0 && eligible - 1 <= recentGridPage * 6) continue;
-     ensureReusableCoverPath(book);
-     recentBooks.push_back(book);
-   }
-@@ -1410,6 +1412,26 @@
+@@ -573,59 +598,59 @@
+ }
+
+ void HomeActivity::loadCoverGridThumbnails() {
+-  recentsLoading = true;
+-  bool showingLoading = false;
+-  Rect popupRect;
+-  for (size_t i = 0; i < recentBooks.size(); ++i) {
+-    auto& book = recentBooks[i];
+-    if (book.coverState == RecentBook::CoverState::Missing || !Storage.exists(book.path.c_str())) continue;
+-    const int width = coverGridUi->thumbWidthFor(i);
+-    const int height = coverGridUi->thumbHeightFor(i);
+-    if (book.coverBmpPath.empty()) {
+-      if (FsHelpers::hasEpubExtension(book.path)) {
+-        auto epub = makeUniqueNoThrow<Epub>(book.path, "/.crosspoint");
+-        if (epub) book.coverBmpPath = epub->getThumbBmpPath();
+-      } else if (FsHelpers::hasXtcExtension(book.path)) {
+-        auto xtc = makeUniqueNoThrow<Xtc>(book.path, "/.crosspoint");
+-        if (xtc) book.coverBmpPath = xtc->getThumbBmpPath();
+-      }
+-    }
+-    const std::string thumbPath = UITheme::getCoverThumbPath(book.coverBmpPath, width, height, false);
+-    if (thumbPath.empty()) continue;
+-    FsFile thumbFile;
+-    if (Storage.exists(thumbPath.c_str()) && Storage.openFileForRead("HOME", thumbPath, thumbFile)) {
+-      Bitmap thumb(thumbFile);
+-      const bool matches =
+-          thumb.parseHeaders() == BmpReaderError::Ok && thumb.getWidth() == width && thumb.getHeight() == height;
+-      thumbFile.close();
+-      if (matches) continue;
+-    }
+-    if (!showingLoading) {
+-      showingLoading = true;
+-      popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+-    }
+-    GUI.fillPopupProgress(renderer, popupRect, static_cast<int>(100 * i / std::max<size_t>(1, recentBooks.size())));
+-    renderer.displayBuffer();
+-    if (FsHelpers::hasEpubExtension(book.path)) {
+-      auto epub = makeUniqueNoThrow<Epub>(book.path, "/.crosspoint");
+-      if (!epub) {
+-        LOG_ERR("HOME", "Cannot allocate EPUB for cover grid thumbnail");
+-        continue;
+-      }
+-      if (!epub->generateThumbBmpFromSource(width, height, &renderer, SETTINGS.getReaderFontId())) {
+-        LOG_ERR("HOME", "Cannot create cover grid thumbnail: %s", book.path.c_str());
+-      }
+-    } else if (FsHelpers::hasXtcExtension(book.path)) {
+-      auto xtc = makeUniqueNoThrow<Xtc>(book.path, "/.crosspoint");
+-      if (!xtc) {
+-        LOG_ERR("HOME", "Cannot allocate XTC for cover grid thumbnail");
+-        continue;
+-      }
+-      if (xtc->load()) xtc->generateThumbBmp(static_cast<uint16_t>(width), static_cast<uint16_t>(height));
+-    }
+-  }
++  // Kept as the layout-ready notification; conversion happens on the main
++  // loop's disk-only LibraryCoverWorker, never on the render task.
++  nextHomeCover = 0;
++  homePrefetchRow = openedBookCount ? (1u + static_cast<uint32_t>(recentGridPage + 1) * 6u) % openedBookCount : 0;
++  homePrefetchRemaining = openedBookCount;
++  homeCoverLayoutReady = true;
+   recentsLoaded = true;
+-  recentsLoading = false;
++}
++
++void HomeActivity::prepareHomeCovers() {
++  RenderLock lock(RenderLock::Mode::Try);
++  if (!lock.ownsLock()) return;
++  int row = -1;
++  bool changed = false;
++  if (homeCoverWorker.collect(row, changed) && changed) {
++    for (const auto& book : recentBooks)
++      if (book.path == homeCoverWorker.completedBook()) {
++        homeCoversChanged = true;
++        break;
++      }
++  }
++  if (!coverGridUi || !homeCoverLayoutReady || homeCoverWorker.busy()) return;
++  if (nextHomeCover >= static_cast<int>(recentBooks.size())) {
++    if (homeCoversChanged) {
++      homeCoversChanged = false;
++      coverGridUi->refreshCoverPaths();
++      requestUpdate();
++    }
++    // Same one-job worker as Library: prepare later history pages while idle,
++    // without retaining their metadata or cover pixels in RAM.
++    if (!homePrefetchRemaining || !openedBookCount) return;
++    const uint32_t row = homePrefetchRow;
++    homePrefetchRow = (homePrefetchRow + 1) % openedBookCount;
++    --homePrefetchRemaining;
++    if (row == 0) return;
++    RecentBook book;
++    if (!openedBooks.open()) return;
++    const bool found = openedBooks.read(row, book.path);
++    openedBooks.close();
++    if (!found) return;
++    const int w = coverGridUi->thumbWidthFor(1), h = coverGridUi->thumbHeightFor(1);
++    const auto thumb = gridThumbPath(book, w, h);
++    if (!thumb.empty() && !hasValidGridThumb(thumb, w, h))
++      homeCoverWorker.submit(book.path.c_str(), thumb.c_str(), w, h, -1);
++    return;
++  }
++  const int slot = nextHomeCover++;
++  const auto& book = recentBooks[slot];
++  if (book.coverState == RecentBook::CoverState::Missing) return;
++  const int w = coverGridUi->thumbWidthFor(slot), h = coverGridUi->thumbHeightFor(slot);
++  const auto thumb = gridThumbPath(book, w, h);
++  if (thumb.empty() || hasValidGridThumb(thumb, w, h)) return;
++  homeCoverWorker.submit(book.path.c_str(), thumb.c_str(), w, h, slot);
+ }
+
+ void HomeActivity::loadAllBookStats() {
+@@ -846,6 +871,10 @@
+   RECENT_BOOKS.ensureLoaded();
+   loadRecentBooks(recentBooksToLoad);
+   gridHasContinueReading = !recentBooks.empty();
++  if (coverGridUi) {
++    coverGridUi->setCoverWorker(&homeCoverWorker);
++    homeCoverWorker.start();
++  }
+
+   const auto selectInitialBook = [this, &metrics](const std::string& path) {
+     if (path.empty()) {
+@@ -1001,6 +1030,8 @@
+ }
+
+ void HomeActivity::onFrontlightPanelOpened() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
+   themeBeforeFrontlightPanel = SETTINGS.uiTheme;
+   scaleBeforeFrontlightPanel = SETTINGS.uiScale;
+   // Save the selection before changed theme metrics can reinterpret its index.
+@@ -1008,6 +1039,7 @@
+ }
+
+ void HomeActivity::onFrontlightPanelClosed() {
++  if (coverGridUi) homeCoverWorker.start();
+   if (themeBeforeFrontlightPanel != SETTINGS.uiTheme || scaleBeforeFrontlightPanel != SETTINGS.uiScale) {
+     // Drawer Settings keeps Home alive. Recreate its theme-specific controls,
+     // cover snapshots and thumbnail loading state through the normal lifecycle.
+@@ -1063,6 +1095,9 @@
+ void HomeActivity::onExit() {
+   Activity::onExit();
+
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  openedBooks.close();
+   coverGridUi.reset();
+   carouselMenuTouchDownIndex = -1;
+   freeCoverBuffer();
+@@ -1410,6 +1445,30 @@
    }
 
    if (coverGridUi) {
++    if (homeCoverRestartPending) {
++      homeCoverRestartPending = false;
++      homeCoverWorker.start();
++    }
++    prepareHomeCovers();
 +    const int direction = coverGridUi->pageSwipe(mappedInput);
 +    if (direction != 0) {
 +      coverGridUi->cancelTouch();
-+      int available = 0;
-+      for (const auto& book : RECENT_BOOKS.getBooks())
-+        if (!RecentBooksStore::isMissing(book)) ++available;
-+      const int lastPage = std::max(0, (available - 2) / 6);
++      const int lastPage = openedBookCount > 1 ? static_cast<int>((openedBookCount - 2) / 6) : 0;
 +      const int page = std::clamp(recentGridPage + direction, 0, lastPage);
 +      if (page != recentGridPage) {
 +        RenderLock lock;
@@ -725,6 +1302,8 @@ diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActi
 +        loadRecentBooks(CoverGridHomeUi::MAX_BOOKS);
 +        selectorIndex = 0;
 +        recentsLoaded = false;
++        nextHomeCover = 0;
++        homeCoverLayoutReady = false;
 +        coverGridUi->begin(recentBooks, hasOpdsServers, gridHasContinueReading,
 +                           gridHasContinueReading ? loadRecentBookProgress(recentBooks.front()) : -1.0f);
 +        requestUpdate();
@@ -734,17 +1313,130 @@ diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActi
      const int touched = coverGridUi->selectedAction(mappedInput);
      if (coverGridUi->app.invalidated()) requestUpdate();
      if (touched >= 0 && touched < getMenuItemCount()) {
+@@ -2316,6 +2375,13 @@
+ }
+
+ void HomeActivity::onSelectBook(const std::string& path) {
++  if (!Storage.exists(path.c_str())) {
++    requestUpdate();
++    return;
++  }
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  openedBooks.close();
+   // renderCarouselFrame() uses the same static cache on the render task. Hold
+   // its lock while invalidating so a book selection cannot free a destination
+   // buffer midway through the snapshot copy.
+@@ -2343,7 +2409,11 @@
+   }
+ }
+
+-void HomeActivity::onFileBrowserOpen() { activityManager.goToFileBrowser(); }
++void HomeActivity::onFileBrowserOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  activityManager.goToFileBrowser();
++}
+
+ void HomeActivity::onContinueReading() {
+   if (recentBooks.empty()) return;
+@@ -2356,15 +2426,33 @@
+   }
+ }
+
+-void HomeActivity::onLibraryOpen() { activityManager.goToLibrary(); }
+-
+-void HomeActivity::onSettingsOpen() { activityManager.goToSettings(); }
+-
+-void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
+-
+-void HomeActivity::onOpdsBrowserOpen() { activityManager.goToBrowser(); }
++void HomeActivity::onLibraryOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  activityManager.goToLibrary();
++}
++
++void HomeActivity::onSettingsOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  activityManager.goToSettings();
++}
++
++void HomeActivity::onFileTransferOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  activityManager.goToFileTransfer();
++}
++
++void HomeActivity::onOpdsBrowserOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
++  activityManager.goToBrowser();
++}
+
+ void HomeActivity::onReadingStatsOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
+   if (!SETTINGS.shouldTrackReadingStats()) return;
+   const int highlightedBookIdx = getHighlightedBookIndex();
+   std::string bookTitle =
+@@ -2416,6 +2504,8 @@
+ }
+
+ void HomeActivity::onSavedItemsOpen() {
++  homeCoverWorker.stop();
++  homeCoverRestartPending = true;
+   startActivityForResult(std::make_unique<SavedItemsHomeActivity>(renderer, mappedInput),
+                          [this](const ActivityResult&) { requestUpdate(); });
+ }
 diff --git a/src/activities/home/HomeActivity.h b/src/activities/home/HomeActivity.h
 --- a/src/activities/home/HomeActivity.h
 +++ b/src/activities/home/HomeActivity.h
-@@ -32,6 +32,7 @@
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <HalDisplay.h>
++#include <OpenedBooks.h>
+
+ #include <array>
+ #include <functional>
+@@ -11,6 +12,7 @@
+ #include "./FileBrowserActivity.h"
+ #include "QuickActions.h"
+ #include "activities/Activity.h"
++#include "activities/library/LibraryCoverWorker.h"
+ #include "activities/reader/BookReadingStats.h"
+ #include "activities/reader/GlobalReadingStats.h"
+ #include "components/CoverGridHomeUi.h"
+@@ -32,6 +34,17 @@
    ButtonNavigator buttonNavigator;
    std::unique_ptr<CoverGridHomeUi> coverGridUi;
    bool gridHasContinueReading = false;
 +  int recentGridPage = 0;
++  library::OpenedBooks openedBooks;
++  uint32_t openedBookCount = 0;
++  LibraryCoverWorker homeCoverWorker;
++  int nextHomeCover = 0;
++  uint32_t homePrefetchRow = 0;
++  uint32_t homePrefetchRemaining = 0;
++  bool homeCoverRestartPending = false;
++  bool homeCoversChanged = false;
++  bool homeCoverLayoutReady = false;
++  void prepareHomeCovers();
    int selectorIndex = 0;
    int lastCarouselBookIndex = 0;  // remembered position when leaving carousel row
    int carouselCoverTouchDownIndex = -1;
+@@ -144,6 +157,10 @@
+         initialBookPath(std::move(initialBookPathValue)) {}
+   void onEnter() override;
+   void onExit() override;
++  void onBeforeSleep() override {
++    homeCoverWorker.stop();
++    homeCoverRestartPending = true;
++  }
+   void loop() override;
+   void render(RenderLock&&) override;
+   bool isHomeActivity() const override { return true; }
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
@@ -756,7 +1448,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  #include <Memory.h>
  #include <Utf8.h>
  #include <Xtc.h>
-@@ -18,17 +19,18 @@
+@@ -18,17 +19,19 @@
  #include <algorithm>
  #include <cstdio>
  #include <cstdlib>
@@ -772,11 +1464,12 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  #include "activities/util/ConfirmationActivity.h"
  #include "activities/util/KeyboardEntryActivity.h"
  #include "activities/util/OptionSelectionActivity.h"
++#include "components/BookCoverCache.h"
 +#include "components/CoverGridLayout.h"
  #include "components/TouchHeaderBackButton.h"
  #include "components/UITheme.h"
  #include "components/UiAppHelpers.h"
-@@ -38,6 +40,11 @@
+@@ -38,6 +41,11 @@
  namespace fui = freeink::ui;
 
  namespace {
@@ -788,7 +1481,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  constexpr fui::ActionId ACTION_ROW = 1;
  constexpr fui::ActionId ACTION_CONTROL = 2;
  constexpr unsigned long LONG_PRESS_MS = 1000;
-@@ -45,13 +52,8 @@
+@@ -45,13 +53,8 @@
  constexpr int HEADER_CONTROL_SIZE = 44;
  constexpr int HEADER_CONTROL_GAP = 10;
  constexpr int FOOTER_HEIGHT = 28;
@@ -804,22 +1497,24 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
 
  uint8_t visibleLibraryFileTypes() {
    return (SETTINGS.libraryShowEpub ? library::FileEpub : 0) | (SETTINGS.libraryShowXtc ? library::FileXtc : 0) |
-@@ -63,6 +65,14 @@
-   const auto it =
-       std::find_if(books.begin(), books.end(), [&path](const RecentBook& book) { return book.path == path; });
+@@ -65,16 +68,6 @@
    return it == books.end() ? nullptr : &*it;
-+}
-+
-+std::string gridThumbPath(const RecentBook& book, const int width, const int height) {
-+  if (FsHelpers::hasEpubExtension(book.path))
-+    return Epub::cachePathForFilePath(book.path, "/.crosspoint") + "/thumb_" + std::to_string(width) + "x" +
-+           std::to_string(height) + ".bmp";
-+  if (FsHelpers::hasXtcExtension(book.path)) return Xtc(book.path, "/.crosspoint").getThumbBmpPath(width, height);
-+  return {};
  }
 
- bool hasValidGridThumb(const std::string& path, const int width, const int height) {
-@@ -85,13 +95,16 @@
+-bool hasValidGridThumb(const std::string& path, const int width, const int height) {
+-  FsFile file;
+-  if (path.empty() || !Storage.exists(path.c_str()) || !Storage.openFileForRead("LIB", path, file)) return false;
+-  Bitmap bitmap(file);
+-  const bool valid =
+-      bitmap.parseHeaders() == BmpReaderError::Ok && bitmap.getWidth() == width && bitmap.getHeight() == height;
+-  file.close();
+-  return valid;
+-}
+-
+ int headerControlRightInset() {
+   const auto& metrics = UITheme::getInstance().getMetrics();
+   // Inline battery themes need a separate lane for the options button.
+@@ -85,13 +78,16 @@
  LibraryActivity::LibraryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
      : Activity("Library", renderer, mappedInput),
        uiTarget(makeUiTarget(renderer)),
@@ -837,7 +1532,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    {
      RenderLock lock;
      Activity::onEnter();
-@@ -99,7 +112,8 @@
+@@ -99,7 +95,8 @@
      // The activity can be constructed while a landscape reader is still active.
      // Refresh FreeInkUI's captured screen size and safe area after rotating.
      app.setDevice(uiTarget.deviceContext());
@@ -847,7 +1542,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      applySharedUiTheme(app, uiTarget);
      seriesScratch.reserve(128);
      genreScratch.reserve(128);
-@@ -111,11 +125,12 @@
+@@ -111,11 +108,12 @@
      app.on(ACTION_ROW, &LibraryActivity::onRowEvent, this);
      app.on(ACTION_CONTROL, &LibraryActivity::onControlEvent, this);
      app.setScreen(&LibraryActivity::listScreen, this);
@@ -863,7 +1558,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    }
 
    // Paint the scan message before the main task starts reading the card.
-@@ -133,17 +148,28 @@
+@@ -133,17 +131,28 @@
      ignoreConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
      requestUpdate();
    }
@@ -892,7 +1587,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    if (sort == Sort::RecentlyRead) {
      index.close();
      scanFailed = false;
-@@ -160,9 +186,9 @@
+@@ -160,9 +169,9 @@
      applyFilter();
      return;
    }
@@ -905,7 +1600,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
        index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0)) {
      rebuildIndex(showScanning);
      return;
-@@ -173,12 +199,11 @@
+@@ -173,12 +182,11 @@
  }
 
  bool LibraryActivity::rebuildIndex(const bool showScanning) {
@@ -923,7 +1618,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    uiReady = false;
    index.close();
    if (showScanning) drawScanScreen(tr(STR_LIBRARY_SCANNING));
-@@ -213,6 +238,11 @@
+@@ -213,6 +221,11 @@
        }
      }
    }
@@ -935,7 +1630,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    applyFilter();
    return !scanFailed;
  }
-@@ -285,6 +315,33 @@
+@@ -285,6 +298,33 @@
 
  void LibraryActivity::resolveRecents() {
    recentCount = 0;
@@ -969,7 +1664,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    const auto& books = RECENT_BOOKS.getBooks();
    const std::string needle = library::fold(query);
    const uint8_t visibleTypes = visibleLibraryFileTypes();
-@@ -303,6 +360,40 @@
+@@ -303,6 +343,40 @@
      }
      if (SETTINGS.libraryHideFinishedBooks && BookActions::isBookCompleted(book.path)) continue;
      recentRows[recentCount++] = static_cast<uint16_t>(row);
@@ -1010,7 +1705,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    }
  }
 
-@@ -358,24 +449,8 @@
+@@ -358,24 +432,8 @@
  }
 
  bool LibraryActivity::gridEnabled() const {
@@ -1037,7 +1732,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  }
 
  uint16_t LibraryActivity::ordinalForRow(const int row) {
-@@ -393,7 +468,8 @@
+@@ -393,7 +451,8 @@
    // Sized when the filter ran: the index may be closed (count 0) while a row
    // is still drawn before the activity swaps out.
    if (!filterBits || !filterRanks || row >= filteredCount || filterSourceCount == 0) return UINT16_MAX;
@@ -1047,7 +1742,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    const uint16_t* ranks = filterRanks.get();
    uint16_t block = static_cast<uint16_t>(std::upper_bound(ranks, ranks + blocks, row) - ranks - 1);
    uint16_t seen = filterRanks[block];
-@@ -426,7 +502,78 @@
+@@ -426,7 +485,78 @@
    return true;
  }
 
@@ -1126,7 +1821,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    filteredCount = 0;
    filterFailed = false;
    filterBits.reset();
-@@ -449,26 +596,46 @@
+@@ -449,26 +579,46 @@
      filterFailed = true;
      return;
    }
@@ -1192,7 +1887,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    const auto readIndexedPath = [&](const library::ClixRecord& record) {
      if (!folderOffsets) {
        folderOffsets = makeUniqueNoThrow<uint32_t[]>(library::LibraryIndexFile::FOLDER_CHECKPOINT_COUNT);
-@@ -483,8 +650,9 @@
+@@ -483,8 +633,9 @@
      }
      return true;
    };
@@ -1204,7 +1899,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      if (row % FILTER_BLOCK_ROWS == 0) filterRanks[row / FILTER_BLOCK_ROWS] = filteredCount;
      const uint16_t ordinal = index.ordinalForRow(filterOrder, row);
      library::ClixRecord record{};
-@@ -544,19 +712,33 @@
+@@ -544,19 +695,33 @@
      filterBits[row / 8] |= static_cast<uint8_t>(1u << (row % 8));
      filteredCount++;
    }
@@ -1240,7 +1935,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  }
 
  void LibraryActivity::reloadAfterBookAction() {
-@@ -566,11 +748,12 @@
+@@ -566,11 +731,12 @@
    listNav.top = topIndex;
    listNav.follow(rowCount());
    topIndex = listNav.top;
@@ -1256,7 +1951,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    requestUpdate();
  }
 
-@@ -579,6 +762,7 @@
+@@ -579,6 +745,7 @@
      LOG_ERR("LIB", "Cannot allocate Library dialog");
      return;
    }
@@ -1264,7 +1959,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    pendingInput.clear();
    touchTracking = false;
    app.clearTapFlash();
-@@ -588,6 +772,7 @@
+@@ -588,6 +755,7 @@
      confirmLongPressCaptured = false;
      uiReady = false;
      handler(result);
@@ -1272,7 +1967,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      requestUpdate();
    });
  }
-@@ -596,7 +781,16 @@
+@@ -596,7 +764,16 @@
    RecentBook book;
    if (!readBook(row, book)) return;
    app.clearTapFlash();
@@ -1289,7 +1984,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    onSelectBook(book.path);
  }
 
-@@ -642,12 +836,49 @@
+@@ -642,12 +819,49 @@
  }
 
  void LibraryActivity::openMenu() {
@@ -1341,7 +2036,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    requestUpdate();
  }
 
-@@ -664,7 +895,10 @@
+@@ -664,7 +878,10 @@
  }
 
  void LibraryActivity::refreshLibrary() {
@@ -1353,7 +2048,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    resetViewport();
    requestUpdate();
  }
-@@ -686,7 +920,7 @@
+@@ -686,7 +903,7 @@
    app.clearTapFlash();
    if (control == 0) refreshLibrary();
    if (control == 1) openSearch();
@@ -1362,7 +2057,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    if (control == 3) openSortPicker();
    if (control == 4) {
      descending = !descending;
-@@ -751,32 +985,45 @@
+@@ -751,32 +968,45 @@
    int x = 0;
    int y = 0;
    if (mappedInput.wasScreenTouchDown(x, y)) {
@@ -1420,7 +2115,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    }
    if (released) touchTracking = false;
    switch (swipe) {
-@@ -805,10 +1052,10 @@
+@@ -805,10 +1035,10 @@
      ignoreBackRelease = false;
    }
    if (mappedInput.hasTouchHardware()) {
@@ -1435,7 +2130,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    } else {
      if (mappedInput.wasReleased(MappedInputManager::Button::Left)) queueInput(Type::LeftRelease);
      if (mappedInput.wasReleased(MappedInputManager::Button::Right)) queueInput(Type::RightRelease);
-@@ -848,8 +1095,50 @@
+@@ -848,8 +1078,50 @@
      handleInput(input);
      return;
    }
@@ -1486,7 +2181,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  }
 
  void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
-@@ -917,14 +1206,15 @@
+@@ -917,14 +1189,15 @@
         (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Right))) {
      if (mappedInput.hasTouchHardware()) showSelection = false;
      if (gridEnabled()) {
@@ -1506,7 +2201,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      } else {
        listNav.top = topIndex;
        const int page = listNav.pageRowsFor(rowCount());
-@@ -950,21 +1240,23 @@
+@@ -950,21 +1223,23 @@
    const auto move = [this](const int next) {
      if (!showSelection) {
        showSelection = true;
@@ -1533,7 +2228,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      } else if (selection >= CONTROL_COUNT) {
        listNav.selected = selection - CONTROL_COUNT;
        listNav.top = topIndex;
-@@ -976,7 +1268,7 @@
+@@ -976,7 +1251,7 @@
    if (mappedInput.hasTouchHardware()) {
      if (input.type == Type::Next) move(ButtonNavigator::nextIndex(selection, count));
      if (input.type == Type::Previous) move(ButtonNavigator::previousIndex(selection, count));
@@ -1542,7 +2237,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      if (input.type == Type::NextPage) move(ButtonNavigator::nextPageIndex(selection, count, page));
      if (input.type == Type::PreviousPage) move(ButtonNavigator::previousPageIndex(selection, count, page));
    } else if (rowCount() > 0) {
-@@ -985,7 +1277,7 @@
+@@ -985,7 +1260,7 @@
      const auto moveBook = [&](const int next) { move(CONTROL_COUNT + next); };
      if (input.type == Type::Next) moveBook(ButtonNavigator::nextIndex(row, bookCount));
      if (input.type == Type::Previous) moveBook(ButtonNavigator::previousIndex(row, bookCount));
@@ -1551,7 +2246,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      if (input.type == Type::NextPage) moveBook(ButtonNavigator::nextPageIndex(row, bookCount, page));
      if (input.type == Type::PreviousPage) moveBook(ButtonNavigator::previousPageIndex(row, bookCount, page));
    }
-@@ -1194,7 +1486,7 @@
+@@ -1194,7 +1469,7 @@
                    fui::Rect{static_cast<int16_t>(right - controlSize),
                              static_cast<int16_t>(header.y + header.height - controlSize), controlSize, controlSize});
    }
@@ -1560,7 +2255,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    // Status lines share the sort row's side padding instead of touching the bezel.
    const int16_t statusPadding = static_cast<int16_t>(metrics.contentSidePadding);
    const fui::Insets statusInsets{0, statusPadding, 0, statusPadding};
-@@ -1207,14 +1499,31 @@
+@@ -1207,14 +1482,31 @@
                                 : tr(STR_LIBRARY_UNSORTED),
                    screen.theme().smallText);
    }
@@ -1595,7 +2290,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
        const char* message = tr(STR_LIBRARY_EMPTY);
        if (hasActiveFilter())
          message = tr(STR_LIBRARY_NO_RESULTS);
-@@ -1252,162 +1561,157 @@
+@@ -1252,162 +1544,157 @@
  }
 
  void LibraryActivity::buildGrid(UiApp::ScreenType& screen) {
@@ -1895,7 +2590,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  }
 
  void LibraryActivity::render(RenderLock&&) {
-@@ -1438,8 +1742,16 @@
+@@ -1438,8 +1725,16 @@
                              mappedInput.hasTouchHardware() ? tr(STR_DIR_UP) : tr(STR_SORT),
                              mappedInput.hasTouchHardware() ? tr(STR_DIR_DOWN) : tr(STR_MENU));
    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -1914,7 +2609,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    int bounds[4]{};
    renderer.getOrientedViewableTRBL(&bounds[0], &bounds[1], &bounds[2], &bounds[3]);
    const int buttonHintsHeight =
-@@ -1469,7 +1781,11 @@
+@@ -1469,7 +1764,11 @@
      // The card changed, so a cancelled scan must not keep showing this book.
      scanCancelledThisVisit = false;
      RECENT_BOOKS.removeByPath(path);
@@ -1927,7 +2622,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    };
 
    const std::string heading = tr(STR_DELETE) + std::string("? ");
-@@ -1503,131 +1819,169 @@
+@@ -1503,131 +1802,169 @@
      items.push_back({FileBrowserAction::SendNearby, StrId::STR_SEND_NEARBY_BOOK});
    }
 
@@ -2448,7 +3143,7 @@ diff --git a/src/activities/library/LibraryCoverWorker.h b/src/activities/librar
 new file mode 100644
 --- /dev/null
 +++ b/src/activities/library/LibraryCoverWorker.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
 +#pragma once
 +#include <freertos/FreeRTOS.h>
 +#include <freertos/task.h>
@@ -2466,6 +3161,8 @@ new file mode 100644
 +  void stop();
 +  bool submit(const char* book, const char* thumb, int width, int height, int row);
 +  bool collect(int& row, bool& changed);
++  // Read on the owning task immediately after collect, before submit.
++  const char* completedBook() const { return bookPath; }
 +  bool busy() const;
 +  bool isWriting(const char* thumb) const;
 +
@@ -2732,18 +3429,63 @@ diff --git a/src/activities/reader/XtcReaderActivity.cpp b/src/activities/reader
    if (isCompleted && statsTrackingActive && !stats.finishedDateManual) {
      ReadingStatsDateTime now;
      if (getCurrentLocalReadingStatsDateTime(now)) {
+diff --git a/src/components/BookCoverCache.cpp b/src/components/BookCoverCache.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/components/BookCoverCache.cpp
+@@ -0,0 +1,27 @@
++#include "BookCoverCache.h"
++
++#include <Bitmap.h>
++#include <Epub.h>
++#include <FsHelpers.h>
++#include <HalStorage.h>
++#include <Xtc.h>
++
++#include "RecentBooksStore.h"
++
++std::string gridThumbPath(const RecentBook& book, const int width, const int height) {
++  if (FsHelpers::hasEpubExtension(book.path))
++    return Epub::cachePathForFilePath(book.path, "/.crosspoint") + "/thumb_" + std::to_string(width) + "x" +
++           std::to_string(height) + ".bmp";
++  if (FsHelpers::hasXtcExtension(book.path)) return Xtc(book.path, "/.crosspoint").getThumbBmpPath(width, height);
++  return {};
++}
++
++bool hasValidGridThumb(const std::string& path, const int width, const int height) {
++  FsFile file;
++  if (path.empty() || !Storage.exists(path.c_str()) || !Storage.openFileForRead("LIB", path, file)) return false;
++  Bitmap bitmap(file);
++  const bool valid =
++      bitmap.parseHeaders() == BmpReaderError::Ok && bitmap.getWidth() == width && bitmap.getHeight() == height;
++  file.close();
++  return valid;
++}
+diff --git a/src/components/BookCoverCache.h b/src/components/BookCoverCache.h
+new file mode 100644
+--- /dev/null
++++ b/src/components/BookCoverCache.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include <string>
++struct RecentBook;
++// Shared library/Home thumbnail identity and header validation.
++std::string gridThumbPath(const RecentBook& book, int width, int height);
++bool hasValidGridThumb(const std::string& path, int width, int height);
 diff --git a/src/components/CoverGridHomeUi.cpp b/src/components/CoverGridHomeUi.cpp
 --- a/src/components/CoverGridHomeUi.cpp
 +++ b/src/components/CoverGridHomeUi.cpp
-@@ -8,6 +8,7 @@
+@@ -8,14 +8,17 @@
  #include <cstdio>
  #include <utility>
 
++#include "BookCoverCache.h"
 +#include "CoverGridLayout.h"
  #include "MappedInputManager.h"
  #include "UITheme.h"
++#include "activities/library/LibraryCoverWorker.h"
  #include "components/icons/listIcons.h"
-@@ -15,7 +16,7 @@
+
  namespace fui = freeink::ui;
  namespace {
  constexpr fui::ActionId SELECT = 1;
@@ -2752,7 +3494,21 @@ diff --git a/src/components/CoverGridHomeUi.cpp b/src/components/CoverGridHomeUi
  }  // namespace
 
  CoverGridHomeUi::CoverGridHomeUi(GfxRenderer& renderer)
-@@ -75,10 +76,61 @@
+@@ -41,10 +44,9 @@
+ void CoverGridHomeUi::refreshCoverPath(size_t index) {
+   if (index >= books->size() || index >= coverPaths.size()) return;
+   coverCache.invalidate(index);
+-  coverPaths[index] =
+-      thumbWidths[index] > 0 && thumbHeights[index] > 0
+-          ? UITheme::getCoverThumbPath((*books)[index].coverBmpPath, thumbWidths[index], thumbHeights[index], false)
+-          : std::string();
++  coverPaths[index] = thumbWidths[index] > 0 && thumbHeights[index] > 0
++                          ? gridThumbPath((*books)[index], thumbWidths[index], thumbHeights[index])
++                          : std::string();
+ }
+
+ int CoverGridHomeUi::thumbWidthFor(size_t index) const {
+@@ -75,10 +77,61 @@
    self.app.clearTapFlash();
  }
 
@@ -2816,7 +3572,7 @@ diff --git a/src/components/CoverGridHomeUi.cpp b/src/components/CoverGridHomeUi
  }
 
  void CoverGridHomeUi::screenFn(UiScreen& screen, void* user) { static_cast<CoverGridHomeUi*>(user)->draw(screen); }
-@@ -172,9 +224,8 @@
+@@ -172,9 +225,8 @@
    card.progressHeight = 6;
    card.padding = fui::Insets{6, 6, 6, 6};
    card.gap = theme.spaceLg + theme.spaceSm;
@@ -2828,19 +3584,48 @@ diff --git a/src/components/CoverGridHomeUi.cpp b/src/components/CoverGridHomeUi
    noteThumbSize(0, card.coverSize.width, card.coverSize.height);
    gridBounds = layoutGrid(screen.body());
    rect.x = gridBounds.x;
+@@ -264,7 +316,9 @@
+   const auto ink = fui::Paint::solid(fui::Color::Black);
+   target.fill(fui::Rect{rect.right(), static_cast<int16_t>(rect.y + SHADOW_OFFSET), SHADOW_OFFSET, rect.height}, ink);
+   target.fill(fui::Rect{static_cast<int16_t>(rect.x + SHADOW_OFFSET), rect.bottom(), rect.width, SHADOW_OFFSET}, ink);
+-  const bool drawn = index < coverPaths.size() && coverCache.paint(rect, index, coverPaths[index]);
++  const bool drawn = index < coverPaths.size() &&
++                     (!coverWorker || !coverWorker->isWriting(coverPaths[index].c_str())) &&
++                     coverCache.paint(rect, index, coverPaths[index]);
+   target.stroke(rect, ink, 1, 0);
+   return drawn;
+ }
 diff --git a/src/components/CoverGridHomeUi.h b/src/components/CoverGridHomeUi.h
 --- a/src/components/CoverGridHomeUi.h
 +++ b/src/components/CoverGridHomeUi.h
-@@ -23,6 +23,8 @@
+@@ -11,6 +11,8 @@
+ #include "components/media/book-card.h"
+ #include "components/media/cover-grid.h"
+
++class LibraryCoverWorker;
++
+ class CoverGridHomeUi final : public UiAppHost<16, 1> {
+  public:
+   using UiScreen = UiAppHost<16, 1>::Screen;
+@@ -23,6 +25,9 @@
    void begin(const std::vector<RecentBook>& books, bool hasOpds, bool hasContinueReading, float featuredProgress);
    void refreshCoverPaths();
    void setSelection(int selection) { selected = selection; }
 +  void cancelTouch();
++  void setCoverWorker(const LibraryCoverWorker* worker) { coverWorker = worker; }
 +  int pageSwipe(const MappedInputManager& input);
    int selectedAction(const MappedInputManager& input);
    // Exact generation size for a slot, recorded during draw. Rescaling a
    // dithered 1-bit image aliases badly.
-@@ -53,6 +55,10 @@
+@@ -44,6 +49,7 @@
+   void refreshCoverPath(size_t index);
+   void noteThumbSize(size_t index, int slotWidth, int slotHeight);
+
++  const LibraryCoverWorker* coverWorker = nullptr;
+   HomeCoverCache coverCache;
+   GfxRenderer& renderer;
+   const std::vector<RecentBook>* books = nullptr;
+@@ -53,6 +59,10 @@
    bool thumbHeightsChanged = false;
    int selected = 0;
    int pending = -1;
@@ -3181,12 +3966,12 @@ diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CM
 new file mode 100644
 --- /dev/null
 +++ b/test/library_thumbnails/CMakeLists.txt
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,56 @@
 +find_package(Python3 REQUIRED COMPONENTS Interpreter)
 +set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
 +add_custom_command(OUTPUT ${EXTRACTED}
 +  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryThumbnails.py ${REPO_ROOT} ${EXTRACTED}
-+  DEPENDS ExtractLibraryThumbnails.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp)
++  DEPENDS ExtractLibraryThumbnails.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${REPO_ROOT}/src/components/BookCoverCache.cpp)
 +add_executable(LibraryThumbnailsTest LibraryThumbnailsTest.cpp ${EXTRACTED})
 +target_include_directories(LibraryThumbnailsTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
 +target_link_libraries(LibraryThumbnailsTest PRIVATE crosspoint_test_common GTest::gtest_main)
@@ -3229,10 +4014,15 @@ new file mode 100644
 +add_custom_command(OUTPUT ${HOME_EXTRACTED}
 + COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractHomePaging.py ${REPO_ROOT} ${HOME_EXTRACTED}
 + DEPENDS ExtractHomePaging.py ${REPO_ROOT}/src/activities/home/HomeActivity.cpp)
-+add_executable(HomePagingTest HomePagingTest.cpp ${HOME_EXTRACTED})
-+target_include_directories(HomePagingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++add_executable(HomePagingTest HomePagingTest.cpp ${HOME_EXTRACTED} ${REPO_ROOT}/lib/LibraryIndex/OpenedBooks.cpp)
++target_include_directories(HomePagingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
 +target_link_libraries(HomePagingTest PRIVATE crosspoint_test_common GTest::gtest_main)
 +gtest_discover_tests(HomePagingTest)
++
++add_executable(OpenedBooksTest OpenedBooksTest.cpp ${REPO_ROOT}/lib/LibraryIndex/OpenedBooks.cpp)
++target_include_directories(OpenedBooksTest PRIVATE ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
++target_link_libraries(OpenedBooksTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(OpenedBooksTest)
 diff --git a/test/library_thumbnails/ExtractHomePaging.py b/test/library_thumbnails/ExtractHomePaging.py
 new file mode 100644
 --- /dev/null
@@ -3288,7 +4078,7 @@ new file mode 100644
 @@ -0,0 +1,16 @@
 +import pathlib, sys
 +root = pathlib.Path(sys.argv[1])
-+source = (root / 'src/activities/library/LibraryActivity.cpp').read_text()
++source = (root / 'src/activities/library/LibraryActivity.cpp').read_text() + (root / 'src/components/BookCoverCache.cpp').read_text()
 +def method(signature):
 +    start = source.index(signature)
 +    brace = source.index('{', start)
@@ -3316,14 +4106,15 @@ diff --git a/test/library_thumbnails/HomePagingTest.cpp b/test/library_thumbnail
 new file mode 100644
 --- /dev/null
 +++ b/test/library_thumbnails/HomePagingTest.cpp
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,60 @@
++#include <OpenedBooks.h>
 +#include <gtest/gtest.h>
 +
 +#include <algorithm>
 +#include <string>
 +#include <vector>
 +struct RecentBook {
-+  std::string path;
++  std::string path, title;
 +  bool missing = false;
 +};
 +struct RecentBooksStore {
@@ -3335,37 +4126,46 @@ new file mode 100644
 +struct HomeActivity {
 +  bool coverGridUi = true;
 +  int recentGridPage = 0;
++  library::OpenedBooks openedBooks;
++  uint32_t openedBookCount = 0;
 +  std::vector<RecentBook> recentBooks;
 +  void loadRecentBooks(int maxBooks);
 +};
 +#include "HomePagingMethods.inc"
-+TEST(HomePaging, AllHistoryAppearsOnceBelowPersistentFeaturedBook) {
-+  RECENT_BOOKS.books.clear();
-+  for (int i = 0; i < 18; ++i) RECENT_BOOKS.books.push_back({std::to_string(i)});
++
++TEST(HomePaging, AllDiskHistoryAppearsOnceBelowPersistentFeaturedBook) {
++  fake::reset();
++  RECENT_BOOKS.books.clear();  // No dependence on the old eighteen-entry metadata cache.
++  for (int i = 99; i >= 0; --i) ASSERT_TRUE(library::OpenedBooks::touch("/" + std::to_string(i) + ".epub"));
 +  HomeActivity home;
 +  std::vector<std::string> seen;
-+  for (int page = 0; page < 3; ++page) {
++  for (int page = 0; page < 17; ++page) {
 +    home.recentGridPage = page;
 +    home.loadRecentBooks(7);
 +    ASSERT_LE(home.recentBooks.size(), 7u);
-+    ASSERT_EQ(home.recentBooks.front().path, "0");
++    ASSERT_EQ(home.openedBookCount, 100u);
++    ASSERT_EQ(home.recentBooks.front().path, "/0.epub");
 +    for (size_t i = 1; i < home.recentBooks.size(); ++i) seen.push_back(home.recentBooks[i].path);
 +  }
-+  ASSERT_EQ(seen.size(), 17u);
-+  for (int i = 1; i < 18; ++i) EXPECT_EQ(seen[i - 1], std::to_string(i));
++  ASSERT_EQ(seen.size(), 99u);
++  for (int i = 1; i < 100; ++i) EXPECT_EQ(seen[i - 1], "/" + std::to_string(i) + ".epub");
++  fake::resetIoCounters();
++  home.recentGridPage = 13;
++  home.loadRecentBooks(7);
++  EXPECT_LE(fake::reads, 30u);  // One page, independent of the full history size.
 +  home.recentGridPage = 0;
 +  home.loadRecentBooks(7);
-+  EXPECT_EQ(home.recentBooks[1].path, "1");
++  EXPECT_EQ(home.recentBooks[1].path, "/1.epub");
 +}
-+TEST(HomePaging, MissingEntriesDoNotMakeHolesOrDuplicatePages) {
-+  RECENT_BOOKS.books.clear();
-+  for (int i = 0; i < 18; ++i) RECENT_BOOKS.books.push_back({std::to_string(i), i == 0 || i == 4});
++TEST(HomePaging, HotMetadataIsReusedAndColdBooksNeedNoContentParsing) {
++  fake::reset();
++  RECENT_BOOKS.books = {{"/first.epub", "First"}};
++  for (const char* path : {"/old.epub", "/first.epub"}) ASSERT_TRUE(library::OpenedBooks::touch(path));
 +  HomeActivity home;
-+  home.recentGridPage = 1;
 +  home.loadRecentBooks(7);
-+  ASSERT_EQ(home.recentBooks.size(), 7u);
-+  EXPECT_EQ(home.recentBooks.front().path, "1");
-+  EXPECT_EQ(home.recentBooks[1].path, "9");
++  ASSERT_EQ(home.recentBooks.size(), 2u);
++  EXPECT_EQ(home.recentBooks.front().path, "/first.epub");
++  EXPECT_EQ(home.recentBooks[1].title, "old");
 +}
 diff --git a/test/library_thumbnails/LibraryCoverWorkerTest.cpp b/test/library_thumbnails/LibraryCoverWorkerTest.cpp
 new file mode 100644
@@ -4129,6 +4929,116 @@ new file mode 100644
 +  screen.captureTouch();
 +  ASSERT_TRUE(screen.pending.pop(event));
 +  EXPECT_EQ(event.x, 100);
++}
+diff --git a/test/library_thumbnails/OpenedBooksTest.cpp b/test/library_thumbnails/OpenedBooksTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/OpenedBooksTest.cpp
+@@ -0,0 +1,105 @@
++#include <OpenedBooks.h>
++#include <gtest/gtest.h>
++
++#include <string>
++#include <vector>
++using library::OpenedBooks;
++namespace {
++std::vector<std::string> all() {
++  OpenedBooks file;
++  if (!file.open()) return {};
++  std::vector<std::string> result;
++  for (uint32_t i = 0; i < file.count(); ++i) {
++    std::string path;
++    EXPECT_TRUE(file.read(i, path));
++    result.push_back(path);
++  }
++  file.close();
++  return result;
++}
++}  // namespace
++TEST(OpenedBooks, KeepsMoreThanEighteenAndPromotesWithoutDuplicates) {
++  fake::reset();
++  for (int i = 0; i < 100; ++i) ASSERT_TRUE(OpenedBooks::touch("/book" + std::to_string(i) + ".epub"));
++  auto paths = all();
++  ASSERT_EQ(paths.size(), 100u);
++  EXPECT_EQ(paths.front(), "/book99.epub");
++  EXPECT_EQ(paths.back(), "/book0.epub");
++  ASSERT_TRUE(OpenedBooks::touch("/book4.epub"));
++  paths = all();
++  ASSERT_EQ(paths.size(), 100u);
++  EXPECT_EQ(paths[0], "/book4.epub");
++  EXPECT_EQ(paths[1], "/book99.epub");
++  fake::resetIoCounters();
++  OpenedBooks file;
++  ASSERT_TRUE(file.open());
++  std::string path;
++  ASSERT_TRUE(file.read(85, path));
++  EXPECT_LE(fake::reads, 4u);  // header, one entry, path length and path; no whole-history scan.
++  file.close();
++}
++TEST(OpenedBooks, CurrentBookMetadataRefreshDoesNotRewriteOrdering) {
++  fake::reset();
++  ASSERT_TRUE(OpenedBooks::touch("/a.epub"));
++  const auto writes = fake::writesByPath;
++  ASSERT_TRUE(OpenedBooks::touch("/a.epub"));
++  EXPECT_EQ(fake::writesByPath, writes);
++}
++TEST(OpenedBooks, RenameKeepsPositionAndRemoveDoesNotAffectOtherBooks) {
++  fake::reset();
++  for (const char* p : {"/a.epub", "/b.epub", "/c.epub"}) ASSERT_TRUE(OpenedBooks::touch(p));
++  ASSERT_TRUE(OpenedBooks::rename("/b.epub", "/renamed.epub"));
++  EXPECT_EQ(all(), (std::vector<std::string>{"/c.epub", "/renamed.epub", "/a.epub"}));
++  ASSERT_TRUE(OpenedBooks::remove("/renamed.epub"));
++  EXPECT_EQ(all(), (std::vector<std::string>{"/c.epub", "/a.epub"}));
++}
++TEST(OpenedBooks, FailedWriteAndFailedPublicationRetainPreviousSnapshot) {
++  fake::reset();
++  ASSERT_TRUE(OpenedBooks::touch("/a.epub"));
++  fake::failWritePath = "/.crosspoint/opened.tmp";
++  EXPECT_FALSE(OpenedBooks::touch("/b.epub"));
++  EXPECT_EQ(all(), (std::vector<std::string>{"/a.epub"}));
++  fake::failRenameToPath = "/.crosspoint/opened.idx";
++  EXPECT_FALSE(OpenedBooks::touch("/b.epub"));
++  EXPECT_EQ(all(), (std::vector<std::string>{"/a.epub"}));
++  ASSERT_TRUE(OpenedBooks::touch("/b.epub"));
++  EXPECT_EQ(all(), (std::vector<std::string>{"/b.epub", "/a.epub"}));
++}
++TEST(OpenedBooks, BackupRecoversInterruptedPublicationAndCorruptHeader) {
++  fake::reset();
++  ASSERT_TRUE(OpenedBooks::touch("/a.epub"));
++  ASSERT_TRUE(OpenedBooks::touch("/b.epub"));
++  fake::files["/.crosspoint/opened.idx"]->bytes.resize(3);
++  EXPECT_EQ(all(), (std::vector<std::string>{"/a.epub"}));
++  ASSERT_TRUE(OpenedBooks::touch("/c.epub"));
++  EXPECT_EQ(all(), (std::vector<std::string>{"/c.epub", "/a.epub"}));
++}
++TEST(OpenedBooks, RejectsInvalidPathAndCorruptPathPayload) {
++  fake::reset();
++  EXPECT_FALSE(OpenedBooks::touch("relative.epub"));
++  EXPECT_FALSE(OpenedBooks::touch("/" + std::string(511, 'x')));
++  ASSERT_TRUE(OpenedBooks::touch("/a.epub"));
++  fake::files["/.crosspoint/opened.paths"]->bytes.back() ^= 1;
++  OpenedBooks file;
++  ASSERT_TRUE(file.open());
++  std::string path;
++  EXPECT_FALSE(file.read(0, path));
++  EXPECT_TRUE(path.empty());
++  file.close();
++}
++
++TEST(OpenedBooks, MigrationPublishesAllEntriesTogetherAndRetriesAfterFailure) {
++  fake::reset();
++  const std::vector<std::string> paths = {"/new.epub", "/middle.epub", "/old.epub"};
++  auto pathAt = [](uint32_t row, const void* context) -> const std::string& {
++    return (*static_cast<const std::vector<std::string>*>(context))[row];
++  };
++  fake::failWritePath = "/.crosspoint/opened.tmp";
++  EXPECT_FALSE(OpenedBooks::seed(paths.size(), pathAt, &paths));
++  EXPECT_FALSE(OpenedBooks::exists());
++  ASSERT_TRUE(OpenedBooks::seed(paths.size(), pathAt, &paths));
++  EXPECT_EQ(all(), paths);
++  ASSERT_TRUE(OpenedBooks::touch("/next.epub"));
++  ASSERT_TRUE(OpenedBooks::seed(paths.size(), pathAt, &paths));
++  EXPECT_EQ(all().front(), "/next.epub");
 +}
 diff --git a/test/library_thumbnails/worker_stubs/Epub.h b/test/library_thumbnails/worker_stubs/Epub.h
 new file mode 100644

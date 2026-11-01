@@ -91,7 +91,7 @@ book outline and title. **⋮ → Refresh covers on this page** retries the visi
 nine covers, removing their thumbnail/source-image/negative caches without
 rebuilding the book index or clearing saved view counts.
 
-Latest verification: 126 native tests passed, including zero book-record reads on
+Latest verification: 133 native tests passed, including zero book-record reads on
 warm filter restore, interrupted-filter resume, cache integrity/invalidation,
 cover batching, worker lifecycle, swipe cancellation and stats persistence.
 The updated X4 Pro firmware compiled, linked and passed the OTA size check.
@@ -104,10 +104,26 @@ cancellation stays latched until a fresh touch, so a later release cannot open a
 cover on the destination page. Physical page buttons page the cover grid.
 
 Home cover mode keeps the newest book featured and swipes the six lower covers
-through all retained reading history (currently capped at 18 books). It reuses
-seven cover slots and the existing size-specific thumbnail cache. Home's existing
-first-time thumbnail generation remains synchronous; this change does not add
-a separate background worker to Home.
+through a persistent SD opening order, with no fixed history-book count. The old
+18-entry recent metadata list remains a bounded compatibility cache for existing
+screens; it no longer limits Home cover browsing. Existing entries seed the disk
+ordering atomically. Books already evicted by older firmware cannot be recovered.
+
+Only paths and opening order are persisted in the new history files, never book
+contents or duplicate covers. Opening order uses a monotonic counter and therefore
+works without a correct device clock. Home reads one page directly instead of
+loading/scanning the complete history. It reuses Library's thumbnail path/header
+validation, optional cover-pixel cache, and the same disk-only cover worker.
+Cached cover assets are reused at matching dimensions; missing sizes are generated
+in the background, visible slots first, then later history pages while idle.
+Swipes stay active during conversion. The worker is joined before reader/child
+navigation, frontlight overlays or sleep; partially written thumbnails are never
+painted. Rename and removal update the disk ordering as well as legacy recents.
+
+Verification includes 100-book disk history and Home paging with an empty legacy
+metadata cache, bounded reads per page, duplicate-free promotion, rename/removal,
+write/rename failure recovery, and atomic migration retry. The complete ten-patch
+series applies cleanly to the pinned upstream source.
 
 ## Direct firmware downloads
 
