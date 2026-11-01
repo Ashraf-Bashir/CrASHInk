@@ -1,7 +1,7 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -1,5 +1,14 @@
+@@ -1,5 +1,16 @@
  ## [Unreleased]
 
 +### Added
@@ -9,6 +9,8 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 +- Library cover view uses the same three-column cover component, proportions and frames as Home, without book-name labels. Cover conversion runs on a low-priority disk-only worker, preparing visible books first and then other pages while idle. Swipes cancel taps before paging; holding a cover keeps the existing book menu. Display settings separate All books, Recently opened and List grouping. Library filters progress after the first paint instead of blocking entry; index reads reuse SD sectors rather than issuing a small read per folder.
 +
 +### Fixed
++
++- Marking a book finished updates Library rows without restarting its filter; shifted history indices no longer leave stale covers. Swipes suppress delayed taps and physical page buttons page cover views. Home cover grid swipes through all retained reading history while keeping the current book featured.
 +
 +- Library cover view keeps its 3 × 3 grid while moving sorting into the menu and combining counts/pages in one compact footer. Covers use tight centered gaps, retain painted pixels, and update as a batch. Completed filtered/recent views are cached on SD, so returning to an unchanged library restores counts without rescanning. Missing covers show the book title inside a book outline; “Refresh covers on this page” retries those nine covers.
 +
@@ -481,6 +483,27 @@ diff --git a/lib/LibraryIndex/LibraryIndexFile.h b/lib/LibraryIndex/LibraryIndex
    HalFile file;
    ClixHeader head{};
    bool opened = false;
+diff --git a/lib/LibraryIndex/LibraryRecentOrder.h b/lib/LibraryIndex/LibraryRecentOrder.h
+--- a/lib/LibraryIndex/LibraryRecentOrder.h
++++ b/lib/LibraryIndex/LibraryRecentOrder.h
+@@ -4,6 +4,17 @@
+ #include <cstdint>
+
+ namespace library {
++
++// Compact visible rows before reading history shifts. No file reads or refilter.
++inline size_t removeRecentRow(uint16_t* rows, size_t count, int historyRow, bool removed, bool hide) {
++  size_t write = 0;
++  for (size_t i = 0; i < count; ++i) {
++    const int row = rows[i];
++    if (row == historyRow && (removed || hide)) continue;
++    rows[write++] = row - (removed && row > historyRow ? 1 : 0);
++  }
++  return write;
++}
+
+ // Map a visible row to reading history, stored in newest-opened order.
+ inline uint16_t recentHistoryRow(const uint16_t row, const uint16_t total, const uint16_t* recentRows,
 diff --git a/lib/LibraryIndex/LibraryViewCache.cpp b/lib/LibraryIndex/LibraryViewCache.cpp
 new file mode 100644
 --- /dev/null
@@ -655,6 +678,73 @@ diff --git a/src/activities/home/BookActions.cpp b/src/activities/home/BookActio
    const bool trackStats = BookStatsTracking::isEnabled(cachePath);
    if (completed && trackStats && !stats.finishedDateManual) {
      ReadingStatsDateTime now;
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -4,8 +4,8 @@
+ #include <Epub.h>
+ #include <FsHelpers.h>
+ #include <GfxRenderer.h>
++#include <HalDisplay.h>
+ #include <HalFrontlight.h>
+-#include <HalDisplay.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+ #include <Memory.h>
+@@ -556,6 +556,7 @@
+   const auto& books = RECENT_BOOKS.getBooks();
+   recentBooks.reserve(coverGridUi ? maxBooks : std::min(static_cast<int>(books.size()), maxBooks));
+
++  int eligible = 0;
+   for (const RecentBook& storedBook : books) {
+     // Limit to maximum number of recent books
+     if (recentBooks.size() >= maxBooks) {
+@@ -567,6 +568,7 @@
+       continue;
+     }
+
++    if (coverGridUi && eligible++ > 0 && eligible - 1 <= recentGridPage * 6) continue;
+     ensureReusableCoverPath(book);
+     recentBooks.push_back(book);
+   }
+@@ -1410,6 +1412,26 @@
+   }
+
+   if (coverGridUi) {
++    const int direction = coverGridUi->pageSwipe(mappedInput);
++    if (direction != 0) {
++      coverGridUi->cancelTouch();
++      int available = 0;
++      for (const auto& book : RECENT_BOOKS.getBooks())
++        if (!RecentBooksStore::isMissing(book)) ++available;
++      const int lastPage = std::max(0, (available - 2) / 6);
++      const int page = std::clamp(recentGridPage + direction, 0, lastPage);
++      if (page != recentGridPage) {
++        RenderLock lock;
++        recentGridPage = page;
++        loadRecentBooks(CoverGridHomeUi::MAX_BOOKS);
++        selectorIndex = 0;
++        recentsLoaded = false;
++        coverGridUi->begin(recentBooks, hasOpdsServers, gridHasContinueReading,
++                           gridHasContinueReading ? loadRecentBookProgress(recentBooks.front()) : -1.0f);
++        requestUpdate();
++      }
++      return;
++    }
+     const int touched = coverGridUi->selectedAction(mappedInput);
+     if (coverGridUi->app.invalidated()) requestUpdate();
+     if (touched >= 0 && touched < getMenuItemCount()) {
+diff --git a/src/activities/home/HomeActivity.h b/src/activities/home/HomeActivity.h
+--- a/src/activities/home/HomeActivity.h
++++ b/src/activities/home/HomeActivity.h
+@@ -32,6 +32,7 @@
+   ButtonNavigator buttonNavigator;
+   std::unique_ptr<CoverGridHomeUi> coverGridUi;
+   bool gridHasContinueReading = false;
++  int recentGridPage = 0;
+   int selectorIndex = 0;
+   int lastCarouselBookIndex = 0;  // remembered position when leaving carousel row
+   int carouselCoverTouchDownIndex = -1;
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
@@ -1182,16 +1272,24 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      requestUpdate();
    });
  }
-@@ -596,6 +781,8 @@
+@@ -596,7 +781,16 @@
    RecentBook book;
    if (!readBook(row, book)) return;
    app.clearTapFlash();
 +  coverWorker.stop();
 +  changeProbe.reset();
    index.close();
++  if (!Storage.exists(book.path.c_str())) {
++    index.open(library::libraryIndexPath());
++    refreshSuggested = true;
++    uiReady = false;
++    requestUpdate();
++    return;
++  }
    onSelectBook(book.path);
  }
-@@ -642,12 +829,49 @@
+
+@@ -642,12 +836,49 @@
  }
 
  void LibraryActivity::openMenu() {
@@ -1243,7 +1341,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    requestUpdate();
  }
 
-@@ -664,7 +888,10 @@
+@@ -664,7 +895,10 @@
  }
 
  void LibraryActivity::refreshLibrary() {
@@ -1255,7 +1353,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    resetViewport();
    requestUpdate();
  }
-@@ -686,7 +913,7 @@
+@@ -686,7 +920,7 @@
    app.clearTapFlash();
    if (control == 0) refreshLibrary();
    if (control == 1) openSearch();
@@ -1264,9 +1362,11 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    if (control == 3) openSortPicker();
    if (control == 4) {
      descending = !descending;
-@@ -752,31 +979,39 @@
+@@ -751,32 +985,45 @@
+   int x = 0;
    int y = 0;
    if (mappedInput.wasScreenTouchDown(x, y)) {
++    touchCancelled = false;
      touchTracking = true;
 +    touchMoved = false;
      touchStartX = touchLastX = x;
@@ -1298,7 +1398,11 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
 -  if (snap.touchPressed) queueInput(Type::TouchPress, snap.touchX, snap.touchY);
 -  if (snap.touchReleased)
 +  const bool navigated = swipe != MappedInputManager::SwipeDir::None;
-+  const bool cancelled = navigated || touchMoved;
++  if (navigated || touchMoved ||
++      (released && touchTracking &&
++       std::max(std::abs(snap.touchX - touchStartX), std::abs(snap.touchY - touchStartY)) > 28))
++    touchCancelled = true;
++  const bool cancelled = touchCancelled;
 +  if (snap.touchPressed && !cancelled) queueInput(Type::TouchPress, snap.touchX, snap.touchY);
 +  if (navigated || (snap.touchReleased && cancelled)) {
 +    // Cancel the SDK press before the page event; never replay a release over
@@ -1316,7 +1420,22 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    }
    if (released) touchTracking = false;
    switch (swipe) {
-@@ -848,8 +1083,50 @@
+@@ -805,10 +1052,10 @@
+     ignoreBackRelease = false;
+   }
+   if (mappedInput.hasTouchHardware()) {
+-    buttonNavigator.onNextRelease([&] { queueInput(Type::Next); });
+-    buttonNavigator.onPreviousRelease([&] { queueInput(Type::Previous); });
+-    buttonNavigator.onNextContinuous([&] { queueInput(Type::NextPage); });
+-    buttonNavigator.onPreviousContinuous([&] { queueInput(Type::PreviousPage); });
++    buttonNavigator.onNextRelease([&] { queueInput(gridEnabled() ? Type::SwipeLeft : Type::Next); });
++    buttonNavigator.onPreviousRelease([&] { queueInput(gridEnabled() ? Type::SwipeRight : Type::Previous); });
++    buttonNavigator.onNextContinuous([&] { queueInput(gridEnabled() ? Type::SwipeLeft : Type::NextPage); });
++    buttonNavigator.onPreviousContinuous([&] { queueInput(gridEnabled() ? Type::SwipeRight : Type::PreviousPage); });
+   } else {
+     if (mappedInput.wasReleased(MappedInputManager::Button::Left)) queueInput(Type::LeftRelease);
+     if (mappedInput.wasReleased(MappedInputManager::Button::Right)) queueInput(Type::RightRelease);
+@@ -848,8 +1095,50 @@
      handleInput(input);
      return;
    }
@@ -1367,7 +1486,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  }
 
  void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
-@@ -917,14 +1194,15 @@
+@@ -917,14 +1206,15 @@
         (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Right))) {
      if (mappedInput.hasTouchHardware()) showSelection = false;
      if (gridEnabled()) {
@@ -1387,7 +1506,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      } else {
        listNav.top = topIndex;
        const int page = listNav.pageRowsFor(rowCount());
-@@ -950,21 +1228,23 @@
+@@ -950,21 +1240,23 @@
    const auto move = [this](const int next) {
      if (!showSelection) {
        showSelection = true;
@@ -1414,7 +1533,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      } else if (selection >= CONTROL_COUNT) {
        listNav.selected = selection - CONTROL_COUNT;
        listNav.top = topIndex;
-@@ -976,7 +1256,7 @@
+@@ -976,7 +1268,7 @@
    if (mappedInput.hasTouchHardware()) {
      if (input.type == Type::Next) move(ButtonNavigator::nextIndex(selection, count));
      if (input.type == Type::Previous) move(ButtonNavigator::previousIndex(selection, count));
@@ -1423,7 +1542,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      if (input.type == Type::NextPage) move(ButtonNavigator::nextPageIndex(selection, count, page));
      if (input.type == Type::PreviousPage) move(ButtonNavigator::previousPageIndex(selection, count, page));
    } else if (rowCount() > 0) {
-@@ -985,7 +1265,7 @@
+@@ -985,7 +1277,7 @@
      const auto moveBook = [&](const int next) { move(CONTROL_COUNT + next); };
      if (input.type == Type::Next) moveBook(ButtonNavigator::nextIndex(row, bookCount));
      if (input.type == Type::Previous) moveBook(ButtonNavigator::previousIndex(row, bookCount));
@@ -1432,7 +1551,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
      if (input.type == Type::NextPage) moveBook(ButtonNavigator::nextPageIndex(row, bookCount, page));
      if (input.type == Type::PreviousPage) moveBook(ButtonNavigator::previousPageIndex(row, bookCount, page));
    }
-@@ -1194,7 +1474,7 @@
+@@ -1194,7 +1486,7 @@
                    fui::Rect{static_cast<int16_t>(right - controlSize),
                              static_cast<int16_t>(header.y + header.height - controlSize), controlSize, controlSize});
    }
@@ -1441,7 +1560,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    // Status lines share the sort row's side padding instead of touching the bezel.
    const int16_t statusPadding = static_cast<int16_t>(metrics.contentSidePadding);
    const fui::Insets statusInsets{0, statusPadding, 0, statusPadding};
-@@ -1207,14 +1487,31 @@
+@@ -1207,14 +1499,31 @@
                                 : tr(STR_LIBRARY_UNSORTED),
                    screen.theme().smallText);
    }
@@ -1476,7 +1595,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
        const char* message = tr(STR_LIBRARY_EMPTY);
        if (hasActiveFilter())
          message = tr(STR_LIBRARY_NO_RESULTS);
-@@ -1252,162 +1549,157 @@
+@@ -1252,162 +1561,157 @@
  }
 
  void LibraryActivity::buildGrid(UiApp::ScreenType& screen) {
@@ -1776,7 +1895,7 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
  }
 
  void LibraryActivity::render(RenderLock&&) {
-@@ -1438,8 +1730,16 @@
+@@ -1438,8 +1742,16 @@
                              mappedInput.hasTouchHardware() ? tr(STR_DIR_UP) : tr(STR_SORT),
                              mappedInput.hasTouchHardware() ? tr(STR_DIR_DOWN) : tr(STR_MENU));
    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -1795,6 +1914,317 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
    int bounds[4]{};
    renderer.getOrientedViewableTRBL(&bounds[0], &bounds[1], &bounds[2], &bounds[3]);
    const int buttonHintsHeight =
+@@ -1469,7 +1781,11 @@
+     // The card changed, so a cancelled scan must not keep showing this book.
+     scanCancelledThisVisit = false;
+     RECENT_BOOKS.removeByPath(path);
+-    reloadAfterBookAction();
++    if (sort != Sort::RecentlyRead) {
++      rebuildIndex(true);
++      resetViewport();
++    } else
++      reloadAfterBookAction();
+   };
+
+   const std::string heading = tr(STR_DELETE) + std::string("? ");
+@@ -1503,131 +1819,169 @@
+     items.push_back({FileBrowserAction::SendNearby, StrId::STR_SEND_NEARBY_BOOK});
+   }
+
+-  openDialog(makeUniqueNoThrow<FileBrowserActionActivity>(renderer, mappedInput, book.title, std::move(items),
+-                                                          ignoreInitialConfirmRelease),
+-             [this, book](const ActivityResult& result) {
+-               confirmLongPressCaptured = false;
+-               if (result.isCancelled) {
+-                 return;
+-               }
+-
+-               const auto* actionResult = std::get_if<FileBrowserActionResult>(&result.data);
+-               if (!actionResult) {
+-                 LOG_ERR("LIB", "Book action result missing");
+-                 return;
+-               }
+-
+-               switch (static_cast<FileBrowserAction>(actionResult->action)) {
+-                 case FileBrowserAction::ToggleBookStatsTracking: {
+-                   bool enabled = false;
+-                   if (!BookActions::toggleBookStatsTracking(book.path, enabled)) {
+-                     const std::string error = std::string(tr(STR_TRACK_READING_STATS)) + " " + tr(STR_FAILED_LOWER);
+-                     BookActions::drawToast(renderer, error.c_str());
+-                   }
+-                   reloadAfterBookAction();
+-                   return;
+-                 }
+-                 case FileBrowserAction::ReadingStats:
+-                   openDialog(BookActions::createReadingStatsActivity(renderer, mappedInput, book.path, book.title),
+-                              [this](const ActivityResult&) { requestUpdate(); });
+-                   return;
+-                 case FileBrowserAction::Delete:
+-                   promptDeleteBook(book);
+-                   return;
+-                 case FileBrowserAction::DeleteCache:
+-                   openDialog(makeUniqueNoThrow<ConfirmationActivity>(
+-                                  renderer, mappedInput, BookActions::confirmationHeading(StrId::STR_DELETE_CACHE),
+-                                  book.title),
+-                              [this, book](const ActivityResult& confirmation) {
+-                                if (!confirmation.isCancelled) {
+-                                  if (!BookActions::clearBookCache(book.path)) {
+-                                    LOG_ERR("LIB", "Failed to clear book cache for: %s", book.path.c_str());
+-                                  } else {
+-                                    pendingCacheDeletedFeedback = true;
+-                                    cacheDeletedFeedbackShowTime = millis();
+-                                  }
+-                                }
+-                                reloadAfterBookAction();
+-                              });
+-                   return;
+-                 case FileBrowserAction::DeleteStats:
+-                   openDialog(makeUniqueNoThrow<ConfirmationActivity>(
+-                                  renderer, mappedInput, BookActions::confirmationHeading(StrId::STR_DELETE_BOOK_STATS),
+-                                  book.title),
+-                              [this, book](const ActivityResult& confirmation) {
+-                                if (!confirmation.isCancelled) {
+-                                  if (!BookActions::deleteBookStats(book.path)) {
+-                                    LOG_ERR("LIB", "Failed to delete book stats for: %s", book.path.c_str());
+-                                  } else {
+-                                    BookActions::drawToast(renderer, tr(STR_BOOK_STATS_DELETED));
+-                                    delay(1000);
+-                                  }
+-                                }
+-                                reloadAfterBookAction();
+-                              });
+-                   return;
+-                 case FileBrowserAction::ResetReaderSettings:
+-                   openDialog(makeUniqueNoThrow<ConfirmationActivity>(
+-                                  renderer, mappedInput,
+-                                  BookActions::confirmationHeading(StrId::STR_RESET_BOOK_READER_SETTINGS), book.title),
+-                              [this, book](const ActivityResult& confirmation) {
+-                                if (!confirmation.isCancelled) {
+-                                  if (!BookActions::resetBookReaderSettings(book.path)) {
+-                                    LOG_ERR("LIB", "Failed to reset reader settings for: %s", book.path.c_str());
+-                                  } else {
+-                                    BookActions::drawToast(renderer, tr(STR_BOOK_READER_SETTINGS_RESET));
+-                                    delay(1000);
+-                                  }
+-                                }
+-                                reloadAfterBookAction();
+-                              });
+-                   return;
+-                 case FileBrowserAction::ToggleCompleted: {
+-                   bool completed = false;
+-                   if (BookActions::toggleBookCompleted(book.path, book.title, completed)) {
+-                     BookActions::drawToast(renderer, completed ? tr(STR_MARKED_FINISHED) : tr(STR_MARKED_UNFINISHED));
+-                     delay(1000);
+-                   }
+-                   reloadAfterBookAction();
+-                   return;
+-                 }
+-                 case FileBrowserAction::EpubRenderMode: {
+-                   const uint8_t currentIndex =
+-                       BookActions::epubRenderModeDisplayIndex(EpubReaderActivity::loadBookRenderMode(book.path));
+-                   openDialog(makeUniqueNoThrow<OptionSelectionActivity>(
+-                                  renderer, mappedInput, "LibraryEpubRenderModeSelect", StrId::STR_EPUB_RENDER_MODE,
+-                                  BookActions::epubRenderModeOptions(), currentIndex),
+-                              [this, book](const ActivityResult& selectionResult) {
+-                                if (!selectionResult.isCancelled) {
+-                                  const auto* selection = std::get_if<OptionSelectionResult>(&selectionResult.data);
+-                                  if (selection != nullptr &&
+-                                      !EpubReaderActivity::saveBookRenderMode(
+-                                          book.path, BookActions::epubRenderModeForDisplayIndex(selection->index))) {
+-                                    LOG_ERR("LIB", "Failed to save render mode for: %s", book.path.c_str());
+-                                  }
+-                                }
+-                                reloadAfterBookAction();
+-                              });
+-                   return;
+-                 }
+-                 case FileBrowserAction::RemoveFromRecents:
+-                   promptRemoveBook(book.path, book.title);
+-                   return;
+-                 case FileBrowserAction::SendNearby:
+-                   activityManager.goToNearbyBookSend(book.path, false);
+-                   return;
+-                 case FileBrowserAction::PinFavorite:
+-                 case FileBrowserAction::UnpinFavorite:
+-                 case FileBrowserAction::PinBootFavorite:
+-                 case FileBrowserAction::UnpinBootFavorite:
+-                 case FileBrowserAction::SetSleepFolder:
+-                 case FileBrowserAction::ClearSleepFolder:
+-                 case FileBrowserAction::ViewBookmarks:
+-                 case FileBrowserAction::ViewClippings:
+-                 case FileBrowserAction::DeleteBookmarks:
+-                 case FileBrowserAction::DeleteClippings:
+-                 case FileBrowserAction::Rename:
+-                   return;
+-               }
+-             });
+-}
++  openDialog(
++      makeUniqueNoThrow<FileBrowserActionActivity>(renderer, mappedInput, book.title, std::move(items),
++                                                   ignoreInitialConfirmRelease),
++      [this, book, bookIndex](const ActivityResult& result) {
++        confirmLongPressCaptured = false;
++        if (result.isCancelled) {
++          return;
++        }
++
++        const auto* actionResult = std::get_if<FileBrowserActionResult>(&result.data);
++        if (!actionResult) {
++          LOG_ERR("LIB", "Book action result missing");
++          return;
++        }
++
++        switch (static_cast<FileBrowserAction>(actionResult->action)) {
++          case FileBrowserAction::ToggleBookStatsTracking: {
++            bool enabled = false;
++            if (!BookActions::toggleBookStatsTracking(book.path, enabled)) {
++              const std::string error = std::string(tr(STR_TRACK_READING_STATS)) + " " + tr(STR_FAILED_LOWER);
++              BookActions::drawToast(renderer, error.c_str());
++            }
++            reloadAfterBookAction();
++            return;
++          }
++          case FileBrowserAction::ReadingStats:
++            openDialog(BookActions::createReadingStatsActivity(renderer, mappedInput, book.path, book.title),
++                       [this](const ActivityResult&) { requestUpdate(); });
++            return;
++          case FileBrowserAction::Delete:
++            promptDeleteBook(book);
++            return;
++          case FileBrowserAction::DeleteCache:
++            openDialog(
++                makeUniqueNoThrow<ConfirmationActivity>(
++                    renderer, mappedInput, BookActions::confirmationHeading(StrId::STR_DELETE_CACHE), book.title),
++                [this, book](const ActivityResult& confirmation) {
++                  if (!confirmation.isCancelled) {
++                    if (!BookActions::clearBookCache(book.path)) {
++                      LOG_ERR("LIB", "Failed to clear book cache for: %s", book.path.c_str());
++                    } else {
++                      pendingCacheDeletedFeedback = true;
++                      cacheDeletedFeedbackShowTime = millis();
++                    }
++                  }
++                  reloadAfterBookAction();
++                });
++            return;
++          case FileBrowserAction::DeleteStats:
++            openDialog(
++                makeUniqueNoThrow<ConfirmationActivity>(
++                    renderer, mappedInput, BookActions::confirmationHeading(StrId::STR_DELETE_BOOK_STATS), book.title),
++                [this, book](const ActivityResult& confirmation) {
++                  if (!confirmation.isCancelled) {
++                    if (!BookActions::deleteBookStats(book.path)) {
++                      LOG_ERR("LIB", "Failed to delete book stats for: %s", book.path.c_str());
++                    } else {
++                      BookActions::drawToast(renderer, tr(STR_BOOK_STATS_DELETED));
++                      delay(1000);
++                    }
++                  }
++                  reloadAfterBookAction();
++                });
++            return;
++          case FileBrowserAction::ResetReaderSettings:
++            openDialog(makeUniqueNoThrow<ConfirmationActivity>(
++                           renderer, mappedInput,
++                           BookActions::confirmationHeading(StrId::STR_RESET_BOOK_READER_SETTINGS), book.title),
++                       [this, book](const ActivityResult& confirmation) {
++                         if (!confirmation.isCancelled) {
++                           if (!BookActions::resetBookReaderSettings(book.path)) {
++                             LOG_ERR("LIB", "Failed to reset reader settings for: %s", book.path.c_str());
++                           } else {
++                             BookActions::drawToast(renderer, tr(STR_BOOK_READER_SETTINGS_RESET));
++                             delay(1000);
++                           }
++                         }
++                         reloadAfterBookAction();
++                       });
++            return;
++          case FileBrowserAction::ToggleCompleted: {
++            const auto& before = RECENT_BOOKS.getBooks();
++            const auto found = std::find_if(before.begin(), before.end(),
++                                            [&book](const RecentBook& entry) { return entry.path == book.path; });
++            const int historyRow = found == before.end() ? -1 : static_cast<int>(found - before.begin());
++            const size_t oldCount = before.size();
++            bool completed = false;
++            if (BookActions::toggleBookCompleted(book.path, book.title, completed)) {
++              if (sort == Sort::RecentlyRead) {
++                const bool removed = RECENT_BOOKS.getBooks().size() < oldCount;
++                recentCount = library::removeRecentRow(recentRows, recentCount, historyRow, removed,
++                                                       completed && SETTINGS.libraryHideFinishedBooks);
++                if (removed && filterWork && filterWork->cursor > historyRow) --filterWork->cursor;
++                cachedViewKey = viewCacheKey(true);
++                if (filterWork)
++                  saveViewProgress();
++                else
++                  library::saveViewCache(true, cachedViewKey, RECENT_BOOKS.getCount(), recentCount, recentRows,
++                                         sizeof(recentRows));
++              } else if (completed && SETTINGS.libraryHideFinishedBooks && filterBits) {
++                const auto source = filteredSourceRow(static_cast<uint16_t>(bookIndex));
++                if (source != UINT16_MAX) {
++                  filterBits[source / 8] &= static_cast<uint8_t>(~(1u << (source % 8)));
++                  uint16_t count = 0;
++                  for (uint32_t row = 0; row < filterProcessedCount; ++row) {
++                    if (row % FILTER_BLOCK_ROWS == 0) filterRanks[row / FILTER_BLOCK_ROWS] = count;
++                    if (filterBits[row / 8] & (1u << (row % 8))) ++count;
++                  }
++                  filteredCount = count;
++                  if (filterWork)
++                    saveViewProgress();
++                  else
++                    saveFilterCache();
++                }
++              }
++              selection = std::clamp(selection, CONTROL_COUNT, std::max(CONTROL_COUNT, CONTROL_COUNT + rowCount() - 1));
++              gridPageStart =
++                  rowCount() ? std::min(gridPageStart, ((rowCount() - 1) / gridPageSize()) * gridPageSize()) : 0;
++              loadedGridPageStart = -1;
++              paintedCovers.invalidate();
++              failedCoverSlots = 0;
++              prefetchFinished = false;
++              prefetchCoverRow = -1;
++            }
++            return;
++          }
++          case FileBrowserAction::EpubRenderMode: {
++            const uint8_t currentIndex =
++                BookActions::epubRenderModeDisplayIndex(EpubReaderActivity::loadBookRenderMode(book.path));
++            openDialog(makeUniqueNoThrow<OptionSelectionActivity>(renderer, mappedInput, "LibraryEpubRenderModeSelect",
++                                                                  StrId::STR_EPUB_RENDER_MODE,
++                                                                  BookActions::epubRenderModeOptions(), currentIndex),
++                       [this, book](const ActivityResult& selectionResult) {
++                         if (!selectionResult.isCancelled) {
++                           const auto* selection = std::get_if<OptionSelectionResult>(&selectionResult.data);
++                           if (selection != nullptr &&
++                               !EpubReaderActivity::saveBookRenderMode(
++                                   book.path, BookActions::epubRenderModeForDisplayIndex(selection->index))) {
++                             LOG_ERR("LIB", "Failed to save render mode for: %s", book.path.c_str());
++                           }
++                         }
++                         reloadAfterBookAction();
++                       });
++            return;
++          }
++          case FileBrowserAction::RemoveFromRecents:
++            promptRemoveBook(book.path, book.title);
++            return;
++          case FileBrowserAction::SendNearby:
++            activityManager.goToNearbyBookSend(book.path, false);
++            return;
++          case FileBrowserAction::PinFavorite:
++          case FileBrowserAction::UnpinFavorite:
++          case FileBrowserAction::PinBootFavorite:
++          case FileBrowserAction::UnpinBootFavorite:
++          case FileBrowserAction::SetSleepFolder:
++          case FileBrowserAction::ClearSleepFolder:
++          case FileBrowserAction::ViewBookmarks:
++          case FileBrowserAction::ViewClippings:
++          case FileBrowserAction::DeleteBookmarks:
++          case FileBrowserAction::DeleteClippings:
++          case FileBrowserAction::Rename:
++            return;
++        }
++      });
++}
 diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
 --- a/src/activities/library/LibraryActivity.h
 +++ b/src/activities/library/LibraryActivity.h
@@ -1844,7 +2274,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    Sort sort = Sort::RecentlyRead;
    bool descending = true;
    int selection = CONTROL_COUNT;
-@@ -59,8 +75,23 @@
+@@ -59,8 +75,24 @@
    int nextGridCoverRow = -1;
    int16_t gridCoverWidth = 0;
    int16_t gridCoverHeight = 0;
@@ -1867,10 +2297,11 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
 +  int prefetchStopRow = -1;
 +  bool prefetchFinished = false;
 +  bool touchMoved = false;
++  bool touchCancelled = false;
    bool uiReady = false;
    bool initialScanPending = false;
    bool confirmLongPressCaptured = false;
-@@ -96,6 +127,15 @@
+@@ -96,6 +128,15 @@
    library::SortOrder filterOrder = library::SortOrder::TitleAsc;
    uint16_t filterSourceCount = 0;
    uint16_t filteredCount = 0;
@@ -1886,7 +2317,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    // Indices into the bounded recent-books history, independent of the Library index.
    uint16_t recentRows[RecentBooksStore::MAX_RECENT_BOOKS]{};
    size_t recentCount = 0;
-@@ -118,7 +158,7 @@
+@@ -118,7 +159,7 @@
    void buildGrid(UiApp::ScreenType& screen);
    void loadGridPageCovers();
    bool loadGridCover(int row);
@@ -1895,7 +2326,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    bool gridEnabled() const;
    void buildSortHeader(UiApp::ScreenType& screen);
    const char* sortLabel() const;
-@@ -142,6 +182,7 @@
+@@ -142,6 +183,7 @@
    static void onScanProgress(void* context, const library::BuildProgress& progress);
    void readRecentBook(size_t historyRow, RecentBook& book) const;
    void resolveRecents();
@@ -2321,7 +2752,71 @@ diff --git a/src/components/CoverGridHomeUi.cpp b/src/components/CoverGridHomeUi
  }  // namespace
 
  CoverGridHomeUi::CoverGridHomeUi(GfxRenderer& renderer)
-@@ -172,9 +173,8 @@
+@@ -75,10 +76,61 @@
+   self.app.clearTapFlash();
+ }
+
++int CoverGridHomeUi::pageSwipe(const MappedInputManager& input) {
++  int x = 0, y = 0;
++  if (input.wasScreenTouchDown(x, y)) {
++    touchTracking = true;
++    touchCancelled = false;
++    touchStartX = touchLastX = x;
++    touchStartY = touchLastY = y;
++  }
++  if (touchTracking && input.isScreenTouchHeld(x, y)) {
++    touchLastX = x;
++    touchLastY = y;
++    if (std::max(std::abs(x - touchStartX), std::abs(y - touchStartY)) > 28) cancelTouch();
++  }
++  const auto swipe = input.wasSwipe();
++  if (swipe != MappedInputManager::SwipeDir::None) {
++    cancelTouch();
++    return swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Up ? 1 : -1;
++  }
++  if (input.wasScreenTouchReleased() && touchTracking) {
++    touchTracking = false;
++    const int dx = touchLastX - touchStartX, dy = touchLastY - touchStartY;
++    if (std::max(std::abs(dx), std::abs(dy)) >= 60) {
++      cancelTouch();
++      return (std::abs(dx) >= std::abs(dy) ? dx : dy) < 0 ? 1 : -1;
++    }
++  }
++  return 0;
++}
++
++void CoverGridHomeUi::cancelTouch() {
++  touchCancelled = true;
++  fui::InputSnapshot cancel{};
++  cancel.touchReleased = true;
++  cancel.touchX = cancel.touchY = -1;
++  app.route(cancel);
++  app.clearTapFlash();
++}
++
+ int CoverGridHomeUi::selectedAction(const MappedInputManager& input) {
+   pending = -1;
+-  fui::ActionEvent event{};
+-  return routeTouch(input, event) ? pending : -1;
++  if (!routingReady()) return -1;
++  auto snap = touchSnapshotFrom(input);
++  if (snap.touchPressed) {
++    touchCancelled = false;
++    touchTracking = true;
++    touchStartX = snap.touchX;
++    touchStartY = snap.touchY;
++  }
++  if (touchTracking && (snap.touchHeld || snap.touchReleased) &&
++      std::max(std::abs(snap.touchX - touchStartX), std::abs(snap.touchY - touchStartY)) > 28)
++    cancelTouch();
++  if (snap.touchReleased) touchTracking = false;
++  if (touchCancelled) return -1;
++  app.route(snap);
++  return pending;
+ }
+
+ void CoverGridHomeUi::screenFn(UiScreen& screen, void* user) { static_cast<CoverGridHomeUi*>(user)->draw(screen); }
+@@ -172,9 +224,8 @@
    card.progressHeight = 6;
    card.padding = fui::Insets{6, 6, 6, 6};
    card.gap = theme.spaceLg + theme.spaceSm;
@@ -2333,6 +2828,29 @@ diff --git a/src/components/CoverGridHomeUi.cpp b/src/components/CoverGridHomeUi
    noteThumbSize(0, card.coverSize.width, card.coverSize.height);
    gridBounds = layoutGrid(screen.body());
    rect.x = gridBounds.x;
+diff --git a/src/components/CoverGridHomeUi.h b/src/components/CoverGridHomeUi.h
+--- a/src/components/CoverGridHomeUi.h
++++ b/src/components/CoverGridHomeUi.h
+@@ -23,6 +23,8 @@
+   void begin(const std::vector<RecentBook>& books, bool hasOpds, bool hasContinueReading, float featuredProgress);
+   void refreshCoverPaths();
+   void setSelection(int selection) { selected = selection; }
++  void cancelTouch();
++  int pageSwipe(const MappedInputManager& input);
+   int selectedAction(const MappedInputManager& input);
+   // Exact generation size for a slot, recorded during draw. Rescaling a
+   // dithered 1-bit image aliases badly.
+@@ -53,6 +55,10 @@
+   bool thumbHeightsChanged = false;
+   int selected = 0;
+   int pending = -1;
++  bool touchCancelled = false;
++  bool touchTracking = false;
++  int touchStartX = 0, touchStartY = 0;
++  int touchLastX = 0, touchLastY = 0;
+   int progress = -1;
+   bool hasOpds = false;
+   char progressText[12]{};
 diff --git a/src/components/CoverGridLayout.h b/src/components/CoverGridLayout.h
 new file mode 100644
 --- /dev/null
@@ -2634,11 +3152,36 @@ diff --git a/test/library_index_file/stubs/HalStorage.h b/test/library_index_fil
    static void resetInvalidCloseCount() { invalidCloses = 0; }
    static int invalidCloseCount() { return invalidCloses; }
 
+diff --git a/test/library_recent_order/LibraryRecentOrderTest.cpp b/test/library_recent_order/LibraryRecentOrderTest.cpp
+--- a/test/library_recent_order/LibraryRecentOrderTest.cpp
++++ b/test/library_recent_order/LibraryRecentOrderTest.cpp
+@@ -62,3 +62,21 @@
+   EXPECT_EQ(library::recentHistoryRow(0, 1, recents, 2, true), UINT16_MAX);
+   EXPECT_EQ(library::recentHistoryRow(0, 2, recents, 2, true), UINT16_MAX);
+ }
++
++TEST(LibraryRecentOrder, RemovingMiddleHistoryEntryRebasesVisibleRows) {
++  uint16_t rows[] = {0, 2, 3, 5};
++  auto count = library::removeRecentRow(rows, 4, 2, true, false);
++  ASSERT_EQ(count, 3u);
++  EXPECT_EQ(rows[0], 0);
++  EXPECT_EQ(rows[1], 2);
++  EXPECT_EQ(rows[2], 4);
++  EXPECT_EQ(library::recentHistoryRow(2, 5, rows, count, true), 4);
++}
++TEST(LibraryRecentOrder, HideFinishedDoesNotShiftOtherHistoryIndices) {
++  uint16_t rows[] = {0, 2, 3};
++  auto count = library::removeRecentRow(rows, 3, 2, false, true);
++  ASSERT_EQ(count, 2u);
++  EXPECT_EQ(rows[1], 3);
++  count = library::removeRecentRow(rows, count, 0, false, false);
++  EXPECT_EQ(count, 2u);
++}
 diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
 new file mode 100644
 --- /dev/null
 +++ b/test/library_thumbnails/CMakeLists.txt
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,51 @@
 +find_package(Python3 REQUIRED COMPONENTS Interpreter)
 +set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
 +add_custom_command(OUTPUT ${EXTRACTED}
@@ -2681,6 +3224,29 @@ new file mode 100644
 +target_include_directories(LibraryFilterPacingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex ${REPO_ROOT}/lib/Memory)
 +target_link_libraries(LibraryFilterPacingTest PRIVATE crosspoint_test_common GTest::gtest_main)
 +gtest_discover_tests(LibraryFilterPacingTest)
++
++set(HOME_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/HomePagingMethods.inc)
++add_custom_command(OUTPUT ${HOME_EXTRACTED}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractHomePaging.py ${REPO_ROOT} ${HOME_EXTRACTED}
++ DEPENDS ExtractHomePaging.py ${REPO_ROOT}/src/activities/home/HomeActivity.cpp)
++add_executable(HomePagingTest HomePagingTest.cpp ${HOME_EXTRACTED})
++target_include_directories(HomePagingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_link_libraries(HomePagingTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(HomePagingTest)
+diff --git a/test/library_thumbnails/ExtractHomePaging.py b/test/library_thumbnails/ExtractHomePaging.py
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/ExtractHomePaging.py
+@@ -0,0 +1,9 @@
++import pathlib,sys
++root=pathlib.Path(sys.argv[1])
++def block(source,signature):
++ a=source.index(signature);b=source.index('{',a)+1;depth=1
++ while depth:
++  depth+=(source[b]=='{')-(source[b]=='}');b+=1
++ return source[a:b]
++source=(root/'src/activities/home/HomeActivity.cpp').read_text()
++pathlib.Path(sys.argv[2]).write_text(block(source,'void HomeActivity::loadRecentBooks('))
 diff --git a/test/library_thumbnails/ExtractLibraryFilter.py b/test/library_thumbnails/ExtractLibraryFilter.py
 new file mode 100644
 --- /dev/null
@@ -2746,6 +3312,61 @@ new file mode 100644
 +a = source.index('  int x = 0;', source.index('void LibraryActivity::latchInput()'))
 +b = source.index('  if (mappedInput.wasReleased(', a)
 +pathlib.Path(sys.argv[2]).write_text('void LibraryActivity::captureTouch() { using Type = LibraryInputBuffer::Type;\n' + source[a:b] + '\n}\n')
+diff --git a/test/library_thumbnails/HomePagingTest.cpp b/test/library_thumbnails/HomePagingTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/test/library_thumbnails/HomePagingTest.cpp
+@@ -0,0 +1,50 @@
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <string>
++#include <vector>
++struct RecentBook {
++  std::string path;
++  bool missing = false;
++};
++struct RecentBooksStore {
++  std::vector<RecentBook> books;
++  const auto& getBooks() const { return books; }
++  static bool isMissing(const RecentBook& book) { return book.missing; }
++} RECENT_BOOKS;
++void ensureReusableCoverPath(RecentBook&) {}
++struct HomeActivity {
++  bool coverGridUi = true;
++  int recentGridPage = 0;
++  std::vector<RecentBook> recentBooks;
++  void loadRecentBooks(int maxBooks);
++};
++#include "HomePagingMethods.inc"
++TEST(HomePaging, AllHistoryAppearsOnceBelowPersistentFeaturedBook) {
++  RECENT_BOOKS.books.clear();
++  for (int i = 0; i < 18; ++i) RECENT_BOOKS.books.push_back({std::to_string(i)});
++  HomeActivity home;
++  std::vector<std::string> seen;
++  for (int page = 0; page < 3; ++page) {
++    home.recentGridPage = page;
++    home.loadRecentBooks(7);
++    ASSERT_LE(home.recentBooks.size(), 7u);
++    ASSERT_EQ(home.recentBooks.front().path, "0");
++    for (size_t i = 1; i < home.recentBooks.size(); ++i) seen.push_back(home.recentBooks[i].path);
++  }
++  ASSERT_EQ(seen.size(), 17u);
++  for (int i = 1; i < 18; ++i) EXPECT_EQ(seen[i - 1], std::to_string(i));
++  home.recentGridPage = 0;
++  home.loadRecentBooks(7);
++  EXPECT_EQ(home.recentBooks[1].path, "1");
++}
++TEST(HomePaging, MissingEntriesDoNotMakeHolesOrDuplicatePages) {
++  RECENT_BOOKS.books.clear();
++  for (int i = 0; i < 18; ++i) RECENT_BOOKS.books.push_back({std::to_string(i), i == 0 || i == 4});
++  HomeActivity home;
++  home.recentGridPage = 1;
++  home.loadRecentBooks(7);
++  ASSERT_EQ(home.recentBooks.size(), 7u);
++  EXPECT_EQ(home.recentBooks.front().path, "1");
++  EXPECT_EQ(home.recentBooks[1].path, "9");
++}
 diff --git a/test/library_thumbnails/LibraryCoverWorkerTest.cpp b/test/library_thumbnails/LibraryCoverWorkerTest.cpp
 new file mode 100644
 --- /dev/null
@@ -3360,7 +3981,7 @@ diff --git a/test/library_thumbnails/LibraryTouchTest.cpp b/test/library_thumbna
 new file mode 100644
 --- /dev/null
 +++ b/test/library_thumbnails/LibraryTouchTest.cpp
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,148 @@
 +#include <gtest/gtest.h>
 +
 +#include <algorithm>
@@ -3393,7 +4014,7 @@ new file mode 100644
 +Snapshot touchSnapshotFrom(const MappedInputManager& input) { return input.snap; }
 +struct LibraryActivity {
 +  MappedInputManager mappedInput;
-+  bool touchTracking = false, touchMoved = false;
++  bool touchTracking = false, touchMoved = false, touchCancelled = false;
 +  int touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0;
 +  LibraryInputBuffer pending;
 +  bool gridEnabled() const { return true; }
@@ -3476,6 +4097,37 @@ new file mode 100644
 +  screen.captureTouch();
 +  ASSERT_TRUE(screen.pending.pop(event));
 +  EXPECT_EQ(event.type, Type::TouchLongPress);
++  EXPECT_EQ(event.x, 100);
++}
++
++TEST(LibraryTouch, ReleaseAfterEarlierFlickStaysCancelledUntilFreshContact) {
++  LibraryActivity screen;
++  auto& input = screen.mappedInput;
++  input.down = true;
++  input.snap = {true, false, false, 100, 100};
++  screen.captureTouch();
++  input.down = false;
++  input.swipe = MappedInputManager::SwipeDir::Left;
++  input.snap = {};
++  screen.captureTouch();
++  screen.pending.clear();
++  input.swipe = MappedInputManager::SwipeDir::None;
++  input.released = true;
++  input.snap = {false, true, false, 100, 100};
++  screen.captureTouch();
++  LibraryInputBuffer::Event event;
++  ASSERT_TRUE(screen.pending.pop(event));
++  EXPECT_EQ(event.x, -1);
++  input.down = true;
++  input.released = false;
++  input.snap = {true, false, false, 100, 100};
++  screen.captureTouch();
++  screen.pending.clear();
++  input.down = false;
++  input.released = true;
++  input.snap = {false, true, false, 100, 100};
++  screen.captureTouch();
++  ASSERT_TRUE(screen.pending.pop(event));
 +  EXPECT_EQ(event.x, 100);
 +}
 diff --git a/test/library_thumbnails/worker_stubs/Epub.h b/test/library_thumbnails/worker_stubs/Epub.h

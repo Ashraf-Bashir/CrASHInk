@@ -91,10 +91,23 @@ book outline and title. **⋮ → Refresh covers on this page** retries the visi
 nine covers, removing their thumbnail/source-image/negative caches without
 rebuilding the book index or clearing saved view counts.
 
-Latest verification: 115 native tests passed, including zero book-record reads on
+Latest verification: 126 native tests passed, including zero book-record reads on
 warm filter restore, interrupted-filter resume, cache integrity/invalidation,
 cover batching, worker lifecycle, swipe cancellation and stats persistence.
 The updated X4 Pro firmware compiled, linked and passed the OTA size check.
+
+Marking a book finished edits current view membership directly, rebasing retained
+history rows if completion removes a recent entry. It does not restart filtering
+or reset the current cover page. Deleted indexed files rebuild the index before
+returning; missing book paths are rejected before entering a reader. Swipe
+cancellation stays latched until a fresh touch, so a later release cannot open a
+cover on the destination page. Physical page buttons page the cover grid.
+
+Home cover mode keeps the newest book featured and swipes the six lower covers
+through all retained reading history (currently capped at 18 books). It reuses
+seven cover slots and the existing size-specific thumbnail cache. Home's existing
+first-time thumbnail generation remains synchronous; this change does not add
+a separate background worker to Home.
 
 ## Direct firmware downloads
 
