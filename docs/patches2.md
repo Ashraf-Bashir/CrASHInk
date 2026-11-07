@@ -3,6 +3,8 @@
 `patches2/` is the active ten-patch series used by `.github/workflows/build.yml`.
 `patches/` retains the original 26 patches as an unchanged reference.
 The pipeline switch does not dispatch a build automatically.
+The workflow selects the newest stable three/four-part version tag; release
+candidates and other suffixed prerelease tags are excluded.
 
 Apply every patch in `patches2/` once, in filename order, to clean upstream source.
 Build after the entire series is applied. These patches share settings and reader
