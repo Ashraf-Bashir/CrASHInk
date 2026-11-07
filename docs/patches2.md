@@ -34,6 +34,25 @@ shared settings-page patch supplies navigation and layout. Later patches extend
 common files where their feature needs integration; this is intentional and
 requires the documented order.
 
+## Clipping boundaries and overlap merging
+
+`0002-clippings.patch` keeps different saved highlights visually separate at
+side/top/bottom boundaries. Words and wrapped rows inside one highlight stay
+connected; only the outer ribbon boundary is inset. The separation pass reads
+resident layout and adds no SD reads, allocations or display refreshes.
+
+Dragging an existing highlight commits on release. Extension/trim buttons keep
+editing a draft until Save. Both commit paths merge other highlights sharing at
+least one complete word at the same strict chapter text position, including
+chained overlaps. Adjacent quotes, punctuation-only contact, repeated text at a
+different position, and different chapter/table scopes remain separate. Cancel
+and a net-unchanged draft leave saved clippings alone.
+
+The store replaces the survivor and drops absorbed entries in one atomic rewrite;
+failed writes/renames retain the original file and records. Survivor indices are
+rebased after success. Tests exercise the actual saved-highlight renderer, strict
+chapter matching, shared editor/drag commit routing, and store failure recovery.
+
 ## Initial consolidation equivalence verification
 
 - Original patch repository revision: `066e2075f74fc13a6b8368a052654c0678dfaa87`.
