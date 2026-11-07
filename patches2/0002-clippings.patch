@@ -1,8 +1,8 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..0452bd4c44612a7ca45153ff41fbe0df4102c16e 100644
+index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..451e4af534954cca88e15bb90b43470cc168e5f5 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -1,12 +1,22 @@
+@@ -1,12 +1,23 @@
 +
 +- Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
 +
@@ -22,10 +22,11 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..0452bd4c44612a7ca45153ff41fbe0df
  - Assign a side-button shortcut to flip the reading screen 180°, alongside clockwise and counterclockwise turns.
  - TTF font support on ESP32-S3 devices. Whole-point sizes from 8pt to 22pt will be automatically available.
 +- Separate saved highlights retain clear side/top/bottom gutters, while each highlight stays continuous across its wrapped lines. Extending a saved highlight into another by at least one complete word merges their text and records on commit, including chained overlaps. Drag release and editor Save use the same atomic merge; adjacency, punctuation-only contact, Cancel and unchanged drafts do not merge.
++- Newly created highlights now share the same one-word overlap merge as edited highlights. Saved highlights show same-shade, full-height continuation triangles toward the next/previous page. Separate quotes keep a visible horizontal gap even when tight line spacing overlaps their line boxes; wrapped rows within one quote remain joined.
  - Library replaces Recent Books with a searchable book list, and adds various book metadata sort options.
  - Assign Library to power, long-press, button-chord, Home-button, or Quick Actions shortcuts to open the book list directly.
  - Customize the top and bottom reader status bars separately, including item positions and progress bars, in EPUB, TXT, and XTC books. Each bar can be previewed where it appears while reading.
-@@ -118,6 +128,28 @@
+@@ -118,6 +129,28 @@
 
  - OPDS and download logs hide URL tokens, fragments, and embedded credentials.
 
@@ -54,7 +55,7 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..0452bd4c44612a7ca45153ff41fbe0df
  ## [v1.6.0] - 2026-09-21
 
  ### Added
-@@ -614,3 +646,9 @@
+@@ -614,3 +647,9 @@
  - Power-button shortcut conflicts outside the reader so reader-only actions fall back to `Confirm` while Sleep, Refresh, Screenshot, Sync Progress, and File Transfer remain real power actions.
  - Potential crash when using `Go to %` in EPUBs.
  - Potential crash when entering sleep with Page Overlay enabled if the cached EPUB page data is invalid.
@@ -1425,15 +1426,16 @@ index b814b1a784839aed857ef3a8d6f585bc72ed4a27..d551af9c24fa68582fe08e7b97c693b6
    bool continueTouchSelectionOnNextPage();
    bool selectFirstWordForTouchDrag();
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f02bb775d 100644
+index a541223401dafb15e8f5c67668386c750d775954..41101b1a3f2be7436833420fbe792280f2d5fc07 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
++#include "clippings/HighlightMerge.h"
 +#include "HighlightTouchPolicy.h"
  #include "EpubReaderActivity.h"
 
  #include <Arduino.h>
-@@ -31,6 +32,8 @@
+@@ -31,6 +33,8 @@
  #include "BookStatsActivity.h"
  #include "BookStatsTracking.h"
  #include "ClipSelectionActivity.h"
@@ -1442,7 +1444,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
  #include "ClippingStore.h"
  #include "CrossPointSettings.h"
  #include "CrossPointState.h"
-@@ -82,7 +85,8 @@
+@@ -82,7 +86,8 @@
  #include "util/ScreenshotUtil.h"
 
  namespace {
@@ -1452,7 +1454,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
  // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
  constexpr unsigned long longPressMenuMs = 600;
  constexpr uint16_t DEFAULT_AUTO_PAGE_TURN_INTERVAL_S = 30;
-@@ -396,13 +400,7 @@ bool hasVisibleWordText(const char* text) {
+@@ -396,13 +401,7 @@ bool hasVisibleWordText(const char* text) {
 
  bool hasVisibleWordText(const std::string& text) { return hasVisibleWordText(text.c_str()); }
 
@@ -1467,7 +1469,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
 
  bool isUtf8SpaceAt(const char* cursor, size_t& advance) {
    const auto c = static_cast<unsigned char>(cursor[0]);
-@@ -458,21 +456,6 @@ uint16_t countClipTokens(const std::string& text) {
+@@ -458,21 +457,6 @@ uint16_t countClipTokens(const std::string& text) {
    return count;
  }
 
@@ -1489,7 +1491,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
  ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
                                                                const char* token, const size_t tokenLen,
                                                                const size_t tokenOffset = 0) {
-@@ -517,20 +500,29 @@ bool forEachVisiblePageWord(const Pages& page, Callback&& callback) {
+@@ -517,20 +501,29 @@ bool forEachVisiblePageWord(const Pages& page, Callback&& callback) {
  }
 
  template <typename Pages>
@@ -1526,7 +1528,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
    bool reachedClipEnd = false;
    bool stoppedByMismatch = false;
    uint16_t tableSelection = UINT16_MAX;
-@@ -559,6 +551,8 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -559,6 +552,8 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
            return false;
          }
 
@@ -1535,7 +1537,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
          lastWord = wordIndex;
          if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::CONTINUES_TOKEN) {
            tokenOffset += fragmentResult.tokenBytes;
-@@ -574,7 +568,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -574,7 +569,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
          return true;
        });
 
@@ -1544,7 +1546,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      return false;
    }
 
-@@ -587,18 +581,21 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -587,18 +582,21 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
      return false;
    }
 
@@ -1568,7 +1570,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
    if (clippingText.empty()) return false;
 
    const uint16_t tokenCount = countClipTokens(clippingText);
-@@ -622,14 +619,33 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+@@ -622,14 +620,33 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
            if (tokenIndex >= tokenCount) {
              break;
            }
@@ -1605,7 +1607,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
                match = candidate;
              }
              if (!uniqueMatch || !matches.unique()) {
-@@ -667,20 +683,119 @@ struct AdjacentClippingPages {
+@@ -667,20 +684,119 @@ struct AdjacentClippingPages {
    }
  };
 
@@ -1734,7 +1736,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
      // Keep at most one temporary neighboring page, and release it on each attempt.
      // loadPage scopes its reader or reuses the build handle; currentPage is unchanged.
-@@ -699,10 +814,12 @@ bool findClippingTextOnPage(Section& section, const Page& page, const std::strin
+@@ -699,10 +815,12 @@ bool findClippingTextOnPage(Section& section, const Page& page, const std::strin
      if (nextPage) {
        match.endWord = currentWordCount - 1;
        match.reachesClipEnd = false;
@@ -1747,7 +1749,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      }
      return true;
    }
-@@ -736,6 +853,8 @@ bool findClippingStoredRangeOnPage(const Page& page, const Clipping& clipping, c
+@@ -736,6 +854,8 @@ bool findClippingStoredRangeOnPage(const Page& page, const Clipping& clipping, c
    match.startWord = startWord;
    match.endWord = endWord;
    match.tableSelection = clipping.tableSelection;
@@ -1756,7 +1758,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
    return true;
  }
 
-@@ -2472,6 +2591,8 @@ void EpubReaderActivity::onEnter() {
+@@ -2472,6 +2592,8 @@ void EpubReaderActivity::onEnter() {
  }
 
  void EpubReaderActivity::onExit() {
@@ -1765,7 +1767,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
    sdFontSystem.setSettingsPersistenceCallback(nullptr, nullptr);
    // Drop the scalable-family catalog retained during reading. The active font
    // and its PSRAM face lifetime remain managed by SdCardFontSystem.
-@@ -3135,6 +3256,9 @@ void EpubReaderActivity::loop() {
+@@ -3135,6 +3257,9 @@ void EpubReaderActivity::loop() {
    if (!atEndOfBook && touch.tapped && handleTouchFootnoteLink(touch.x, touch.y)) {
      return;
    }
@@ -1775,7 +1777,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
  #endif
 
    // Long-press Confirm: execute the configured reader action without opening the menu.
-@@ -3380,7 +3504,8 @@ void EpubReaderActivity::loop() {
+@@ -3380,7 +3505,8 @@ void EpubReaderActivity::loop() {
      if (drainPendingManualPageTurn()) {
        return;
      }
@@ -1785,7 +1787,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      return;
    }
 
-@@ -3692,15 +3817,11 @@ bool EpubReaderActivity::handleTouchDictionaryLookup() {
+@@ -3692,15 +3818,11 @@ bool EpubReaderActivity::handleTouchDictionaryLookup() {
      touchDictionaryLookupHandled = false;
      return false;
    }
@@ -1802,7 +1804,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
    openWordSelect(/*framebufferContainsPage=*/true, touchX, touchY, /*autoLookupInitialWord=*/true);
    return true;
  }
-@@ -4395,7 +4516,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
+@@ -4395,7 +4517,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
      }
      case EpubReaderMenuAction::VIEW_CLIPPINGS: {
        pauseReadingPaceTimer("clipping_list");
@@ -1811,7 +1813,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
                               [this, returnToReaderMenu](const ActivityResult& result) {
                                 if (!result.isCancelled) {
                                   const auto& clipping = std::get<ClippingJumpResult>(result.data);
-@@ -4700,8 +4821,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4700,8 +4822,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
        }
      }
      const int lineHeight = renderer.getLineHeight(readerFontId);
@@ -1828,7 +1830,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      static constexpr uint32_t CLIP_SELECTION_WORD_RESERVE_HEADROOM = 16U * 1024U;
      static constexpr size_t CLIP_SELECTION_INITIAL_TEXT_RESERVE = 4U * 1024U;
      // Page density varies with font size and layout. Keep the fixed memory cap,
-@@ -4709,7 +4836,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4709,7 +4837,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      const size_t maxSelectableWords = pagesToLoad > 0 ? MAX_CLIP_SELECTION_WORDS : 0;
      const uint32_t wordReserveBytes = static_cast<uint32_t>(maxSelectableWords * sizeof(WordRef));
      const auto heapBeforeWords = MemoryBudget::snapshot();
@@ -1840,7 +1842,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
        LOG_ERR("CLIP", "Low heap for clipping selection (%u free, %u max alloc, need block %u); skipping",
                heapBeforeWords.freeHeap, heapBeforeWords.maxAllocHeap,
                wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM);
-@@ -4949,7 +5079,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4949,26 +5080,37 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
                                                      clippingLayoutSignature](const ActivityResult& result) {
      MemoryBudget::logHeapShape("clip.child_destroyed");
      const char* clippingFeedback = nullptr;
@@ -1848,19 +1850,46 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      if (!result.isCancelled) {
        const auto& clip = std::get<ClippingResult>(result.data);
        if (!clip.text.empty()) {
-@@ -4966,9 +5095,9 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+-        const size_t clippingIndex = CLIPPINGS.clippingCount();
+-        const auto addResult = CLIPPINGS.addClipping(
+-            static_cast<uint16_t>(currentSpineIndex), clip.sectionPage, clip.endSectionPage, clip.sectionPageCount,
+-            clip.startPageWordIndex, clip.endPageWordIndex, clip.wordCount, chapterTitle.c_str(), clip.paragraphIndex,
+-            clip.text, clip.tableSelection, clippingLayoutSignature);
++        Clipping metadata;
++        metadata.spineIndex = static_cast<uint16_t>(currentSpineIndex);
++        metadata.startPage = clip.sectionPage;
++        metadata.endPage = clip.endSectionPage;
++        metadata.pageCount = clip.sectionPageCount;
++        metadata.startWordIndex = clip.startPageWordIndex;
++        metadata.endWordIndex = clip.endPageWordIndex;
++        metadata.wordCount = clip.wordCount;
++        metadata.paragraphIndex = clip.paragraphIndex;
++        metadata.tableSelection = clip.tableSelection;
++        metadata.layoutSignature = clippingLayoutSignature;
++        size_t clippingIndex = SIZE_MAX;
++        bool merged = false;
++        const auto addResult = HighlightMerge::add(epub, metadata, chapterTitle.c_str(), clip.text, clippingIndex, merged);
+         bool exported = false;
+         if (addResult == ClippingStore::AddResult::Added) {
+           exported = ClippingsManager::saveClipping(bookTitle, author, chapterTitle,
+                                                     static_cast<int>(clip.sectionPage) + 1, clip.text);
+-          if (!exported && !CLIPPINGS.removeClippingAt(clippingIndex)) {
++          // A merged survivor contains older saved text: never delete it to
++          // roll back a failure in the optional plain-text export.
++          if (!exported && merged) LOG_ERR("CLIP", "Merged clipping saved, but optional text export failed");
++          if (!exported && !merged && !CLIPPINGS.removeClippingAt(clippingIndex)) {
              LOG_ERR("CLIP", "Failed to roll back clipping after export failure");
            }
          }
 -        saved = addResult == ClippingStore::AddResult::Added && exported;
-+        const bool saved = addResult == ClippingStore::AddResult::Added && exported;
++        const bool saved = addResult == ClippingStore::AddResult::Added && (exported || merged);
          clippingFeedback = addResult == ClippingStore::AddResult::LimitReached ? tr(STR_CLIPPING_LIMIT_REACHED)
 -                           : saved                                             ? tr(STR_CLIPPING_SAVED)
 +                           : saved                                             ? nullptr
                                                                                 : tr(STR_CLIPPING_FAILED);
        }
      }
-@@ -4977,11 +5106,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4977,11 +5119,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      MemoryBudget::logHeapShape("clip.after_font_release");
      pendingHeapShapeReaderRedrawStages.fetch_or(HEAP_SHAPE_REDRAW_CLIP, std::memory_order_relaxed);
      if (clippingFeedback) {
@@ -1872,7 +1901,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
        {
          RenderLock lock(*this);
          drawToast(renderer, clippingFeedback);
-@@ -6512,7 +6636,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6512,7 +6649,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -1881,7 +1910,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -6561,7 +6685,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6561,7 +6698,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -1890,7 +1919,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -7586,29 +7710,207 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
+@@ -7586,29 +7723,207 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
    navigateToHref(currentPageFootnotes[bestIndex].href, true, /*preferFootnotePreview=*/true);
    return true;
  }
@@ -2015,13 +2044,13 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
 +    clippingPreparePage.reset();
 +    clippingPageMatches.reset();
 +    return nullptr;
-+  }
+   }
 +  if (!section || activeSectionLayoutSignature == 0) return nullptr;
 +  if (!clippingPageMatches) {
 +    if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), 20U * 1024U, 8U * 1024U)) return nullptr;
 +    clippingPageMatches = makeUniqueNoThrow<ClippingPageMatchCache>();
 +    if (!clippingPageMatches) return nullptr;
-   }
++  }
 +  const ClippingPageMatchCache::Key key{section.get(), activeSectionLayoutSignature, CLIPPINGS.contentRevision(),
 +                                        currentSpineIndex, section->pageCount};
 +  if (clippingPageMatches->resetFor(key)) {
@@ -2111,7 +2140,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      const Clipping& clipping = clippings[clippingIndex];
      if (clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex)) {
        continue;
-@@ -7626,9 +7928,20 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7626,9 +7941,20 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const bool shouldSearchText =
          legacyWordLayout ? (!matchedStoredRange && pageInStoredRange) : (!storedLayoutMatches || pageInStoredRange);
      bool matchedText = false;
@@ -2133,7 +2162,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
          bool uniqueTextMatch = false;
          const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
          matchedText =
-@@ -7639,35 +7952,127 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7639,35 +7965,137 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
            CLIPPINGS.cacheResolvedLayoutRange(clippingIndex, currentPage, match.startWord, match.endWord,
                                               currentClippingLayoutSignature);
          }
@@ -2242,15 +2271,25 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
 +    return -1;
    };
 
-+  // At most 16 small row descriptors (~96 bytes on the render stack).
++  // At most 16 small row descriptors (192 bytes on the render stack).
 +  // This pass inspects resident layout only: no font measurements, SD reads,
 +  // allocations, or additional screen refreshes.
 +  std::array<ClippingHighlightGeometry::RibbonRows, CLIPPING_MAX_PAGE_MATCHES> ribbonRows{};
++  static_assert(sizeof(ribbonRows) <= 256);
 +  forEachVisiblePageWord(page, [&](const uint16_t index, const PageTextLine& line, const TextBlock&, const size_t) {
 +    const int owner = getMatchIndexForWord(index, line);
-+    if (owner >= 0) ribbonRows[owner].include(orientedMarginTop + line.yPos);
++    if (owner >= 0) ribbonRows[owner].include(orientedMarginTop + line.yPos,
++        line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId));
 +    return true;
 +  });
++  for (uint16_t i = 0; i < matchCount; ++i) {
++    for (uint16_t j = 0; j < matchCount; ++j) {
++      if (i != j && matches[i].tableSelection == matches[j].tableSelection)
++        ClippingHighlightGeometry::separateStackedRibbons(ribbonRows[i], ribbonRows[j]);
++    }
++  }
++  int bezelTop = 0, bezelRight = 0, bezelBottom = 0, bezelLeft = 0;
++  renderer.getOrientedViewableTRBL(&bezelTop, &bezelRight, &bezelBottom, &bezelLeft);
    ClippingHighlightGeometry::WordRect previousHighlight;
 +  int previousMatchIndex = -1;
    const TextBlock* previousHighlightBlock = nullptr;
@@ -2266,7 +2305,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
        hasPreviousHighlight = false;
        return true;
      }
-@@ -7682,12 +8087,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7682,12 +8110,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const char* visibleText = wordText + (hasEmSpace ? 3 : 0);
      const int lineFontId = block.resolvedFontId(renderer, fontId);
      const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
@@ -2285,7 +2324,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
      if (wordIndex + 1 < block.wordCount()) {
        const uint16_t nextIndex = static_cast<uint16_t>(wordIndex + 1);
        const char* nextWordText = block.wordText(nextIndex);
-@@ -7697,49 +8107,99 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7697,49 +8130,113 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", nextTextStyle) : 0;
        const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
        const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
@@ -2345,6 +2384,20 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
        }
 -      renderer.fillRectDither(wordX, wordY, wordW, wordH, Color::LightGray);
 +      renderer.fillRectDither(marker.x, marker.y, marker.width, marker.height, Color::LightGray);
++      int hitLeft = wordX, hitRight = wordX + wordW;
++      const int limitLeft = line.clipWidth > 0 ? std::max(bezelLeft, orientedMarginLeft + line.clipX) : bezelLeft;
++      const int limitRight = line.clipWidth > 0
++          ? std::min(renderer.getScreenWidth() - bezelRight, orientedMarginLeft + line.clipX + line.clipWidth)
++          : renderer.getScreenWidth() - bezelRight;
++      const auto continuation = [&](bool left) {
++        const auto tip = ClippingHighlightGeometry::continuationTip(marker, left, limitLeft, limitRight);
++        ClippingHighlightGeometry::paintContinuation(tip, left, [&](const ClippingHighlightGeometry::GapRect& row) {
++          renderer.fillRectDither(row.x, row.y, row.width, row.height, Color::LightGray);
++        });
++        if (tip.width > 0) { hitLeft = std::min(hitLeft, tip.x); hitRight = std::max(hitRight, tip.x + tip.width); }
++      };
++      if (pageWordIndex == matched.startWord && !matched.startsAtClipStart) continuation(true);
++      if (pageWordIndex == matched.endWord && !matched.reachesClipEnd) continuation(false);
        // A saved clipping always uses black text on its light-gray marker.
        // The ordinary reader foreground is white in dark mode, which makes the
        // text fade into this marker.
@@ -2353,9 +2406,9 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
 -                               line.clipHeight);
 -      }
 +      const int clipLeft = line.clipWidth > 0 ? std::max(wordX, orientedMarginLeft + line.clipX) : wordX;
-+      const int clipTop = line.clipHeight > 0 ? std::max(wordY, orientedMarginTop + line.clipY) : wordY;
++      const int clipTop = line.clipHeight > 0 ? std::max(marker.y, orientedMarginTop + line.clipY) : marker.y;
 +      const int clipRight = line.clipWidth > 0 ? std::min(wordX + wordW, orientedMarginLeft + line.clipX + line.clipWidth) : wordX + wordW;
-+      const int clipBottom = line.clipHeight > 0 ? std::min(wordY + wordH, orientedMarginTop + line.clipY + line.clipHeight) : wordY + wordH;
++      const int clipBottom = line.clipHeight > 0 ? std::min(marker.y + marker.height, orientedMarginTop + line.clipY + line.clipHeight) : marker.y + marker.height;
 +      renderer.beginTextClip(clipLeft, clipTop, std::max(0, clipRight - clipLeft), std::max(0, clipBottom - clipTop));
        // Match TextBlock::render()'s Focus Reading split. The prewarm pass
        // loaded the leading run as bold, so redrawing it as regular here can
@@ -2381,12 +2434,12 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
 +      if (matchIndex >= 0 && matchIndex < static_cast<int>(clippingBounds.size())) {
 +        auto& bounds = clippingBounds[matchIndex];
 +        if (bounds.width <= 0 || bounds.height <= 0) {
-+          bounds = {static_cast<int16_t>(wordX), static_cast<int16_t>(wordY), static_cast<int16_t>(wordW),
++          bounds = {static_cast<int16_t>(hitLeft), static_cast<int16_t>(wordY), static_cast<int16_t>(hitRight - hitLeft),
 +                    static_cast<int16_t>(wordH), matchClippingIndices[matchIndex]};
 +        } else {
-+          const int left = std::min<int>(bounds.x, wordX);
++          const int left = std::min<int>(bounds.x, hitLeft);
 +          const int top = std::min<int>(bounds.y, wordY);
-+          const int right = std::max<int>(bounds.x + bounds.width, wordX + wordW);
++          const int right = std::max<int>(bounds.x + bounds.width, hitRight);
 +          const int bottom = std::max<int>(bounds.y + bounds.height, wordY + wordH);
 +          bounds = {static_cast<int16_t>(left), static_cast<int16_t>(top), static_cast<int16_t>(right - left),
 +                    static_cast<int16_t>(bottom - top), matchClippingIndices[matchIndex]};
@@ -2397,7 +2450,7 @@ index a541223401dafb15e8f5c67668386c750d775954..093b1c0595ed5fc5f7af901e00b8317f
        previousHighlight = currentHighlight;
        previousHighlightBlock = &block;
        hasPreviousHighlight = true;
-@@ -7748,6 +8208,15 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7748,6 +8245,15 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      }
      return true;
    });
@@ -4515,17 +4568,20 @@ index 0000000000000000000000000000000000000000..d97e8ade60b29e794461f938b23b0607
 +  void reset() { pointPending = released = false; }
 +};
 diff --git a/src/clippings/ClippingHighlightGeometry.h b/src/clippings/ClippingHighlightGeometry.h
-index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..03abc79e83187b9fcb04ae6e6aaec3096fc3e26e 100644
+index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..6e5cb657420c9d3fc8cb5ce93713ca3a94410dfb 100644
 --- a/src/clippings/ClippingHighlightGeometry.h
 +++ b/src/clippings/ClippingHighlightGeometry.h
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,9 @@
  #pragma once
 
 +#include <algorithm>
  #include <cstdint>
++#include <cstdlib>
++#include <limits>
 
  namespace ClippingHighlightGeometry {
-@@ -19,6 +20,39 @@ struct GapRect {
+
+@@ -19,6 +22,81 @@ struct GapRect {
    int height = 0;
  };
 
@@ -4533,18 +4589,37 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..03abc79e83187b9fcb04ae6e6aaec309
 +// receives a gutter; spacing is never inserted between lines of one clipping.
 +inline constexpr int BoundaryInset = 1;
 +struct RibbonRows {
-+  int16_t first = 0, last = 0;
++  int16_t first = 0, last = 0, lastHeight = 0;
++  int16_t topLimit = std::numeric_limits<int16_t>::min();
++  int16_t bottomLimit = std::numeric_limits<int16_t>::max();
 +  bool seen = false;
-+  void include(int y) {
++  void include(int y, int height) {
 +    if (!seen) {
 +      first = last = static_cast<int16_t>(y);
++      lastHeight = static_cast<int16_t>(height);
 +      seen = true;
 +    } else {
 +      first = std::min<int>(first, y);
-+      last = std::max<int>(last, y);
++      if (y > last) {
++        last = static_cast<int16_t>(y);
++        lastHeight = static_cast<int16_t>(height);
++      } else if (y == last)
++        lastHeight = std::max<int>(lastHeight, height);
 +    }
 +  }
 +};
++// Negative/tight line spacing can make two quote rectangles overlap. Reserve
++// two horizontal background rows at their shared boundary rather than merely
++// subtracting a fixed pixel from each rectangle (which can still touch).
++inline void separateStackedRibbons(RibbonRows& upper, RibbonRows& lower) {
++  if (!upper.seen || !lower.seen || upper.last >= lower.first) return;
++  const int bottom = upper.last + upper.lastHeight;
++  if (bottom <= lower.first) return;  // Existing outer insets already leave a gap.
++  const int seam = (bottom + lower.first) / 2;
++  upper.bottomLimit = std::min<int>(upper.bottomLimit, seam - 1);
++  lower.topLimit = std::max<int>(lower.topLimit, seam + 1);
++}
++
 +inline bool sameClipping(int a, int b) { return a >= 0 && a == b; }
 +inline GapRect ribbonMarker(const WordRect& word, const RibbonRows& rows, bool startsRow, bool endsRow,
 +                            bool startsClipping, bool endsClipping) {
@@ -4559,7 +4634,30 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..03abc79e83187b9fcb04ae6e6aaec309
 +  marker.y += top;
 +  marker.width -= left + right;
 +  marker.height -= top + bottom;
++  int end = marker.y + marker.height;
++  if (word.y == rows.first) marker.y = std::max<int>(marker.y, rows.topLimit);
++  if (word.y == rows.last) end = std::min<int>(end, rows.bottomLimit);
++  marker.height = std::max(0, end - marker.y);
 +  return marker;
++}
++
++// Attach an isosceles continuation tip outside the highlighted word. Its
++// vertical base is exactly the ribbon height; width fits the visible margin.
++inline GapRect continuationTip(const GapRect& marker, bool left, int limitLeft, int limitRight) {
++  if (marker.width <= 0 || marker.height <= 0) return {};
++  const int base = left ? marker.x : marker.x + marker.width;
++  const int available = left ? base - limitLeft : limitRight - base;
++  const int width = std::min(std::max(1, marker.height / 2), std::max(0, available));
++  return {left ? base - width : base, marker.y, width, marker.height};
++}
++template <class Paint>
++void paintContinuation(const GapRect& tip, bool left, Paint&& paint) {
++  if (tip.width <= 0 || tip.height <= 0) return;
++  for (int row = 0; row < tip.height; ++row) {
++    const int distance = std::abs(2 * row + 1 - tip.height);
++    const int width = std::max(1, (tip.width * (tip.height - distance) + tip.height - 1) / tip.height);
++    paint(GapRect{left ? tip.x + tip.width - width : tip.x, tip.y + row, width, 1});
++  }
 +}
 +
  inline bool matchesTableSelection(const uint16_t selection, const uint16_t wordSelection) {
@@ -5070,10 +5168,10 @@ index 0000000000000000000000000000000000000000..dc37389e6aef97e8a10c3782a95ed657
 +};
 diff --git a/src/clippings/HighlightMerge.cpp b/src/clippings/HighlightMerge.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4f0a1f656514577a6b1a2b7ec80c9f33e67ac9e1
+index 0000000000000000000000000000000000000000..5600106bd607f9aff2d28f792e63581900c4e19c
 --- /dev/null
 +++ b/src/clippings/HighlightMerge.cpp
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,133 @@
 +#include "HighlightMerge.h"
 +
 +#include <Logging.h>
@@ -5091,21 +5189,23 @@ index 0000000000000000000000000000000000000000..4f0a1f656514577a6b1a2b7ec80c9f33
 +  uint32_t start = UINT32_MAX, end = 0;
 +  size_t index = 0;
 +};
-+}  // namespace
-+bool save(const std::shared_ptr<Epub>& book, uint16_t spine, size_t& index, XPathTextLocation& location,
-+          const std::string& text) {
-+  const auto* active = CLIPPINGS.clippingAt(index);
-+  if (!active || active->spineIndex != spine || location.loose || location.start > location.end || text.empty())
-+    return false;
-+  const uint16_t table = active->tableSelection;
++struct Plan {
++  std::unique_ptr<uint8_t[]> remove;
++  XPathTextLocation combined;
++  bool merged = false;
++};
++bool plan(const std::shared_ptr<Epub>& book, uint16_t spine, uint16_t table, size_t index,
++          const XPathTextLocation& location, Plan& result) {
++  result.combined = location;
 +  const auto& records = CLIPPINGS.getClippings();
 +  size_t candidates = 0;
 +  for (size_t i = 0; i < records.size(); ++i)
 +    if (i != index && records[i].spineIndex == spine && records[i].tableSelection == table) ++candidates;
-+  if (!candidates) return CLIPPINGS.updateClippingText(index, text);
++  if (!candidates) return true;
 +  // Commit-lifetime scratch: one byte per saved record, and 12 bytes per
 +  // same-chapter candidate on ESP32. Fallible; never retain other quote texts.
-+  auto remove = makeUniqueNoThrow<uint8_t[]>(records.size());
++  result.remove = makeUniqueNoThrow<uint8_t[]>(records.size());
++  auto* remove = result.remove.get();
 +  auto ranges = makeUniqueNoThrow<Candidate[]>(candidates);
 +  if (!remove || !ranges) {
 +    LOG_ERR("CLIP", "Cannot allocate overlap-merge scratch");
@@ -5128,8 +5228,8 @@ index 0000000000000000000000000000000000000000..4f0a1f656514577a6b1a2b7ec80c9f33
 +      candidate.end = found.end;
 +    }
 +  }
-+  auto combined = location;
-+  bool grew = true, merged = false;
++  auto& combined = result.combined;
++  bool grew = true;
 +  while (grew) {
 +    grew = false;
 +    for (size_t i = 0; i < used; ++i) {
@@ -5146,37 +5246,88 @@ index 0000000000000000000000000000000000000000..4f0a1f656514577a6b1a2b7ec80c9f33
 +      grew |= start != combined.start || end != combined.end;
 +      combined.start = start;
 +      combined.end = end;
-+      merged = true;
++      result.merged = true;
 +    }
 +  }
-+  if (!merged) return CLIPPINGS.updateClippingText(index, text);
++  return true;
++}
++bool commit(const std::shared_ptr<Epub>& book, uint16_t spine, size_t& index, Plan& plan) {
 +  std::string joined;
-+  if (!ChapterXPathResolver::extractText(book, spine, combined, joined) || joined.empty() ||
++  if (!ChapterXPathResolver::extractText(book, spine, plan.combined, joined) || joined.empty() ||
 +      joined.size() > CLIPPING_TEXT_MAX)
 +    return false;
-+  if (!CLIPPINGS.mergeClippingText(index, joined, remove.get(), records.size())) return false;
-+  location = combined;
++  return CLIPPINGS.mergeClippingText(index, joined, plan.remove.get(), CLIPPINGS.clippingCount());
++}
++}  // namespace
++bool save(const std::shared_ptr<Epub>& book, uint16_t spine, size_t& index, XPathTextLocation& location,
++          const std::string& text) {
++  const auto* active = CLIPPINGS.clippingAt(index);
++  if (!active || active->spineIndex != spine || location.loose || location.start > location.end || text.empty())
++    return false;
++  Plan result;
++  if (!plan(book, spine, active->tableSelection, index, location, result)) return false;
++  if (!result.merged) return CLIPPINGS.updateClippingText(index, text);
++  if (!commit(book, spine, index, result)) return false;
++  location = result.combined;
 +  return true;
++}
++ClippingStore::AddResult add(const std::shared_ptr<Epub>& book, const Clipping& metadata, const char* chapterTitle,
++                             const std::string& text, size_t& index, bool& merged) {
++  using Result = ClippingStore::AddResult;
++  merged = false;
++  XPathTextLocation location;
++  const float hint = metadata.pageCount ? static_cast<float>(metadata.startPage) / metadata.pageCount : -1.0f;
++  // A failed/loose source mapping must never absorb an existing quote. Keep
++  // the established new-clipping path available for otherwise valid selections.
++  const auto& records = CLIPPINGS.getClippings();
++  const bool hasCandidates = std::any_of(records.begin(), records.end(), [&](const Clipping& clipping) {
++    return clipping.spineIndex == metadata.spineIndex && clipping.tableSelection == metadata.tableSelection;
++  });
++  if (hasCandidates && ChapterXPathResolver::locateText(book, metadata.spineIndex, text, hint, location) &&
++      !location.loose) {
++    Plan result;
++    if (!plan(book, metadata.spineIndex, metadata.tableSelection, SIZE_MAX, location, result))
++      return Result::SaveFailed;
++    if (result.merged) {
++      const size_t count = CLIPPINGS.clippingCount();
++      for (index = 0; index < count && !result.remove[index]; ++index) {
++      }
++      if (index == count) return Result::SaveFailed;
++      result.remove[index] = 0;
++      if (!commit(book, metadata.spineIndex, index, result)) return Result::SaveFailed;
++      merged = true;
++      return Result::Added;
++    }
++  }
++  index = CLIPPINGS.clippingCount();
++  return CLIPPINGS.addClipping(metadata.spineIndex, metadata.startPage, metadata.endPage, metadata.pageCount,
++                               metadata.startWordIndex, metadata.endWordIndex, metadata.wordCount, chapterTitle,
++                               metadata.paragraphIndex, text, metadata.tableSelection, metadata.layoutSignature);
 +}
 +}  // namespace HighlightMerge
 diff --git a/src/clippings/HighlightMerge.h b/src/clippings/HighlightMerge.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c7cb1b296c0baa21c2c0186fd16090ff5b37d7f0
+index 0000000000000000000000000000000000000000..d77159d232d29f807c3a502a3ef66a3294e77e65
 --- /dev/null
 +++ b/src/clippings/HighlightMerge.h
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,18 @@
 +#pragma once
 +#include <cstddef>
 +#include <memory>
 +#include <string>
 +
 +#include "ChapterXPathResolver.h"
++#include "ClippingStore.h"
 +
 +namespace HighlightMerge {
 +// Commit only: no chapter reads, allocations or writes during dragging/button
 +// presses. Cancel and reversed draft edits retain the original saved records.
 +bool save(const std::shared_ptr<Epub>& book, uint16_t spine, size_t& index, XPathTextLocation& location,
 +          const std::string& text);
++// New highlights use the same plan before any store write. An overlap edits
++// an existing survivor atomically instead of appending a duplicate first.
++ClippingStore::AddResult add(const std::shared_ptr<Epub>& book, const Clipping& metadata, const char* chapterTitle,
++                             const std::string& text, size_t& index, bool& merged);
 +}  // namespace HighlightMerge
 diff --git a/src/clippings/HighlightMergeWords.h b/src/clippings/HighlightMergeWords.h
 new file mode 100644
@@ -6655,10 +6806,10 @@ index 0000000000000000000000000000000000000000..f06d35833ee12acbaa07253ca6aa2c46
 +}
 diff --git a/test/clipping_page_turn/ClippingRibbonRenderTest.cpp b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8f0da585428da6caf69d0828b9d3ab1b65f48791
+index 0000000000000000000000000000000000000000..57ae7e55ce7fae2b7ff6da730621af57fda69c38
 --- /dev/null
 +++ b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,274 @@
 +#include <gtest/gtest.h>
 +
 +#include <algorithm>
@@ -6719,6 +6870,8 @@ index 0000000000000000000000000000000000000000..8f0da585428da6caf69d0828b9d3ab1b
 +  std::array<uint8_t, Width * Height> pixels{};
 +  explicit GfxRenderer(bool dark = false) : background(dark ? 1 : 0) { pixels.fill(background); }
 +  int getRenderMode() const { return BW; }
++  int getScreenWidth() const { return Width; }
++  void getOrientedViewableTRBL(int* t, int* r, int* b, int* l) const { *t = *r = *b = *l = 0; }
 +  int getLineHeight(int) const { return 20; }
 +  int getTextAdvanceX(int, const char* text, EpdFontFamily::Style) const { return std::strlen(text) * 5; }
 +  void fillRectDither(int x, int y, int w, int h, int) {
@@ -6845,13 +6998,91 @@ index 0000000000000000000000000000000000000000..8f0da585428da6caf69d0828b9d3ab1b
 +
 +TEST(ClippingRibbonRender, VisualNeighborsControlGuttersInMixedDirectionRows) {
 +  EpubReaderActivity activity;
-+  Page page{{line(10,{90,70,50,30},{20,20,20,20},false)}};
-+  matches(activity,{{0,1},{2,3}});
-+  activity.drawClippingHighlights(page,0,0,0);
-+  EXPECT_TRUE(activity.renderer.marked(89,20));
-+  EXPECT_TRUE(activity.renderer.marked(90,20));
-+  EXPECT_FALSE(activity.renderer.marked(69,20));
-+  EXPECT_FALSE(activity.renderer.marked(70,20));
++  Page page{{line(10, {90, 70, 50, 30}, {20, 20, 20, 20}, false)}};
++  matches(activity, {{0, 1}, {2, 3}});
++  activity.drawClippingHighlights(page, 0, 0, 0);
++  EXPECT_TRUE(activity.renderer.marked(89, 20));
++  EXPECT_TRUE(activity.renderer.marked(90, 20));
++  EXPECT_FALSE(activity.renderer.marked(69, 20));
++  EXPECT_FALSE(activity.renderer.marked(70, 20));
++}
++
++TEST(ClippingRibbonRender, RightTipMarksNextPageAndLeftTipMarksPreviousPage) {
++  for (bool dark : {false, true}) {
++    EpubReaderActivity outgoing(dark), incoming(dark);
++    Page page{{line(10, {30}, {40})}};
++    matches(outgoing, {{0, 0}});
++    matches(incoming, {{0, 0}});
++    outgoing.cache.claim(0).matches[0].reachesClipEnd = false;
++    incoming.cache.claim(0).matches[0].startsAtClipStart = false;
++    outgoing.drawClippingHighlights(page, 0, 0, 0);
++    incoming.drawClippingHighlights(page, 0, 0, 0);
++    EXPECT_TRUE(outgoing.renderer.marked(69, 11));
++    EXPECT_TRUE(outgoing.renderer.marked(69, 29));
++    EXPECT_TRUE(outgoing.renderer.marked(76, 20));
++    EXPECT_FALSE(outgoing.renderer.marked(76, 11));
++    EXPECT_TRUE(incoming.renderer.marked(30, 10));
++    EXPECT_TRUE(incoming.renderer.marked(30, 28));
++    EXPECT_TRUE(incoming.renderer.marked(23, 19));
++    EXPECT_FALSE(incoming.renderer.marked(23, 10));
++  }
++}
++TEST(ClippingRibbonRender, MiddlePageHasBothTipsAndNormalHighlightHasNeither) {
++  EpubReaderActivity middle, complete;
++  Page page{{line(10, {30}, {40})}};
++  matches(middle, {{0, 0}});
++  matches(complete, {{0, 0}});
++  middle.cache.claim(0).matches[0].startsAtClipStart = false;
++  middle.cache.claim(0).matches[0].reachesClipEnd = false;
++  middle.drawClippingHighlights(page, 0, 0, 0);
++  complete.drawClippingHighlights(page, 0, 0, 0);
++  EXPECT_TRUE(middle.renderer.marked(22, 19));
++  EXPECT_TRUE(middle.renderer.marked(77, 19));
++  EXPECT_FALSE(complete.renderer.marked(22, 19));
++  EXPECT_FALSE(complete.renderer.marked(77, 19));
++}
++TEST(ClippingRibbonRender, TipsFitTheirColumnAndDoNotOverwriteNeighborText) {
++  const ClippingHighlightGeometry::GapRect marker{10, 20, 40, 20};
++  auto right = ClippingHighlightGeometry::continuationTip(marker, false, 0, 54);
++  EXPECT_EQ(right.x, 50);
++  EXPECT_EQ(right.width, 4);
++  EXPECT_EQ(right.height, marker.height);
++  auto left = ClippingHighlightGeometry::continuationTip(marker, true, 8, 100);
++  EXPECT_EQ(left.x, 8);
++  EXPECT_EQ(left.width, 2);
++  EXPECT_EQ(left.height, marker.height);
++  EXPECT_EQ(ClippingHighlightGeometry::continuationTip(marker, false, 0, 50).width, 0);
++}
++
++TEST(ClippingRibbonRender, HorizontalGapSurvivesNegativeAndTightLineSpacingInBothModes) {
++  for (bool dark : {false, true})
++    for (int step : {8, 12, 16, 18, 19, 20}) {
++      EpubReaderActivity activity(dark);
++      Page page{{line(10, {20, 60}, {30, 30}), line(10 + step, {20, 60}, {30, 30})}};
++      matches(activity, {{0, 1}, {2, 3}});
++      activity.drawClippingHighlights(page, 0, 0, 0);
++      int widest = 0, current = 0;
++      for (int y = 11; y < 10 + step + 19; ++y) {
++        if (!activity.renderer.marked(30, y)) {
++          ++current;
++          widest = std::max(widest, current);
++        } else
++          current = 0;
++      }
++      EXPECT_GE(widest, 2) << "line step=" << step;
++      EXPECT_TRUE(activity.renderer.marked(30, 12));
++      EXPECT_TRUE(activity.renderer.marked(30, 10 + step + 17));
++    }
++}
++TEST(ClippingRibbonRender, TightRowsInsideOneHighlightNeverGetHorizontalSeparators) {
++  for (int step : {8, 12, 16, 18, 20}) {
++    EpubReaderActivity activity;
++    Page page{{line(10, {20}, {60}), line(10 + step, {20}, {60}), line(10 + 2 * step, {20}, {60})}};
++    matches(activity, {{0, 2}});
++    activity.drawClippingHighlights(page, 0, 0, 0);
++    for (int y = 11; y < 10 + 2 * step + 19; ++y)
++      EXPECT_TRUE(activity.renderer.marked(30, y)) << "line step=" << step << " y=" << y;
++  }
 +}
 diff --git a/test/clipping_page_turn/ExtractCollector.py b/test/clipping_page_turn/ExtractCollector.py
 new file mode 100644
@@ -7435,10 +7666,10 @@ index 0000000000000000000000000000000000000000..f9f02f372153dc674d961408f19f0488
 +}
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7e369eb3ff4e069d6b66ed40bf3aec33cba729a
+index 0000000000000000000000000000000000000000..cb184afbeeaf47370a1ac52aa6a0f5febcd6e3d0
 --- /dev/null
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,129 @@
 +add_executable(highlight_word_edit_test HighlightWordEditTest.cpp
 +  ${REPO_ROOT}/lib/KOReaderSync/ChapterXPathResolver.cpp
 +  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
@@ -7561,6 +7792,13 @@ index 0000000000000000000000000000000000000000..e7e369eb3ff4e069d6b66ed40bf3aec3
 +target_include_directories(ClippingMergeStoreTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/src)
 +target_link_libraries(ClippingMergeStoreTest PRIVATE crosspoint_test_common GTest::gtest_main)
 +gtest_discover_tests(ClippingMergeStoreTest)
++
++set(READER_CREATION_INC ${CMAKE_CURRENT_BINARY_DIR}/ReaderCreation.inc)
++add_custom_command(OUTPUT ${READER_CREATION_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractReaderCreation.py ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp ${READER_CREATION_INC}
++ DEPENDS ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractReaderCreation.py VERBATIM)
++target_sources(HighlightMergeTest PRIVATE ${READER_CREATION_INC})
++target_include_directories(HighlightMergeTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 diff --git a/test/highlight_word_edit/ClippingMergeStoreTest.cpp b/test/highlight_word_edit/ClippingMergeStoreTest.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..dfb7ee036db80f921f412ce484f24981f20ca7ae
@@ -7893,6 +8131,18 @@ index 0000000000000000000000000000000000000000..5b5faaeae8f3153095c8b15dc3f78ec7
 +b=text.index('OnPageHighlightActivity::OnPageHighlightActivity',a)
 +c=text.index('void OnPageHighlightActivity::HandleSnapshot::capture')
 +Path(sys.argv[2]).write_text(text[a:b]+text[c:])
+diff --git a/test/highlight_word_edit/ExtractReaderCreation.py b/test/highlight_word_edit/ExtractReaderCreation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..26ce362623d497eac3293be7b6980580c23cf0b0
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractReaderCreation.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++source=Path(sys.argv[1]).read_text()
++a=source.index('        Clipping metadata;')
++b=source.index('        const bool saved =',a)
++Path(sys.argv[2]).write_text(source[a:b])
 diff --git a/test/highlight_word_edit/ExtractTouchRelease.py b/test/highlight_word_edit/ExtractTouchRelease.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..905ee71ce4108e09a397eb9785aaca33d223c1f7
@@ -8128,10 +8378,10 @@ index 0000000000000000000000000000000000000000..312126bdf6d6b1299a428c54ebd13ee6
 +}
 diff --git a/test/highlight_word_edit/HighlightMergeTest.cpp b/test/highlight_word_edit/HighlightMergeTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..90bb70b59c1da57c83775dc358bbb8f0f1e4b3ee
+index 0000000000000000000000000000000000000000..5922117b60947cd81079c03135c6771e45848de8
 --- /dev/null
 +++ b/test/highlight_word_edit/HighlightMergeTest.cpp
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,213 @@
 +#include <gtest/gtest.h>
 +
 +#include "ClippingStore.h"
@@ -8234,6 +8484,116 @@ index 0000000000000000000000000000000000000000..90bb70b59c1da57c83775dc358bbb8f0
 +    EXPECT_EQ(CLIPPINGS.writes, 0u);
 +  }
 +  failMergeAllocation = false;
++}
++
++TEST(HighlightMerge, NewlyCreatedHighlightMergesOneWordOverlapWithoutAppendingDuplicate) {
++  auto epub = book("alpha bravo charlie delta");
++  reset({"bravo charlie delta"});
++  Clipping metadata;
++  size_t index = SIZE_MAX;
++  bool merged = false;
++  ASSERT_EQ(HighlightMerge::add(epub, metadata, "Chapter", "alpha bravo", index, merged),
++            ClippingStore::AddResult::Added);
++  ASSERT_EQ(CLIPPINGS.records.size(), 1u);
++  EXPECT_TRUE(merged);
++  EXPECT_EQ(index, 0u);
++  EXPECT_EQ(CLIPPINGS.records[0].text, "alpha bravo charlie delta");
++  EXPECT_EQ(CLIPPINGS.adds, 0u);
++  EXPECT_EQ(CLIPPINGS.writes, 1u);
++}
++TEST(HighlightMerge, NewHighlightCanBridgeSeveralSavedQuotes) {
++  auto epub = book("alpha bravo charlie delta echo foxtrot");
++  reset({"alpha bravo", "echo foxtrot"});
++  Clipping metadata;
++  size_t index = SIZE_MAX;
++  bool merged = false;
++  ASSERT_EQ(HighlightMerge::add(epub, metadata, "Chapter", "bravo charlie delta echo", index, merged),
++            ClippingStore::AddResult::Added);
++  ASSERT_EQ(CLIPPINGS.records.size(), 1u);
++  EXPECT_TRUE(merged);
++  EXPECT_EQ(CLIPPINGS.records[0].text, "alpha bravo charlie delta echo foxtrot");
++  EXPECT_EQ(CLIPPINGS.adds, 0u);
++  EXPECT_EQ(CLIPPINGS.writes, 1u);
++}
++TEST(HighlightMerge, NewAdjacentQuoteRemainsSeparateAndFirstHighlightUsesFastAppend) {
++  auto epub = book("alpha bravo charlie");
++  reset({});
++  Clipping metadata;
++  size_t index = SIZE_MAX;
++  bool merged = true;
++  ASSERT_EQ(HighlightMerge::add(epub, metadata, "Chapter", "alpha", index, merged), ClippingStore::AddResult::Added);
++  EXPECT_FALSE(merged);
++  EXPECT_EQ(epub->streamReads, 0u);
++  ASSERT_EQ(HighlightMerge::add(epub, metadata, "Chapter", "bravo charlie", index, merged),
++            ClippingStore::AddResult::Added);
++  EXPECT_FALSE(merged);
++  EXPECT_EQ(CLIPPINGS.records.size(), 2u);
++  EXPECT_EQ(CLIPPINGS.adds, 2u);
++}
++TEST(HighlightMerge, FailedNewMergeCannotAppendDuplicateOrEraseSavedQuote) {
++  auto epub = book("alpha bravo charlie");
++  for (int mode = 0; mode < 3; ++mode) {
++    reset({"bravo charlie"});
++    failMergeAllocation = mode == 0;
++    CLIPPINGS.failRead = mode == 1;
++    CLIPPINGS.failSave = mode == 2;
++    Clipping metadata;
++    size_t index = SIZE_MAX;
++    bool merged = false;
++    EXPECT_EQ(HighlightMerge::add(epub, metadata, "Chapter", "alpha bravo", index, merged),
++              ClippingStore::AddResult::SaveFailed);
++    EXPECT_FALSE(merged);
++    ASSERT_EQ(CLIPPINGS.records.size(), 1u);
++    EXPECT_EQ(CLIPPINGS.records[0].text, "bravo charlie");
++    EXPECT_EQ(CLIPPINGS.writes, 0u);
++    EXPECT_EQ(CLIPPINGS.adds, 0u);
++  }
++  failMergeAllocation = false;
++}
++
++namespace {
++bool failExport = false;
++struct ClippingsManager {
++  static bool saveClipping(const std::string&, const std::string&, const std::string&, int, const std::string&) {
++    return !failExport;
++  }
++};
++struct Creation {
++  ClippingStore::AddResult result;
++  bool merged;
++  size_t index;
++};
++Creation createFromReader(const std::shared_ptr<Epub>& epub, const std::string& text) {
++  struct ClipResult {
++    uint16_t sectionPage = 0, endSectionPage = 0, sectionPageCount = 100;
++    uint16_t startPageWordIndex = 0, endPageWordIndex = 1, wordCount = 2, paragraphIndex = 0,
++             tableSelection = UINT16_MAX;
++    std::string text;
++  } clip;
++  clip.text = text;
++  const int currentSpineIndex = 0;
++  const uint32_t clippingLayoutSignature = 17;
++  const std::string chapterTitle = "Chapter", bookTitle = "Book", author = "Author";
++#define LOG_ERR(...) ((void)0)
++#include "ReaderCreation.inc"
++#undef LOG_ERR
++  return {addResult, merged, clippingIndex};
++}
++}  // namespace
++TEST(HighlightMerge, ActualReaderCreationPathUsesMergeAndExportFailureCannotDeleteSurvivor) {
++  auto epub = book("alpha bravo charlie delta");
++  for (bool failed : {false, true}) {
++    reset({"bravo charlie delta"});
++    failExport = failed;
++    const auto result = createFromReader(epub, "alpha bravo");
++    EXPECT_EQ(result.result, ClippingStore::AddResult::Added);
++    EXPECT_TRUE(result.merged);
++    ASSERT_EQ(CLIPPINGS.records.size(), 1u);
++    EXPECT_EQ(CLIPPINGS.records[0].text, "alpha bravo charlie delta");
++    EXPECT_EQ(CLIPPINGS.deletes, 0u);
++    EXPECT_EQ(CLIPPINGS.adds, 0u);
++  }
++  failExport = false;
 +}
 diff --git a/test/highlight_word_edit/HighlightWordEditTest.cpp b/test/highlight_word_edit/HighlightWordEditTest.cpp
 new file mode 100644
@@ -8841,35 +9201,84 @@ index 0000000000000000000000000000000000000000..61a3d6094067a1ad3c905a445036f76d
 +}
 diff --git a/test/highlight_word_edit/merge_stubs/ClippingStore.h b/test/highlight_word_edit/merge_stubs/ClippingStore.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4a22c9f8c2cbc099e1d0a23eeff59fb84d3c5be9
+index 0000000000000000000000000000000000000000..b80f1d0075a8ec7ce075e3ce1dbc7f8532b93c3d
 --- /dev/null
 +++ b/test/highlight_word_edit/merge_stubs/ClippingStore.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,76 @@
 +#pragma once
 +#include <algorithm>
 +#include <cstdint>
 +#include <string>
 +#include <vector>
-+inline constexpr size_t CLIPPING_TEXT_MAX = 60*1024, CLIPPING_TEXT_RESERVE = 4096;
++inline constexpr size_t CLIPPING_TEXT_MAX = 60 * 1024, CLIPPING_TEXT_RESERVE = 4096;
++struct ClippingStore {
++  enum class AddResult { Added, LimitReached, SaveFailed };
++};
 +struct Clipping {
-+ uint16_t spineIndex = 0, startPage = 0, pageCount = 100, tableSelection = UINT16_MAX;
-+ std::string text;
++  uint16_t spineIndex = 0, startPage = 0, endPage = 0, pageCount = 100, tableSelection = UINT16_MAX;
++  uint16_t startWordIndex = 0, endWordIndex = 0, wordCount = 0, paragraphIndex = UINT16_MAX;
++  uint32_t layoutSignature = 0;
++  std::string text;
 +};
 +struct MergeStore {
-+ std::vector<Clipping> records;
-+ bool failRead = false, failSave = false;
-+ unsigned writes = 0, merges = 0;
-+ const Clipping* clippingAt(size_t i) const { return i < records.size() ? &records[i] : nullptr; }
-+ const auto& getClippings() const { return records; }
-+ bool readClippingText(size_t i, std::string& text) const { if(failRead)return false;text=records[i].text;return true; }
-+ bool updateClippingText(size_t i, const std::string& text) { if(failSave)return false;++writes;records[i].text=text;return true; }
-+ bool mergeClippingText(size_t& index, const std::string& text, const uint8_t* remove, size_t count) {
-+  if(failSave)return false;
-+  ++writes;++merges;records[index].text=text;
-+  size_t write=0,newIndex=0;
-+  for(size_t i=0;i<count;++i){if(remove[i])continue;if(i==index)newIndex=write;records[write++]=records[i];}
-+  records.resize(write);index=newIndex;return true;
-+ }
++  std::vector<Clipping> records;
++  bool failRead = false, failSave = false;
++  unsigned writes = 0, merges = 0, adds = 0, deletes = 0;
++  size_t clippingCount() const { return records.size(); }
++  bool removeClippingAt(size_t index) {
++    ++deletes;
++    records.erase(records.begin() + index);
++    return true;
++  }
++  ClippingStore::AddResult addClipping(uint16_t spine, uint16_t start, uint16_t end, uint16_t pages, uint16_t first,
++                                       uint16_t last, uint16_t words, const char*, uint16_t paragraph,
++                                       const std::string& text, uint16_t table, uint32_t layout) {
++    if (failSave) return ClippingStore::AddResult::SaveFailed;
++    Clipping clip;
++    clip.spineIndex = spine;
++    clip.startPage = start;
++    clip.endPage = end;
++    clip.pageCount = pages;
++    clip.startWordIndex = first;
++    clip.endWordIndex = last;
++    clip.wordCount = words;
++    clip.paragraphIndex = paragraph;
++    clip.tableSelection = table;
++    clip.layoutSignature = layout;
++    clip.text = text;
++    records.push_back(clip);
++    ++writes;
++    ++adds;
++    return ClippingStore::AddResult::Added;
++  }
++  const Clipping* clippingAt(size_t i) const { return i < records.size() ? &records[i] : nullptr; }
++  const auto& getClippings() const { return records; }
++  bool readClippingText(size_t i, std::string& text) const {
++    if (failRead) return false;
++    text = records[i].text;
++    return true;
++  }
++  bool updateClippingText(size_t i, const std::string& text) {
++    if (failSave) return false;
++    ++writes;
++    records[i].text = text;
++    return true;
++  }
++  bool mergeClippingText(size_t& index, const std::string& text, const uint8_t* remove, size_t count) {
++    if (failSave) return false;
++    ++writes;
++    ++merges;
++    records[index].text = text;
++    size_t write = 0, newIndex = 0;
++    for (size_t i = 0; i < count; ++i) {
++      if (remove[i]) continue;
++      if (i == index) newIndex = write;
++      records[write++] = records[i];
++    }
++    records.resize(write);
++    index = newIndex;
++    return true;
++  }
 +};
 +extern MergeStore CLIPPINGS;
 diff --git a/test/highlight_word_edit/merge_stubs/Memory.h b/test/highlight_word_edit/merge_stubs/Memory.h

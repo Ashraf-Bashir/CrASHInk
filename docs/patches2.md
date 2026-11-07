@@ -41,12 +41,24 @@ side/top/bottom boundaries. Words and wrapped rows inside one highlight stay
 connected; only the outer ribbon boundary is inset. The separation pass reads
 resident layout and adds no SD reads, allocations or display refreshes.
 
-Dragging an existing highlight commits on release. Extension/trim buttons keep
-editing a draft until Save. Both commit paths merge other highlights sharing at
-least one complete word at the same strict chapter text position, including
+New highlight creation, drag release, and editor Save share the same overlap
+planner. Extension/trim buttons keep editing a draft until Save. These paths merge
+other highlights sharing at least one complete word at the same strict chapter
+text position, including
 chained overlaps. Adjacent quotes, punctuation-only contact, repeated text at a
 different position, and different chapter/table scopes remain separate. Cancel
 and a net-unchanged draft leave saved clippings alone.
+
+Saved highlights that continue across pages attach a triangle in the same marker
+shade and height: right at the outgoing end, left at the incoming start, both on
+an intermediate page. Tips fit the visible page/table margin and are included in
+highlight touch bounds. No arrow is added at a true quote boundary.
+
+Different quotes reserve at least two background rows at a shared horizontal
+boundary even when negative/tight line spacing overlaps their boxes. The row
+layout determines the separator; internal wrapped rows of one quote stay joined.
+Text redraws stay within the adjusted marker height to preserve original glyph
+pixels in the separator. This uses bounded stack metadata and no extra SD reads.
 
 The store replaces the survivor and drops absorbed entries in one atomic rewrite;
 failed writes/renames retain the original file and records. Survivor indices are
