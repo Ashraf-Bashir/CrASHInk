@@ -61,7 +61,7 @@ layout determines the separator; internal wrapped rows of one quote stay joined.
 Text redraws stay within the adjusted marker height to preserve original glyph
 pixels in the separator. This uses bounded stack metadata and no extra SD reads.
 
-Horizontal separators reserve three background pixels, borrowing the extra row
+Horizontal separators reserve five background pixels, borrowing the extra space
 from the lower quote only where needed; internal lines remain joined.
 When quotes share a line, the separator follows the stepped contour: it cuts only
 the appropriate portion above/below the shared row, and assigns each side to its
