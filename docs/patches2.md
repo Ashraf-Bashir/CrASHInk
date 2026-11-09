@@ -182,3 +182,20 @@ Patch 0003 uses `vbsyxfusjjqdxkjqlysc.supabase.co` for sign-in and token
 refresh, matching Readest upstream commit `074603ce62ee` (PR #6729). The
 former `readest.supabase.co` vanity host is being retired. The sync endpoint
 and stored credentials/session format are unchanged.
+
+### Readest rejected-session recovery
+
+Patch 0003 refreshes and replays an authenticated request once on HTTP 401 or
+an explicit `Not authenticated` HTTP 403, matching Readest's KOReader policy.
+Other 403 responses preserve the session. Server errors are not replayed, so
+an uncertain highlight write cannot be duplicated. A server/transport error
+while refreshing is surfaced directly instead of triggering a second password
+request. Failure screens show the translated operation and HTTP status.
+
+The client reuses a 192-byte member buffer only for error prefixes on streamed
+POST responses; successful sync echoes remain discarded. Error-detail strings
+are allocated only on the failure path. Native tests compile the complete
+production client with the real ArduinoJson parser and a scripted HTTP transport,
+covering successful book/note pulls, rejected tokens, rotation persistence,
+permission errors, refresh failure, malformed tokens and non-replayed writes.
+These tests do not authenticate against the user's live Readest account.

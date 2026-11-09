@@ -1,5 +1,5 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index c77d71ea646849006c72c360ca4f7aaeda12dfc4..72aa55c95239d8307e59e463f68a56ac2a1eb409 100644
+index c77d71ea646849006c72c360ca4f7aaeda12dfc4..5e458b2786dbc86e0be41e108f8ff9fc6440447d 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,14 +1,29 @@
@@ -32,15 +32,16 @@ index c77d71ea646849006c72c360ca4f7aaeda12dfc4..72aa55c95239d8307e59e463f68a56ac
  - crASHink: tapping a highlight opens a word editor with start/end extension and trimming, a paged text preview with surrounding context and a visibly marked selection, Save, Cancel, and Delete.
 
  - Assign a physical-button-only Home/Reader shortcut that returns from nested reader menus directly to the open book, and otherwise returns Home.
-@@ -18,6 +33,7 @@
+@@ -18,6 +33,8 @@
  - TTF font support on ESP32-S3 devices. Whole-point sizes from 8pt to 22pt will be automatically available.
  - Separate saved highlights retain clear side/top/bottom gutters, while each highlight stays continuous across its wrapped lines. Extending a saved highlight into another by at least one complete word merges their text and records on commit, including chained overlaps. Drag release and editor Save use the same atomic merge; adjacency, punctuation-only contact, Cancel and unchanged drafts do not merge.
  - Newly created highlights now share the same one-word overlap merge as edited highlights. Saved highlights show same-shade, full-height continuation triangles toward the next/previous page. Separate quotes keep a visible horizontal gap even when tight line spacing overlaps their line boxes; wrapped rows within one quote remain joined.
++- Readest sync retries a rejected session once after refreshing its token, without replaying server failures. Errors now show the failing operation and HTTP status instead of an unexplained server-error message.
 +- Readest sign-in and token refresh now use Readest's permanent Supabase project address, matching upstream's migration away from the old vanity host.
  - Horizontal gaps between separate highlights are now five pixels, taking the extra space from the lower highlight only where needed. Grey highlight boxes now stay visually separate when two quotes share a line and wrap above/below one another. Ownership-aware stepped boundaries prevent background overlap around the side gap while each individual quote remains continuous, including tight spacing and right-to-left layouts.
  - Library replaces Recent Books with a searchable book list, and adds various book metadata sort options.
  - Assign Library to power, long-press, button-chord, Home-button, or Quick Actions shortcuts to open the book list directly.
-@@ -148,10 +164,12 @@
+@@ -148,10 +165,12 @@
 
  - Delete in the highlight editor now acts immediately without an extra confirmation.
 
@@ -53,7 +54,7 @@ index c77d71ea646849006c72c360ca4f7aaeda12dfc4..72aa55c95239d8307e59e463f68a56ac
  ## [v1.6.0] - 2026-09-21
 
  ### Added
-@@ -649,6 +667,11 @@
+@@ -649,6 +668,11 @@
  - Potential crash when using `Go to %` in EPUBs.
  - Potential crash when entering sleep with Page Overlay enabled if the cached EPUB page data is invalid.
 
@@ -2264,7 +2265,7 @@ index 0000000000000000000000000000000000000000..292610f54ca437940cd4005434b7fbeb
 +};
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..eec42267f8200e667f5ee0d8721f273c253c8be5
+index 0000000000000000000000000000000000000000..b8e7d3b274a324a563a7118dea821ea42bfffa0c
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
 @@ -0,0 +1,1189 @@
@@ -2554,7 +2555,7 @@ index 0000000000000000000000000000000000000000..eec42267f8200e667f5ee0d8721f273c
 +
 +  const auto found = client.findCandidates(epub->getTitle(), epub->getAuthor(), localHash, candidates);
 +  if (found != ReadestClient::OK) {
-+    std::string detail = ReadestClient::errorString(found);
++    std::string detail = client.errorDetail(found);
 +    if (found == ReadestClient::BOOK_NOT_FOUND) detail += ": " + epub->getTitle();
 +    fail(std::move(detail));
 +    return;
@@ -2750,7 +2751,7 @@ index 0000000000000000000000000000000000000000..eec42267f8200e667f5ee0d8721f273c
 +  std::vector<ReadestNote> remote;
 +  const auto pulled = client.pullNotes(book, remote);
 +  if (pulled != ReadestClient::OK) {
-+    fail(ReadestClient::errorString(pulled));
++    fail(client.errorDetail(pulled));
 +    return false;
 +  }
 +
@@ -2925,7 +2926,7 @@ index 0000000000000000000000000000000000000000..eec42267f8200e667f5ee0d8721f273c
 +    notes = batch.to<JsonArray>();
 +    batchCount = 0;
 +    if (result != ReadestClient::OK) {
-+      fail(ReadestClient::errorString(result));
++      fail(client.errorDetail(result));
 +      return false;
 +    }
 +    return true;
@@ -3605,10 +3606,10 @@ index 0000000000000000000000000000000000000000..2525a95e92dceb949ef9baa54b74fcfd
 +};
 diff --git a/src/activities/settings/ReadestAuthActivity.cpp b/src/activities/settings/ReadestAuthActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a73e41fd5885165f5de77ef06af745a88520528
+index 0000000000000000000000000000000000000000..1486afee9d0387ef67dc82a890a319567f2dab25
 --- /dev/null
 +++ b/src/activities/settings/ReadestAuthActivity.cpp
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,133 @@
 +#include "ReadestAuthActivity.h"
 +
 +#include <GfxRenderer.h>
@@ -3657,7 +3658,8 @@ index 0000000000000000000000000000000000000000..9a73e41fd5885165f5de77ef06af745a
 +      autoFinishAt = millis() + 1500;
 +    } else {
 +      state = FAILED;
-+      errorMessage = ReadestClient::errorString(result);
++      errorMessage = client.errorDetail(result);
++      for (char& ch : errorMessage) if (ch == '\n') ch = ' ';
 +    }
 +  }
 +  requestUpdate();
@@ -4644,10 +4646,10 @@ index 0000000000000000000000000000000000000000..001497495f60112f1ce5daaa9dd0d47a
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b7a3cd35e
+index 0000000000000000000000000000000000000000..017cf58e333010050aa4fbce969a5aa2bdf6f18b
 --- /dev/null
 +++ b/src/readest/ReadestClient.cpp
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,644 @@
 +#include "ReadestClient.h"
 +
 +#include <ArduinoJson.h>
@@ -4701,7 +4703,8 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +// Sends one JSON request. With keepBody=false the response is drained and
 +// dropped chunk by chunk (the sync POST echoes every stored record back).
 +int sendJson(freeink::SecureHttpClient& http, const char* method, const std::string& url, const std::string& bearer,
-+             const bool supabase, const std::string& body, const bool keepBody) {
++             const bool supabase, const std::string& body, const bool keepBody, char* errorPrefix = nullptr,
++             size_t prefixSize = 0) {
 +  http.setInsecure();
 +  http.setTimeout(REQUEST_TIMEOUT_MS);
 +  http.setUserAgent(USER_AGENT);
@@ -4716,7 +4719,17 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +
 +  const uint8_t* payload = body.empty() ? nullptr : reinterpret_cast<const uint8_t*>(body.data());
 +  if (keepBody) return http.sendRequest(method, payload, body.size());
-+  return http.sendRequest(method, payload, body.size(), [](const uint8_t*, size_t) { return true; });
++  size_t used = 0;
++  if (errorPrefix && prefixSize) errorPrefix[0] = '\0';
++  return http.sendRequest(method, payload, body.size(), [&](const uint8_t* data, size_t len) {
++    if (http.getStatus() >= 400 && errorPrefix && prefixSize > used + 1) {
++      const size_t count = std::min(len, prefixSize - used - 1);
++      std::memcpy(errorPrefix + used, data, count);
++      used += count;
++      errorPrefix[used] = '\0';
++    }
++    return true;
++  });
 +}
 +
 +ReadestClient::Error errorForStatus(const int code) {
@@ -4827,6 +4840,8 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +}  // namespace
 +
 +ReadestClient::Error ReadestClient::requestToken(const char* grantType, const std::string& body) {
++  lastHttpCode = 0;
++  lastStage = RequestStage::Auth;
 +  if (insufficientHeap()) return LOW_MEMORY;
 +
 +  int code = 0;
@@ -4834,6 +4849,8 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +  {
 +    freeink::SecureHttpClient http;
 +    code = sendJson(http, "POST", std::string(SUPABASE_AUTH_URL) + grantType, "", true, body, true);
++    lastHttpCode = code;
++    lastStage = RequestStage::Auth;
 +    LOG_DBG("RDS", "Token (%s) response: %d", grantType, code);
 +    if (code != 200) {
 +      http.end();
@@ -4891,10 +4908,79 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +    std::string body;
 +    serializeJson(doc, body);
 +    const Error result = requestToken("refresh_token", body);
-+    if (result == OK || result == NETWORK_ERROR || result == LOW_MEMORY) return result;
++    if (result != AUTH_FAILED) return result;
 +    LOG_DBG("RDS", "Refresh token rejected, signing in with password");
 +  }
 +  return signIn();
++}
++
++int ReadestClient::authorizedRequest(freeink::SecureHttpClient& http, const char* method, const std::string& url,
++                                     const std::string& body, bool keepBody, RequestStage stage) {
++  requestFailure = OK;
++  for (int attempt = 0; attempt < 2; ++attempt) {
++    lastStage = stage;
++    const int code =
++        sendJson(http, method, url, accessToken, false, body, keepBody, responsePrefix, sizeof(responsePrefix));
++    lastHttpCode = code;
++    bool rejected = code == 401;
++    if (code == 403) {
++      // Like KOReader: a generic permission/quota 403 must not invalidate login.
++      JsonDocument doc;
++      JsonDocument filter;
++      filter["error"] = true;
++      const auto& buffered = http.getString();
++      const char* data = keepBody ? buffered.c_str() : responsePrefix;
++      const size_t size = keepBody ? std::min<size_t>(buffered.size(), 1024) : std::strlen(responsePrefix);
++      if (!deserializeJson(doc, data, size, DeserializationOption::Filter(filter)))
++        rejected = std::strcmp(doc["error"] | "", "Not authenticated") == 0;
++    }
++    if (!rejected || attempt != 0) return code;
++    // Release TLS before refreshing. Only a rejected request is replayed;
++    // never replay an uncertain server error, particularly a highlight POST.
++    http.end();
++    accessToken.clear();
++    const Error refreshed = ensureSession();
++    if (refreshed != OK) {
++      requestFailure = refreshed;
++      return -1;
++    }
++  }
++  return lastHttpCode;
++}
++
++std::string ReadestClient::errorDetail(const Error error) const {
++  const char* stage = "";
++  switch (lastStage) {
++    case RequestStage::Auth:
++      stage = tr(STR_READEST_SIGNING_IN);
++      break;
++    case RequestStage::Library:
++      stage = tr(STR_READEST_FINDING_BOOK);
++      break;
++    case RequestStage::Notes:
++      stage = tr(STR_READEST_PULLING);
++      break;
++    case RequestStage::Position:
++      stage = tr(STR_READEST_SYNCING_POSITION);
++      break;
++    case RequestStage::Push:
++      stage = tr(STR_READEST_PUSHING);
++      break;
++    case RequestStage::Download:
++      stage = tr(STR_READEST_DOWNLOADING_BOOK);
++      break;
++  }
++  std::string detail;
++  detail.reserve(std::strlen(stage) + std::strlen(errorString(error)) + 40);
++  detail = stage;
++  detail += "\n";
++  detail += errorString(error);
++  if (lastHttpCode > 0) {
++    char code[24];
++    std::snprintf(code, sizeof(code), " (HTTP %d)", lastHttpCode);
++    detail += code;
++  }
++  return detail;
 +}
 +
 +ReadestClient::Error ReadestClient::findCandidates(const std::string& title, const std::string& author,
@@ -4928,11 +5014,11 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +    JsonDocument doc;
 +    {
 +      freeink::SecureHttpClient http;
-+      const int code = sendJson(http, "GET", url, accessToken, false, "", true);
++      const int code = authorizedRequest(http, "GET", url, "", true, RequestStage::Library);
 +      if (code != 200) {
 +        LOG_ERR("RDS", "Library page %d failed: %d", page, code);
 +        http.end();
-+        return errorForStatus(code);
++        return requestFailure != OK ? requestFailure : errorForStatus(code);
 +      }
 +      const DeserializationError error = deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
 +      http.end();
@@ -4993,11 +5079,11 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +  if (insufficientHeap()) return LOW_MEMORY;
 +
 +  freeink::SecureHttpClient http;
-+  const int code = sendJson(http, "POST", SYNC_URL, accessToken, false, body, false);
++  const int code = authorizedRequest(http, "POST", SYNC_URL, body, false, RequestStage::Push);
 +  http.end();
 +  LOG_DBG("RDS", "Sync POST response: %d (%u bytes sent)", code, static_cast<unsigned>(body.size()));
 +  if (code >= 200 && code < 300) return OK;
-+  return errorForStatus(code);
++  return requestFailure != OK ? requestFailure : errorForStatus(code);
 +}
 +
 +ReadestClient::Error ReadestClient::pushNotes(const std::string& notesJson) {
@@ -5023,11 +5109,12 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +  std::string downloadUrl;
 +  {
 +    freeink::SecureHttpClient http;
-+    const int code = sendJson(http, "GET", std::string(STORAGE_DOWNLOAD_URL) + fileKey, accessToken, false, "", true);
++    const int code =
++        authorizedRequest(http, "GET", std::string(STORAGE_DOWNLOAD_URL) + fileKey, "", true, RequestStage::Download);
 +    if (code != 200) {
 +      LOG_ERR("RDS", "Download URL request failed: %d", code);
 +      http.end();
-+      return code == 404 ? BOOK_NOT_FOUND : errorForStatus(code);
++      return code == 404 ? BOOK_NOT_FOUND : (requestFailure != OK ? requestFailure : errorForStatus(code));
 +    }
 +    JsonDocument filter;
 +    filter["downloadUrl"] = true;
@@ -5067,11 +5154,11 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +  JsonDocument doc;
 +  {
 +    freeink::SecureHttpClient http;
-+    const int code = sendJson(http, "GET", url, accessToken, false, "", true);
++    const int code = authorizedRequest(http, "GET", url, "", true, RequestStage::Position);
 +    if (code != 200) {
 +      LOG_ERR("RDS", "Progress pull failed: %d", code);
 +      http.end();
-+      return errorForStatus(code);
++      return requestFailure != OK ? requestFailure : errorForStatus(code);
 +    }
 +    const DeserializationError error = deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
 +    http.end();
@@ -5152,11 +5239,11 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +  JsonDocument doc;
 +  {
 +    freeink::SecureHttpClient http;
-+    const int code = sendJson(http, "GET", url, accessToken, false, "", true);
++    const int code = authorizedRequest(http, "GET", url, "", true, RequestStage::Notes);
 +    if (code != 200) {
 +      LOG_ERR("RDS", "Notes pull failed: %d", code);
 +      http.end();
-+      return errorForStatus(code);
++      return requestFailure != OK ? requestFailure : errorForStatus(code);
 +    }
 +    const DeserializationError error = deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
 +    http.end();
@@ -5209,15 +5296,19 @@ index 0000000000000000000000000000000000000000..01094f65d5d22bdf81c83ab3a217ec2b
 +}
 diff --git a/src/readest/ReadestClient.h b/src/readest/ReadestClient.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4722555485cb2c1d8f1db15ab6274c6c2bbe00cb
+index 0000000000000000000000000000000000000000..6d965c1da3efb5596991267b11541b33fc610953
 --- /dev/null
 +++ b/src/readest/ReadestClient.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,110 @@
 +#pragma once
 +
 +#include <cstdint>
 +#include <string>
 +#include <vector>
++
++namespace freeink {
++class SecureHttpClient;
++}
 +
 +// A book row from the user's Readest library.
 +struct ReadestBook {
@@ -5303,9 +5394,18 @@ index 0000000000000000000000000000000000000000..4722555485cb2c1d8f1db15ab6274c6c
 +  Error pushProgress(const ReadestBook& book, const std::string& xpointer, float fraction, int64_t updatedAtMs);
 +
 +  static const char* errorString(Error error);
++  std::string errorDetail(Error error) const;
 +
 + private:
++  enum class RequestStage { Auth, Library, Notes, Position, Push, Download };
 +  std::string accessToken;
++  int lastHttpCode = 0;
++  Error requestFailure = OK;
++  RequestStage lastStage = RequestStage::Auth;
++  // Reused, bounded error-only prefix; successful POST echoes are never buffered.
++  char responsePrefix[192]{};
++  int authorizedRequest(freeink::SecureHttpClient& http, const char* method, const std::string& url,
++                        const std::string& body, bool keepBody, RequestStage stage);
 +
 +  Error requestToken(const char* grantType, const std::string& body);
 +  Error postSync(const std::string& body);
@@ -5840,15 +5940,16 @@ index 0000000000000000000000000000000000000000..0ca19c37a98aae1089c6b2b62e5668a9
 +bool download(const std::string& url, const std::string& destPath);
 +}  // namespace ReadestTextEpub
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
-index 039870decc6ed7253653629d79a68fd86476eebc..a747bfdd24b818569f03b5c9fd78ba46fbd8fd6e 100644
+index 039870decc6ed7253653629d79a68fd86476eebc..64d8359b5155b4a91ce246429011de5e05656a8c 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -111,8 +111,14 @@ add_subdirectory(library_builder)
+@@ -111,8 +111,15 @@ add_subdirectory(library_builder)
  add_subdirectory(library_input_buffer)
 
  add_subdirectory(library_recent_order)
 +add_subdirectory(readest_text_confidence)
 +add_subdirectory(readest_highlight_safety)
++add_subdirectory(readest_http)
  add_subdirectory(scalable_fonts)
 
  add_subdirectory(glyph_bitmap)
@@ -6002,7 +6103,7 @@ index 0000000000000000000000000000000000000000..bef83496d8f1b26fc958868903ee08b3
 +''')
 diff --git a/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..70203e928d27c4736a842a33ad09deec51a483ed
+index 0000000000000000000000000000000000000000..b200846c48af320a3f5447e5596ad3f2aa11e8a0
 --- /dev/null
 +++ b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
 @@ -0,0 +1,100 @@
@@ -6058,7 +6159,7 @@ index 0000000000000000000000000000000000000000..70203e928d27c4736a842a33ad09deec
 +    out = notes;
 +    return OK;
 +  }
-+  static const char* errorString(Error) { return "error"; }
++  const char* errorDetail(Error) const { return "error"; }
 +};
 +std::string keyHashFor(const std::string& text) { return text; }
 +class ReadestSyncActivity {
@@ -6106,6 +6207,342 @@ index 0000000000000000000000000000000000000000..70203e928d27c4736a842a33ad09deec
 +  std::cout << "Partial/empty remote responses preserve earlier chapters; explicit tombstones apply; local read "
 +               "failures stop sync\n";
 +}
+diff --git a/test/readest_http/CMakeLists.txt b/test/readest_http/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..79b1f5d50c057da223b7e5ad5a20d78877428239
+--- /dev/null
++++ b/test/readest_http/CMakeLists.txt
+@@ -0,0 +1,22 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++# Reuse PlatformIO's exact parser if present; otherwise fetch its pinned version.
++set(READEST_JSON_DIR ${REPO_ROOT}/.pio/libdeps/x4-pro/ArduinoJson/src)
++if(NOT EXISTS ${READEST_JSON_DIR}/ArduinoJson.h)
++  include(FetchContent)
++  FetchContent_Declare(readest_arduinojson
++    GIT_REPOSITORY https://github.com/bblanchon/ArduinoJson.git
++    GIT_TAG v7.4.2 GIT_SHALLOW TRUE)
++  FetchContent_MakeAvailable(readest_arduinojson)
++  set(READEST_JSON_DIR ${readest_arduinojson_SOURCE_DIR}/src)
++endif()
++set(CLIENT_INC ${CMAKE_CURRENT_BINARY_DIR}/ReadestClientUnderTest.inc)
++add_custom_command(OUTPUT ${CLIENT_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractClient.py
++    ${REPO_ROOT}/src/readest/ReadestClient.cpp ${CLIENT_INC}
++  DEPENDS ${REPO_ROOT}/src/readest/ReadestClient.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractClient.py VERBATIM)
++add_executable(readest_http_test ReadestHttpTest.cpp ${CLIENT_INC})
++target_include_directories(readest_http_test PRIVATE stubs ${CMAKE_CURRENT_BINARY_DIR}
++  ${REPO_ROOT}/src/readest ${READEST_JSON_DIR})
++target_compile_features(readest_http_test PRIVATE cxx_std_17)
++target_compile_options(readest_http_test PRIVATE -UNDEBUG)
++add_test(NAME readest_http COMMAND readest_http_test)
+diff --git a/test/readest_http/ExtractClient.py b/test/readest_http/ExtractClient.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..289db0fa75dc0c3d220be8114c89fc9d772e2d7d
+--- /dev/null
++++ b/test/readest_http/ExtractClient.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++for name in ['ReadestStore.h','ReadestTextEpub.h']:
++ s=s.replace('#include "'+name+'"', '')
++Path(sys.argv[2]).write_text(s)
+diff --git a/test/readest_http/ReadestHttpTest.cpp b/test/readest_http/ReadestHttpTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..918c8feb9dcc83b915a662043896d9bf816222b9
+--- /dev/null
++++ b/test/readest_http/ReadestHttpTest.cpp
+@@ -0,0 +1,155 @@
++#include <SecureHttpClient.h>
++
++#include <cassert>
++#include <iostream>
++#include <string>
++struct FakeStore {
++  std::string refresh = "r0", user = "u", email = "test@example.invalid", password = "dummy";
++  int saves = 0;
++  bool hasCredentials() const { return true; }
++  const std::string& getRefreshToken() const { return refresh; }
++  const std::string& getUserId() const { return user; }
++  const std::string& getEmail() const { return email; }
++  const std::string& getPassword() const { return password; }
++  void setSession(const std::string& u, const std::string& r) {
++    user = u;
++    refresh = r;
++  }
++  void clearSession() { refresh.clear(); }
++  void saveToFile() { ++saves; }
++} store;
++#define READEST_STORE store
++namespace ReadestTextEpub {
++bool download(const std::string&, const std::string&) { return true; }
++}  // namespace ReadestTextEpub
++#include "ReadestClientUnderTest.inc"
++using namespace freeink;
++const std::string token = R"({"access_token":"a1","refresh_token":"r1","user":{"id":"u"}})";
++void reset() {
++  replies.clear();
++  requests.clear();
++  store = FakeStore{};
++}
++void done() { assert(replies.empty()); }
++int main() {
++  ReadestBook book;
++  book.hash = "book";
++  {
++    reset();
++    replies = {{200, token}, {500, R"({"error":"book_notes unavailable"})"}};
++    ReadestClient c;
++    std::vector<ReadestNote> n;
++    assert(c.pullNotes(book, n) == ReadestClient::SERVER_ERROR);
++    assert(requests.size() == 2);
++    assert(c.errorDetail(ReadestClient::SERVER_ERROR).find("HTTP 500") != std::string::npos);
++    assert(c.errorDetail(ReadestClient::SERVER_ERROR).find("STR_READEST_PULLING") != std::string::npos);
++    done();
++  }
++  {
++    reset();
++    replies = {{200, token}, {500, "failure"}};
++    ReadestClient c;
++    std::vector<ReadestBook> b;
++    assert(c.findCandidates("Title", "Author", "hash", b) == ReadestClient::SERVER_ERROR);
++    assert(c.errorDetail(ReadestClient::SERVER_ERROR).find("STR_READEST_FINDING_BOOK") != std::string::npos);
++    done();
++  }
++  for (int code : {401, 403}) {
++    reset();
++    replies = {{200, token}, {code, R"({"error":"Not authenticated"})"}, {200, token}, {200, R"({"notes":[]})"}};
++    ReadestClient c;
++    std::vector<ReadestNote> n;
++    assert(c.pullNotes(book, n) == ReadestClient::OK);
++    assert(requests.size() == 4);
++    assert(requests[0].url.find("vbsyxfusjjqdxkjqlysc.supabase.co") != std::string::npos);
++    assert(requests[2].url.find("grant_type=refresh_token") != std::string::npos);
++    assert(store.saves == 2);
++    done();
++  }
++  {
++    reset();
++    replies = {{200, token}, {403, R"({"error":"quota exceeded"})"}};
++    ReadestClient c;
++    std::vector<ReadestNote> n;
++    assert(c.pullNotes(book, n) == ReadestClient::AUTH_FAILED);
++    assert(requests.size() == 2);
++    assert(store.refresh == "r1");
++    done();
++  }
++  {
++    reset();
++    replies = {{200, token}, {401, ""}, {200, token}, {401, ""}};
++    ReadestClient c;
++    std::vector<ReadestNote> n;
++    assert(c.pullNotes(book, n) == ReadestClient::AUTH_FAILED);
++    assert(requests.size() == 4);
++    done();
++  }
++  {
++    reset();
++    replies = {{200, token}, {403, R"({"error":"Not authenticated"})"}, {200, token}, {200, std::string(20000, 'x')}};
++    ReadestClient c;
++    assert(c.pushNotes("[]") == ReadestClient::OK);
++    assert(requests.size() == 4);
++    assert(requests[1].body == requests[3].body);
++    done();
++  }
++  {
++    reset();
++    replies = {{200, token}, {500, "failure"}};
++    ReadestClient c;
++    assert(c.pushNotes("[]") == ReadestClient::SERVER_ERROR);
++    assert(requests.size() == 2);
++    done();
++  }
++  {
++    reset();
++    replies = {{522, "timeout"}};
++    ReadestClient c;
++    std::vector<ReadestNote> n;
++    assert(c.pullNotes(book, n) == ReadestClient::SERVER_ERROR);
++    assert(c.errorDetail(ReadestClient::SERVER_ERROR).find("STR_READEST_SIGNING_IN") != std::string::npos);
++    done();
++  }
++  {
++    reset();
++    replies = {{200, token}, {401, ""}, {200, "{}"}};
++    ReadestClient c;
++    assert(c.pushNotes("[]") == ReadestClient::JSON_ERROR);
++    done();
++  }
++  {
++    reset();
++    replies = {
++        {200, token},
++        {200,
++         R"({"notes":[{"id":"n1","type":"annotation","text":"hello world","xpointer0":"/p[1]","color":"yellow","deleted_at":null}]})"}};
++    ReadestClient c;
++    std::vector<ReadestNote> notes;
++    assert(c.pullNotes(book, notes) == ReadestClient::OK);
++    assert(notes.size() == 1 && notes[0].id == "n1" && notes[0].text == "hello world" && !notes[0].deleted);
++    done();
++  }
++  {
++    reset();
++    replies = {
++        {200, token},
++        {200,
++         R"({"books":[{"book_hash":"book","title":"Title","author":"Author","format":"EPUB","deleted_at":null}]})"}};
++    ReadestClient c;
++    std::vector<ReadestBook> books;
++    assert(c.findCandidates("Title", "Author", "book", books) == ReadestClient::OK);
++    assert(books.size() == 1 && books[0].hash == "book");
++    done();
++  }
++  {
++    reset();
++    replies = {{400, R"({"error":"refresh token expired"})"}, {200, token}, {200, R"({"notes":[]})"}};
++    ReadestClient c;
++    std::vector<ReadestNote> notes;
++    assert(c.pullNotes(book, notes) == ReadestClient::OK);
++    assert(requests[1].url.find("grant_type=password") != std::string::npos);
++    done();
++  }
++  std::cout << "Readest HTTP regression scenarios passed\n";
++}
+diff --git a/test/readest_http/stubs/I18n.h b/test/readest_http/stubs/I18n.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2098f5bf9164aea007b21eb8db43feaa133a263
+--- /dev/null
++++ b/test/readest_http/stubs/I18n.h
+@@ -0,0 +1,50 @@
++#pragma once
++enum StrId {
++  STR_READEST_DOWNLOADING_BOOK,
++  STR_READEST_ERR_AUTH,
++  STR_READEST_ERR_BOOK,
++  STR_READEST_ERR_JSON,
++  STR_READEST_ERR_MEMORY,
++  STR_READEST_ERR_NETWORK,
++  STR_READEST_ERR_NO_CREDENTIALS,
++  STR_READEST_ERR_SERVER,
++  STR_READEST_FINDING_BOOK,
++  STR_READEST_PULLING,
++  STR_READEST_PUSHING,
++  STR_READEST_SIGNING_IN,
++  STR_READEST_SYNCING_POSITION,
++  STR_READEST_SYNC_FAILED
++};
++inline const char* tr(StrId id) {
++  switch (id) {
++    case STR_READEST_DOWNLOADING_BOOK:
++      return "STR_READEST_DOWNLOADING_BOOK";
++    case STR_READEST_ERR_AUTH:
++      return "STR_READEST_ERR_AUTH";
++    case STR_READEST_ERR_BOOK:
++      return "STR_READEST_ERR_BOOK";
++    case STR_READEST_ERR_JSON:
++      return "STR_READEST_ERR_JSON";
++    case STR_READEST_ERR_MEMORY:
++      return "STR_READEST_ERR_MEMORY";
++    case STR_READEST_ERR_NETWORK:
++      return "STR_READEST_ERR_NETWORK";
++    case STR_READEST_ERR_NO_CREDENTIALS:
++      return "STR_READEST_ERR_NO_CREDENTIALS";
++    case STR_READEST_ERR_SERVER:
++      return "STR_READEST_ERR_SERVER";
++    case STR_READEST_FINDING_BOOK:
++      return "STR_READEST_FINDING_BOOK";
++    case STR_READEST_PULLING:
++      return "STR_READEST_PULLING";
++    case STR_READEST_PUSHING:
++      return "STR_READEST_PUSHING";
++    case STR_READEST_SIGNING_IN:
++      return "STR_READEST_SIGNING_IN";
++    case STR_READEST_SYNCING_POSITION:
++      return "STR_READEST_SYNCING_POSITION";
++    case STR_READEST_SYNC_FAILED:
++      return "STR_READEST_SYNC_FAILED";
++  }
++  return "";
++}
+diff --git a/test/readest_http/stubs/Logging.h b/test/readest_http/stubs/Logging.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c1ee02bfa5b373d0f3ad729a0b07cdc27741303
+--- /dev/null
++++ b/test/readest_http/stubs/Logging.h
+@@ -0,0 +1,4 @@
++#pragma once
++#define LOG_ERR(...) ((void)0)
++#define LOG_DBG(...) ((void)0)
++#define LOG_INF(...) ((void)0)
+diff --git a/test/readest_http/stubs/SecureHttpClient.h b/test/readest_http/stubs/SecureHttpClient.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1808cc290aaa985a4e7c6626d5875b007c0e2d61
+--- /dev/null
++++ b/test/readest_http/stubs/SecureHttpClient.h
+@@ -0,0 +1,63 @@
++#pragma once
++#include <cassert>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <string>
++#include <vector>
++struct FakeESP {
++  uint32_t getFreeHeap() const { return 100000; }
++  uint32_t getMaxAllocHeap() const { return 100000; }
++};
++inline FakeESP ESP;
++namespace freeink {
++struct Reply {
++  int code;
++  std::string body;
++};
++struct Request {
++  std::string method, url, body, authorization;
++};
++inline std::deque<Reply> replies;
++inline std::vector<Request> requests;
++class SecureHttpClient {
++  std::string url, response, authorization;
++  int code = 0;
++
++ public:
++  void setInsecure() {}
++  void setTimeout(uint32_t) {}
++  void setUserAgent(const char*) {}
++  bool begin(const std::string& u) {
++    url = u;
++    response.clear();
++    authorization.clear();
++    return true;
++  }
++  void addHeader(const std::string& k, const std::string& v) {
++    if (k == "Authorization") authorization = v;
++  }
++  void end() {}
++  const std::string& getString() const { return response; }
++  int getStatus() const { return code; }
++  int sendRequest(const char* m, const uint8_t* p, size_t n) {
++    int result = sendRequest(m, p, n, [&](const uint8_t* b, size_t z) {
++      response.append(reinterpret_cast<const char*>(b), z);
++      return true;
++    });
++    return result;
++  }
++  template <class Callback>
++  int sendRequest(const char* m, const uint8_t* p, size_t n, Callback cb) {
++    assert(!replies.empty());
++    requests.push_back({m, url, p ? std::string(reinterpret_cast<const char*>(p), n) : "", authorization});
++    auto r = replies.front();
++    replies.pop_front();
++    code = r.code;
++    // Deliberately split the error string across callback chunks.
++    for (size_t i = 0; i < r.body.size(); i += 7)
++      cb(reinterpret_cast<const uint8_t*>(r.body.data() + i), std::min<size_t>(7, r.body.size() - i));
++    return code;
++  }
++};
++}  // namespace freeink
 diff --git a/test/readest_position_sync/CMakeLists.txt b/test/readest_position_sync/CMakeLists.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..9ff5c5496823794fcdbc0abb57d6400de03f5514
