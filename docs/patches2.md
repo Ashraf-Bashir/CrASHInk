@@ -216,3 +216,18 @@ Native tests exercise the production input/dismissal methods with and without
 suggestions, both swipe directions, explicit Finished state, and repeated close.
 On X4 Pro, advance past the final page, then tap × or swipe back: the final page
 should reopen immediately and the book should remain in its original folder.
+
+### Backtracking during a new cross-page highlight
+
+Patch 0002 lets a touch selection that crossed onto the next page return through
+the upper margin (including the upper-left corner) without releasing the finger.
+It reloads the original page, restores the original word anchor and selects through
+that page's end. Continued finger motion then shortens/extends the live range.
+The old page text is repainted before differential highlighting resumes, and a
+stationary finger cannot immediately skip another page. Dwell timing resets when
+switching between the upper and lower edges. Release still commits only once.
+A failed prior-page load leaves the current draft intact; a geometry rebuild
+failure preserves the captured valid range. Tests exercise the production reverse
+transition and touch loop, original anchor restoration, continued hold/release,
+render invalidation, and failures. This keeps the existing page-zero/page-one
+selection model; it does not add arbitrary backward extension before page zero.
