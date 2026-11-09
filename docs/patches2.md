@@ -175,3 +175,10 @@ The build workflow uses `actions/upload-artifact@v7` with `archive: false` and a
 single `.bin` file. New runs provide the versioned firmware file directly in
 Artifacts, without a ZIP wrapper. Existing older run artifacts are unchanged.
 See [GitHub's direct-artifact download announcement](https://github.blog/changelog/2026-02-26-github-actions-now-supports-uploading-and-downloading-non-zipped-artifacts/).
+
+### Readest authentication host
+
+Patch 0003 uses `vbsyxfusjjqdxkjqlysc.supabase.co` for sign-in and token
+refresh, matching Readest upstream commit `074603ce62ee` (PR #6729). The
+former `readest.supabase.co` vanity host is being retired. The sync endpoint
+and stored credentials/session format are unchanged.
