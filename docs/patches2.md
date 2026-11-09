@@ -38,8 +38,9 @@ requires the documented order.
 
 `0002-clippings.patch` keeps different saved highlights visually separate at
 side/top/bottom boundaries. Words and wrapped rows inside one highlight stay
-connected; only the outer ribbon boundary is inset. The separation pass reads
-resident layout and adds no SD reads, allocations or display refreshes.
+connected; only the outer ribbon boundary is inset. The separation pass uses
+resident layout and fixed geometry storage, without per-frame allocations or
+extra display refreshes.
 
 New highlight creation, drag release, and editor Save share the same overlap
 planner. Extension/trim buttons keep editing a draft until Save. These paths merge
@@ -59,6 +60,14 @@ boundary even when negative/tight line spacing overlaps their boxes. The row
 layout determines the separator; internal wrapped rows of one quote stay joined.
 Text redraws stay within the adjusted marker height to preserve original glyph
 pixels in the separator. This uses bounded stack metadata and no extra SD reads.
+
+When quotes share a line, the separator follows the stepped contour: it cuts only
+the appropriate portion above/below the shared row, and assigns each side to its
+own quote. This prevents tight line boxes from reconnecting around the side gap.
+Fixed reader-lifetime boundary storage is 384 bytes; seam descriptors stay on the
+render stack, without another framebuffer. Regression tests check that the two
+grey shapes are separate while each quote's own rows remain connected, including
+left-to-right/right-to-left text and tight spacing in both display modes.
 
 The store replaces the survivor and drops absorbed entries in one atomic rewrite;
 failed writes/renames retain the original file and records. Survivor indices are
