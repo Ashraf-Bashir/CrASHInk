@@ -1,5 +1,5 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..85f7371d521e2649663650cafbfdd50dca71f807 100644
+index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..62c671591988bec236004533d55d6b465cb03197 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,12 +1,24 @@
@@ -23,7 +23,7 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..85f7371d521e2649663650cafbfdd50d
  - TTF font support on ESP32-S3 devices. Whole-point sizes from 8pt to 22pt will be automatically available.
 +- Separate saved highlights retain clear side/top/bottom gutters, while each highlight stays continuous across its wrapped lines. Extending a saved highlight into another by at least one complete word merges their text and records on commit, including chained overlaps. Drag release and editor Save use the same atomic merge; adjacency, punctuation-only contact, Cancel and unchanged drafts do not merge.
 +- Newly created highlights now share the same one-word overlap merge as edited highlights. Saved highlights show same-shade, full-height continuation triangles toward the next/previous page. Separate quotes keep a visible horizontal gap even when tight line spacing overlaps their line boxes; wrapped rows within one quote remain joined.
-+- Grey highlight boxes now stay visually separate when two quotes share a line and wrap above/below one another. Ownership-aware stepped boundaries prevent background overlap around the side gap while each individual quote remains continuous, including tight spacing and right-to-left layouts.
++- Horizontal gaps between separate highlights are now three pixels, taking the extra row from the lower highlight only where needed. Grey highlight boxes now stay visually separate when two quotes share a line and wrap above/below one another. Ownership-aware stepped boundaries prevent background overlap around the side gap while each individual quote remains continuous, including tight spacing and right-to-left layouts.
  - Library replaces Recent Books with a searchable book list, and adds various book metadata sort options.
  - Assign Library to power, long-press, button-chord, Home-button, or Quick Actions shortcuts to open the book list directly.
  - Customize the top and bottom reader status bars separately, including item positions and progress bars, in EPUB, TXT, and XTC books. Each bar can be previewed where it appears while reading.
@@ -4654,7 +4654,7 @@ index 0000000000000000000000000000000000000000..d97e8ade60b29e794461f938b23b0607
 +  void reset() { pointPending = released = false; }
 +};
 diff --git a/src/clippings/ClippingHighlightGeometry.h b/src/clippings/ClippingHighlightGeometry.h
-index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eacd19c32cc 100644
+index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..2b4702a8cf4a1c26569c955954d50bdc131759e7 100644
 --- a/src/clippings/ClippingHighlightGeometry.h
 +++ b/src/clippings/ClippingHighlightGeometry.h
 @@ -1,6 +1,10 @@
@@ -4668,13 +4668,15 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eac
 
  namespace ClippingHighlightGeometry {
 
-@@ -19,6 +23,209 @@ struct GapRect {
+@@ -19,6 +23,211 @@ struct GapRect {
    int height = 0;
  };
 
 +// A ribbon is continuous between wrapped lines. Only its outer boundary
 +// receives a gutter; spacing is never inserted between lines of one clipping.
 +inline constexpr int BoundaryInset = 1;
++// Keep the upper edge fixed; borrow the extra background row from the lower quote.
++inline constexpr int HorizontalSeparator = 3;
 +struct RibbonRows {
 +  int16_t first = 0, last = 0, lastHeight = 0;
 +  int16_t topLimit = std::numeric_limits<int16_t>::min();
@@ -4696,15 +4698,15 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eac
 +  }
 +};
 +// Negative/tight line spacing can make two quote rectangles overlap. Reserve
-+// two horizontal background rows at their shared boundary rather than merely
++// three horizontal background rows at their shared boundary rather than merely
 +// subtracting a fixed pixel from each rectangle (which can still touch).
 +inline void separateStackedRibbons(RibbonRows& upper, RibbonRows& lower) {
 +  if (!upper.seen || !lower.seen || upper.last >= lower.first) return;
 +  const int bottom = upper.last + upper.lastHeight;
-+  if (bottom <= lower.first) return;  // Existing outer insets already leave a gap.
++  if (bottom + 1 < lower.first) return;  // Existing outer insets already leave a gap.
 +  const int seam = (bottom + lower.first) / 2;
 +  upper.bottomLimit = std::min<int>(upper.bottomLimit, seam - 1);
-+  lower.topLimit = std::max<int>(lower.topLimit, seam + 1);
++  lower.topLimit = std::max<int>(lower.topLimit, seam - 1 + HorizontalSeparator);
 +}
 +
 +inline bool sameClipping(int a, int b) { return a >= 0 && a == b; }
@@ -4798,7 +4800,7 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eac
 +    }
 +  }
 +}
-+// Paint only the rectangle pieces outside the two-pixel contour cuts. Normal
++// Paint only the rectangle pieces outside the three-pixel contour cuts. Normal
 +// words take one paint call; only boundary words/gaps need splitting.
 +template <class Paint>
 +void paintSeparated(const GapRect& rect, const RibbonSeams& seams, int owner, Paint&& paint) {
@@ -4808,7 +4810,7 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eac
 +  for (size_t i = 0; i < seams.count; ++i) {
 +    const auto& c = seams.cuts[i];
 +    if (c.left < right && c.right > rect.x &&
-+        ((c.upper == owner && c.y < bottom) || (c.lower == owner && c.y + 2 > rect.y))) {
++        ((c.upper == owner && c.y < bottom) || (c.lower == owner && c.y + HorizontalSeparator > rect.y))) {
 +      intersects = true;
 +      break;
 +    }
@@ -4824,7 +4826,7 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eac
 +      const auto& c = seams.cuts[i];
 +      if (c.left >= right || c.right <= rect.x || (c.upper != owner && c.lower != owner)) continue;
 +      const int cutTop = c.upper == owner ? c.y : rect.y;
-+      const int cutBottom = c.lower == owner ? c.y + 2 : bottom;
++      const int cutBottom = c.lower == owner ? c.y + HorizontalSeparator : bottom;
 +      if (cutTop > y)
 +        nextY = std::min(nextY, cutTop);
 +      else if (cutBottom > y) {
@@ -4839,7 +4841,7 @@ index 9a72b387df358fc5d584e0f61495af5bc1dd9d3e..8f990db52f02f07dd6ec3075dd106eac
 +        int nextX = right, skip = x;
 +        for (size_t i = 0; i < seams.count; ++i) {
 +          const auto& c = seams.cuts[i];
-+          if (!((c.upper == owner && y >= c.y) || (c.lower == owner && y < c.y + 2))) continue;
++          if (!((c.upper == owner && y >= c.y) || (c.lower == owner && y < c.y + HorizontalSeparator))) continue;
 +          if (c.left <= x && c.right > x)
 +            skip = std::max<int>(skip, std::min<int>(right, c.right));
 +          else if (c.left > x)
@@ -7021,10 +7023,10 @@ index 0000000000000000000000000000000000000000..f06d35833ee12acbaa07253ca6aa2c46
 +}
 diff --git a/test/clipping_page_turn/ClippingRibbonRenderTest.cpp b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e450b4b0f8d462e49cbe51354a9c4a50ce8c01f3
+index 0000000000000000000000000000000000000000..f9ce7e1c0311fa4c0ec4c7ddc36a178ecaf2a251
 --- /dev/null
 +++ b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,350 @@
 +#include <gtest/gtest.h>
 +
 +#include <algorithm>
@@ -7285,7 +7287,7 @@ index 0000000000000000000000000000000000000000..e450b4b0f8d462e49cbe51354a9c4a50
 +        } else
 +          current = 0;
 +      }
-+      EXPECT_GE(widest, 2) << "line step=" << step;
++      EXPECT_GE(widest, 3) << "line step=" << step;
 +      EXPECT_TRUE(activity.renderer.marked(30, 12));
 +      EXPECT_TRUE(activity.renderer.marked(30, 10 + step + 17));
 +    }
@@ -7361,6 +7363,19 @@ index 0000000000000000000000000000000000000000..e450b4b0f8d462e49cbe51354a9c4a50
 +  EXPECT_EQ(a, labels[34 * GfxRenderer::Width + 100]);
 +  EXPECT_EQ(b, labels[34 * GfxRenderer::Width + 20]);
 +  EXPECT_EQ(b, labels[52 * GfxRenderer::Width + 100]);
++}
++
++TEST(ClippingRibbonRender, WiderContourGapOnlyBorrowsFromLowerQuote) {
++  using namespace ClippingHighlightGeometry;
++  RibbonSeams seams;
++  seams.add(0, 100, 20, 0, 1);
++  int upperBottom = 0, lowerTop = 100;
++  paintSeparated(GapRect{10, 10, 20, 30}, seams, 0,
++                 [&](const GapRect& r) { upperBottom = std::max(upperBottom, r.y + r.height); });
++  paintSeparated(GapRect{10, 10, 20, 30}, seams, 1, [&](const GapRect& r) { lowerTop = std::min(lowerTop, r.y); });
++  EXPECT_EQ(upperBottom, 20);
++  EXPECT_EQ(lowerTop, 23);
++  EXPECT_EQ(lowerTop - upperBottom, 3);
 +}
 diff --git a/test/clipping_page_turn/ExtractCollector.py b/test/clipping_page_turn/ExtractCollector.py
 new file mode 100644
