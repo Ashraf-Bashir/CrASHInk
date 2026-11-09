@@ -1,5 +1,5 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..c77d71ea646849006c72c360ca4f7aaeda12dfc4 100644
+index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..c74426570a43f40e797b2aeb3d7763c77f2ec71a 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,12 +1,24 @@
@@ -27,7 +27,15 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..c77d71ea646849006c72c360ca4f7aae
  - Library replaces Recent Books with a searchable book list, and adds various book metadata sort options.
  - Assign Library to power, long-press, button-chord, Home-button, or Quick Actions shortcuts to open the book list directly.
  - Customize the top and bottom reader status bars separately, including item positions and progress bars, in EPUB, TXT, and XTC books. Each bar can be previewed where it appears while reading.
-@@ -118,6 +130,28 @@
+@@ -55,6 +67,7 @@
+ - Saved clipping lists now show a scrollbar when more clippings are available below the visible rows.
+ - EPUB Safe Mode no longer pins inherited fonts and page layout as personal book settings.
+ - The X4 Pro Home button now steps back through dictionary lookup, chapter selection, and nested settings instead of jumping to Home.
++- A new highlight dragged onto the next page can now be dragged back through the upper margin to the previous page without releasing. The original word anchor and live selection are restored, and the prior page text is repainted before selection updates.
+ - OPDS downloads now use the first listed author for filename templates when a catalog also lists translators or other contributors.
+ - Retain the CSS spacing supplied by empty inline spans.
+ - Improve stability when connecting to Wi-Fi for update checks and KOReader authentication on X4 Pro.
+@@ -118,6 +131,28 @@
 
  - OPDS and download logs hide URL tokens, fragments, and embedded credentials.
 
@@ -56,7 +64,7 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..c77d71ea646849006c72c360ca4f7aae
  ## [v1.6.0] - 2026-09-21
 
  ### Added
-@@ -614,3 +648,9 @@
+@@ -614,3 +649,9 @@
  - Power-button shortcut conflicts outside the reader so reader-only actions fall back to `Confirm` while Sleep, Refresh, Screenshot, Sync Progress, and File Transfer remain real power actions.
  - Potential crash when using `Go to %` in EPUBs.
  - Potential crash when entering sleep with Page Overlay enabled if the cached EPUB page data is invalid.
@@ -1086,7 +1094,7 @@ index 425d572ca5ec66335a2b9b7b70b231cf0751389e..9d2c68a019eb3600a668c74575c9a44e
  #endif
    int dictionaryFooterHeight() const;
 diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activities/reader/DictionaryWordSelectActivity.cpp
-index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1c300001b 100644
+index b7474a37c00145d4a189b1e84d6f8c358d012823..ac373ee48714fa568e886b8027fb3e4d8937cb93 100644
 --- a/src/activities/reader/DictionaryWordSelectActivity.cpp
 +++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
 @@ -153,6 +153,8 @@ constexpr uint8_t styleToBitMask(EpdFontFamily::Style style) {
@@ -1151,7 +1159,90 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
    }
    if (!nextPagePrepared) {
      LOG_ERR("DICT", "Failed to prepare next reader page for touch selection");
-@@ -908,6 +924,16 @@ void DictionaryWordSelectActivity::resetCrossPageSelection() {
+@@ -881,6 +897,82 @@ bool DictionaryWordSelectActivity::continueTouchSelectionOnNextPage() {
+   return true;
+ }
+
++bool DictionaryWordSelectActivity::continueTouchSelectionOnPreviousPage() {
++  if (activePageOffset_ != 1 || !hasCrossPageSelection_ || !readerPageLoad_) return false;
++  std::unique_ptr<Page> previousPage;
++  {
++    RenderLock lock(*this);
++    previousPage = readerPageLoad_(readerContext_, 0);
++  }
++  if (!previousPage) return false;  // Keep the current page and live selection on read failure.
++
++  DictionaryClippingRequest fallbackRequest = crossPageFirstRequest_;
++  DictionaryClippingRequest currentRequest;
++  if (!captureCurrentClippingRequest(currentRequest)) return false;
++  fallbackRequest.lastPageOffset = currentRequest.lastPageOffset;
++  fallbackRequest.lastPageWordOrdinal = currentRequest.lastPageWordOrdinal;
++  fallbackRequest.lastWordByteEndOffset = currentRequest.lastWordByteEndOffset;
++  // Preserve the valid range if rebuilding the prior page runs out of memory.
++  std::string fallbackPhrase = crossPageLookupPrefix_;
++  int firstIdx = 0, lastIdx = 0;
++  if (navigator.getLookupSelectionRange(firstIdx, lastIdx)) {
++    std::string suffix = navigator.buildPhrase(firstIdx, lastIdx);
++    if (crossPageFirstWordWasMerged_ && !crossPageMergedFirstWord_.empty() &&
++        suffix.rfind(crossPageMergedFirstWord_, 0) == 0) {
++      suffix.erase(0, crossPageMergedFirstWord_.size());
++      if (!suffix.empty() && suffix.front() == ' ') suffix.erase(0, 1);
++    }
++    if (!suffix.empty()) {
++      fallbackPhrase += ' ';
++      fallbackPhrase += suffix;
++    }
++  }
++
++  bool prepared = false;
++  {
++    RenderLock lock(*this);
++    navigator.releaseWorkingSet();
++    workingSet_.clear();
++    page = std::move(previousPage);
++    activePageOffset_ = 0;
++    framebufferContainsPage_ = false;
++    forceFullRepaintOnNextRender();
++    nextPageFirstWord.clear();
++    if (buildWorkingSet(/*consumeInitialConfirm=*/false)) {
++      const int height = renderer.getLineHeight(SETTINGS.getReaderFontId());
++      // Restore the original word anchor, not the first word of the old page.
++      for (int i = 0; i <= navigator.getLastFlatIndex(); ++i) {
++        const auto* word = navigator.getWordAt(i);
++        if (!word || word->pageWordOrdinal != crossPageFirstRequest_.firstPageWordOrdinal ||
++            word->sourceWordByteOffset > crossPageFirstRequest_.firstWordByteOffset ||
++            word->sourceWordByteOffset + word->textLen <= crossPageFirstRequest_.firstWordByteOffset)
++          continue;
++        bool hit = false;
++        navigator.selectWordAtPoint(word->screenX + word->width / 2, word->screenY + word->heightOr(height) / 2, height,
++                                    &hit);
++        if (hit && navigator.beginTouchMultiSelect()) {
++          const auto* last = navigator.getWordAt(navigator.getLastFlatIndex());
++          if (last) {
++            navigator.selectWordAtPoint(last->screenX + last->width / 2, last->screenY + last->heightOr(height) / 2,
++                                        height, &hit);
++            prepared = hit;
++          }
++        }
++        break;
++      }
++    }
++  }
++  if (!prepared) {
++    LOG_ERR("DICT", "Cannot restore prior page selection; preserving captured range");
++    finishTouchLookupOnCurrentPage(fallbackPhrase, DictionaryLookupController::phraseWordCount(fallbackPhrase),
++                                   fallbackRequest);
++    return true;
++  }
++  resetCrossPageSelection();
++  requestUpdate();
++  return true;
++}
++
+ std::string DictionaryWordSelectActivity::finishTouchLookupPhrase() {
+   std::string phrase = navigator.finishTouchMultiSelect();
+   if (!hasCrossPageSelection_) return phrase;
+@@ -908,6 +1000,16 @@ void DictionaryWordSelectActivity::resetCrossPageSelection() {
    crossPageFirstWordWasMerged_ = false;
  }
 
@@ -1168,7 +1259,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
  void DictionaryWordSelectActivity::finishWithClippingRequest() {
    if (!hasPendingClippingRequest_) {
      LOG_ERR("CLIP", "Dictionary clipping requested without a selected range");
-@@ -1014,8 +1040,7 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1014,8 +1116,7 @@ void DictionaryWordSelectActivity::loop() {
              controller.getRecordHistory(), controller.getLookupWord(),
              DictionaryLookupController::toHistStatus(controller.getFoundStatus()), this,
              &DictionaryWordSelectActivity::renderDefinitionBackgroundCallback, dictionaryFontFamilyName_,
@@ -1178,7 +1269,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
          if (!definition) {
            LOG_ERR("DICT", "OOM allocating DictionaryDefinitionActivity (%u bytes)",
                    static_cast<unsigned>(sizeof(DictionaryDefinitionActivity)));
-@@ -1024,12 +1049,7 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1024,12 +1125,7 @@ void DictionaryWordSelectActivity::loop() {
            break;
          }
          suspendWorkingSet();
@@ -1192,7 +1283,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
            // A definition is the terminal screen of reader-page lookup. Its
            // dismiss paths (Back and an outside tap) must return to the reader,
            // rather than restoring the word-selection highlight beneath it.
-@@ -1042,9 +1062,6 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1042,9 +1138,6 @@ void DictionaryWordSelectActivity::loop() {
          setResult(ActivityResult{});
          finish();
          break;
@@ -1202,7 +1293,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
        case DictionaryLookupController::LookupEvent::NotFoundDismissedDone:
          setResult(ActivityResult{});
          finish();
-@@ -1070,7 +1087,7 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1070,7 +1163,7 @@ void DictionaryWordSelectActivity::loop() {
      return;
    }
 
@@ -1211,7 +1302,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
      requestUpdate();
    }
 
-@@ -1078,23 +1095,87 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1078,23 +1171,103 @@ void DictionaryWordSelectActivity::loop() {
    if (touchDragLookup_) {
      int dragX = 0;
      int dragY = 0;
@@ -1227,11 +1318,14 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
 +    // Start the bottom-edge dwell while the panel is busy, so a completed
 +    // refresh does not add another whole dwell before the page can advance.
 +    if (RenderLock::peek()) {
-+      if (held && dragY >= renderer.getScreenHeight() - 48 &&
-+          ClipSelectionPaging::hasDraggedFrom(touchDragStartX_, touchDragStartY_, dragX, dragY)) {
-+        if (!touchPageEdgeSince_) touchPageEdgeSince_ = millis();
-+      } else
++      const int edge = dragY < 48 ? -1 : dragY >= renderer.getScreenHeight() - 48 ? 1 : 0;
++      if (held && edge && ClipSelectionPaging::hasDraggedFrom(touchDragStartX_, touchDragStartY_, dragX, dragY)) {
++        if (!touchPageEdgeSince_ || edge != touchPageEdgeDirection_) touchPageEdgeSince_ = millis();
++        touchPageEdgeDirection_ = edge;
++      } else {
 +        touchPageEdgeSince_ = 0;
++        touchPageEdgeDirection_ = 0;
++      }
 +      return;
 +    }
 +    if (touchDragInput_.pointPending) {
@@ -1260,21 +1354,34 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
 +          last &&
 +          (touchDragInput_.y >= renderer.getScreenHeight() - 48 ||
 +           touchDragInput_.y >= last->screenY + last->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) + 8);
-+      const bool atEnd = touchDragHasMoved_ && last && !touchEndpointHit_ && inBottomMargin;
-+      if (!atEnd)
++      const auto* first = navigator.getWordAt(0);
++      const bool inTopMargin =
++          first &&
++          (touchDragInput_.y < 48 || touchDragInput_.y < first->screenY - 8 ||
++           (touchDragInput_.x < 48 &&
++            touchDragInput_.y < first->screenY + first->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId()))));
++      const int edge = touchDragHasMoved_ && !touchEndpointHit_ ? (inTopMargin              ? -1
++                                                                   : last && inBottomMargin ? 1
++                                                                                            : 0)
++                                                                : 0;
++      if (!edge) {
 +        touchPageEdgeSince_ = 0;
-+      else if (!touchPageEdgeSince_)
++        touchPageEdgeDirection_ = 0;
++      } else if (!touchPageEdgeSince_ || edge != touchPageEdgeDirection_) {
 +        touchPageEdgeSince_ = millis();
-+      else if (millis() - touchPageEdgeSince_ >= 200 && !RenderLock::peek()) {
++        touchPageEdgeDirection_ = edge;
++      } else if (millis() - touchPageEdgeSince_ >= 200 && !RenderLock::peek()) {
 +        {
 +          RenderLock lock(*this);
++          const auto* boundary = edge < 0 ? first : last;
 +          bool hit = false;
 +          navigator.selectWordAtPoint(
-+              last->screenX + last->width / 2,
-+              last->screenY + last->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) / 2,
++              boundary->screenX + boundary->width / 2,
++              boundary->screenY + boundary->heightOr(renderer.getLineHeight(SETTINGS.getReaderFontId())) / 2,
 +              renderer.getLineHeight(SETTINGS.getReaderFontId()), &hit);
 +        }
-+        if (!continueTouchSelectionOnNextPage()) return;
++        const bool turned = edge < 0 ? continueTouchSelectionOnPreviousPage() : continueTouchSelectionOnNextPage();
++        if (!turned) return;
 +        touchPageArrivalX_ = touchDragInput_.x;
 +        touchPageArrivalY_ = touchDragInput_.y;
 +        touchPageAwaitMotion_ = true;
@@ -1308,7 +1415,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1106,13 +1187,16 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1106,13 +1279,16 @@ void DictionaryWordSelectActivity::loop() {
      bool touchedWord = false;
      navigator.selectWordAtPoint(touchX, touchY, renderer.getLineHeight(SETTINGS.getReaderFontId()), &touchedWord);
      if (touchedWord && navigator.beginTouchMultiSelect()) {
@@ -1328,7 +1435,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
      }
      return;
    }
-@@ -1126,6 +1210,10 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1126,6 +1302,10 @@ void DictionaryWordSelectActivity::loop() {
    }
 
    if (controller.handleMultiSelect(navigator)) {
@@ -1339,7 +1446,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1133,6 +1221,10 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1133,6 +1313,10 @@ void DictionaryWordSelectActivity::loop() {
    if (navigator.isMultiSelecting()) return;
 
    if (controller.handleConfirmLookup(navigator)) {
@@ -1350,7 +1457,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1153,7 +1245,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+@@ -1153,7 +1337,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
    //   - the controller has nothing pending to draw,
    //   - we have a current selection.
    if (nextRenderMode_ == RenderMode::Differential && !controller.isActive() && currIdx >= 0) {
@@ -1359,7 +1466,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
      auto dirty =
          navigator.renderHighlightDifferential(renderer, lineHeight, prevHighlightIdx_, currIdx, foregroundBlack);
      if (dirty.has_value()) {
-@@ -1194,7 +1286,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+@@ -1194,7 +1378,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
          renderer.fillRect(bezelLeft, clearY, clearW, reservedBottomHeight_, false);
        }
 
@@ -1368,7 +1475,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
 
        auto setup =
            navigator.renderHighlightDifferential(renderer, lineHeight, /*prevWordIdx=*/-1, currIdx, foregroundBlack);
-@@ -1240,6 +1332,8 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+@@ -1240,6 +1424,8 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
    // Without this, every cold codepoint cold-misses the 8-slot SD glyph
    // overflow ring and the page render serializes ~100+ individual SD reads.
    // Same pattern as EpubReaderActivity::renderContents().
@@ -1378,7 +1485,7 @@ index b7474a37c00145d4a189b1e84d6f8c358d012823..eb748e129bcba048c342e4c10f5cdde1
    auto scope = fcm->createPrewarmScope();
    page->render(renderer, SETTINGS.getReaderFontId(), marginLeft, marginTop, foregroundBlack);  // scan pass
 diff --git a/src/activities/reader/DictionaryWordSelectActivity.h b/src/activities/reader/DictionaryWordSelectActivity.h
-index b814b1a784839aed857ef3a8d6f585bc72ed4a27..d551af9c24fa68582fe08e7b97c693b6d785f4e8 100644
+index b814b1a784839aed857ef3a8d6f585bc72ed4a27..078475c9805d6791e845c597987bcf4573cd46d6 100644
 --- a/src/activities/reader/DictionaryWordSelectActivity.h
 +++ b/src/activities/reader/DictionaryWordSelectActivity.h
 @@ -9,6 +9,7 @@
@@ -1406,26 +1513,30 @@ index b814b1a784839aed857ef3a8d6f585bc72ed4a27..d551af9c24fa68582fe08e7b97c693b6
 
   private:
    std::unique_ptr<Page> page;
-@@ -132,6 +134,11 @@ class DictionaryWordSelectActivity final : public Activity {
+@@ -132,6 +134,12 @@ class DictionaryWordSelectActivity final : public Activity {
    char dictionaryFontFamilyName_[64] = "";
    uint8_t dictionaryFontPointSize_ = 0;
    bool touchDragLookup_ = false;
 +  TouchDragInput touchDragInput_;
 +  unsigned long touchPageEdgeSince_ = 0;
++  int touchPageEdgeDirection_ = 0;
 +  bool touchEndpointHit_ = false;
 +  bool touchPageAwaitMotion_ = false;
 +  int touchPageArrivalX_ = 0, touchPageArrivalY_ = 0;
    bool touchDragHasMoved_ = false;
    int touchDragStartX_ = 0;
    int touchDragStartY_ = 0;
-@@ -187,6 +194,7 @@ class DictionaryWordSelectActivity final : public Activity {
+@@ -187,8 +195,10 @@ class DictionaryWordSelectActivity final : public Activity {
    bool extractWords();
    bool mergeHyphenatedWords();
    bool captureCurrentClippingRequest(DictionaryClippingRequest& request) const;
 +  void finishSelectionAsClipping();
    bool captureClippingRequest();
    bool continueTouchSelectionOnNextPage();
++  bool continueTouchSelectionOnPreviousPage();
    bool selectFirstWordForTouchDrag();
+   void finishTouchLookupOnCurrentPage(const std::string& phrase, size_t wordCount,
+                                       const DictionaryClippingRequest& request);
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
 index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3f7b0f327 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
@@ -7959,10 +8070,10 @@ index 0000000000000000000000000000000000000000..f9f02f372153dc674d961408f19f0488
 +}
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..cb184afbeeaf47370a1ac52aa6a0f5febcd6e3d0
+index 0000000000000000000000000000000000000000..d30ff5079ebbd73591d0ac1afec49cbca597d898
 --- /dev/null
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,140 @@
 +add_executable(highlight_word_edit_test HighlightWordEditTest.cpp
 +  ${REPO_ROOT}/lib/KOReaderSync/ChapterXPathResolver.cpp
 +  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
@@ -8092,6 +8203,17 @@ index 0000000000000000000000000000000000000000..cb184afbeeaf47370a1ac52aa6a0f5fe
 + DEPENDS ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractReaderCreation.py VERBATIM)
 +target_sources(HighlightMergeTest PRIVATE ${READER_CREATION_INC})
 +target_include_directories(HighlightMergeTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++
++set(DICTIONARY_REVERSE ${CMAKE_CURRENT_BINARY_DIR}/DictionaryReverse.inc)
++add_custom_command(OUTPUT ${DICTIONARY_REVERSE}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractDictionaryReverse.py
++    ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp ${DICTIONARY_REVERSE}
++  DEPENDS ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractDictionaryReverse.py VERBATIM)
++add_executable(dictionary_reverse_drag_test DictionaryReverseTest.cpp ${DICTIONARY_REVERSE})
++target_include_directories(dictionary_reverse_drag_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(dictionary_reverse_drag_test PRIVATE -UNDEBUG)
++add_test(NAME dictionary_reverse_drag COMMAND dictionary_reverse_drag_test)
 diff --git a/test/highlight_word_edit/ClippingMergeStoreTest.cpp b/test/highlight_word_edit/ClippingMergeStoreTest.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..dfb7ee036db80f921f412ce484f24981f20ca7ae
@@ -8331,6 +8453,67 @@ index 0000000000000000000000000000000000000000..fc28264e823f3fa41eddd0faff9bc88e
 + }
 + std::cout<<"Production page transition/render: new page replaces old text once, then resumes differential selection\n";
 +}
+diff --git a/test/highlight_word_edit/DictionaryReverseTest.cpp b/test/highlight_word_edit/DictionaryReverseTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0310d2750ae63b137fc1d1a82f4fddbee5689670
+--- /dev/null
++++ b/test/highlight_word_edit/DictionaryReverseTest.cpp
+@@ -0,0 +1,55 @@
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <iostream>
++#define LOG_ERR(...) ((void)0)
++struct Page {int id;};
++struct DictionaryClippingRequest {uint8_t firstPageOffset=0,lastPageOffset=0;uint16_t firstPageWordOrdinal=1,lastPageWordOrdinal=2,firstWordByteOffset=0,lastWordByteEndOffset=4;};
++struct Renderer {int getLineHeight(int)const{return 20;}};
++struct {int getReaderFontId()const{return 0;}}SETTINGS;
++struct RenderLock {template<class T>explicit RenderLock(T&) {}};
++struct Navigator {
++ struct Word {int screenX=0,screenY=100,width=30,textLen=4,pageWordOrdinal=0,sourceWordByteOffset=0;int heightOr(int h)const{return h;}}words[3];
++ int current=1,anchor=0;
++ Navigator(){for(int i=0;i<3;++i){words[i].screenX=10+50*i;words[i].pageWordOrdinal=i;}}
++ bool getLookupSelectionRange(int& a,int& b)const{a=anchor;b=current;return true;}
++ std::string buildPhrase(int,int)const{return "next words";}
++ void releaseWorkingSet(){}
++ int getLastFlatIndex()const{return 2;}
++ const Word*getWordAt(int i)const{return i>=0&&i<3?&words[i]:nullptr;}
++ bool beginTouchMultiSelect(){anchor=current;return true;}
++ bool selectWordAtPoint(int x,int y,int,bool*hit){*hit=false;for(int i=0;i<3;++i)if(x>=words[i].screenX&&x<words[i].screenX+30&&y>=100&&y<120){current=i;*hit=true;return true;}return false;}
++};
++struct DictionaryLookupController {static size_t phraseWordCount(const std::string&){return 4;}};
++class DictionaryWordSelectActivity {
++ public:
++ int activePageOffset_=1;bool hasCrossPageSelection_=true,framebufferContainsPage_=true,crossPageFirstWordWasMerged_=false;
++ void*readerContext_=this;bool failLoad=false,failBuild=false;int loads=0,updates=0;bool fallback=false,fullRepaint=false,touchDragLookup_=true;
++ std::unique_ptr<Page>page=std::make_unique<Page>(Page{1});
++ std::unique_ptr<Page>(*readerPageLoad_)(void*,int)=[](void*c,int p){auto*self=static_cast<DictionaryWordSelectActivity*>(c);++self->loads;assert(p==0);return self->failLoad?nullptr:std::make_unique<Page>(Page{p});};
++ DictionaryClippingRequest crossPageFirstRequest_{},capturedFallback{};
++ std::string crossPageLookupPrefix_="original words",crossPageMergedFirstWord_,nextPageFirstWord;
++ Navigator navigator;Renderer renderer;struct {void clear(){}}workingSet_;
++ bool captureCurrentClippingRequest(DictionaryClippingRequest& r)const{r.firstPageOffset=r.lastPageOffset=1;return true;}
++ bool buildWorkingSet(bool){return !failBuild;}
++ void forceFullRepaintOnNextRender(){fullRepaint=true;}
++ void resetCrossPageSelection(){hasCrossPageSelection_=false;crossPageLookupPrefix_.clear();}
++ void requestUpdate(){++updates;}
++ void finishTouchLookupOnCurrentPage(const std::string&,size_t,const DictionaryClippingRequest&r){fallback=true;capturedFallback=r;}
++ bool continueTouchSelectionOnPreviousPage();
++};
++#include "DictionaryReverse.inc"
++int main(){
++ DictionaryWordSelectActivity a;assert(a.continueTouchSelectionOnPreviousPage());
++ assert(a.activePageOffset_==0&&a.page->id==0&&!a.hasCrossPageSelection_);
++ assert(a.navigator.anchor==1&&a.navigator.current==2); // original anchor was not page's first word
++ assert(a.touchDragLookup_&&!a.fallback&&a.fullRepaint&&!a.framebufferContainsPage_&&a.updates==1);
++ DictionaryWordSelectActivity blocked;blocked.failLoad=true;const auto*old=blocked.page.get();assert(!blocked.continueTouchSelectionOnPreviousPage());
++ assert(blocked.page.get()==old&&blocked.activePageOffset_==1&&blocked.hasCrossPageSelection_&&blocked.navigator.current==1);
++ DictionaryWordSelectActivity oom;oom.failBuild=true;assert(oom.continueTouchSelectionOnPreviousPage());
++ assert(oom.fallback&&oom.capturedFallback.firstPageOffset==0&&oom.capturedFallback.lastPageOffset==1);
++ DictionaryWordSelectActivity same;same.activePageOffset_=0;assert(!same.continueTouchSelectionOnPreviousPage()&&same.loads==0);
++ std::cout<<"Reverse selection preserves original anchor, live drag, repaint and failed-load range\n";
++}
 diff --git a/test/highlight_word_edit/ExtractBoundaryActions.py b/test/highlight_word_edit/ExtractBoundaryActions.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..b8482ab55313c3a63c4796f38d835b44c6ecdd8e
@@ -8347,7 +8530,7 @@ index 0000000000000000000000000000000000000000..b8482ab55313c3a63c4796f38d835b44
 +Path(sys.argv[2]).write_text(text[a:b]+text[c:d])
 diff --git a/test/highlight_word_edit/ExtractDictionaryPageRender.py b/test/highlight_word_edit/ExtractDictionaryPageRender.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1334cdd0e38b63537d4f94c6f19e9e667ebb87ff
+index 0000000000000000000000000000000000000000..cd861d73585a93f425cf5fb3c052b87da5f885d3
 --- /dev/null
 +++ b/test/highlight_word_edit/ExtractDictionaryPageRender.py
 @@ -0,0 +1,7 @@
@@ -8355,9 +8538,19 @@ index 0000000000000000000000000000000000000000..1334cdd0e38b63537d4f94c6f19e9e66
 +import sys
 +text=Path(sys.argv[1]).read_text()
 +a=text.index('bool DictionaryWordSelectActivity::continueTouchSelectionOnNextPage()')
-+b=text.index('std::string DictionaryWordSelectActivity::finishTouchLookupPhrase()',a)
++b=text.index('bool DictionaryWordSelectActivity::continueTouchSelectionOnPreviousPage()',a)
 +c=text.index('void DictionaryWordSelectActivity::render(')
 +Path(sys.argv[2]).write_text(text[a:b]+text[c:])
+diff --git a/test/highlight_word_edit/ExtractDictionaryReverse.py b/test/highlight_word_edit/ExtractDictionaryReverse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..37b14cfbea4e9c90edb440063fd348685039a95c
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractDictionaryReverse.py
+@@ -0,0 +1,4 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text();a=s.index('bool DictionaryWordSelectActivity::continueTouchSelectionOnPreviousPage()');b=s.index('std::string DictionaryWordSelectActivity::finishTouchLookupPhrase()',a)
++Path(sys.argv[2]).write_text(s[a:b])
 diff --git a/test/highlight_word_edit/ExtractEditorActions.py b/test/highlight_word_edit/ExtractEditorActions.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..14e86a04d632baef371ac3b3d41a6eb410eda394
@@ -9386,10 +9579,10 @@ index 0000000000000000000000000000000000000000..58ad8fd6086d86381fc2c3b7af7b1c41
 +}
 diff --git a/test/highlight_word_edit/TouchReleaseTest.cpp b/test/highlight_word_edit/TouchReleaseTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..61a3d6094067a1ad3c905a445036f76dd5596bc9
+index 0000000000000000000000000000000000000000..68dab30a188cef56113d0fe09e364599f589bd3e
 --- /dev/null
 +++ b/test/highlight_word_edit/TouchReleaseTest.cpp
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,112 @@
 +#include <cassert>
 +#include <cstddef>
 +#include <cstdlib>
@@ -9417,7 +9610,7 @@ index 0000000000000000000000000000000000000000..61a3d6094067a1ad3c905a445036f76d
 + int heightOr(int height) const {return height;}
 + int getCurrentFlatIndex() const {return current;}
 + int getLastFlatIndex() const {return 1;}
-+ bool selectWordAtPoint(int x,int y,int,bool* hit) { ++selectCalls;if(y>=20){*hit=false;return false;}*hit=true;int old=current;current=x>10?1:0;return old!=current; }
++ bool selectWordAtPoint(int x,int y,int,bool* hit) { ++selectCalls;if(y<0||y>=20){*hit=false;return false;}*hit=true;int old=current;current=x>10?1:0;return old!=current; }
 + int screenY=0;
 + const Navigator* getWordAt(int i) const {return i>=0 && i<2?this:nullptr;}
 +};
@@ -9430,16 +9623,17 @@ index 0000000000000000000000000000000000000000..61a3d6094067a1ad3c905a445036f76d
 +struct Selection {
 + bool touchDragLookup_=true,touchDragHasMoved_=false;
 + TouchDragInput touchDragInput_;
-+ unsigned long touchPageEdgeSince_=0;bool touchEndpointHit_=false;
++ int touchPageEdgeDirection_=0;unsigned long touchPageEdgeSince_=0;bool touchEndpointHit_=false;
 + bool touchPageAwaitMotion_=false;int touchPageArrivalX_=0,touchPageArrivalY_=0;
 + int touchDragStartX_=0,touchDragStartY_=0;
 + Input mappedInput;Renderer renderer;Navigator navigator;DictionaryLookupController controller;
-+ unsigned clips=0,captures=0,pageLoads=0;bool pageOk=false;
++ unsigned clips=0,captures=0,pageLoads=0;bool pageOk=false,previousPageOk=false;
 + void requestUpdate() {}
 + bool continueTouchSelectionOnNextPage() {++pageLoads;if(pageOk){pageOk=false;navigator.current=0;return true;}return false;}
 + std::string finishTouchLookupPhrase() {return navigator.current?"one two":"one";}
 + void finishSelectionAsClipping() {++clips;}
 + void captureClippingRequest() {++captures;}
++ bool continueTouchSelectionOnPreviousPage() {if(!previousPageOk)return false;previousPageOk=false;++pageLoads;navigator.current=1;return true;}
 + void loop();
 +};
 +#include "TouchRelease.inc"
@@ -9480,6 +9674,15 @@ index 0000000000000000000000000000000000000000..61a3d6094067a1ad3c905a445036f76d
 + for(int i=0;i<250;++i) millis();
 + RenderLock::busy=false;edgeBusy.loop();
 + assert(edgeBusy.touchPageAwaitMotion_ && edgeBusy.pageLoads==1);
++ Selection back;back.previousPageOk=true;back.mappedInput.x=100;back.mappedInput.y=-10;
++ for(int i=0;i<500 && !back.touchPageAwaitMotion_;++i)back.loop();
++ assert(back.touchPageAwaitMotion_ && back.navigator.current==1 && back.pageLoads==1);
++ const int calls=back.navigator.selectCalls;
++ for(int i=0;i<100;++i)back.loop();
++ assert(back.navigator.selectCalls==calls && back.touchDragLookup_ && back.clips==0);
++ back.mappedInput.x=50;back.mappedInput.y=10;back.loop();
++ assert(!back.touchPageAwaitMotion_ && back.touchDragLookup_ && back.controller.lookups==0);
++ back.mappedInput.held=false;back.loop();assert(back.clips==1 && back.controller.lookups==0);
 + Selection one;
 + for(int i=0;i<10000;++i) one.loop();
 + one.mappedInput.held=false;one.loop();
