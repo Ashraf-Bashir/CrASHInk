@@ -199,3 +199,20 @@ production client with the real ArduinoJson parser and a scripted HTTP transport
 covering successful book/note pulls, rejected tokens, rotation persistence,
 permission errors, refresh failure, malformed tokens and non-replayed writes.
 These tests do not authenticate against the user's live Readest account.
+
+### End-of-book dismissal
+
+Patch 0009 adds a top-right × touch target on the end screen, including books
+without next-book suggestions. A backward reading swipe (rightward in LTR,
+leftward in RTL) and physical Back return to the last page. Swipes are handled
+before list touch releases, preventing accidental next-book opens. Other swipe
+directions are consumed by the end screen instead of activating a list row.
+
+Returning to the EPUB's last page immediately cancels an automatic pending
+move to `/Read/` and restores its recent-book entry. An explicit manual Finished
+choice remains respected. The shared close/swipe controls also work for XTC.
+The change adds no persistent store, heap buffer, or per-render allocation.
+Native tests exercise the production input/dismissal methods with and without
+suggestions, both swipe directions, explicit Finished state, and repeated close.
+On X4 Pro, advance past the final page, then tap × or swipe back: the final page
+should reopen immediately and the book should remain in its original folder.
