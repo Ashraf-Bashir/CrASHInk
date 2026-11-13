@@ -74,6 +74,69 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..c74426570a43f40e797b2aeb3d7763c7
 +- Reuse one clipping-file reader per render, filter impossible highlight matches before SD reads, and collect short boundary candidates in one matching pass. Filters are session-only, conservative, and invalidated after edits.
 +- Cache nearby pages' resolved highlights (including empty results) and prepare them in bounded idle slices; invalidate after clipping edits, sync/reloads, chapter or layout changes. Prepared page turns do no clipping-text reads or matching.
 +- Start touch word selection after a 200 ms stationary hold instead of one second; immediate swipes remain page turns.
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index 389d2485ae59189c84a580dc8858a916c9673528..c9737c81e69221f6fb03e111f309c91fd4c9d506 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -1495,7 +1495,11 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
+   }
+ }
+
+-template <Color C>
++void GfxRenderer::shadeRect(int x, int y, int width, int height) const {
++  fillRectImpl<Color::LightGray, true>(x, y, width, height);
++}
++
++template <Color C, bool PreserveInk>
+ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const int height) const {
+   if constexpr (C == Color::Clear) return;
+   if (width <= 0 || height <= 0) return;
+@@ -1646,12 +1650,18 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const
+       const uint8_t blackMask = blackMasks[py & 1];
+       const uint8_t whiteMask = static_cast<uint8_t>(~blackMask);
+
+-      // Dither writes BOTH inks (the slow path called drawPixel for every
+-      // pixel — setting or clearing — so we must do the same). Inside the
+-      // rect mask: write whiteMask (1s where white, 0s where black). Outside
+-      // the rect mask: leave the framebuffer untouched.
++      // PreserveInk only adds black dots. An ordinary fill replaces both
++      // black and white pixels inside the rectangle.
+       uint8_t* row = target + static_cast<int32_t>(py - originY) * panelStride;
+-      if (byteStart == byteEnd) {
++      if constexpr (PreserveInk) {
++        if (byteStart == byteEnd) {
++          row[byteStart] &= static_cast<uint8_t>(~(blackMask & headMask & tailMask));
++        } else {
++          row[byteStart] &= static_cast<uint8_t>(~(blackMask & headMask));
++          for (int byte = byteStart + 1; byte < byteEnd; ++byte) row[byte] &= whiteMask;
++          row[byteEnd] &= static_cast<uint8_t>(~(blackMask & tailMask));
++        }
++      } else if (byteStart == byteEnd) {
+         const uint8_t rectMask = headMask & tailMask;
+         row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~rectMask) | (rectMask & whiteMask));
+       } else {
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index d606966e29b8cc2d9b313444052588d1333614c6..a082471336a7f24ff162767fcc2fa4fb9cc9dbb4 100644
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -136,7 +136,7 @@ class GfxRenderer {
+   // two opposing corners into physical-framebuffer space once, then walks each
+   // physical row with head-mask / middle memset / tail-mask byte writes — no
+   // per-pixel rotation, no per-pixel RMW.
+-  template <Color color>
++  template <Color color, bool PreserveInk = false>
+   void fillRectImpl(int x, int y, int width, int height) const;
+
+  public:
+@@ -257,6 +257,8 @@ class GfxRenderer {
+   void maskRoundedRectOutsideCorners(int x, int y, int width, int height, int radius, Color color = Color::White) const;
+   void fillRect(int x, int y, int width, int height, bool state = true) const;
+   void fillRectDither(int x, int y, int width, int height, Color color) const;
++  // Add light gray dithering while preserving existing black pixels.
++  void shadeRect(int x, int y, int width, int height) const;
+   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
+   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
+                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
 index 5dc5d57e20e9149df98710a832271b7ef75a48c7..abec5af76a67e52640d7de7c77e3a38f6257e9c9 100644
 --- a/lib/I18n/translations/english.yaml
@@ -1538,7 +1601,7 @@ index b814b1a784839aed857ef3a8d6f585bc72ed4a27..078475c9805d6791e845c597987bcf45
    void finishTouchLookupOnCurrentPage(const std::string& phrase, size_t wordCount,
                                        const DictionaryClippingRequest& request);
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3f7b0f327 100644
+index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc45b0cd26 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -1,3 +1,5 @@
@@ -1556,7 +1619,15 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
  #include "ClippingStore.h"
  #include "CrossPointSettings.h"
  #include "CrossPointState.h"
-@@ -82,7 +86,8 @@
+@@ -44,7 +48,6 @@
+ #include "EpubReaderFootnotesActivity.h"
+ #include "EpubReaderPercentSelectionActivity.h"
+ #include "EpubReaderUtils.h"
+-#include "FocusReadingText.h"
+ #include "GlobalActions.h"
+ #include "KOReaderCredentialStore.h"
+ #include "KOReaderSyncActivity.h"
+@@ -82,7 +85,8 @@
  #include "util/ScreenshotUtil.h"
 
  namespace {
@@ -1566,7 +1637,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
  // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
  constexpr unsigned long longPressMenuMs = 600;
  constexpr uint16_t DEFAULT_AUTO_PAGE_TURN_INTERVAL_S = 30;
-@@ -396,13 +401,7 @@ bool hasVisibleWordText(const char* text) {
+@@ -396,13 +400,7 @@ bool hasVisibleWordText(const char* text) {
 
  bool hasVisibleWordText(const std::string& text) { return hasVisibleWordText(text.c_str()); }
 
@@ -1581,7 +1652,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 
  bool isUtf8SpaceAt(const char* cursor, size_t& advance) {
    const auto c = static_cast<unsigned char>(cursor[0]);
-@@ -458,21 +457,6 @@ uint16_t countClipTokens(const std::string& text) {
+@@ -458,21 +456,6 @@ uint16_t countClipTokens(const std::string& text) {
    return count;
  }
 
@@ -1603,7 +1674,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
  ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
                                                                const char* token, const size_t tokenLen,
                                                                const size_t tokenOffset = 0) {
-@@ -517,20 +501,29 @@ bool forEachVisiblePageWord(const Pages& page, Callback&& callback) {
+@@ -517,20 +500,29 @@ bool forEachVisiblePageWord(const Pages& page, Callback&& callback) {
  }
 
  template <typename Pages>
@@ -1640,7 +1711,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
    bool reachedClipEnd = false;
    bool stoppedByMismatch = false;
    uint16_t tableSelection = UINT16_MAX;
-@@ -559,6 +552,8 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -559,6 +551,8 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
            return false;
          }
 
@@ -1649,7 +1720,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
          lastWord = wordIndex;
          if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::CONTINUES_TOKEN) {
            tokenOffset += fragmentResult.tokenBytes;
-@@ -574,7 +569,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -574,7 +568,7 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
          return true;
        });
 
@@ -1658,7 +1729,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      return false;
    }
 
-@@ -587,18 +582,21 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
+@@ -587,18 +581,21 @@ bool matchClipRunFromPageWord(const Pages& page, const std::string& clippingText
      return false;
    }
 
@@ -1682,7 +1753,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
    if (clippingText.empty()) return false;
 
    const uint16_t tokenCount = countClipTokens(clippingText);
-@@ -622,14 +620,33 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+@@ -622,14 +619,33 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
            if (tokenIndex >= tokenCount) {
              break;
            }
@@ -1719,7 +1790,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
                match = candidate;
              }
              if (!uniqueMatch || !matches.unique()) {
-@@ -667,20 +684,119 @@ struct AdjacentClippingPages {
+@@ -667,20 +683,119 @@ struct AdjacentClippingPages {
    }
  };
 
@@ -1744,7 +1815,11 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 +  }
 +  return i < text.size() ? text.substr(i) : text;
 +}
-+
+
+-  // Only read a neighbor if this page has an otherwise plausible short fragment.
+-  // A coincidental trailing "and" must agree with text across the page break.
+-  ClippingPageMatch shortMatch;
+-  if (!findClippingTextInPages(page, clippingText, shortMatch, nullptr, expectedTableColumn, true)) return false;
 +// Reuse one adjacent page across all clipping checks in this render. Release
 +// it before loading another so peak memory remains one neighboring page.
 +struct ClippingNeighborPageCache {
@@ -1762,11 +1837,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 +    return page.get();
 +  }
 +};
-
--  // Only read a neighbor if this page has an otherwise plausible short fragment.
--  // A coincidental trailing "and" must agree with text across the page break.
--  ClippingPageMatch shortMatch;
--  if (!findClippingTextInPages(page, clippingText, shortMatch, nullptr, expectedTableColumn, true)) return false;
++
 +bool findHyphenatedClippingContinuation(Section& section, const Page& page, const std::string& text,
 +                                        ClippingPageMatch& match, ClippingNeighborPageCache& neighborCache,
 +                                        const int currentPage) {
@@ -1848,7 +1919,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
      // Keep at most one temporary neighboring page, and release it on each attempt.
      // loadPage scopes its reader or reuses the build handle; currentPage is unchanged.
-@@ -699,10 +815,12 @@ bool findClippingTextOnPage(Section& section, const Page& page, const std::strin
+@@ -699,10 +814,12 @@ bool findClippingTextOnPage(Section& section, const Page& page, const std::strin
      if (nextPage) {
        match.endWord = currentWordCount - 1;
        match.reachesClipEnd = false;
@@ -1861,7 +1932,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      }
      return true;
    }
-@@ -736,6 +854,8 @@ bool findClippingStoredRangeOnPage(const Page& page, const Clipping& clipping, c
+@@ -736,6 +853,8 @@ bool findClippingStoredRangeOnPage(const Page& page, const Clipping& clipping, c
    match.startWord = startWord;
    match.endWord = endWord;
    match.tableSelection = clipping.tableSelection;
@@ -1870,7 +1941,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
    return true;
  }
 
-@@ -2472,6 +2592,8 @@ void EpubReaderActivity::onEnter() {
+@@ -2472,6 +2591,8 @@ void EpubReaderActivity::onEnter() {
  }
 
  void EpubReaderActivity::onExit() {
@@ -1879,7 +1950,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
    sdFontSystem.setSettingsPersistenceCallback(nullptr, nullptr);
    // Drop the scalable-family catalog retained during reading. The active font
    // and its PSRAM face lifetime remain managed by SdCardFontSystem.
-@@ -3135,6 +3257,9 @@ void EpubReaderActivity::loop() {
+@@ -3135,6 +3256,9 @@ void EpubReaderActivity::loop() {
    if (!atEndOfBook && touch.tapped && handleTouchFootnoteLink(touch.x, touch.y)) {
      return;
    }
@@ -1889,7 +1960,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
  #endif
 
    // Long-press Confirm: execute the configured reader action without opening the menu.
-@@ -3380,7 +3505,8 @@ void EpubReaderActivity::loop() {
+@@ -3380,7 +3504,8 @@ void EpubReaderActivity::loop() {
      if (drainPendingManualPageTurn()) {
        return;
      }
@@ -1899,7 +1970,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      return;
    }
 
-@@ -3692,15 +3818,11 @@ bool EpubReaderActivity::handleTouchDictionaryLookup() {
+@@ -3692,15 +3817,11 @@ bool EpubReaderActivity::handleTouchDictionaryLookup() {
      touchDictionaryLookupHandled = false;
      return false;
    }
@@ -1916,7 +1987,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
    openWordSelect(/*framebufferContainsPage=*/true, touchX, touchY, /*autoLookupInitialWord=*/true);
    return true;
  }
-@@ -4395,7 +4517,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
+@@ -4395,7 +4516,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
      }
      case EpubReaderMenuAction::VIEW_CLIPPINGS: {
        pauseReadingPaceTimer("clipping_list");
@@ -1925,7 +1996,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
                               [this, returnToReaderMenu](const ActivityResult& result) {
                                 if (!result.isCancelled) {
                                   const auto& clipping = std::get<ClippingJumpResult>(result.data);
-@@ -4700,8 +4822,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4700,8 +4821,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
        }
      }
      const int lineHeight = renderer.getLineHeight(readerFontId);
@@ -1942,7 +2013,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      static constexpr uint32_t CLIP_SELECTION_WORD_RESERVE_HEADROOM = 16U * 1024U;
      static constexpr size_t CLIP_SELECTION_INITIAL_TEXT_RESERVE = 4U * 1024U;
      // Page density varies with font size and layout. Keep the fixed memory cap,
-@@ -4709,7 +4837,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4709,7 +4836,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      const size_t maxSelectableWords = pagesToLoad > 0 ? MAX_CLIP_SELECTION_WORDS : 0;
      const uint32_t wordReserveBytes = static_cast<uint32_t>(maxSelectableWords * sizeof(WordRef));
      const auto heapBeforeWords = MemoryBudget::snapshot();
@@ -1954,7 +2025,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
        LOG_ERR("CLIP", "Low heap for clipping selection (%u free, %u max alloc, need block %u); skipping",
                heapBeforeWords.freeHeap, heapBeforeWords.maxAllocHeap,
                wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM);
-@@ -4949,26 +5080,37 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4949,26 +5079,37 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
                                                      clippingLayoutSignature](const ActivityResult& result) {
      MemoryBudget::logHeapShape("clip.child_destroyed");
      const char* clippingFeedback = nullptr;
@@ -2001,7 +2072,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
                                                                                 : tr(STR_CLIPPING_FAILED);
        }
      }
-@@ -4977,11 +5119,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -4977,11 +5118,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      MemoryBudget::logHeapShape("clip.after_font_release");
      pendingHeapShapeReaderRedrawStages.fetch_or(HEAP_SHAPE_REDRAW_CLIP, std::memory_order_relaxed);
      if (clippingFeedback) {
@@ -2013,7 +2084,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
        {
          RenderLock lock(*this);
          drawToast(renderer, clippingFeedback);
-@@ -6512,7 +6649,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6512,7 +6648,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -2022,7 +2093,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -6561,7 +6698,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -6561,7 +6697,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -2031,7 +2102,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -7586,29 +7723,207 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
+@@ -7586,29 +7722,207 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
    navigateToHref(currentPageFootnotes[bestIndex].href, true, /*preferFootnotePreview=*/true);
    return true;
  }
@@ -2252,7 +2323,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      const Clipping& clipping = clippings[clippingIndex];
      if (clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex)) {
        continue;
-@@ -7626,9 +7941,20 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7626,9 +7940,20 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const bool shouldSearchText =
          legacyWordLayout ? (!matchedStoredRange && pageInStoredRange) : (!storedLayoutMatches || pageInStoredRange);
      bool matchedText = false;
@@ -2274,7 +2345,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
          bool uniqueTextMatch = false;
          const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
          matchedText =
-@@ -7639,35 +7965,188 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7639,35 +7964,187 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
            CLIPPINGS.cacheResolvedLayoutRange(clippingIndex, currentPage, match.startWord, match.endWord,
                                               currentClippingLayoutSignature);
          }
@@ -2345,9 +2416,8 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 +    return;
 +  }
 +
-+  // The BW frame owns the dithered marker and its redrawn black text. Repeating
-+  // that marker in the grayscale anti-aliasing planes overlays gray pixels on
-+  // the glyphs and makes a saved clipping look washed out.
++  // Shade the completed BW page so glyphs that extend into another line
++  // retain their original ink.
 +
 +#if CROSSINK_APP_CAP_TOUCH
 +  currentPageClippingTouchTargets.fill({});
@@ -2448,7 +2518,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 +  const auto paintMarker = [&](const ClippingHighlightGeometry::GapRect& rect, int owner) {
 +    ClippingHighlightGeometry::paintSeparated(
 +        rect, contourSeams, owner, [&](const ClippingHighlightGeometry::GapRect& piece) {
-+          renderer.fillRectDither(piece.x, piece.y, piece.width, piece.height, Color::LightGray);
++          renderer.shadeRect(piece.x, piece.y, piece.width, piece.height);
 +        });
 +  };
 +  int bezelTop = 0, bezelRight = 0, bezelBottom = 0, bezelLeft = 0;
@@ -2468,7 +2538,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
        hasPreviousHighlight = false;
        return true;
      }
-@@ -7682,12 +8161,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7682,12 +8159,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const char* visibleText = wordText + (hasEmSpace ? 3 : 0);
      const int lineFontId = block.resolvedFontId(renderer, fontId);
      const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
@@ -2487,7 +2557,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
      if (wordIndex + 1 < block.wordCount()) {
        const uint16_t nextIndex = static_cast<uint16_t>(wordIndex + 1);
        const char* nextWordText = block.wordText(nextIndex);
-@@ -7697,49 +8181,128 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7697,49 +8179,95 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", nextTextStyle) : 0;
        const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
        const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
@@ -2542,33 +2612,11 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 +      if (continuesPrevious &&
            ClippingHighlightGeometry::gapBetweenAdjacentWords(previousHighlight, currentHighlight, gap)) {
 -        renderer.fillRectDither(gap.x, gap.y, gap.width, gap.height, Color::LightGray);
-+        // Clip the inter-word fill to the same ribbon height, so it cannot
-+        // close the outer top/bottom gutter on a one-line clipping.
-+        gap.y = marker.y;
-+        gap.height = marker.height;
-+        paintMarker(gap, matchIndex);
-       }
+-      }
 -      renderer.fillRectDither(wordX, wordY, wordW, wordH, Color::LightGray);
-+      paintMarker(marker, matchIndex);
-+      int hitLeft = wordX, hitRight = wordX + wordW;
-+      const int limitLeft = line.clipWidth > 0 ? std::max(bezelLeft, orientedMarginLeft + line.clipX) : bezelLeft;
-+      const int limitRight = line.clipWidth > 0 ? std::min(renderer.getScreenWidth() - bezelRight,
-+                                                           orientedMarginLeft + line.clipX + line.clipWidth)
-+                                                : renderer.getScreenWidth() - bezelRight;
-+      const auto continuation = [&](bool left) {
-+        const auto tip = ClippingHighlightGeometry::continuationTip(marker, left, limitLeft, limitRight);
-+        ClippingHighlightGeometry::paintContinuation(
-+            tip, left, [&](const ClippingHighlightGeometry::GapRect& row) { paintMarker(row, matchIndex); });
-+        if (tip.width > 0) {
-+          hitLeft = std::min(hitLeft, tip.x);
-+          hitRight = std::max(hitRight, tip.x + tip.width);
-+        }
-+      };
-+      if (pageWordIndex == matched.startWord && !matched.startsAtClipStart) continuation(true);
-+      if (pageWordIndex == matched.endWord && !matched.reachesClipEnd) continuation(false);
-       // A saved clipping always uses black text on its light-gray marker.
-       // The ordinary reader foreground is white in dark mode, which makes the
-       // text fade into this marker.
+-      // A saved clipping always uses black text on its light-gray marker.
+-      // The ordinary reader foreground is white in dark mode, which makes the
+-      // text fade into this marker.
 -      if (line.clipWidth > 0 && line.clipHeight > 0) {
 -        renderer.beginTextClip(orientedMarginLeft + line.clipX, orientedMarginTop + line.clipY, line.clipWidth,
 -                               line.clipHeight);
@@ -2591,36 +2639,29 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
 -      }
 -      if (line.clipWidth > 0 && line.clipHeight > 0) {
 -        renderer.endTextClip();
-+      const int clipLeft = line.clipWidth > 0 ? std::max(wordX, orientedMarginLeft + line.clipX) : wordX;
-+      const int clipTop = line.clipHeight > 0 ? std::max(marker.y, orientedMarginTop + line.clipY) : marker.y;
-+      const int clipRight = line.clipWidth > 0
-+                                ? std::min(wordX + wordW, orientedMarginLeft + line.clipX + line.clipWidth)
-+                                : wordX + wordW;
-+      const int clipBottom = line.clipHeight > 0
-+                                 ? std::min(marker.y + marker.height, orientedMarginTop + line.clipY + line.clipHeight)
-+                                 : marker.y + marker.height;
-+      const ClippingHighlightGeometry::GapRect textClip{clipLeft, clipTop, std::max(0, clipRight - clipLeft),
-+                                                        std::max(0, clipBottom - clipTop)};
-+      ClippingHighlightGeometry::paintSeparated(
-+          textClip, contourSeams, matchIndex, [&](const ClippingHighlightGeometry::GapRect& piece) {
-+            renderer.beginTextClip(piece.x, piece.y, piece.width, piece.height);
-+            // Match TextBlock::render()'s Focus Reading split. The prewarm pass
-+            // loaded the leading run as bold, so redrawing it as regular here can
-+            // miss the glyph bitmap for SD-card fonts and show replacement marks.
-+            const uint8_t focusBoundary = block.focusBoundary(wordIndex);
-+            const uint16_t wordLength = block.wordTextLen(wordIndex);
-+            const int fullWordX = orientedMarginLeft + line.xPos + geometry.xOffset;
-+            if (!FocusReadingText::drawSplitRuns(
-+                    wordText, wordLength, focusBoundary, fullWordX, block.focusRunOffset(wordIndex), textStyle,
-+                    baseDir == BidiUtils::BidiBaseDir::RTL,
-+                    [&](const int runX, const char* runText, const EpdFontFamily::Style runStyle) {
-+                      renderer.drawText(lineFontId, runX, wordY, runText, true, runStyle, baseDir);
-+                    })) {
-+              renderer.drawText(lineFontId, orientedMarginLeft + line.xPos + geometry.xOffset + skipX, wordY,
-+                                visibleText, true, textStyle);
-+            }
-+            renderer.endTextClip();
-+          });
++        // Clip the inter-word fill to the same ribbon height, so it cannot
++        // close the outer top/bottom gutter on a one-line clipping.
++        gap.y = marker.y;
++        gap.height = marker.height;
++        paintMarker(gap, matchIndex);
++      }
++      paintMarker(marker, matchIndex);
++      int hitLeft = wordX, hitRight = wordX + wordW;
++      const int limitLeft = line.clipWidth > 0 ? std::max(bezelLeft, orientedMarginLeft + line.clipX) : bezelLeft;
++      const int limitRight = line.clipWidth > 0 ? std::min(renderer.getScreenWidth() - bezelRight,
++                                                           orientedMarginLeft + line.clipX + line.clipWidth)
++                                                : renderer.getScreenWidth() - bezelRight;
++      const auto continuation = [&](bool left) {
++        const auto tip = ClippingHighlightGeometry::continuationTip(marker, left, limitLeft, limitRight);
++        ClippingHighlightGeometry::paintContinuation(
++            tip, left, [&](const ClippingHighlightGeometry::GapRect& row) { paintMarker(row, matchIndex); });
++        if (tip.width > 0) {
++          hitLeft = std::min(hitLeft, tip.x);
++          hitRight = std::max(hitRight, tip.x + tip.width);
++        }
++      };
++      if (pageWordIndex == matched.startWord && !matched.startsAtClipStart) continuation(true);
++      if (pageWordIndex == matched.endWord && !matched.reachesClipEnd) continuation(false);
 +#if CROSSINK_APP_CAP_TOUCH
 +      if (matchIndex >= 0 && matchIndex < static_cast<int>(clippingBounds.size())) {
 +        auto& bounds = clippingBounds[matchIndex];
@@ -2642,7 +2683,7 @@ index a541223401dafb15e8f5c67668386c750d775954..34f4781c2ad55849129dafc28f12edc3
        previousHighlight = currentHighlight;
        previousHighlightBlock = &block;
        hasPreviousHighlight = true;
-@@ -7748,6 +8311,16 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7748,6 +8276,16 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      }
      return true;
    });
@@ -7134,10 +7175,10 @@ index 0000000000000000000000000000000000000000..f06d35833ee12acbaa07253ca6aa2c46
 +}
 diff --git a/test/clipping_page_turn/ClippingRibbonRenderTest.cpp b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4cb9d3677b8bd1fff9affb138f1753d5cfe21c76
+index 0000000000000000000000000000000000000000..dc6ba0dcbe6e870fc77d7b95d9442d95a12602c6
 --- /dev/null
 +++ b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,337 @@
 +#include <gtest/gtest.h>
 +
 +#include <algorithm>
@@ -7161,12 +7202,6 @@ index 0000000000000000000000000000000000000000..4cb9d3677b8bd1fff9affb138f1753d5
 +enum class BidiBaseDir { LTR, RTL };
 +int detectParagraphLevel(const char*, int fallback) { return fallback; }
 +}  // namespace BidiUtils
-+namespace FocusReadingText {
-+template <class F>
-+bool drawSplitRuns(const char*, uint16_t, uint8_t, int, int, EpdFontFamily::Style, bool, F&&) {
-+  return false;
-+}
-+}  // namespace FocusReadingText
 +struct TextBlock {
 +  std::vector<std::string> words;
 +  std::vector<int> positions, widths;
@@ -7194,7 +7229,7 @@ index 0000000000000000000000000000000000000000..4cb9d3677b8bd1fff9affb138f1753d5
 +struct GfxRenderer {
 +  enum { BW };
 +  static constexpr int Width = 160, Height = 100;
-+  int background = 0, textDraws = 0;
++  int background = 0;
 +  std::array<uint8_t, Width * Height> pixels{};
 +  explicit GfxRenderer(bool dark = false) : background(dark ? 1 : 0) { pixels.fill(background); }
 +  int getRenderMode() const { return BW; }
@@ -7202,15 +7237,9 @@ index 0000000000000000000000000000000000000000..4cb9d3677b8bd1fff9affb138f1753d5
 +  void getOrientedViewableTRBL(int* t, int* r, int* b, int* l) const { *t = *r = *b = *l = 0; }
 +  int getLineHeight(int) const { return 20; }
 +  int getTextAdvanceX(int, const char* text, EpdFontFamily::Style) const { return std::strlen(text) * 5; }
-+  void fillRectDither(int x, int y, int w, int h, int) {
++  void shadeRect(int x, int y, int w, int h) {
 +    for (int row = std::max(0, y); row < std::min(Height, y + h); ++row)
 +      for (int col = std::max(0, x); col < std::min(Width, x + w); ++col) pixels[row * Width + col] = 2;
-+  }
-+  void beginTextClip(int, int, int, int) {}
-+  void endTextClip() {}
-+  template <class... Args>
-+  void drawText(Args&&...) {
-+    ++textDraws;
 +  }
 +  bool marked(int x, int y) const { return pixels[y * Width + x] == 2; }
 +};
@@ -7283,7 +7312,6 @@ index 0000000000000000000000000000000000000000..4cb9d3677b8bd1fff9affb138f1753d5
 +    EXPECT_FALSE(activity.renderer.marked(20, 10));  // only ribbon's outside is inset
 +    EXPECT_FALSE(activity.renderer.marked(20, 69));
 +    EXPECT_EQ(activity.collections, 0);  // prepared matches reused
-+    EXPECT_EQ(activity.renderer.textDraws, 6);
 +  }
 +}
 +TEST(ClippingRibbonRender, AdjacentHighlightsKeepSideGutterInsteadOfBridging) {
@@ -7991,6 +8019,44 @@ index 0000000000000000000000000000000000000000..a125ba8d4582e04d875a5587657b0ac3
 +  bool isFrontNavButtonSwapActive() const { return false; }
 +  unsigned long getHeldTime() const { return 0; }
 +};
+diff --git a/test/epub_grayscale/EpubTextGrayscaleTest.cpp b/test/epub_grayscale/EpubTextGrayscaleTest.cpp
+index 1e75dc815c957754da7fce3c19caf7c7c63c24f7..315646ab28d2952a006354f26dcfd7d7bae6c9d0 100644
+--- a/test/epub_grayscale/EpubTextGrayscaleTest.cpp
++++ b/test/epub_grayscale/EpubTextGrayscaleTest.cpp
+@@ -320,3 +320,33 @@ TEST(EpubTextGrayscaleTest, ColdSdSamplePreviewMatchesFullyLoadedFont) {
+     }
+   }
+ }
++
++TEST(EpubTextGrayscaleTest, HighlightShadingPreservesInkAcrossLineBoundaries) {
++  fakeheap::reset(true);
++  RasterFont fixture(12);
++  HalDisplay display;
++  GfxRenderer renderer(display);
++  renderer.begin();
++  renderer.insertFont(1, EpdFontFamily(&fixture.font));
++  for (int orientation = 0; orientation < 4; ++orientation) {
++    SCOPED_TRACE(orientation);
++    renderer.setOrientation(GfxRenderer::Orientation(orientation));
++    renderer.clearScreen();
++    renderer.drawText(1, 25, 40, "pjqy");
++    const auto original = display.bw;
++
++    renderer.clearScreen();
++    renderer.fillRectDither(26, 53, 42, 18, Color::LightGray);
++    renderer.fillRectDither(25, 52, 3, 4, Color::LightGray);
++    const auto shade = display.bw;
++    auto expected = original;
++    for (size_t i = 0; i < expected.size(); ++i) expected[i] &= shade[i];
++    ASSERT_NE(expected, shade);
++    ASSERT_NE(expected, original);
++
++    std::copy(original.begin(), original.end(), display.bw.begin());
++    renderer.shadeRect(26, 53, 42, 18);
++    renderer.shadeRect(25, 52, 3, 4);
++    EXPECT_EQ(display.bw, expected);
++  }
++}
 diff --git a/test/highlight_chapter_groups/CMakeLists.txt b/test/highlight_chapter_groups/CMakeLists.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..247b376725f419635a729c05c701f738ab0a6141
