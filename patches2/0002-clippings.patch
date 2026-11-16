@@ -75,7 +75,7 @@ index 8af1efc4d00b7dbed3cea3e0f23fe7650e04bb43..c74426570a43f40e797b2aeb3d7763c7
 +- Cache nearby pages' resolved highlights (including empty results) and prepare them in bounded idle slices; invalidate after clipping edits, sync/reloads, chapter or layout changes. Prepared page turns do no clipping-text reads or matching.
 +- Start touch word selection after a 200 ms stationary hold instead of one second; immediate swipes remain page turns.
 diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
-index 389d2485ae59189c84a580dc8858a916c9673528..c9737c81e69221f6fb03e111f309c91fd4c9d506 100644
+index 389d2485ae59189c84a580dc8858a916c9673528..9b72c47953a80dd5d57cb33def5b47a5e738ff14 100644
 --- a/lib/GfxRenderer/GfxRenderer.cpp
 +++ b/lib/GfxRenderer/GfxRenderer.cpp
 @@ -1495,7 +1495,11 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
@@ -115,8 +115,29 @@ index 389d2485ae59189c84a580dc8858a916c9673528..c9737c81e69221f6fb03e111f309c91f
          const uint8_t rectMask = headMask & tailMask;
          row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~rectMask) | (rectMask & whiteMask));
        } else {
+@@ -2937,6 +2947,20 @@ int GfxRenderer::getFontAscenderSize(const int fontId) const {
+   return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;
+ }
+
++int GfxRenderer::getFontInkHeight(const int fontId) const {
++#if CROSSINK_SCALABLE_FONTS
++  ScalableFontAccess access;
++#endif
++  const auto font = fontMap.find(fontId);
++  if (font == fontMap.end()) return 0;
++  const auto* regular = font->second.getData(EpdFontFamily::REGULAR);
++  const int descender = std::max({std::abs(regular->descender),
++                                 std::abs(font->second.getData(EpdFontFamily::BOLD)->descender),
++                                 std::abs(font->second.getData(EpdFontFamily::ITALIC)->descender),
++                                 std::abs(font->second.getData(EpdFontFamily::BOLD_ITALIC)->descender)});
++  return regular->ascender + descender;
++}
++
+ int GfxRenderer::getLineHeight(const int fontId) const {
+ #if CROSSINK_SCALABLE_FONTS
+   ScalableFontAccess access;
 diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
-index d606966e29b8cc2d9b313444052588d1333614c6..a082471336a7f24ff162767fcc2fa4fb9cc9dbb4 100644
+index d606966e29b8cc2d9b313444052588d1333614c6..8060a5ca524b66a8428481b1a6054498b3c8436d 100644
 --- a/lib/GfxRenderer/GfxRenderer.h
 +++ b/lib/GfxRenderer/GfxRenderer.h
 @@ -136,7 +136,7 @@ class GfxRenderer {
@@ -137,6 +158,14 @@ index d606966e29b8cc2d9b313444052588d1333614c6..a082471336a7f24ff162767fcc2fa4fb
    void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
    void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
                         bool roundBottomLeft, bool roundBottomRight, Color color) const;
+@@ -314,6 +316,7 @@ class GfxRenderer {
+   /// step that drawText() uses, without drawing or consuming that codepoint.
+   int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style, uint32_t followingCp = 0) const;
+   int getFontAscenderSize(int fontId) const;
++  int getFontInkHeight(int fontId) const;
+   int getLineHeight(int fontId) const;
+   // Zero means bitmap font: EPUB content sizing stays disabled.
+   uint8_t getFontPointSize(int fontId) const;
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
 index 5dc5d57e20e9149df98710a832271b7ef75a48c7..abec5af76a67e52640d7de7c77e3a38f6257e9c9 100644
 --- a/lib/I18n/translations/english.yaml
@@ -1601,7 +1630,7 @@ index b814b1a784839aed857ef3a8d6f585bc72ed4a27..078475c9805d6791e845c597987bcf45
    void finishTouchLookupOnCurrentPage(const std::string& phrase, size_t wordCount,
                                        const DictionaryClippingRequest& request);
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc45b0cd26 100644
+index a541223401dafb15e8f5c67668386c750d775954..a300fa09efaea9691baf86e30872ba14178f5a3a 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -1,3 +1,5 @@
@@ -2233,14 +2262,14 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
 +    if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), 20U * 1024U, 8U * 1024U)) return nullptr;
 +    clippingPageMatches = makeUniqueNoThrow<ClippingPageMatchCache>();
 +    if (!clippingPageMatches) return nullptr;
-+  }
+   }
 +  const ClippingPageMatchCache::Key key{section.get(), activeSectionLayoutSignature, CLIPPINGS.contentRevision(),
 +                                        currentSpineIndex, section->pageCount};
 +  if (clippingPageMatches->resetFor(key)) {
 +    clippingPrepareRetryAt = 0;
 +    clippingPreparePage.reset();
 +    clippingPreparePageNumber = -1;
-   }
++  }
 +  return clippingPageMatches.get();
 +}
 
@@ -2345,7 +2374,7 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
          bool uniqueTextMatch = false;
          const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
          matchedText =
-@@ -7639,35 +7964,187 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7639,35 +7964,203 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
            CLIPPINGS.cacheResolvedLayoutRange(clippingIndex, currentPage, match.startWord, match.endWord,
                                               currentClippingLayoutSignature);
          }
@@ -2454,6 +2483,22 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
 +    return -1;
    };
 
++  // Layout spacing can be tighter than the font's ink box. Reserve room
++  // for descenders even after applying the ribbon's outer bottom inset.
++  int measuredFont = 0;
++  int inkHeight = 0;
++  bool measured = false;
++  const auto ribbonHeight = [&](const PageTextLine& line, const TextBlock& block) {
++    const int lineFont = block.resolvedFontId(renderer, fontId);
++    if (!measured || lineFont != measuredFont) {
++      measuredFont = lineFont;
++      inkHeight = renderer.getFontInkHeight(lineFont);
++      measured = true;
++    }
++    const int spacing = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
++    return std::max(spacing, inkHeight + ClippingHighlightGeometry::BoundaryInset);
++  };
++
 +  // At most 16 small row descriptors (192 bytes on the render stack).
 +  // Resident rows plus at most two boundary-word measurements per clipping;
 +  // no chapter reads, allocations, or additional screen refreshes.
@@ -2465,7 +2510,7 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
 +    const int owner = getMatchIndexForWord(index, line);
 +    if (owner < 0) return true;
 +    const int y = orientedMarginTop + line.yPos;
-+    const int height = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
++    const int height = ribbonHeight(line, block);
 +    auto& contour = clippingRibbonContours[owner];
 +    contour.includeRow(ribbonRows[owner], y, height);
 +    const auto& match = matches[owner];
@@ -2538,7 +2583,7 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
        hasPreviousHighlight = false;
        return true;
      }
-@@ -7682,12 +8159,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7682,12 +8175,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const char* visibleText = wordText + (hasEmSpace ? 3 : 0);
      const int lineFontId = block.resolvedFontId(renderer, fontId);
      const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
@@ -2551,13 +2596,14 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
 +    int wordX = orientedMarginLeft + line.xPos + geometry.xOffset + skipX;
      const int wordY = orientedMarginTop + line.yPos;
      int wordW = geometry.width - skipX;
-     const int wordH = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
+-    const int wordH = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
++    const int wordH = ribbonHeight(line, block);
 +    bool continuesRow = false;
 +    int nextHighlightX = wordX;
      if (wordIndex + 1 < block.wordCount()) {
        const uint16_t nextIndex = static_cast<uint16_t>(wordIndex + 1);
        const char* nextWordText = block.wordText(nextIndex);
-@@ -7697,49 +8179,95 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7697,49 +8195,95 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", nextTextStyle) : 0;
        const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
        const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
@@ -2683,7 +2729,7 @@ index a541223401dafb15e8f5c67668386c750d775954..8c4df7653a28cae328e3b1bc54708ddc
        previousHighlight = currentHighlight;
        previousHighlightBlock = &block;
        hasPreviousHighlight = true;
-@@ -7748,6 +8276,16 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -7748,6 +8292,16 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      }
      return true;
    });
@@ -3576,7 +3622,7 @@ index 0000000000000000000000000000000000000000..c39babc9fef8c5efdf469b6ca9ae3d8a
 +};
 diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/reader/HighlightEditActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..85324b5298726ed4319800c5300f971d5e067f89
+index 0000000000000000000000000000000000000000..9466d5791b193f6755f2c542a7c8840171c12b2c
 --- /dev/null
 +++ b/src/activities/reader/HighlightEditActivity.cpp
 @@ -0,0 +1,377 @@
@@ -3867,11 +3913,11 @@ index 0000000000000000000000000000000000000000..85324b5298726ed4319800c5300f971d
 +          HighlightWordEdit::Action::ExtendStart, HighlightWordEdit::Action::TrimStart,
 +          HighlightWordEdit::Action::TrimEnd, HighlightWordEdit::Action::ExtendEnd};
 +      adjust(actions[i]);
-+    } else if (i == 4) {
++    } else if (i == 6) {
 +      accept();
 +    } else if (i == 5) {
 +      openSavedClipping();
-+    } else if (i == 6) {
++    } else if (i == 4) {
 +      RenderLock lock(*this);
 +      if (CLIPPINGS.removeClippingAt(index))
 +        finish();
@@ -3938,7 +3984,7 @@ index 0000000000000000000000000000000000000000..85324b5298726ed4319800c5300f971d
 +  snprintf(page, sizeof(page), "%d/%d", previewPage + 1, previewPages);
 +  renderer.drawText(SMALL_FONT_ID, safe.x + 12, buttonRect(0).y - 30,
 +                    failed ? tr(STR_HIGHLIGHT_EDIT_UNAVAILABLE) : page);
-+  const char* labels[] = {tr(STR_SAVE), tr(STR_OPEN), tr(STR_DELETE)};
++  const char* labels[] = {tr(STR_DELETE), tr(STR_OPEN), tr(STR_SAVE)};
 +  for (int i = 0; i < 7; ++i) {
 +    const Rect rect = buttonRect(i);
 +    renderer.drawRect(rect.x, rect.y, rect.width, rect.height, true);
@@ -3949,7 +3995,7 @@ index 0000000000000000000000000000000000000000..85324b5298726ed4319800c5300f971d
 +    const std::string label = renderer.truncatedText(UI_10_FONT_ID, labels[i - 4], rect.width - 8);
 +    renderer.drawText(UI_10_FONT_ID, rect.x + (rect.width - renderer.getTextWidth(UI_10_FONT_ID, label.c_str())) / 2,
 +                      rect.y + (rect.height - renderer.getLineHeight(UI_10_FONT_ID)) / 2, label.c_str());
-+    if (i == 4 && !changed) {
++    if (i == 6 && !changed) {
 +      // Dim the label and frame without an extra framebuffer or gray refresh.
 +      for (int y = rect.y; y < rect.y + rect.height; ++y)
 +        for (int x = rect.x + ((y - rect.y) & 1); x < rect.x + rect.width; x += 2) renderer.drawPixel(x, y, false);
@@ -7175,10 +7221,10 @@ index 0000000000000000000000000000000000000000..f06d35833ee12acbaa07253ca6aa2c46
 +}
 diff --git a/test/clipping_page_turn/ClippingRibbonRenderTest.cpp b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..dc6ba0dcbe6e870fc77d7b95d9442d95a12602c6
+index 0000000000000000000000000000000000000000..12541ea3af8016bad98cc9d9228287a973b1fed9
 --- /dev/null
 +++ b/test/clipping_page_turn/ClippingRibbonRenderTest.cpp
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,349 @@
 +#include <gtest/gtest.h>
 +
 +#include <algorithm>
@@ -7230,12 +7276,14 @@ index 0000000000000000000000000000000000000000..dc6ba0dcbe6e870fc77d7b95d9442d95
 +  enum { BW };
 +  static constexpr int Width = 160, Height = 100;
 +  int background = 0;
++  int fontInkHeight = 19;
 +  std::array<uint8_t, Width * Height> pixels{};
 +  explicit GfxRenderer(bool dark = false) : background(dark ? 1 : 0) { pixels.fill(background); }
 +  int getRenderMode() const { return BW; }
 +  int getScreenWidth() const { return Width; }
 +  void getOrientedViewableTRBL(int* t, int* r, int* b, int* l) const { *t = *r = *b = *l = 0; }
 +  int getLineHeight(int) const { return 20; }
++  int getFontInkHeight(int) const { return fontInkHeight; }
 +  int getTextAdvanceX(int, const char* text, EpdFontFamily::Style) const { return std::strlen(text) * 5; }
 +  void shadeRect(int x, int y, int w, int h) {
 +    for (int row = std::max(0, y); row < std::min(Height, y + h); ++row)
@@ -7431,6 +7479,16 @@ index 0000000000000000000000000000000000000000..dc6ba0dcbe6e870fc77d7b95d9442d95
 +      EXPECT_TRUE(activity.renderer.marked(30, 10 + step + 17));
 +    }
 +}
++TEST(ClippingRibbonRender, IsolatedHighlightCoversDescendersBelowTightLineSpacing) {
++  EpubReaderActivity activity;
++  activity.renderer.fontInkHeight = 24;
++  Page page{{line(10, {20}, {60}), line(40, {20}, {60})}};
++  matches(activity, {{0, 0}});
++  activity.drawClippingHighlights(page, 0, 0, 0);
++  EXPECT_TRUE(activity.renderer.marked(30, 33));
++  EXPECT_FALSE(activity.renderer.marked(30, 34));
++}
++
 +TEST(ClippingRibbonRender, TightRowsInsideOneHighlightNeverGetHorizontalSeparators) {
 +  for (int step : {8, 12, 16, 18, 20}) {
 +    EpubReaderActivity activity;
@@ -8784,7 +8842,7 @@ index 0000000000000000000000000000000000000000..4f03290d5caaeb2f8aa9834a74fb1ecb
 +}
 diff --git a/test/highlight_word_edit/HighlightEditorActionsTest.cpp b/test/highlight_word_edit/HighlightEditorActionsTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..312126bdf6d6b1299a428c54ebd13ee60b38a784
+index 0000000000000000000000000000000000000000..f9a4c85e2fa46f97fc2ced9c422bc631641ae73c
 --- /dev/null
 +++ b/test/highlight_word_edit/HighlightEditorActionsTest.cpp
 @@ -0,0 +1,140 @@
@@ -8876,7 +8934,7 @@ index 0000000000000000000000000000000000000000..312126bdf6d6b1299a428c54ebd13ee6
 +#include "EditorActions.inc"
 +int main() {
 +  HighlightEditActivity unchanged;
-+  unchanged.mappedInput.tap = 4;
++  unchanged.mappedInput.tap = 6;
 +  unchanged.loop();
 +  assert(!unchanged.finished && CLIPPINGS.saves == 0);
 +  unchanged.mappedInput.tap = -1;
@@ -8885,13 +8943,13 @@ index 0000000000000000000000000000000000000000..312126bdf6d6b1299a428c54ebd13ee6
 +  assert(!unchanged.finished && CLIPPINGS.saves == 0);
 +  HighlightEditActivity save;
 +  save.changed = true;
-+  save.mappedInput.tap = 4;
++  save.mappedInput.tap = 6;
 +  save.loop();
 +  assert(save.finished && CLIPPINGS.saves == 1);
 +  CLIPPINGS.saveOk = false;
 +  HighlightEditActivity failed;
 +  failed.changed = true;
-+  failed.mappedInput.tap = 4;
++  failed.mappedInput.tap = 6;
 +  failed.loop();
 +  assert(!failed.finished && failed.failed && CLIPPINGS.saves == 2);
 +  CLIPPINGS.saveOk = true;
@@ -8903,12 +8961,12 @@ index 0000000000000000000000000000000000000000..312126bdf6d6b1299a428c54ebd13ee6
 +  assert(open.finished && open.opened && CLIPPINGS.saves == 2);
 +  assert(open.jump.spineIndex == 2 && open.jump.page == 7 && open.jump.pageCount == 30 && open.jump.clippingIndex == 4);
 +  HighlightEditActivity remove;
-+  remove.mappedInput.tap = 6;
++  remove.mappedInput.tap = 4;
 +  remove.loop();
 +  assert(remove.finished && CLIPPINGS.deletes == 1);  // no extra confirmation
 +  CLIPPINGS.deleteOk = false;
 +  HighlightEditActivity failedDelete;
-+  failedDelete.mappedInput.tap = 6;
++  failedDelete.mappedInput.tap = 4;
 +  failedDelete.loop();
 +  assert(!failedDelete.finished && failedDelete.failed);
 +  HighlightEditActivity cancel;
@@ -8926,7 +8984,7 @@ index 0000000000000000000000000000000000000000..312126bdf6d6b1299a428c54ebd13ee6
 +  pages.mappedInput.swipe = Input::SwipeDir::Down;
 +  pages.loop();
 +  assert(pages.previewPage == 1);
-+  std::cout << "Save/Open/Delete/Cancel routing, disabled Save, immediate Delete and long-quote paging passed\n";
++  std::cout << "Delete/Open/Save/Cancel routing, disabled Save, immediate Delete and long-quote paging passed\n";
 +}
 diff --git a/test/highlight_word_edit/HighlightMergeTest.cpp b/test/highlight_word_edit/HighlightMergeTest.cpp
 new file mode 100644
