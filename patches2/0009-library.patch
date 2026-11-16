@@ -188,10 +188,16 @@ index 0fa5e72789adf8f77feefcc4aadbc47bc04e718c..51d06e521c1a5e27320572b2fabd4c88
 +
 +STR_LIBRARY_REFRESH_HINT: " · Refresh available"
 diff --git a/lib/LibraryIndex/LibraryBuilder.cpp b/lib/LibraryIndex/LibraryBuilder.cpp
-index 6ff9b75c84cdbf35cdd3272f6dc8f47399ee0092..c3d55c6550120b31bf1b37b3ef5dcf5e5c7cfebb 100644
+index 6ff9b75c84cdbf35cdd3272f6dc8f47399ee0092..1768806d1685ae6b15b9dd99cd092bde69c219fb 100644
 --- a/lib/LibraryIndex/LibraryBuilder.cpp
 +++ b/lib/LibraryIndex/LibraryBuilder.cpp
-@@ -25,6 +25,7 @@
+@@ -20,11 +20,13 @@
+ #include <optional>
+
+ #include "../../src/util/BookCacheUtils.h"
++#include "LibraryChangeProbe.h"
+ #include "LibraryFileTypes.h"
+ #include "LibraryIndexFile.h"
  #include "LibraryMetadataCache.h"
  #include "LibrarySort.h"
  #include "LibraryText.h"
@@ -199,7 +205,23 @@ index 6ff9b75c84cdbf35cdd3272f6dc8f47399ee0092..c3d55c6550120b31bf1b37b3ef5dcf5e
 
  namespace library {
  namespace {
-@@ -1830,10 +1831,15 @@ static bool rebuildLibraryIndex(const char* rootPath, BuildStats& stats, const b
+@@ -1758,7 +1760,6 @@ static bool rebuildLibraryIndex(const char* rootPath, BuildStats& stats, const b
+     return false;
+   }
+
+-  setBuildPhase(BuildPhase::Organizing);
+   if (buildCancelled()) return false;
+
+   stats.books = st.books;
+@@ -1785,6 +1786,7 @@ static bool rebuildLibraryIndex(const char* rootPath, BuildStats& stats, const b
+     return true;
+   }
+
++  setBuildPhase(BuildPhase::Organizing);
+   [[maybe_unused]] const uint32_t reconcileStartMs = millis();
+   if (st.unresolved > 0) {
+     if (!resolveUnmatchedBooks(st, previous, priorByPath, stats)) return false;
+@@ -1830,10 +1832,15 @@ static bool rebuildLibraryIndex(const char* rootPath, BuildStats& stats, const b
  }
 
  namespace {
@@ -218,21 +240,86 @@ index 6ff9b75c84cdbf35cdd3272f6dc8f47399ee0092..c3d55c6550120b31bf1b37b3ef5dcf5e
 
  bool libraryIndexNeedsRefresh() { return indexDirty.load(std::memory_order_relaxed); }
 
-@@ -1843,6 +1849,7 @@ uint16_t libraryBookLimit() { return CLIX_MAX_RECORDS; }
+@@ -1841,22 +1848,52 @@ void restoreLibraryIndexAfterSleep() { indexDirty.store(false, std::memory_order
 
+ uint16_t libraryBookLimit() { return CLIX_MAX_RECORDS; }
+
++// A healthy snapshot can be kept as-is, including its persisted sort orders.
++static bool reuseUnchangedIndex(LibraryChangeProbe& probe, BuildStats& stats, bool readMetadata) {
++  if (Storage.exists(NEW_PATH) || Storage.exists(BACKUP_PATH)) return false;
++  LibraryIndexFile index;
++  if (!index.open(INDEX_PATH)) return false;
++  const auto& header = index.header();
++  if (header.metadataEnabled != static_cast<uint8_t>(readMetadata) ||
++      (header.flags & (CLIX_FLAG_RANKS_DEGRADED | CLIX_FLAG_DEDUP_DEGRADED | CLIX_FLAG_ARRIVAL_DEGRADED)) != 0)
++    return false;
++  probe.begin(index, true);
++  uint32_t workUnits = 0;
++  const uint32_t start = millis();
++  auto state = probe.step(index);
++  while (!buildCancelled() &&
++         (state == LibraryChangeProbe::State::ReadingIndex || state == LibraryChangeProbe::State::Walking)) {
++    serviceBuilder(workUnits);
++    if (!buildCancelled()) state = probe.step(index);
++  }
++  probe.reset();
++  if (state != LibraryChangeProbe::State::Unchanged) return false;
++  stats.books = stats.unchanged = index.bookCount();
++  stats.walkMs = millis() - start;
++  return true;
++}
++
  bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readMetadata,
-                        const BuildCallbacks* callbacks) {
-+  invalidateViewCache();
+-                       const BuildCallbacks* callbacks) {
++                       const BuildCallbacks* callbacks, LibraryChangeProbe* refreshProbe) {
++  stats = {};
    // Clear before scanning, not after: a file mutation during the scan must
    // survive as a request for another reconciliation. Builds are foreground-only.
-   indexDirty.exchange(false, std::memory_order_relaxed);
+-  indexDirty.exchange(false, std::memory_order_relaxed);
++  const bool wasDirty = indexDirty.exchange(false, std::memory_order_relaxed);
+   buildControl = BuildControl{};
+   buildControl.callbacks = callbacks;
+   buildControl.lastPollMs = buildControl.lastProgressMs = millis();
+-  const bool ok = rebuildLibraryIndex(rootPath, stats, readMetadata);
++  const bool reused = refreshProbe && !wasDirty && std::strcmp(rootPath, "/") == 0 &&
++                      reuseUnchangedIndex(*refreshProbe, stats, readMetadata);
++  const bool ok = reused || (!buildCancelled() && rebuildLibraryIndex(rootPath, stats, readMetadata));
++  if (stats.indexReplaced) invalidateViewCache();
+   if (!ok && stats.failure == BuildFailure::None)
+     stats.failure = buildControl.cancelled ? BuildFailure::Cancelled : BuildFailure::Error;
+   buildControl = BuildControl{};
+   // Retry only what another scan could change. Unreadable files and a capped
+   // duplicate tracker come from the card's contents, so re-dirtying for them
+   // would rescan on every Library visit until the files themselves change.
+-  if (!ok || stats.ranksDegraded || stats.dedupAllocFailed || stats.arrivalDegraded) invalidateLibraryIndex();
++  if (!ok || stats.ranksDegraded || stats.dedupAllocFailed || stats.arrivalDegraded)
++    indexDirty.store(true, std::memory_order_relaxed);
+   return ok;
+ }
+
 diff --git a/lib/LibraryIndex/LibraryBuilder.h b/lib/LibraryIndex/LibraryBuilder.h
-index 2d7202cb684f9f9d9d90aefd6a55d08ce827f865..1fd54691a9e19d5c4cd0cd3be587548466b3a3de 100644
+index 2d7202cb684f9f9d9d90aefd6a55d08ce827f865..ecf9fd598100e41550c8e5a96a7d4018fff28384 100644
 --- a/lib/LibraryIndex/LibraryBuilder.h
 +++ b/lib/LibraryIndex/LibraryBuilder.h
-@@ -114,7 +114,7 @@ uint16_t libraryBookLimit();
+@@ -26,6 +26,8 @@
+
+ namespace library {
+
++class LibraryChangeProbe;
++
+ // Directory levels below the scan root that are walked. The measured corpus is
+ // two deep (genre/author/book); the cap exists because a corrupted FAT can
+ // contain a directory that contains itself, and an uncapped walk would never
+@@ -110,11 +112,12 @@ uint16_t libraryBookLimit();
+ // stops the normal EPUB parser at the end of <metadata>, before the manifest,
+ // without building the reader's spine, TOC, CSS, or section caches. Unchanged
+ // books reuse these values from the prior Library index.
+-// `callbacks` may be null.
++// A refresh probe can reuse a healthy root index when the card metadata matches.
++// `callbacks` and `refreshProbe` may be null.
  bool buildLibraryIndex(const char* rootPath, BuildStats& stats, bool readMetadata = false,
-                        const BuildCallbacks* callbacks = nullptr);
+-                       const BuildCallbacks* callbacks = nullptr);
++                       const BuildCallbacks* callbacks = nullptr, LibraryChangeProbe* refreshProbe = nullptr);
 
 -// Starts dirty on cold boots to reconcile external card edits. File-changing
 +// Starts with the saved index on cold boots; Refresh reconciles external SD edits. File-changing
@@ -241,10 +328,10 @@ index 2d7202cb684f9f9d9d90aefd6a55d08ce827f865..1fd54691a9e19d5c4cd0cd3be5875484
  // builds remain retryable. Results a rescan would repeat, such as skipped
 diff --git a/lib/LibraryIndex/LibraryChangeProbe.cpp b/lib/LibraryIndex/LibraryChangeProbe.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079fb55de0d
+index 0000000000000000000000000000000000000000..ac5bd0cc76fe0525140cd2a01967282590f65df7
 --- /dev/null
 +++ b/lib/LibraryIndex/LibraryChangeProbe.cpp
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,121 @@
 +#include "LibraryChangeProbe.h"
 +
 +#include <FsHelpers.h>
@@ -255,9 +342,11 @@ index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079
 +#include <cstring>
 +
 +namespace library {
-+void LibraryChangeProbe::Fingerprint::add(uint64_t pathHash, const uint32_t size, const uint32_t modified) {
++void LibraryChangeProbe::Fingerprint::add(uint64_t pathHash, const uint32_t size, const uint32_t modified,
++                                          const uint32_t created) {
 +  // Order independent: FAT enumeration order and index title order differ.
 +  pathHash ^= (static_cast<uint64_t>(size) << 32) | modified;
++  pathHash ^= static_cast<uint64_t>(created) * 0x9e3779b97f4a7c15ULL;
 +  pathHash ^= pathHash >> 30;
 +  pathHash *= 0xbf58476d1ce4e5b9ULL;
 +  pathHash ^= pathHash >> 27;
@@ -278,8 +367,9 @@ index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079
 +  indexRow = depth = 0;
 +  entriesSeen = 0;
 +}
-+void LibraryChangeProbe::begin(const LibraryIndexFile& index) {
++void LibraryChangeProbe::begin(const LibraryIndexFile& index, const bool requireReusableMetadata) {
 +  reset();
++  this->requireReusableMetadata = requireReusableMetadata;
 +  // One setup allocation (at most 256 bytes), reused throughout the check.
 +  nameText.reserve(255);
 +  state = index.isOpen() ? State::ReadingIndex : State::Unavailable;
@@ -304,8 +394,13 @@ index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079
 +    if (indexRow < index.bookCount()) {
 +      ClixRecord record{};
 +      uint64_t hash = 0;
-+      if (!index.readRecord(indexRow++, record) || !index.readPathHash(record, hash)) return finish(State::Unavailable);
-+      expected.add(hash, record.fileSize, record.modificationTime);
++      const uint16_t row = indexRow++;
++      uint32_t created = 0;
++      if (!index.readRecord(row, record) || !index.readPathHash(record, hash) || !index.readCreationTime(row, created))
++        return finish(State::Unavailable);
++      if (requireReusableMetadata && (record.modificationTime == 0 || record.metadataStatus == CLIX_METADATA_FAILED))
++        return finish(State::Changed);
++      expected.add(hash, record.fileSize, record.modificationTime, created);
 +      return state;
 +    }
 +    std::strcpy(folders[0].path, "/");
@@ -332,6 +427,7 @@ index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079
 +  const bool isDirectory = entry.isDirectory();
 +  const uint32_t size = isDirectory ? 0 : static_cast<uint32_t>(entry.fileSize());
 +  const uint32_t modified = isDirectory ? 0 : entry.modificationTime();
++  const uint32_t created = isDirectory ? 0 : entry.creationTime();
 +  entry.close();
 +  if (!name[0] || name[0] == '.') return state;
 +  // Match the builder's name/path limits, depth, hidden-file and zero-size rules.
@@ -351,7 +447,7 @@ index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079
 +  if (size == 0) return state;
 +  nameText.assign(name, nameLength);
 +  if (fileTypeFor(nameText) == 0) return state;
-+  actual.add(clixPathHash(fullPath, static_cast<size_t>(length)), size, modified);
++  actual.add(clixPathHash(fullPath, static_cast<size_t>(length)), size, modified, created);
 +  // More current books than indexed books already proves a change.
 +  if (actual.count > expected.count) return finish(State::Changed);
 +  return state;
@@ -359,10 +455,10 @@ index 0000000000000000000000000000000000000000..023597177a7fbf8712676ecd5475a079
 +}  // namespace library
 diff --git a/lib/LibraryIndex/LibraryChangeProbe.h b/lib/LibraryIndex/LibraryChangeProbe.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c44864cba324f4a343c5934fc83df69a76ceba6b
+index 0000000000000000000000000000000000000000..3605448b494f393ed86aa09478ddad5652a5bfae
 --- /dev/null
 +++ b/lib/LibraryIndex/LibraryChangeProbe.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +#pragma once
 +
 +#include <HalStorage.h>
@@ -380,7 +476,7 @@ index 0000000000000000000000000000000000000000..c44864cba324f4a343c5934fc83df69a
 +  enum class State : uint8_t { Idle, ReadingIndex, Walking, Unchanged, Changed, Unavailable };
 +  ~LibraryChangeProbe() { reset(); }
 +  void reset();
-+  void begin(const LibraryIndexFile& index);
++  void begin(const LibraryIndexFile& index, bool requireReusableMetadata = false);
 +  State step(LibraryIndexFile& index);
 +
 + private:
@@ -388,7 +484,7 @@ index 0000000000000000000000000000000000000000..c44864cba324f4a343c5934fc83df69a
 +    uint64_t sum = 0;
 +    uint64_t xored = 0;
 +    uint32_t count = 0;
-+    void add(uint64_t pathHash, uint32_t size, uint32_t modified);
++    void add(uint64_t pathHash, uint32_t size, uint32_t modified, uint32_t created);
 +    bool operator==(const Fingerprint& other) const;
 +  } expected, actual;
 +  // Fixed ~2 KiB in the activity's owned object, never on a render-task stack.
@@ -403,6 +499,7 @@ index 0000000000000000000000000000000000000000..c44864cba324f4a343c5934fc83df69a
 +  // Reused extension-check scratch; bounded by the builder's 255-byte filename limit.
 +  std::string nameText;
 +  State state = State::Idle;
++  bool requireReusableMetadata = false;
 +  uint16_t indexRow = 0;
 +  uint8_t depth = 0;
 +  uint32_t entriesSeen = 0;
@@ -1467,7 +1564,7 @@ index 4307bac8046a5de4345b2e5ba75fec47fc11c8e4..7a31d10c07c2625e3a1cc8f2d0441d31
    void render(RenderLock&&) override;
    bool isHomeActivity() const override { return true; }
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc50012720388ffd2da0 100644
+index 08c6c5b936f3be408267159531300c0c0ab2f016..8f67133d33007dd0480ded37489d75524b310c8a 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
 @@ -11,6 +11,7 @@
@@ -1630,16 +1727,18 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
        index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0)) {
      rebuildIndex(showScanning);
      return;
-@@ -173,12 +182,11 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+@@ -172,13 +181,12 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+   applyFilter();
  }
 
- bool LibraryActivity::rebuildIndex(const bool showScanning) {
+-bool LibraryActivity::rebuildIndex(const bool showScanning) {
 -  if (sort == Sort::RecentlyRead) {
 -    library::invalidateLibraryIndex();
 -    if (RECENT_BOOKS.pruneMissing()) RECENT_BOOKS.saveToFile();
 -    refreshIndexIfNeeded();
 -    return true;
 -  }
++bool LibraryActivity::rebuildIndex(const bool showScanning, const bool refresh) {
 +  coverWorker.stop();
 +  changeProbe.reset();
 +  changeCheckStarted = false;
@@ -1648,19 +1747,33 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    uiReady = false;
    index.close();
    if (showScanning) drawScanScreen(tr(STR_LIBRARY_SCANNING));
-@@ -213,6 +221,11 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
+@@ -189,7 +197,8 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
+   callbacks.progress = &LibraryActivity::onScanProgress;
+   scanCancelledThisVisit = false;
+   scanBackHeldAtStart = mappedInput.isPressed(MappedInputManager::Button::Back);
+-  scanFailed = !library::buildLibraryIndex("/", stats, SETTINGS.libraryUseMetadata != 0, &callbacks);
++  scanFailed = !library::buildLibraryIndex("/", stats, SETTINGS.libraryUseMetadata != 0, &callbacks,
++                                          refresh ? &changeProbe : nullptr);
+   scanFailureText = stats.failure == library::BuildFailure::Cancelled      ? StrId::STR_LIBRARY_SCAN_CANCELLED
+                     : stats.failure == library::BuildFailure::TooManyBooks ? StrId::STR_LIBRARY_TOO_MANY_BOOKS
+                                                                            : StrId::STR_LIBRARY_SCAN_FAILED;
+@@ -213,7 +222,15 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
        }
      }
    }
-+  refreshSuggested = scanFailed;
++  refreshSuggested = scanFailed || library::libraryIndexNeedsRefresh();
 +  libraryCheckedThisBoot = !scanFailed;
-+  libraryChangedThisBoot = scanFailed;
-+  warmedCoverView = 0;
++  libraryChangedThisBoot = refreshSuggested;
 +  coverWorker.start();
++  if (refresh && !scanFailed && !stats.indexReplaced && !filterFailed) return true;
++  if (refresh && !scanFailed && RECENT_BOOKS.pruneMissing()) RECENT_BOOKS.saveToFile();
++  warmedCoverView = 0;
    applyFilter();
++  if (refresh && stats.indexReplaced) resetViewport();
    return !scanFailed;
  }
-@@ -285,6 +298,33 @@ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book)
+
+@@ -285,6 +302,33 @@ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book)
 
  void LibraryActivity::resolveRecents() {
    recentCount = 0;
@@ -1694,7 +1807,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    const auto& books = RECENT_BOOKS.getBooks();
    const std::string needle = library::fold(query);
    const uint8_t visibleTypes = visibleLibraryFileTypes();
-@@ -304,6 +344,40 @@ void LibraryActivity::resolveRecents() {
+@@ -304,6 +348,40 @@ void LibraryActivity::resolveRecents() {
      if (SETTINGS.libraryHideFinishedBooks && BookActions::isBookCompleted(book.path)) continue;
      recentRows[recentCount++] = static_cast<uint16_t>(row);
    }
@@ -1735,7 +1848,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
  }
 
  library::SortOrder LibraryActivity::indexOrder() const {
-@@ -358,24 +432,8 @@ int LibraryActivity::rowCount() const {
+@@ -358,24 +436,8 @@ int LibraryActivity::rowCount() const {
  }
 
  bool LibraryActivity::gridEnabled() const {
@@ -1762,7 +1875,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
  }
 
  uint16_t LibraryActivity::ordinalForRow(const int row) {
-@@ -393,7 +451,8 @@ uint16_t LibraryActivity::filteredSourceRow(const uint16_t row) const {
+@@ -393,7 +455,8 @@ uint16_t LibraryActivity::filteredSourceRow(const uint16_t row) const {
    // Sized when the filter ran: the index may be closed (count 0) while a row
    // is still drawn before the activity swaps out.
    if (!filterBits || !filterRanks || row >= filteredCount || filterSourceCount == 0) return UINT16_MAX;
@@ -1772,7 +1885,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    const uint16_t* ranks = filterRanks.get();
    uint16_t block = static_cast<uint16_t>(std::upper_bound(ranks, ranks + blocks, row) - ranks - 1);
    uint16_t seen = filterRanks[block];
-@@ -426,7 +485,78 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
+@@ -426,7 +489,78 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
    return true;
  }
 
@@ -1851,7 +1964,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    filteredCount = 0;
    filterFailed = false;
    filterBits.reset();
-@@ -449,26 +579,46 @@ void LibraryActivity::applyFilter() {
+@@ -449,26 +583,46 @@ void LibraryActivity::applyFilter() {
      filterFailed = true;
      return;
    }
@@ -1917,7 +2030,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    const auto readIndexedPath = [&](const library::ClixRecord& record) {
      if (!folderOffsets) {
        folderOffsets = makeUniqueNoThrow<uint32_t[]>(library::LibraryIndexFile::FOLDER_CHECKPOINT_COUNT);
-@@ -483,8 +633,9 @@ void LibraryActivity::applyFilter() {
+@@ -483,8 +637,9 @@ void LibraryActivity::applyFilter() {
      }
      return true;
    };
@@ -1929,7 +2042,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
      if (row % FILTER_BLOCK_ROWS == 0) filterRanks[row / FILTER_BLOCK_ROWS] = filteredCount;
      const uint16_t ordinal = index.ordinalForRow(filterOrder, row);
      library::ClixRecord record{};
-@@ -544,19 +695,33 @@ void LibraryActivity::applyFilter() {
+@@ -544,19 +699,33 @@ void LibraryActivity::applyFilter() {
      filterBits[row / 8] |= static_cast<uint8_t>(1u << (row % 8));
      filteredCount++;
    }
@@ -1965,7 +2078,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
  }
 
  void LibraryActivity::reloadAfterBookAction() {
-@@ -566,11 +731,12 @@ void LibraryActivity::reloadAfterBookAction() {
+@@ -566,11 +735,12 @@ void LibraryActivity::reloadAfterBookAction() {
    listNav.top = topIndex;
    listNav.follow(rowCount());
    topIndex = listNav.top;
@@ -1981,7 +2094,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    requestUpdate();
  }
 
-@@ -579,6 +745,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
+@@ -579,6 +749,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
      LOG_ERR("LIB", "Cannot allocate Library dialog");
      return;
    }
@@ -1989,7 +2102,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    pendingInput.clear();
    touchTracking = false;
    app.clearTapFlash();
-@@ -588,6 +755,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
+@@ -588,6 +759,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
      confirmLongPressCaptured = false;
      uiReady = false;
      handler(result);
@@ -1997,7 +2110,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
      requestUpdate();
    });
  }
-@@ -596,7 +764,16 @@ void LibraryActivity::openBook(const int row) {
+@@ -596,7 +768,16 @@ void LibraryActivity::openBook(const int row) {
    RecentBook book;
    if (!readBook(row, book)) return;
    app.clearTapFlash();
@@ -2014,7 +2127,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
    onSelectBook(book.path);
  }
 
-@@ -642,15 +819,52 @@ void LibraryActivity::openSortPicker(const int selectedIndex) {
+@@ -642,15 +823,52 @@ void LibraryActivity::openSortPicker(const int selectedIndex) {
  }
 
  void LibraryActivity::openMenu() {
@@ -2069,18 +2182,16 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
  void LibraryActivity::openSearch() {
    openDialog(
        makeUniqueNoThrow<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_SEARCH), query, 48, InputType::Text),
-@@ -664,7 +878,10 @@ void LibraryActivity::openSearch() {
+@@ -664,8 +882,7 @@ void LibraryActivity::openSearch() {
  }
 
  void LibraryActivity::refreshLibrary() {
 -  rebuildIndex(true);
-+  if (rebuildIndex(true) && RECENT_BOOKS.pruneMissing()) {
-+    RECENT_BOOKS.saveToFile();
-+    applyFilter();
-+  }
-   resetViewport();
+-  resetViewport();
++  rebuildIndex(true, true);
    requestUpdate();
  }
+
 @@ -686,7 +903,7 @@ void LibraryActivity::activateControl(const int control) {
    app.clearTapFlash();
    if (control == 0) refreshLibrary();
@@ -2949,7 +3060,7 @@ index 08c6c5b936f3be408267159531300c0c0ab2f016..45c975b2ac8931d39d5cbc5001272038
 +      });
  }
 diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
-index 97f455067396602b944aa98958f588f7a5d50cd6..9fd4e816112234ccb08fc470358266e49d4ce8b7 100644
+index 97f455067396602b944aa98958f588f7a5d50cd6..4b1d7811ff2445de3822bed13529563a0b7e6875 100644
 --- a/src/activities/library/LibraryActivity.h
 +++ b/src/activities/library/LibraryActivity.h
 @@ -3,15 +3,19 @@
@@ -3050,7 +3161,15 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..9fd4e816112234ccb08fc470358266e4
    bool gridEnabled() const;
    void buildSortHeader(UiApp::ScreenType& screen);
    const char* sortLabel() const;
-@@ -142,6 +183,7 @@ class LibraryActivity final : public Activity {
+@@ -135,13 +176,14 @@ class LibraryActivity final : public Activity {
+   void queueInput(LibraryInputBuffer::Type type, int x = -1, int y = -1);
+   void handleInput(const LibraryInputBuffer::Event& input);
+   void refreshIndexIfNeeded(bool showScanning = false);
+-  bool rebuildIndex(bool showScanning);
++  bool rebuildIndex(bool showScanning, bool refresh = false);
+   void drawScanScreen(const char* message) const;
+   bool scanTouchEnabled() const;
+   static bool scanCancelRequested(void* context);
    static void onScanProgress(void* context, const library::BuildProgress& progress);
    void readRecentBook(size_t historyRow, RecentBook& book) const;
    void resolveRecents();
@@ -4126,10 +4245,10 @@ index 45f49edef51910eb285062bf4c998801ab455daa..829ff3e7a1b70d33d19f935c787dd060
    ${REPO_ROOT}/lib/LibraryIndex/LibraryMetadataCache.cpp
    ${REPO_ROOT}/lib/LibraryIndex/LibrarySort.cpp
 diff --git a/test/library_builder/LibraryBuilderTest.cpp b/test/library_builder/LibraryBuilderTest.cpp
-index 8d2e48d4230022c372996a5f16ae9b785df6786a..d30463f4f8376797a725d55b116414f268f599aa 100644
+index 8d2e48d4230022c372996a5f16ae9b785df6786a..8afdb69dc6b7cbfae1ff6d99f114e1b14a89cfc7 100644
 --- a/test/library_builder/LibraryBuilderTest.cpp
 +++ b/test/library_builder/LibraryBuilderTest.cpp
-@@ -1556,3 +1556,129 @@ TEST_F(LibraryBuilderTest, CancellingWhileCreatingTheMetadataCacheLeavesNoPartia
+@@ -1556,3 +1556,156 @@ TEST_F(LibraryBuilderTest, CancellingWhileCreatingTheMetadataCacheLeavesNoPartia
    ASSERT_TRUE(buildLibraryIndex("/", stats, true));
    EXPECT_EQ(stats.books, 6);
  }
@@ -4162,7 +4281,7 @@ index 8d2e48d4230022c372996a5f16ae9b785df6786a..d30463f4f8376797a725d55b116414f2
 +  EXPECT_EQ(fake::parses, parsesBefore);
 +}
 +TEST_F(LibraryBuilderTest, ChangeProbeDetectsAddedDeletedRenamedAndModifiedBooks) {
-+  for (int change = 0; change < 4; ++change) {
++  for (int change = 0; change < 5; ++change) {
 +    fake::reset();
 +    fake::add("/a.epub");
 +    fake::add("/b.epub");
@@ -4176,6 +4295,7 @@ index 8d2e48d4230022c372996a5f16ae9b785df6786a..d30463f4f8376797a725d55b116414f2
 +      fake::files.erase("/b.epub");
 +    }
 +    if (change == 3) ++fake::files["/b.epub"]->time;
++    if (change == 4) ++fake::files["/b.epub"]->created;
 +    library::LibraryChangeProbe probe;
 +    probe.begin(index);
 +    EXPECT_EQ(completeChangeProbe(probe, index), library::LibraryChangeProbe::State::Changed) << change;
@@ -4215,7 +4335,7 @@ index 8d2e48d4230022c372996a5f16ae9b785df6786a..d30463f4f8376797a725d55b116414f2
 +  fake::resetIoCounters();
 +  fake::directoryEntriesByPath.clear();
 +  EXPECT_EQ(probe.step(index), library::LibraryChangeProbe::State::ReadingIndex);
-+  EXPECT_LE(fake::reads, 2u);
++  EXPECT_LE(fake::reads, 3u);  // record, path hash, and creation time
 +  EXPECT_TRUE(fake::directoryEntriesByPath.empty());
 +  probe.reset();
 +  EXPECT_EQ(probe.step(index), library::LibraryChangeProbe::State::Idle);
@@ -4258,6 +4378,32 @@ index 8d2e48d4230022c372996a5f16ae9b785df6786a..d30463f4f8376797a725d55b116414f2
 +  uint16_t restored[2]{}, count = 0;
 +  EXPECT_FALSE(library::loadViewCache(false, 42, 2, count, restored, sizeof(restored)));
 +  EXPECT_FALSE(library::loadViewCache(true, 42, 2, count, restored, sizeof(restored)));
++}
++
++TEST_F(LibraryBuilderTest, RefreshPreservesIndexAndFilterUntilTheCardChanges) {
++  initial();
++  const uint8_t bits[] = {1};
++  ASSERT_TRUE(library::saveViewCache(false, 42, stats.books, 1, bits, sizeof(bits)));
++  const auto oldCount = stats.books;
++  const auto parses = fake::parses;
++  fake::writesByPath.clear();
++  LibraryChangeProbe probe;
++  ASSERT_TRUE(buildLibraryIndex("/", stats, true, nullptr, &probe));
++  EXPECT_FALSE(stats.indexReplaced);
++  EXPECT_EQ(stats.unchanged, oldCount);
++  EXPECT_EQ(fake::parses, parses);
++  EXPECT_EQ(fake::writesByPath["/.crosspoint/library.stage"], 0u);
++  EXPECT_EQ(fake::writesByPath["/.crosspoint/library.new"], 0u);
++  uint8_t restored[1]{};
++  uint16_t count = 0;
++  ASSERT_TRUE(library::loadViewCache(false, 42, oldCount, count, restored, sizeof(restored)));
++  EXPECT_EQ(restored[0], bits[0]);
++
++  fake::add("/new.epub");
++  ASSERT_TRUE(buildLibraryIndex("/", stats, true, nullptr, &probe));
++  EXPECT_TRUE(stats.indexReplaced);
++  EXPECT_EQ(stats.books, oldCount + 1);
++  EXPECT_FALSE(library::loadViewCache(false, 42, oldCount, count, restored, sizeof(restored)));
 +}
 diff --git a/test/library_index_file/LibraryIndexFileTest.cpp b/test/library_index_file/LibraryIndexFileTest.cpp
 index b8038cd6df70ef449e4afee5189de023efa0ae0f..88a1ba9a6271a6b9c98cf8d78c34a7bfb26a3284 100644
