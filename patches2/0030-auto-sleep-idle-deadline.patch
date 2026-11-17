@@ -1,0 +1,143 @@
+diff --git a/src/activities/reader/ReadestPositionPreviewActivity.cpp b/src/activities/reader/ReadestPositionPreviewActivity.cpp
+index ea114195ea6bb2607343b485dbec94be6eb5d861..7f8ecff20a04552cd4a2c80c99ac29b8bfd75e2e 100644
+--- a/src/activities/reader/ReadestPositionPreviewActivity.cpp
++++ b/src/activities/reader/ReadestPositionPreviewActivity.cpp
+@@ -5,19 +5,24 @@
+ #include <algorithm>
+ #include <cstdio>
+
++#include "CrossPointSettings.h"
+ #include "components/TouchHeaderBackButton.h"
+ #include "fontIds.h"
+
+ ReadestPositionPreviewActivity::ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input,
+-                                                               Position here, Position there, std::string opening)
++                                                               Position here, Position there, std::string opening, bool automatic)
+     : Activity("ReadestPositionPreview", renderer, input),
+       here(std::move(here)),
+       there(std::move(there)),
+-      opening(std::move(opening)) {}
++      opening(std::move(opening)),
++      automatic(automatic) {}
+ void ReadestPositionPreviewActivity::onEnter() {
+   Activity::onEnter();
++  onUserInput();
+   requestUpdate();
+ }
++void ReadestPositionPreviewActivity::onUserInput() { lastInputAt = millis(); }
++
+ Rect ReadestPositionPreviewActivity::button(bool go) const {
+   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+   const int width = (safe.width - 18) / 2;
+@@ -46,6 +51,12 @@ void ReadestPositionPreviewActivity::loop() {
+       return;
+     }
+   }
++  // Automatic prompts can be left unattended after wake or closing a book.
++  // Preserve the current position and return so the normal sleep timer can run.
++  constexpr unsigned long automaticPreviewIdleMs = 30000;
++  if (automatic && SETTINGS.getSleepTimeoutMs() > 0 && millis() - lastInputAt >= automaticPreviewIdleMs) {
++    choose(false);
++  }
+ }
+ void ReadestPositionPreviewActivity::render(RenderLock&&) {
+   renderer.clearScreen();
+diff --git a/src/activities/reader/ReadestPositionPreviewActivity.h b/src/activities/reader/ReadestPositionPreviewActivity.h
+index 292610f54ca437940cd4005434b7fbebc69526e5..1b2492aaf6d559808edf788f60f7e6d2ac0b60cc 100644
+--- a/src/activities/reader/ReadestPositionPreviewActivity.h
++++ b/src/activities/reader/ReadestPositionPreviewActivity.h
+@@ -12,9 +12,10 @@ class ReadestPositionPreviewActivity final : public Activity {
+     bool approximate = false;
+   };
+   ReadestPositionPreviewActivity(GfxRenderer& renderer, MappedInputManager& input, Position here, Position there,
+-                                 std::string opening);
++                                 std::string opening, bool automatic = false);
+   void onEnter() override;
+   void loop() override;
++  void onUserInput() override;
+   void render(RenderLock&&) override;
+   bool preventAutoSleep() override { return true; }
+
+@@ -22,6 +23,8 @@ class ReadestPositionPreviewActivity final : public Activity {
+   Position here;
+   Position there;
+   std::string opening;
++  bool automatic;
++  unsigned long lastInputAt = 0;
+   Rect button(bool go) const;
+   void choose(bool go);
+ };
+diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
+index 082ae6a11e35061cff7fd081bf818a3e763fc45d..38b395e98a5f1e58af809b121b24fe3984e369ad 100644
+--- a/src/activities/reader/ReadestSyncActivity.cpp
++++ b/src/activities/reader/ReadestSyncActivity.cpp
+@@ -982,7 +982,7 @@ std::string ReadestSyncActivity::syncPosition(const ReadestBook& book) {
+       ReadestPositionPreviewActivity::Position there{
+           std::move(chapter), remotePos.pageNumber, remotePos.totalPages, percentOf(percent), true};
+       auto preview = makeUniqueNoThrow<ReadestPositionPreviewActivity>(renderer, mappedInput, std::move(here),
+-                                                                       std::move(there), std::move(remoteOpening));
++                                                                       std::move(there), std::move(remoteOpening), sleepMode);
+       if (!preview) {
+         LOG_ERR("RDS", "Cannot allocate sync position preview");
+         return tr(STR_READEST_POS_UNAVAILABLE);
+diff --git a/src/main.cpp b/src/main.cpp
+index 429114704dc88d5d4d0352b838b89ab24250abbc..bc50d82d51ee07531353f8cd314a3eca1ec6e67c 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1843,6 +1843,17 @@ void loop() {
+     return;
+   }
+
++  // Check the deadline before routing shortcuts. A consumed input frame
++  // can return early, but only a new input edge should extend the deadline.
++  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
++  if (!buttonShortcutController.isQuickLocked() && !gpio.isPressed(HalGPIO::BTN_POWER) &&
++      sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
++    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
++    enterDeepSleep(true);
++    lastActivityTime = millis();  // Deep sleep returns only in the simulator.
++    return;
++  }
++
+   const bool modalOwnsInput = activityManager.blocksGlobalInput();
+
+   // Keep Power + Down screenshot-only. The configurable chord below uses Up,
+@@ -1864,10 +1875,11 @@ void loop() {
+   const auto sideButtonShortcutResult = buttonShortcutController.updateUpDown(
+       millis(), gpio.isPressed(HalGPIO::BTN_UP), gpio.isPressed(HalGPIO::BTN_DOWN), configuredSideButtonChordAction(),
+       touchscreenEscapeHatch, modalOwnsInput);
+-  if (dispatchButtonShortcut(sideButtonShortcutResult) || sideButtonShortcutResult.consumeInput) {
++  if (dispatchButtonShortcut(sideButtonShortcutResult)) {
+     lastActivityTime = millis();
+     return;
+   }
++  if (sideButtonShortcutResult.consumeInput) return;
+
+   const bool powerPressed = gpio.isPressed(HalGPIO::BTN_POWER);
+   const bool chordButtonPressed = gpio.isPressed(HalGPIO::BTN_UP);
+@@ -1912,7 +1924,6 @@ void loop() {
+       lastActivityTime = millis();
+       return;
+     }
+-    const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+     if (sleepTimeoutMs > 0 && buttonShortcutController.shouldQuickLockSleep(millis(), sleepTimeoutMs)) {
+       LOG_DBG("SLP", "Quick Lock timeout triggered after %lu ms", sleepTimeoutMs);
+       APP_STATE.quickLockResumePending = true;
+@@ -1953,17 +1964,6 @@ void loop() {
+     return;
+   }
+
+-  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+-    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
+-    enterDeepSleep(true);
+-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+-    // In the simulator, deep sleep is a no-op and returns — reset the timer so
+-    // the main loop does not immediately re-trigger auto-sleep.
+-    lastActivityTime = millis();
+-    return;
+-  }
+-
+   // Do not feed the wake gesture into getPowerButtonAction(). In particular,
+   // the release edge can otherwise run the configured short/long Power action
+   // in the same loop that arms the post-wake guard.
