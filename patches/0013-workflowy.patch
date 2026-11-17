@@ -654,10 +654,10 @@ index 0000000000000000000000000000000000000000..8d7e545627fbd94feb289ed0c08eee87
 +};
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553bccbcd372
+index 0000000000000000000000000000000000000000..479f6eff87271468a51016e63d146f2bc5b31adf
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,1037 @@
+@@ -0,0 +1,974 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -892,17 +892,17 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  return result == ESP_OK && !sink.overflow && (complete || !response) ? status : 0;
 +}
 +
-+bool WorkflowyDailyActivity::loadChildren(const std::string& parent, const unsigned depth, std::vector<Node>& result, const bool quiet) {
++bool WorkflowyDailyActivity::loadChildren(const std::string& parent, const unsigned depth, std::vector<Node>& result) {
 +  auto response = makePsramByteBufferNoThrow(MAX_RESPONSE);
 +  if (!response) {
-+    if (!quiet) showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
 +    return false;
 +  }
 +  size_t received = 0;
 +  const int status = request("GET", "?parent_id=" + parent, {}, response.get(), &received);
 +  if (status == 404 && depth == 0) return true;
 +  if (status != 200) {
-+    if (!quiet) showMessage(status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
++    showMessage(status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
 +                : status == 401 || status == 403 ? tr(STR_WORKFLOWY_AUTH_FAILED)
 +                                                : tr(STR_WORKFLOWY_NETWORK_FAILED));
 +    return false;
@@ -917,12 +917,12 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  ResponseAllocator allocator;
 +  JsonDocument doc(&allocator);
 +  if (deserializeJson(doc, response.get(), received, DeserializationOption::Filter(filter)) || !doc["nodes"].is<JsonArray>()) {
-+    if (!quiet) showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
 +    return false;
 +  }
 +  const auto nodes = doc["nodes"].as<JsonArrayConst>();
 +  if (nodes.size() > MAX_ROWS) {
-+    if (!quiet) showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
 +    return false;
 +  }
 +  result.reserve(nodes.size());
@@ -936,42 +936,15 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  return true;
 +}
 +
-+bool WorkflowyDailyActivity::loadTree(const std::string& parent, unsigned depth, std::vector<Node>& result) {
-+  std::vector<Node> pending;
-+  if (!loadChildren(parent, depth, pending)) return false;
-+  std::reverse(pending.begin(), pending.end());
-+  while (!pending.empty()) {
-+    auto node = std::move(pending.back());
-+    pending.pop_back();
-+    std::vector<Node> children;
-+    if (node.depth >= 64) {
-+      showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
-+      return false;
-+    }
-+    if (!loadChildren(node.id, node.depth + 1, children)) return false;
-+    if (result.size() + pending.size() + children.size() >= MAX_ROWS) {
-+      showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
-+      return false;
-+    }
-+    node.childrenKnown = true;
-+    node.leaf = children.empty();
-+    node.expanded = !node.leaf;
-+    result.push_back(std::move(node));
-+    pending.insert(pending.end(), std::make_move_iterator(children.rbegin()), std::make_move_iterator(children.rend()));
-+  }
-+  return true;
-+}
-+
 +void WorkflowyDailyActivity::loadDay() {
 +  if (date.empty()) {
 +    auto today = isoDate(0);
 +    RenderLock lock(*this);
 +    date = today.empty() ? "today" : std::move(today);
 +  }
-+  probeFailed = false;
 +  setLoading(true);
 +  std::vector<Node> loaded;
-+  const bool loadedDay = zoomId.empty() ? loadChildren(date, 0, loaded) : loadTree(zoomId, 1, loaded);
++  const bool loadedDay = zoomId.empty() ? loadChildren(date, 0, loaded) : loadChildren(zoomId, 1, loaded);
 +  if (loadedDay && !zoomId.empty()) {
 +    Node root = rows.front();
 +    root.leaf = loaded.empty();
@@ -1023,7 +996,7 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  }
 +  std::vector<Node> children;
 +  setLoading(true);
-+  const bool loadedChildren = loadTree(rows[row].id, depth + 1, children);
++  const bool loadedChildren = loadChildren(rows[row].id, depth + 1, children);
 +  setLoading(false);
 +  if (!loadedChildren) return;
 +  if (rows.size() + children.size() > MAX_ROWS) {
@@ -1032,7 +1005,6 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  }
 +  {
 +    RenderLock lock(*this);
-+    rows[row].childrenKnown = true;
 +    rows[row].leaf = children.empty();
 +    rows[row].expanded = !children.empty();
 +    layoutDirty = true;
@@ -1215,7 +1187,7 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +    const auto& node = rows[i];
 +    if (node.done && !showDone && (i != 0 || zoomId.empty())) continue;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
-+    const int width = std::max(1, bounds.width - indent - 25 - (node.childrenKnown && !node.leaf ? ROW_ARROW_TARGET : 0));
++    const int width = std::max(1, bounds.width - indent - 25 - (!node.leaf ? ROW_ARROW_TARGET : 0));
 +    size_t first = outlineLines.size();
 +    if (wrapItems) {
 +      workflowy::wrapOutlineText(node.title, width, [&](std::string_view text) {
@@ -1279,36 +1251,6 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  return -1;
 +}
 +
-+void WorkflowyDailyActivity::probeVisibleChildren() {
-+  if (probeFailed || static_cast<long>(millis() - nextProbe) < 0) return;
-+  int index = -1;
-+  {
-+    RenderLock lock(*this);
-+    if (layoutDirty || paintedPage != page || page >= pageStarts.size()) return;
-+    const auto end = page + 1 < pageStarts.size() ? pageStarts[page + 1] : placements.size();
-+    for (auto i = pageStarts[page]; i < end; ++i) {
-+      if (!rows[placements[i].row].childrenKnown) {
-+        index = static_cast<int>(placements[i].row);
-+        break;
-+      }
-+    }
-+  }
-+  if (index < 0) return;
-+  std::vector<Node> children;
-+  if (!loadChildren(rows[index].id, rows[index].depth + 1, children, true)) {
-+    probeFailed = true;  // Let the user refresh after a network failure.
-+    return;
-+  }
-+  {
-+    RenderLock lock(*this);
-+    rows[index].childrenKnown = true;
-+    rows[index].leaf = children.empty();
-+    layoutDirty = !children.empty();
-+  }
-+  nextProbe = millis() + 260;
-+  if (!children.empty()) requestUpdate();
-+}
-+
 +void WorkflowyDailyActivity::zoom(size_t row) {
 +  if (rows[row].id == zoomId) return;
 +  Node root = rows[row];
@@ -1320,12 +1262,11 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +    for (auto& node : focused) node.depth -= root.depth;
 +  } else if (!root.leaf) {
 +    setLoading(true);
-+    const bool loaded = loadTree(root.id, 1, focused);
++    const bool loaded = loadChildren(root.id, 1, focused);
 +    setLoading(false);
 +    if (!loaded) return;
 +  }
 +  root.depth = 0;
-+  root.childrenKnown = true;
 +  root.leaf = focused.empty();
 +  root.expanded = !root.leaf;
 +  focused.insert(focused.begin(), std::move(root));
@@ -1420,7 +1361,6 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +      }
 +      sibling.expanded = old->expanded;
 +      sibling.leaf = old->leaf;
-+      sibling.childrenKnown = old->childrenKnown;
 +      rebuilt.push_back(std::move(sibling));
 +      auto lastChild = old + 1;
 +      while (lastChild != end && lastChild->depth > depth) ++lastChild;
@@ -1515,10 +1455,7 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +    }
 +    return;
 +  }
-+  if (!release || !tracking) {
-+    if (!tracking && !release) probeVisibleChildren();
-+    return;
-+  }
++  if (!release || !tracking) return;
 +  tracking = false;
 +  if (moved) return;
 +  const bool held = millis() - touchAt >= 550;
@@ -1565,7 +1502,7 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +  if (row < 0) return;
 +  const int indent = std::min<unsigned>(rows[row].depth, 8) * 16;
 +  if (held) actions(row);
-+  else if (x >= bounds.x + bounds.width - ROW_ARROW_TARGET && rows[row].childrenKnown && !rows[row].leaf) expand(row);
++  else if (x >= bounds.x + bounds.width - ROW_ARROW_TARGET && !rows[row].leaf) expand(row);
 +  else if (rows[row].todo && x < bounds.x + indent + 30) toggle(row);
 +  else edit(row);
 +}
@@ -1631,7 +1568,7 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +        text = title.substr(span.begin, span.end - span.begin);
 +      } else {
 +        const int width = bounds.x + bounds.width - textX -
-+                          (node.childrenKnown && !node.leaf ? ROW_ARROW_TARGET : 0);
++                          (!node.leaf ? ROW_ARROW_TARGET : 0);
 +        text = renderer.truncatedText(UI_12_FONT_ID, node.title.c_str(), width);
 +        if (text != title && text.ends_with("…")) span.end = text.size() - 3;
 +      }
@@ -1653,7 +1590,7 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +      const int marker = dropAfter ? placement.bottom - 1 : placement.top;
 +      renderer.drawLine(start, marker, bounds.x + bounds.width - 1, marker, 2, true);
 +    }
-+    if (node.childrenKnown && !node.leaf) {
++    if (!node.leaf) {
 +      const int tipX = bounds.x + bounds.width - 10;
 +      const int xs[3] = {tipX - 5, tipX + 4, node.expanded ? tipX : tipX - 5};
 +      const int ys[3] = {y + 8, node.expanded ? y + 8 : y + 13, y + 18};
@@ -1697,10 +1634,10 @@ index 0000000000000000000000000000000000000000..6c66d4fcf5aa631c5f9e5e99534d553b
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ad5f85a72714aa00c8634cf9b2e1eca6850a963a
+index 0000000000000000000000000000000000000000..7a65b5180ce0efef9e4bd3b7c3225addb02682a7
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,98 @@
 +#pragma once
 +
 +#include <string>
@@ -1728,7 +1665,6 @@ index 0000000000000000000000000000000000000000..ad5f85a72714aa00c8634cf9b2e1eca6
 +    bool done = false;
 +    bool expanded = false;
 +    bool leaf = false;
-+    bool childrenKnown = false;
 +  };
 +
 +  enum class Step { Start, Waiting, Load, Ready };
@@ -1755,8 +1691,6 @@ index 0000000000000000000000000000000000000000..ad5f85a72714aa00c8634cf9b2e1eca6
 +  int dropRow = -1;
 +  bool dropAfter = false;
 +  bool dragging = false;
-+  bool probeFailed = false;
-+  unsigned long nextProbe = 0;
 +  bool zoomChanged = false;
 +  std::string zoomId;
 +  struct View {
@@ -1787,15 +1721,13 @@ index 0000000000000000000000000000000000000000..ad5f85a72714aa00c8634cf9b2e1eca6
 +  void reorder(size_t source, size_t target, bool after);
 +  void zoom(size_t row);
 +  void back();
-+  void probeVisibleChildren();
-+  bool loadTree(const std::string& parent, unsigned depth, std::vector<Node>& result);
 +  void nextPage(int delta);
 +  void showMessage(const char* text);
 +  void connect();
 +  void editKey();
 +  int request(const char* method, const std::string& path, const std::string& body, uint8_t* response = nullptr,
 +              size_t* received = nullptr);
-+  bool loadChildren(const std::string& parent, unsigned depth, std::vector<Node>& result, bool quiet = false);
++  bool loadChildren(const std::string& parent, unsigned depth, std::vector<Node>& result);
 +  void loadDay();
 +  void toggle(size_t row);
 +  void expand(size_t row);
@@ -1849,65 +1781,6 @@ index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfc
 +    0xff, 0xff, 0xff, 0xff,
 +};
 +inline constexpr freeink::Icon workflowyIcon{32, 32, 16, workflowyBits};
-diff --git a/src/workflowy/WorkflowyRoot.h b/src/workflowy/WorkflowyRoot.h
-new file mode 100644
-index 0000000000000000000000000000000000000000..469dcecb0c1bf412819307309e87a6514c411ba8
---- /dev/null
-+++ b/src/workflowy/WorkflowyRoot.h
-@@ -0,0 +1,36 @@
-+#pragma once
-+
-+// ISRG Root X1, the root of the Workflowy HTTPS certificate chain.
-+inline constexpr char WorkflowyRoot[] = R"PEM(
-+-----BEGIN CERTIFICATE-----
-+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
-+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
-+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
-+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
-+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
-+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
-+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
-+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
-+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
-+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
-+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
-+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
-+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
-+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
-+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
-+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
-+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
-+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
-+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
-+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
-+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
-+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
-+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
-+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
-+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
-+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
-+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
-+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
-+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
-+-----END CERTIFICATE-----
-+)PEM";
-diff --git a/src/workflowy/WorkflowySettings.h b/src/workflowy/WorkflowySettings.h
-new file mode 100644
-index 0000000000000000000000000000000000000000..eda7d41fe23f9a8506dfef71024a191fb86f26a6
---- /dev/null
-+++ b/src/workflowy/WorkflowySettings.h
-@@ -0,0 +1,11 @@
-+#pragma once
-+
-+#include <cstddef>
-+#include <string>
-+
-+namespace workflowy {
-+inline constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
-+inline constexpr size_t KEY_MAX = 256;
-+std::string readSetting(const char* path, size_t limit);
-+bool writeSetting(const char* path, const std::string& value);
-+}  // namespace workflowy
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..f00bf7c537a1a80bea62d1a5d318e91f2f66e0e9
@@ -1997,4 +1870,63 @@ index 0000000000000000000000000000000000000000..f00bf7c537a1a80bea62d1a5d318e91f
 +  return best;
 +}
 +
++}  // namespace workflowy
+diff --git a/src/workflowy/WorkflowyRoot.h b/src/workflowy/WorkflowyRoot.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..469dcecb0c1bf412819307309e87a6514c411ba8
+--- /dev/null
++++ b/src/workflowy/WorkflowyRoot.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++// ISRG Root X1, the root of the Workflowy HTTPS certificate chain.
++inline constexpr char WorkflowyRoot[] = R"PEM(
++-----BEGIN CERTIFICATE-----
++MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
++TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
++cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
++WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
++ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
++MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
++h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
++0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
++A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
++T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
++B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
++B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
++KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
++OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
++jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
++qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
++rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
++HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
++hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
++ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
++3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
++NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
++ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
++TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
++jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
++oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
++4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
++mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
++emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
++-----END CERTIFICATE-----
++)PEM";
+diff --git a/src/workflowy/WorkflowySettings.h b/src/workflowy/WorkflowySettings.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..eda7d41fe23f9a8506dfef71024a191fb86f26a6
+--- /dev/null
++++ b/src/workflowy/WorkflowySettings.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <cstddef>
++#include <string>
++
++namespace workflowy {
++inline constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
++inline constexpr size_t KEY_MAX = 256;
++std::string readSetting(const char* path, size_t limit);
++bool writeSetting(const char* path, const std::string& value);
 +}  // namespace workflowy
