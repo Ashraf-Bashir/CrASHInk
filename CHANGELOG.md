@@ -2,6 +2,8 @@
 
 ### Added
 
+- In-book image controls are grouped under Layout → Images and saved per EPUB, with a new monochrome mode.
+
 - Zoomed Workflowy items show a tappable breadcrumb with shortened ancestor names and an overflow menu.
 
 - Workflowy multi-select persists across pages and supports Select all, completion changes, moving to a date, and confirmed deletion.
@@ -13,6 +15,8 @@
 - Workflowy can add items above or below a sibling and move an item to the top or bottom of its sibling list. An item starting with `[]` becomes a todo.
 
 ### Changed
+
+- Clipping shares send the quote and any saved note directly to Workflowy over saved Wi-Fi. Sending runs in the background and switches off Wi-Fi if sharing enabled it.
 
 - The date, completed count, Calendar, and Refresh are at the top. Back, Show completed, Add, Undo, and Wrap are at the bottom. Wrapped items use the remaining page space and show inline ellipses on both sides of a page break. Completed items appear below open ones. Wrap and Back use distinct icons without a fill.
 - Workflowy tries saved Wi-Fi networks in the background. Text edits, new items, checkboxes, and queued captures save without blocking the outline.

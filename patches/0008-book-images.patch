@@ -116,7 +116,7 @@ index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16d
 
  bool ImageBlock::serialize(FsFile& file) {
 diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/converters/DirectPixelWriter.h
-index debe10c9037d4cf9a38794031d3f5ac5f934b712..1dc6bd0c1f54e1f613b983eb51ce6e624168527b 100644
+index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b6ee31692 100644
 --- a/lib/Epub/Epub/converters/DirectPixelWriter.h
 +++ b/lib/Epub/Epub/converters/DirectPixelWriter.h
 @@ -1,13 +1,13 @@
@@ -136,17 +136,18 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..1dc6bd0c1f54e1f613b983eb51ce6e62
  //
  // Caller is responsible for ensuring (outX, outY) are within screen bounds.
  // ImageBlock::render() already validates this before entering the pixel loop,
-@@ -15,6 +15,9 @@
+@@ -15,6 +15,10 @@
  struct DirectPixelWriter {
    uint8_t* fb;
    GfxRenderer::RenderMode mode;
 +  bool absolute;
 +  bool transparentBackground;
++  bool monochrome;
 +  uint8_t contrast;
    uint16_t displayWidthBytes;  // Runtime framebuffer stride (X4: 100, X3: 99)
    // Active write target: for tiled grayscale, fb is the band scratch, originY is
    // the band's top physical row, and clipRows is the band height. Off-band
-@@ -33,11 +36,14 @@ struct DirectPixelWriter {
+@@ -33,11 +37,15 @@ struct DirectPixelWriter {
    // Row-precomputed: the Y-dependent portion of the physical coords
    int rowPhyXBase, rowPhyYBase;
 
@@ -158,11 +159,12 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..1dc6bd0c1f54e1f613b983eb51ce6e62
      mode = renderer.getRenderMode();
 +    absolute = renderer.grayPlanesAreAbsolute();
 +    transparentBackground = renderer.transparentImageBackground();
++    monochrome = renderer.monochromeImages();
 +    contrast = imageContrast;
      displayWidthBytes = renderer.getDisplayWidthBytes();
 
      const int phyW = renderer.getDisplayWidth();
-@@ -103,31 +109,23 @@ struct DirectPixelWriter {
+@@ -103,31 +111,24 @@ struct DirectPixelWriter {
    // Must be called after beginRow() for the current row.
    // No bounds checking — caller guarantees coordinates are valid.
    inline void writePixel(int logicalX, uint8_t pixelValue) const {
@@ -189,6 +191,7 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..1dc6bd0c1f54e1f613b983eb51ce6e62
 +    const int phyX = rowPhyXBase + logicalX * phyXStepX;
 +    const int phyY = rowPhyYBase + logicalX * phyYStepX;
 +    pixelValue = applyImageContrast(pixelValue, contrast, phyX, phyY);
++    if (monochrome) pixelValue = applyImageMonochrome(pixelValue);
 +    bool draw, state;
 +    if (mode == GfxRenderer::BW) {
 +      draw = pixelValue < 3;
@@ -323,7 +326,7 @@ diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
    absoluteGrayPlanes = false;
  #ifdef SIMULATOR
 diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
-index 1074ecce03413a49979152e0d0c5956211daccce..19ce6ace713f13ff891e273102df2f6ed8731860 100644
+index 1074ecce03413a49979152e0d0c5956211daccce..f9285087f20fa9f00b04d7ded44182082adaa5ac 100644
 --- a/lib/GfxRenderer/GfxRenderer.h
 +++ b/lib/GfxRenderer/GfxRenderer.h
 @@ -24,6 +24,7 @@ class SdCardFont;
@@ -334,15 +337,16 @@ index 1074ecce03413a49979152e0d0c5956211daccce..19ce6ace713f13ff891e273102df2f6e
 
  namespace glyphBitmap {
  struct Frame;
-@@ -84,6 +85,7 @@ class GfxRenderer {
+@@ -84,6 +85,8 @@ class GfxRenderer {
    // Only set for book text (see TextWeightScope); UI text is always drawn as-is.
    mutable int8_t textWeight_ = 0;
    uint8_t imageContrast_ = NORMAL_IMAGE_CONTRAST;
++  bool monochromeImages_ = false;
 +  bool transparentImageBackground_ = false;
    // Reader images drawn as a negative in Dark Mode (see setInvertImages). Reader pages only; covers ignore it.
    mutable bool invertImages_ = false;
    mutable int textClipLeft_ = 0;
-@@ -353,12 +355,18 @@ class GfxRenderer {
+@@ -353,12 +356,20 @@ class GfxRenderer {
    // The GrayscaleMode enum stays out of this header: the simulator's HalDisplay
    // does not define it.
    bool supportsDirectGrayscale() const;
@@ -356,12 +360,14 @@ index 1074ecce03413a49979152e0d0c5956211daccce..19ce6ace713f13ff891e273102df2f6e
    void setTextWeight(const int8_t weight) const { textWeight_ = weight < -2 ? -2 : (weight > 2 ? 2 : weight); }
    void setImageContrast(uint8_t contrast) { imageContrast_ = contrast; }
    uint8_t getImageContrast() const { return imageContrast_; }
++  void setMonochromeImages(bool enabled) { monochromeImages_ = enabled; }
++  bool monochromeImages() const { return monochromeImages_; }
 +  void setTransparentImageBackground(bool enabled) { transparentImageBackground_ = enabled; }
 +  bool transparentImageBackground() const { return transparentImageBackground_; }
    // When set, images inside book pages are not pre-inverted for Dark Mode, so the panel's
    // frame inversion shows them as a negative. The reader sets this before drawing a page;
    // it only affects ImageBlock, never covers or sleep screens.
-@@ -389,8 +397,8 @@ class GfxRenderer {
+@@ -389,8 +400,8 @@ class GfxRenderer {
    // `fallback`).
    void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH,
                              bool turnOffScreen = false) const;
@@ -374,9 +380,10 @@ index 1074ecce03413a49979152e0d0c5956211daccce..19ce6ace713f13ff891e273102df2f6e
    bool shouldSkipImageBlanking() const;
 diff --git a/lib/GfxRenderer/ImageContrast.h b/lib/GfxRenderer/ImageContrast.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..d6c6feb4d4b2fc8775c9fa428d5cb185b93ecdcf
 --- /dev/null
 +++ b/lib/GfxRenderer/ImageContrast.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,21 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -394,15 +401,21 @@ new file mode 100644
 +  if (matrix[panelY & 3][panelX & 3] >= threshold) return level;
 +  return static_cast<uint8_t>((level == 2) == stronger ? level + 1 : level - 1);
 +}
++
++constexpr uint8_t applyImageMonochrome(uint8_t level) {
++  return level < 2 ? 0 : 3;
++}
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index dc631727a74d04962643bb5a51ce628aa48520c4..ea158c133c4d856fe3b48efdfb714af3fdb62660 100644
+index dc631727a74d04962643bb5a51ce628aa48520c4..836a95fffe9246d8dd244a785650b49159fbefc8 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -171,6 +171,9 @@ STR_IMAGES: "Images"
+@@ -171,6 +171,11 @@ STR_IMAGES: "Images"
  STR_IMAGES_DISPLAY: "Display"
  STR_IMAGES_PLACEHOLDER: "Placeholder"
  STR_IMAGES_SUPPRESS: "Suppress"
 +STR_IMAGE_CONTRAST: "Image Contrast"
++STR_IMAGES_MONOCHROME: "Monochrome"
++STR_IMAGE_DISPLAY_MODE: "Display mode"
 +STR_TRANSPARENT_IMAGE_BACKGROUND: "Transparent Image Background"
 +STR_INVERT_IMAGES_DARK: "Invert Images in Dark Mode"
  STR_TOUCH_READER_CONTROLS: "Touch Reader Controls"
@@ -503,16 +516,17 @@ diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
 
    // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
-index a091acf49617d86e0429c9e2ca6410ac8fc58457..7fd6739383c1ae896fc7436c85df32d38df04d78 100644
+index a091acf49617d86e0429c9e2ca6410ac8fc58457..13255967af14691b5e8106cb0bf8a08223693a69 100644
 --- a/src/CrossPointSettings.h
 +++ b/src/CrossPointSettings.h
-@@ -665,6 +665,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+@@ -665,6 +665,11 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
    uint8_t readingIdleTimeThresholdUnits = 30;
    // Image rendering mode in EPUB reader
    uint8_t imageRendering = IMAGES_DISPLAY;
 +  // In Dark Mode, draw reader images as a negative (off = images keep their own colours).
 +  uint8_t invertImagesDark = 0;
 +  uint8_t imageContrast = 100;
++  uint8_t monochromeImages = 0;
 +  uint8_t transparentImageBackground = 0;
    // Long-press Confirm (menu button) quick action in reader (0 = off)
    uint8_t longPressMenuAction = LONG_MENU_OFF;
@@ -558,14 +572,15 @@ index 2ff41f9ff60fc1796a30a6973305e47a9de4968a..4a2339a523d539be6b35eecda9191c3d
    addSettingByName(readerSettings, allSettings, StrId::STR_GUIDE_READING);
    addSettingByName(readerSettings, allSettings, StrId::STR_DICTIONARY);
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index cd652d64a7c7419e6b10b32b78f2e45d006c9fb7..af4c800a4dbeb1d893dce67929a1dd8132dffda6 100644
+index cd652d64a7c7419e6b10b32b78f2e45d006c9fb7..286cd07b9f3b2618647080f9c58e1db46f1f0ab7 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -487,6 +487,8 @@ void ActivityManager::renderTaskLoop() {
+@@ -487,6 +487,9 @@ void ActivityManager::renderTaskLoop() {
        // Apply Night Mode to each activity's normal-polarity frame. SleepActivity
        // preserves it only for Quick Resume and clears it for other sleep screens.
        display.setInverted(SETTINGS.screenInverted != 0);
 +      renderer.setImageContrast(SETTINGS.imageContrast);
++      renderer.setMonochromeImages(SETTINGS.monochromeImages != 0);
 +      renderer.setTransparentImageBackground(SETTINGS.transparentImageBackground != 0);
        currentActivity->render(std::move(lock));
        restoredActivityNeedsRender = false;
@@ -622,26 +637,42 @@ diff --git a/src/activities/reader/EpubGrayscale.h b/src/activities/reader/EpubG
 
  // Preserves the live BW buffer and existing controller synchronization. False
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce0635f0de80f 100644
+index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..a97e10039d27d65e0122da813c450eb2d45dc687 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -1259,6 +1259,7 @@ void captureReaderSettings(EpubReaderActivity::ReaderSettingsSnapshot& out) {
+@@ -105,7 +105,8 @@ constexpr uint8_t PRE_DICTIONARY_FONT_SIZE_READER_SETTINGS_FILE_VERSION = 6;
+ constexpr uint8_t PRE_SPLIT_SCREEN_MARGIN_READER_SETTINGS_FILE_VERSION = 7;
+ constexpr uint8_t PRE_GLOBAL_DARK_MODE_READER_SETTINGS_FILE_VERSION = 8;
+ constexpr uint8_t PRE_FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION = 9;
+-constexpr uint8_t READER_SETTINGS_FILE_VERSION = 10;
++constexpr uint8_t FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION = 10;
++constexpr uint8_t READER_SETTINGS_FILE_VERSION = 11;
+ constexpr uint8_t READER_SETTINGS_FLAG_CUSTOM = 1 << 0;
+ constexpr uint8_t READER_SETTINGS_FLAG_AUTO_PAGE_TURN = 1 << 1;
+ constexpr uint8_t READER_SETTINGS_FLAG_RENDER_MODE = 1 << 2;
+@@ -1259,6 +1260,10 @@ void captureReaderSettings(EpubReaderActivity::ReaderSettingsSnapshot& out) {
    out.textAntiAliasing = SETTINGS.textAntiAliasing;
    out.textWeight = SETTINGS.textWeight;
    out.imageRendering = SETTINGS.imageRendering;
 +  out.invertImagesDark = SETTINGS.invertImagesDark;
++  out.imageContrast = SETTINGS.imageContrast;
++  out.transparentImageBackground = SETTINGS.transparentImageBackground;
++  out.monochromeImages = SETTINGS.monochromeImages;
    out.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
    out.forceParagraphIndents = SETTINGS.forceParagraphIndents;
    out.focusReadingEnabled = SETTINGS.focusReadingEnabled;
-@@ -1298,6 +1299,7 @@ void applyReaderSettings(const EpubReaderActivity::ReaderSettingsSnapshot& in) {
+@@ -1298,6 +1303,10 @@ void applyReaderSettings(const EpubReaderActivity::ReaderSettingsSnapshot& in) {
    SETTINGS.textWeight = in.textWeight < CrossPointSettings::TEXT_WEIGHT_COUNT ? in.textWeight : CrossPointSettings::WEIGHT_NORMAL;
    SETTINGS.imageRendering =
        in.imageRendering < CrossPointSettings::IMAGE_RENDERING_COUNT ? in.imageRendering : SETTINGS.imageRendering;
 +  SETTINGS.invertImagesDark = in.invertImagesDark ? 1 : 0;
++  SETTINGS.imageContrast = std::min<uint8_t>(in.imageContrast, 200);
++  SETTINGS.transparentImageBackground = in.transparentImageBackground ? 1 : 0;
++  SETTINGS.monochromeImages = in.monochromeImages ? 1 : 0;
    SETTINGS.extraParagraphSpacing = in.extraParagraphSpacing ? 1 : 0;
    SETTINGS.forceParagraphIndents = in.forceParagraphIndents ? 1 : 0;
    SETTINGS.focusReadingEnabled = in.focusReadingEnabled ? 1 : 0;
-@@ -1330,10 +1332,15 @@ constexpr std::array<uint8_t ReaderSettingsSnapshot::*, 18> READER_SETTING_FIELD
+@@ -1330,10 +1339,19 @@ constexpr std::array<uint8_t ReaderSettingsSnapshot::*, 18> READER_SETTING_FIELD
      &ReaderSettingsSnapshot::indexingMethod,
  };
  constexpr uint32_t SD_FONT_FAMILY_OVERRIDE = 1U << READER_SETTING_FIELDS.size();
@@ -650,28 +681,98 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
 +constexpr uint32_t TEXT_WEIGHT_OVERRIDE = SD_FONT_FAMILY_OVERRIDE << 1;
 +// Invert Images in Dark Mode follows the same rule: a later bit, so older masks keep their meaning.
 +constexpr uint32_t INVERT_IMAGES_OVERRIDE = TEXT_WEIGHT_OVERRIDE << 1;
-+constexpr uint32_t ALL_READER_SETTING_OVERRIDES = (INVERT_IMAGES_OVERRIDE << 1) - 1;
++constexpr uint32_t LEGACY_READER_SETTING_OVERRIDES = (INVERT_IMAGES_OVERRIDE << 1) - 1;
++constexpr uint32_t IMAGE_CONTRAST_OVERRIDE = INVERT_IMAGES_OVERRIDE << 1;
++constexpr uint32_t TRANSPARENT_IMAGE_OVERRIDE = IMAGE_CONTRAST_OVERRIDE << 1;
++constexpr uint32_t MONOCHROME_IMAGE_OVERRIDE = TRANSPARENT_IMAGE_OVERRIDE << 1;
++constexpr uint32_t ALL_READER_SETTING_OVERRIDES = (MONOCHROME_IMAGE_OVERRIDE << 1) - 1;
  constexpr uint32_t READER_FONT_OVERRIDES = (1U << 0) | (1U << 1) | SD_FONT_FAMILY_OVERRIDE;
 -// Anti-aliasing changes the page drawing, but not its saved line/page layout.
 -constexpr uint32_t READER_LAYOUT_SETTING_OVERRIDES = ALL_READER_SETTING_OVERRIDES & ~(1U << 11);
 +// Anti-aliasing, font weight and image inversion change the page drawing, but not its saved line/page layout.
 +constexpr uint32_t READER_LAYOUT_SETTING_OVERRIDES =
-+    ALL_READER_SETTING_OVERRIDES & ~(1U << 11) & ~TEXT_WEIGHT_OVERRIDE & ~INVERT_IMAGES_OVERRIDE;
++    LEGACY_READER_SETTING_OVERRIDES & ~(1U << 11) & ~TEXT_WEIGHT_OVERRIDE & ~INVERT_IMAGES_OVERRIDE;
  constexpr uint32_t SAFE_MODE_SETTING_OVERRIDES = (1U << 9) | (1U << 15) | (1U << 16);
 
  uint32_t changedReaderSettingsMask(const ReaderSettingsSnapshot& current, const ReaderSettingsSnapshot& global) {
-@@ -1561,7 +1568,9 @@ bool saveBookReaderSettingsFile(const std::string& cachePath, const BookReaderSe
+@@ -1345,6 +1363,9 @@ uint32_t changedReaderSettingsMask(const ReaderSettingsSnapshot& current, const
+   if (std::strcmp(current.sdFontFamilyName, global.sdFontFamilyName) != 0) mask |= SD_FONT_FAMILY_OVERRIDE;
+   if (current.textWeight != global.textWeight) mask |= TEXT_WEIGHT_OVERRIDE;
+   if (current.invertImagesDark != global.invertImagesDark) mask |= INVERT_IMAGES_OVERRIDE;
++  if (current.imageContrast != global.imageContrast) mask |= IMAGE_CONTRAST_OVERRIDE;
++  if (current.transparentImageBackground != global.transparentImageBackground) mask |= TRANSPARENT_IMAGE_OVERRIDE;
++  if (current.monochromeImages != global.monochromeImages) mask |= MONOCHROME_IMAGE_OVERRIDE;
+   return mask;
+ }
+
+@@ -1361,6 +1382,9 @@ void applyReaderSettingsOverrides(ReaderSettingsSnapshot& target, const ReaderSe
+   }
+   if (mask & TEXT_WEIGHT_OVERRIDE) target.textWeight = book.textWeight;
+   if (mask & INVERT_IMAGES_OVERRIDE) target.invertImagesDark = book.invertImagesDark;
++  if (mask & IMAGE_CONTRAST_OVERRIDE) target.imageContrast = book.imageContrast;
++  if (mask & TRANSPARENT_IMAGE_OVERRIDE) target.transparentImageBackground = book.transparentImageBackground;
++  if (mask & MONOCHROME_IMAGE_OVERRIDE) target.monochromeImages = book.monochromeImages;
+ }
+
+ using BookReaderSettingsData = EpubReaderActivity::BookReaderSettingsData;
+@@ -1456,7 +1480,8 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
+       version != PRE_DICTIONARY_FONT_SIZE_READER_SETTINGS_FILE_VERSION &&
+       version != PRE_SPLIT_SCREEN_MARGIN_READER_SETTINGS_FILE_VERSION &&
+       version != PRE_GLOBAL_DARK_MODE_READER_SETTINGS_FILE_VERSION &&
+-      version != PRE_FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION && version != READER_SETTINGS_FILE_VERSION) {
++      version != PRE_FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION &&
++      version != FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION && version != READER_SETTINGS_FILE_VERSION) {
+     file.close();
+     LOG_DBG("ERS", "Reader settings version mismatch, using defaults");
+     return data;
+@@ -1490,8 +1515,10 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
+     ok = readU8(file, data.dictionaryFontPointSize);
+   }
+   uint32_t overrideMask = 0;
+-  if (ok && version >= READER_SETTINGS_FILE_VERSION) {
+-    ok = readU32(file, overrideMask) && (overrideMask & ~ALL_READER_SETTING_OVERRIDES) == 0;
++  if (ok && version >= FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION) {
++    const uint32_t allowed = version >= READER_SETTINGS_FILE_VERSION ? ALL_READER_SETTING_OVERRIDES
++                                                                     : LEGACY_READER_SETTING_OVERRIDES;
++    ok = readU32(file, overrideMask) && (overrideMask & ~allowed) == 0;
+   }
+   if (ok) {
+     // Font weight is a trailing byte added after this format shipped: older files
+@@ -1501,6 +1528,10 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
+     // Invert Images in Dark Mode is one more trailing byte; files without it keep the global value.
+     uint8_t storedInvertImages = 0;
+     if (readU8(file, storedInvertImages)) snapshot.invertImagesDark = storedInvertImages ? 1 : 0;
++    if (version >= READER_SETTINGS_FILE_VERSION) {
++      ok = readU8(file, snapshot.imageContrast) && readU8(file, snapshot.transparentImageBackground) &&
++           readU8(file, snapshot.monochromeImages);
++    }
+   }
+   file.close();
+   if (!ok) {
+@@ -1516,7 +1547,7 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
+     // Older records owned the entire snapshot. New records only own the fields
+     // the reader actually changed, so unrelated global defaults still apply.
+     data.readerSettingsOverrideMask =
+-        version < READER_SETTINGS_FILE_VERSION ? ALL_READER_SETTING_OVERRIDES : overrideMask;
++        version < FIELD_OVERRIDES_READER_SETTINGS_FILE_VERSION ? LEGACY_READER_SETTING_OVERRIDES : overrideMask;
+     data.hasCustomReaderSettings = data.readerSettingsOverrideMask != 0;
+     applyReaderSettingsOverrides(data.readerSettings, snapshot, data.readerSettingsOverrideMask);
+   }
+@@ -1561,7 +1592,12 @@ bool saveBookReaderSettingsFile(const std::string& cachePath, const BookReaderSe
                    writeReaderSettingsSnapshot(file, normalizedReaderSettings) &&
                    writeExact(file, data.dictionarySdFontFamilyName, sizeof(data.dictionarySdFontFamilyName)) &&
                    writeU8(file, data.dictionaryFontPointSize) &&
 -                  writeU32(file, data.readerSettingsOverrideMask & ALL_READER_SETTING_OVERRIDES);
 +                  writeU32(file, data.readerSettingsOverrideMask & ALL_READER_SETTING_OVERRIDES) &&
 +                  writeU8(file, normalizedReaderSettings.textWeight) &&
-+                  writeU8(file, normalizedReaderSettings.invertImagesDark);
++                  writeU8(file, normalizedReaderSettings.invertImagesDark) &&
++                  writeU8(file, normalizedReaderSettings.imageContrast) &&
++                  writeU8(file, normalizedReaderSettings.transparentImageBackground) &&
++                  writeU8(file, normalizedReaderSettings.monochromeImages);
    file.close();
    if (!ok) {
      LOG_ERR("ERS", "Short write saving reader settings");
-@@ -7499,6 +7508,8 @@ void EpubReaderActivity::prepareCurrentSectionForRelayout() {
+@@ -7499,6 +7535,8 @@ void EpubReaderActivity::prepareCurrentSectionForRelayout() {
  bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fontId, const int orientedMarginTop,
                                          const int orientedMarginRight, const int orientedMarginBottom,
                                          const int orientedMarginLeft, const bool updatePanel) {
@@ -680,7 +781,7 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
  #if CROSSINK_APP_CAP_TOUCH
    if (mappedInput.hasTouchHardware()) {
      if (!touchReaderPreviewAllocationAttempted) {
-@@ -7580,6 +7591,13 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7580,6 +7618,13 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      needsImageGrayscale = false;
    }
    const bool pageHasImagesNeedingDecode = !deferImageLoading && pageHasImages && page->hasImagesNeedingDecode();
@@ -694,7 +795,7 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
 
    const auto finalizeBufferComposition = [&]() {
      if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
-@@ -7601,6 +7619,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7601,6 +7646,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      if (deferImageLoading) {
        page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
                                          /*renderCachedImages=*/false);
@@ -703,7 +804,7 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
      } else {
        page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
      }
-@@ -7616,14 +7636,15 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7616,14 +7663,15 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      }
      finalizeBufferComposition();
    };
@@ -721,7 +822,7 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
      // Show the new page's placeholders before ZIP extraction or sidecar
      // materialization. The loan can overwrite the framebuffer, so rebuild
      // the complete page after returning it; the panel keeps the preview.
-@@ -7667,47 +7688,70 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7667,47 +7715,70 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    if (!updatePanel) {
      return true;
    }
@@ -826,7 +927,7 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
    } else if (needsAnyGrayscale) {
      if (pagesUntilFullRefresh <= 1) {
        // Cleanup turns still need the stronger HALF pass, but X3 grayscale
-@@ -8959,6 +9003,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+@@ -8959,6 +9030,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
      ImageBlock::setExtractor(nullptr, nullptr, nullptr);
    }
    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
@@ -835,68 +936,236 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce063
    drawPublisherPageMarkers(renderer, *page, layout.marginTop, renderer.getScreenHeight() - layout.marginBottom,
                             ReaderUtils::readerForegroundBlack());
 diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+index d8f5b5ead701bc8cc95b6cfe0fc02e5e9ec50c37..77420c0a7014be5b070a66adb22c094f8f369a4c 100644
 --- a/src/activities/reader/EpubReaderActivity.h
 +++ b/src/activities/reader/EpubReaderActivity.h
-@@ -58,6 +58,7 @@
+@@ -58,6 +58,10 @@ class EpubReaderActivity final : public Activity {
      uint8_t textAntiAliasing = 1;
      uint8_t textWeight = CrossPointSettings::WEIGHT_NORMAL;
      uint8_t imageRendering = 0;
 +    uint8_t invertImagesDark = 0;
++    uint8_t imageContrast = 100;
++    uint8_t transparentImageBackground = 0;
++    uint8_t monochromeImages = 0;
      uint8_t extraParagraphSpacing = 1;
      uint8_t forceParagraphIndents = 0;
      uint8_t focusReadingEnabled = 0;
 diff --git a/src/activities/reader/EpubReaderDrawerActivity.cpp b/src/activities/reader/EpubReaderDrawerActivity.cpp
+index 3be3ac2c4b4390e18e4d159f312af8db4e49b558..bf01bbff621eea19230fa76e3e996c40910759d0 100644
 --- a/src/activities/reader/EpubReaderDrawerActivity.cpp
 +++ b/src/activities/reader/EpubReaderDrawerActivity.cpp
-@@ -1794,6 +1794,7 @@
+@@ -29,6 +29,7 @@
+ #include "StablePageSelectionModel.h"
+ #include "activities/reader/ControlsOptionsActivity.h"
+ #include "activities/settings/StatusBarSettingsActivity.h"
++#include "activities/util/IntervalSelectionActivity.h"
+ #if CROSSINK_SCALABLE_FONTS
+ #include "activities/settings/TtfRenderOptionsActivity.h"
+ #endif
+@@ -662,6 +663,9 @@ ReaderSettingsDraft EpubReaderDrawerActivity::captureSettings() {
+   value.textAntiAliasing = SETTINGS.textAntiAliasing;
+   value.textWeight = SETTINGS.textWeight;
+   value.invertImagesDark = SETTINGS.invertImagesDark;
++  value.imageContrast = SETTINGS.imageContrast;
++  value.transparentImageBackground = SETTINGS.transparentImageBackground;
++  value.monochromeImages = SETTINGS.monochromeImages;
+   value.focusReadingEnabled = SETTINGS.focusReadingEnabled;
+   value.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+   value.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+@@ -689,6 +693,9 @@ void EpubReaderDrawerActivity::applySettings(const ReaderSettingsDraft& value) {
+   SETTINGS.textAntiAliasing = value.textAntiAliasing;
+   SETTINGS.textWeight = value.textWeight;
+   SETTINGS.invertImagesDark = value.invertImagesDark;
++  SETTINGS.imageContrast = value.imageContrast;
++  SETTINGS.transparentImageBackground = value.transparentImageBackground;
++  SETTINGS.monochromeImages = value.monochromeImages;
+   SETTINGS.focusReadingEnabled = value.focusReadingEnabled;
+   SETTINGS.guideReadingEnabled = value.guideReadingEnabled;
+   SETTINGS.hyphenationEnabled = value.hyphenationEnabled;
+@@ -1128,7 +1135,16 @@ void EpubReaderDrawerActivity::buildSimplePane(UiApp::ScreenType& screen) {
+     props.state = isReaderDrawerRowFocused(buttonFocusActive, state.selectedIndex, static_cast<int16_t>(i))
+                       ? fui::StateSelected
+                       : fui::StateNormal;
+-    screen.settingRow(props, rowHeight);
++    if (rowIsToggle(rows[i])) {
++      fui::ToggleRowProps toggle;
++      toggle.row = props;
++      toggle.checked = rowToggleValue(rows[i]);
++      toggle.toggleAction = ACTION_ROW;
++      toggle.toggleValue = static_cast<int16_t>(i);
++      screen.toggleRow(toggle, rowHeight);
++    } else {
++      screen.settingRow(props, rowHeight);
++    }
+   }
+ }
+
+@@ -1561,6 +1577,10 @@ void EpubReaderDrawerActivity::openPane(const ReaderDrawerPane pane) {
+     paneRows = {RowId::FontFamily, RowId::FontSize, RowId::TextWeight};
+     refreshTtfRenderingRow();
+   }
++  if (pane == ReaderDrawerPane::Images) {
++    paneRows = {RowId::ImageDisplay, RowId::MonochromeImages, RowId::ImageContrast,
++                RowId::TransparentImageBackground, RowId::InvertImages};
++  }
+   if (pane == ReaderDrawerPane::DictionaryFont) {
+     paneRows = {RowId::DictionaryFontFamily, RowId::DictionaryFontSize};
+   }
+@@ -1599,6 +1619,10 @@ void EpubReaderDrawerActivity::closePane() {
+     paneRows = {RowId::FontFamily, RowId::FontSize, RowId::TextWeight};
+     refreshTtfRenderingRow();
+   }
++  if (state.pane == ReaderDrawerPane::Images) {
++    paneRows = {RowId::ImageDisplay, RowId::MonochromeImages, RowId::ImageContrast,
++                RowId::TransparentImageBackground, RowId::InvertImages};
++  }
+   if (state.pane == ReaderDrawerPane::DictionaryFont) {
+     paneRows = {RowId::DictionaryFontFamily, RowId::DictionaryFontSize};
+   }
+@@ -1715,11 +1739,30 @@ void EpubReaderDrawerActivity::activateRow(const RowId row) {
+     case RowId::DictionaryFontSize:
+     case RowId::Orientation:
+     case RowId::Alignment:
+-    case RowId::Images:
++    case RowId::ImageDisplay:
+     case RowId::RenderMode:
+     case RowId::TextWeight:
+       showEnumOptions(row);
+       return;
++    case RowId::Images:
++      openPane(ReaderDrawerPane::Images);
++      return;
++    case RowId::ImageContrast:
++      startActivityForResult(
++          std::make_unique<IntervalSelectionActivity>(
++              renderer, mappedInput, "BookImageContrast", StrId::STR_IMAGE_CONTRAST, draft.imageContrast,
++              0, 200, 5, 4, StrId::STR_NONE_OPT,
++              /*readerActivity=*/true, /*allowPowerAsConfirm=*/false, /*ignoreInitialConfirmRelease=*/true,
++              /*showPercentValue=*/true, StrId::STR_NONE_OPT, /*overrideDisabledReaderTouchscreen=*/false,
++              /*showTouchHeaderBackButton=*/true, /*valueFormatter=*/nullptr, /*tapStep=*/5, /*useReaderSlider=*/true),
++          [this](const ActivityResult& result) {
++            if (const auto* value = std::get_if<IntervalResult>(&result.data); !result.isCancelled && value) {
++              draft.imageContrast = static_cast<uint8_t>(value->value);
++              markSettingChanged(ReaderSettingsChangeMask::NonLayout);
++            }
++            requestUpdate();
++          });
++      return;
+     case RowId::IndexingMethod:
+       draft.indexingMethod = draft.indexingMethod == 0 ? 1 : 0;
+       markSettingChanged(ReaderSettingsChangeMask::Relayout);
+@@ -1794,6 +1837,9 @@ void EpubReaderDrawerActivity::activateRow(const RowId row) {
      case RowId::ExtraSpacing:
      case RowId::ForceIndents:
      case RowId::EmbeddedStyle:
 +    case RowId::InvertImages:
++    case RowId::TransparentImageBackground:
++    case RowId::MonochromeImages:
        toggleSetting(row);
        return;
      case RowId::BookmarkToggle:
-@@ -1896,10 +1897,16 @@
+@@ -1896,10 +1942,22 @@ void EpubReaderDrawerActivity::toggleSetting(const RowId row) {
      case RowId::EmbeddedStyle:
        draft.embeddedStyle = !draft.embeddedStyle;
        break;
 +    case RowId::InvertImages:
 +      draft.invertImagesDark = !draft.invertImagesDark;
 +      break;
++    case RowId::TransparentImageBackground:
++      draft.transparentImageBackground = !draft.transparentImageBackground;
++      break;
++    case RowId::MonochromeImages:
++      draft.monochromeImages = !draft.monochromeImages;
++      break;
      default:
        return;
    }
 -  if (row == RowId::TextAa) {
-+  if (row == RowId::InvertImages) {
++  if (row == RowId::InvertImages || row == RowId::TransparentImageBackground || row == RowId::MonochromeImages) {
 +    // Image polarity changes pixels only; no relayout needed.
 +    markSettingChanged(ReaderSettingsChangeMask::NonLayout);
 +  } else if (row == RowId::TextAa) {
      // Anti-aliasing changes pixels only. Rebuilding the EPUB section here
      // makes the in-drawer preview appear to zoom while the page reflows.
      markSettingChanged(ReaderSettingsChangeMask::Preview | ReaderSettingsChangeMask::NonLayout);
-@@ -3054,6 +3061,8 @@
+@@ -1964,8 +2022,8 @@ void EpubReaderDrawerActivity::showEnumOptions(const RowId row) {
+       raw = {0, 1, 2, 3, 4};
+       currentRaw = draft.textWeight;
+       break;
+-    case RowId::Images:
+-      title = StrId::STR_IMAGES;
++    case RowId::ImageDisplay:
++      title = StrId::STR_IMAGE_DISPLAY_MODE;
+       labels = {tr(STR_IMAGES_DISPLAY), tr(STR_IMAGES_PLACEHOLDER), tr(STR_IMAGES_SUPPRESS)};
+       raw = {0, 1, 2};
+       currentRaw = draft.imageRendering;
+@@ -2106,7 +2164,7 @@ void EpubReaderDrawerActivity::selectEnumOption(const int index) {
+       previewedEnumOptionIndex = -1;
+       markSettingChanged(ReaderSettingsChangeMask::Preview | ReaderSettingsChangeMask::NonLayout);
+       break;
+-    case RowId::Images:
++    case RowId::ImageDisplay:
+       draft.imageRendering = value;
+       markSettingChanged(ReaderSettingsChangeMask::NonLayout);
+       break;
+@@ -2994,6 +3052,8 @@ const char* EpubReaderDrawerActivity::paneTitle() const {
+       return tr(STR_SPACING);
+     case ReaderDrawerPane::Margins:
+       return tr(STR_SCREEN_MARGIN);
++    case ReaderDrawerPane::Images:
++      return tr(STR_IMAGES);
+     case ReaderDrawerPane::Percent:
+       return tr(STR_GO_TO_PERCENT);
+     case ReaderDrawerPane::StablePage:
+@@ -3054,6 +3114,16 @@ const char* EpubReaderDrawerActivity::rowLabel(const RowId row) const {
        return tr(STR_EMBEDDED_STYLE);
      case RowId::Images:
        return tr(STR_IMAGES);
++    case RowId::ImageDisplay:
++      return tr(STR_IMAGE_DISPLAY_MODE);
++    case RowId::ImageContrast:
++      return tr(STR_IMAGE_CONTRAST);
++    case RowId::TransparentImageBackground:
++      return tr(STR_TRANSPARENT_IMAGE_BACKGROUND);
++    case RowId::MonochromeImages:
++      return tr(STR_IMAGES_MONOCHROME);
 +    case RowId::InvertImages:
 +      return tr(STR_INVERT_IMAGES_DARK);
      case RowId::SelectChapter:
        return tr(STR_SELECT_CHAPTER);
      case RowId::GoToPercent:
-@@ -3229,6 +3238,7 @@
+@@ -3186,7 +3256,10 @@ const char* EpubReaderDrawerActivity::rowValue(const RowId row, char* buffer, co
+                                                   StrId::STR_WEIGHT_BOLDEST};
+       return I18N.get(labels[std::min<size_t>(draft.textWeight, labels.size() - 1)]);
+     }
+-    case RowId::Images: {
++    case RowId::ImageContrast:
++      snprintf(buffer, bufferSize, "%u%%", static_cast<unsigned>(draft.imageContrast));
++      return buffer;
++    case RowId::ImageDisplay: {
+       static const std::array<StrId, 3> labels = {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER,
+                                                   StrId::STR_IMAGES_SUPPRESS};
+       return I18N.get(labels[std::min<size_t>(draft.imageRendering, labels.size() - 1)]);
+@@ -3229,6 +3302,9 @@ bool EpubReaderDrawerActivity::rowIsToggle(const RowId row) const {
      case RowId::ExtraSpacing:
      case RowId::ForceIndents:
      case RowId::EmbeddedStyle:
 +    case RowId::InvertImages:
++    case RowId::TransparentImageBackground:
++    case RowId::MonochromeImages:
  #if CROSSINK_SCALABLE_FONTS
      case RowId::TtfStemDarkening:
  #endif
-@@ -3288,6 +3298,8 @@
+@@ -3288,6 +3364,12 @@ bool EpubReaderDrawerActivity::rowToggleValue(const RowId row) const {
  #endif
      case RowId::EmbeddedStyle:
        return draft.embeddedStyle;
 +    case RowId::InvertImages:
 +      return draft.invertImagesDark;
++    case RowId::TransparentImageBackground:
++      return draft.transparentImageBackground;
++    case RowId::MonochromeImages:
++      return draft.monochromeImages;
      default:
        return false;
    }
@@ -912,16 +1181,38 @@ diff --git a/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp b/src/ac
    drawHighlightWithSnapshot();
    drawChrome();
 diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
+index 24b1e219bff1893f6245f8a82f4e5631c3e70a8e..033c310427edbddd9e0de1e190d7055c5760f04e 100644
 --- a/src/activities/reader/EpubReaderMenuModel.h
 +++ b/src/activities/reader/EpubReaderMenuModel.h
-@@ -192,6 +192,7 @@
-   layout.add(ReaderDrawerCatalogItem::Orientation);
-   layout.add(ReaderDrawerCatalogItem::Alignment);
-   layout.add(ReaderDrawerCatalogItem::Images);
-+  layout.add(ReaderDrawerCatalogItem::InvertImages);
-   layout.add(ReaderDrawerCatalogItem::Hyphenation);
-   layout.add(ReaderDrawerCatalogItem::PublisherPages);
-   layout.add(ReaderDrawerCatalogItem::ExtraSpacing);
+@@ -63,6 +63,7 @@ enum class ReaderDrawerPane : uint8_t {
+   DictionaryFont,
+   EnumOptions,
+   TtfRendering,
++  Images,
+ };
+
+ enum class ReaderButtonSliderInput : uint8_t { Next, Previous, Confirm, Back };
+@@ -154,6 +155,10 @@ enum class ReaderDrawerCatalogItem : uint8_t {
+   ReadestSync,
+   TextWeight,
+   InvertImages,
++  ImageDisplay,
++  ImageContrast,
++  TransparentImageBackground,
++  MonochromeImages,
+ };
+
+ struct ReaderDrawerAvailability {
+@@ -335,6 +340,9 @@ struct ReaderSettingsDraft {
+   uint8_t textAntiAliasing = 0;
+   uint8_t textWeight = 0;
+   uint8_t invertImagesDark = 0;
++  uint8_t imageContrast = 100;
++  uint8_t transparentImageBackground = 0;
++  uint8_t monochromeImages = 0;
+   uint8_t focusReadingEnabled = 0;
+   uint8_t guideReadingEnabled = 0;
+   uint8_t hyphenationEnabled = 0;
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
@@ -1215,18 +1506,20 @@ diff --git a/test/memory_policy/jpeg_decoder_stubs/GfxRenderer.h b/test/memory_p
 
   private:
 diff --git a/test/reader_drawer_model/ReaderDrawerModelTest.cpp b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
+index 1637cf1ce3e06455a40a71a03652bb86c136dabf..221b84ef21e121f6a9e72c1e52478f54ee545e45 100644
 --- a/test/reader_drawer_model/ReaderDrawerModelTest.cpp
 +++ b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
-@@ -109,7 +109,7 @@
-   EXPECT_EQ(font.items[5], ReaderDrawerCatalogItem::GuideDots);
-
-   const auto& layout = minimal[static_cast<size_t>(ReaderDrawerTab::Layout)];
--  EXPECT_EQ(layout.count, 9);
-+  EXPECT_EQ(layout.count, 10);
+@@ -112,6 +112,9 @@ TEST(ReaderDrawerModel, CatalogOrderAndConditionalRowsMatchTouchDesign) {
+   EXPECT_EQ(layout.count, 9);
    EXPECT_EQ(layout.items[0], ReaderDrawerCatalogItem::Margins);
    EXPECT_EQ(layout.items[3], ReaderDrawerCatalogItem::Images);
++  for (size_t i = 0; i < layout.count; ++i) {
++    EXPECT_NE(layout.items[i], ReaderDrawerCatalogItem::InvertImages);
++  }
 
-@@ -142,14 +142,15 @@
+   const auto& minimalMore = minimal[static_cast<size_t>(ReaderDrawerTab::More)];
+   EXPECT_EQ(minimalMore.count, 3);
+@@ -142,14 +145,15 @@ TEST(ReaderDrawerModel, CatalogOrderAndConditionalRowsMatchTouchDesign) {
    EXPECT_EQ(more.items[5], ReaderDrawerCatalogItem::AutoPageTurn);
 
    const auto& location = complete[static_cast<size_t>(ReaderDrawerTab::Location)];
@@ -1245,7 +1538,7 @@ diff --git a/test/reader_drawer_model/ReaderDrawerModelTest.cpp b/test/reader_dr
 
    const auto& settings = complete[static_cast<size_t>(ReaderDrawerTab::Settings)];
    EXPECT_EQ(settings.count, 11);
-@@ -188,19 +189,21 @@
+@@ -188,19 +192,21 @@ TEST(ReaderDrawerModel, ButtonDevicesRestoreStatsAndTransfersInTheirTabs) {
    EXPECT_EQ(more.items[3], ReaderDrawerCatalogItem::ReadingStats);
 
    const auto& location = catalog[static_cast<size_t>(ReaderDrawerTab::Location)];
@@ -1295,3 +1588,50 @@ diff --git a/src/activities/ScreenTransitionRefresh.h b/src/activities/ScreenTra
    }
 
   private:
+diff --git a/docs/file-formats.md b/docs/file-formats.md
+index 38c7341f4f2bffc752dfc0d9bfefd6a22a3623c0..ec4f77be0638480dd0333dc32d4dceafdb58e094 100644
+--- a/docs/file-formats.md
++++ b/docs/file-formats.md
+@@ -378,7 +378,7 @@ if (parsedSize != fileSize) {
+
+ ## `reader_settings.bin`
+
+-### Version 10
++### Version 11
+
+ Each EPUB cache directory may contain `reader_settings.bin`. Missing files mean
+ the book uses global Reader settings and the default auto-page-turn interval.
+@@ -396,7 +396,10 @@ point sizes, version 7 appends the dictionary font's selected point size, and
+ version 8 splits the screen margin into vertical and horizontal values. Version
+ 9 removes the obsolete per-book Dark Mode byte: Dark Mode is now a global
+ display setting. Version 10 appends a field mask so a book overrides only the
+-reader settings that differ from its current global defaults. Version 2-9
++reader settings that differ from its current global defaults. Version 11 adds
++three optional per-book overrides for image contrast, white-background
++transparency, and monochrome rendering. Older books inherit their defaults.
++Version 2-9
+ records with the custom-settings flag keep their full snapshot as an override
+ when migrated; they cannot distinguish past manual edits from automatic ones.
+ The file can preserve an auto-page-turn interval without forcing custom
+@@ -409,7 +412,7 @@ fallback successfully opens a difficult book.
+
+ ```c++
+ struct ReaderSettingsBin {
+-    u8 version; // 10
++    u8 version; // 11
+     u8 flags;   // bit 0 = at least one custom reader field, bit 1 = custom auto-page-turn interval, bit 2 = render mode override, bit 3 = dictionary font override, bit 4 = Safe Mode override
+     u16 autoPageTurnSeconds;
+     u8 renderMode; // 0 = CrossInk Default, 1 = Balanced, 2 = Light
+@@ -436,6 +439,11 @@ struct ReaderSettingsBin {
+     char sdFontFamilyName[64];
+     char dictionarySdFontFamilyName[64]; // meaningful only when flag bit 3 is set
+     u8 dictionaryFontPointSize; // 0 = follow reader size
+-    u32 readerSettingsOverrideMask; // bits 0-17 correspond to snapshot fields above, excluding snapshotRenderMode; bit 18 = sdFontFamilyName
++    u32 readerSettingsOverrideMask; // field-override bits
++    u8 textWeight;
++    u8 invertImagesDark;
++    u8 imageContrast; // 0-200, neutral is 100
++    u8 transparentImageBackground;
++    u8 monochromeImages;
+ };
+ ```
