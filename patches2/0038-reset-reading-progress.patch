@@ -1,0 +1,165 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 98d21df73b4e2765466f0dd8d7b93cc9a8a1b95d..13eec068970f1fb65d811632f5ffed8eba9ddfcb 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -618,6 +618,7 @@ STR_DELETE_BOOK_STATS: "Delete Book's Reading Stats"
+ STR_BOOK_STATS_DELETED: "Reading Stats Deleted"
+ STR_RESET_BOOK_READER_SETTINGS: "Reset Book Reader Settings"
+ STR_BOOK_READER_SETTINGS_RESET: "Book Reader Settings Reset"
++STR_RESET_READING_PROGRESS: "Reset Reading Progress"
+ STR_RESET_READING_PACE: "Reset Reading Pace"
+ STR_READING_PACE_RESET: "Reading Pace Reset"
+ STR_DELETE: "Delete"
+diff --git a/src/activities/home/FileBrowserActionActivity.h b/src/activities/home/FileBrowserActionActivity.h
+index c67f40e0395b87ce4f2ca707a1a996064b267cf4..3ed3e983825e80a3481a4a79deef53043d2b8f19 100644
+--- a/src/activities/home/FileBrowserActionActivity.h
++++ b/src/activities/home/FileBrowserActionActivity.h
+@@ -33,6 +33,7 @@ enum class FileBrowserAction : int {
+   ToggleBookStatsTracking = 20,
+   OpenInBook = 21,
+   EditHighlight = 22,
++  ResetReadingProgress = 23,
+ };
+
+ class FileBrowserActionActivity final : public Activity {
+diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+index 3beff0bb2357b21a18156c221579c5ce9a3d8eaa..1a577efbdd4a859723a5947e54a1039ae434f946 100644
+--- a/src/activities/home/FileBrowserActivity.cpp
++++ b/src/activities/home/FileBrowserActivity.cpp
+@@ -602,6 +602,7 @@ void FileBrowserActivity::showDirectoryActionMenu(const std::string& entry, bool
+                              case FileBrowserAction::ReadingStats:
+                              case FileBrowserAction::DeleteStats:
+                              case FileBrowserAction::ToggleCompleted:
++                             case FileBrowserAction::ResetReadingProgress:
+                              case FileBrowserAction::RemoveFromRecents:
+                              case FileBrowserAction::PinFavorite:
+                              case FileBrowserAction::UnpinFavorite:
+@@ -895,6 +896,7 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
+             return;
+           case FileBrowserAction::SetSleepFolder:
+           case FileBrowserAction::ClearSleepFolder:
++          case FileBrowserAction::ResetReadingProgress:
+           case FileBrowserAction::RemoveFromRecents:
+           case FileBrowserAction::ViewBookmarks:
+           case FileBrowserAction::ViewClippings:
+diff --git a/src/activities/home/RecentBookProgress.cpp b/src/activities/home/RecentBookProgress.cpp
+index 19f2dcda6ba3a9cfa0aa6cf5d6d9bdbedc7e4316..14486043f08cab2c5bdb61be1fe2efe69ce1a7b6 100644
+--- a/src/activities/home/RecentBookProgress.cpp
++++ b/src/activities/home/RecentBookProgress.cpp
+@@ -306,6 +306,40 @@ void RecentBookProgress::invalidateEpubPercents() {
+   library::invalidateRecentViewCache();
+ }
+
++bool RecentBookProgress::resetEpubProgress(const std::string& bookPath) {
++  if (!FsHelpers::hasEpubExtension(bookPath)) return false;
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  const auto cachePath = Epub::resolveCachePathForFilePath(bookPath, "/.crosspoint");
++  if (!Storage.exists(cachePath.c_str())) {
++    Storage.mkdir("/.crosspoint");
++    if (!Storage.mkdir(cachePath.c_str())) return false;
++  }
++
++  if (auto* entry = findPercent(cachePath)) entry->path.clear();
++  library::invalidateRecentViewCache();
++  // Remove recovery copies before the authoritative position, so a later
++  // open cannot restore the position from a stale backup.
++  for (const char* name : {"/progress.bin.tmp", "/progress.bin.bak", EPUB_PERCENT_CACHE_FILE, "/progress.bin"}) {
++    const auto file = cachePath + name;
++    if (Storage.exists(file.c_str()) && !Storage.remove(file.c_str())) {
++      LOG_ERR("RBPR", "Could not remove reading progress: %s", file.c_str());
++      return false;
++    }
++  }
++  if (!saveCachedEpubPercentToCachePath(cachePath, 0.0f)) return false;
++  rememberPercent(cachePath, 0.0f);
++  return true;
++}
++
++bool RecentBookProgress::hasResetEpubProgress(const std::string& bookPath) {
++  const auto cachePath = Epub::cachePathForFilePath(bookPath, "/.crosspoint");
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  const auto* entry = findPercent(cachePath);
++  const float saved = entry ? entry->percent : loadCachedEpubPercentFromCachePath(cachePath);
++  // A zero percentage without a position is the explicit reset state.
++  return saved == 0.0f && !Storage.exists((cachePath + "/progress.bin").c_str());
++}
++
+ void RecentBookProgress::saveCachedEpubPercent(const Epub& epub, const int spineIndex, const int currentPage,
+                                                const int pageCount) {
+   if (pageCount <= 0) {
+diff --git a/src/activities/home/RecentBookProgress.h b/src/activities/home/RecentBookProgress.h
+index 8f2f011036a7fe2b238bb693a0b8780b95c3b8d5..76e0b6c0cfa3cead960477752ce70e5330dc5108 100644
+--- a/src/activities/home/RecentBookProgress.h
++++ b/src/activities/home/RecentBookProgress.h
+@@ -20,6 +20,9 @@ float loadPercent(const RecentBook& book);
+ float loadCachedEpubPercent(const RecentBook& book);
+ // Drop the in-memory copies after library or cache files change externally.
+ void invalidateEpubPercents();
++// Reset only local reading position and its cached cover percentage.
++bool resetEpubProgress(const std::string& bookPath);
++bool hasResetEpubProgress(const std::string& bookPath);
+ // Saves a cached EPUB reading percentage for fast cover rendering.
+ void saveCachedEpubPercent(const std::string& cachePath, float progress);
+ // Calculates and saves cached EPUB progress from a reader position.
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index 8726105697ff16ff6c216cd2c8132076112d2d52..3f9be9eeb14cd5ee46b3ec0195b7c277b2f8be67 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -21,6 +21,7 @@
+ #include <cstring>
+ #include <functional>
+
++#include "CrossPointState.h"
+ #include "activities/ActivityManager.h"
+ #include "activities/home/BookActions.h"
+ #include "activities/home/FileBrowserActionActivity.h"
+@@ -1658,6 +1659,7 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+                                     [&book](const RecentBook& recent) { return recent.path == book.path; });
+   std::vector<FileBrowserActionActivity::MenuItem> items =
+       BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/isRecent);
++  items.push_back({FileBrowserAction::ResetReadingProgress, StrId::STR_RESET_READING_PROGRESS});
+   if (BookActions::canSendNearby(book.path)) {
+     items.push_back({FileBrowserAction::SendNearby, StrId::STR_SEND_NEARBY_BOOK});
+   }
+@@ -1806,6 +1808,19 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+                        });
+             return;
+           }
++          case FileBrowserAction::ResetReadingProgress: {
++            if (!RecentBookProgress::resetEpubProgress(book.path)) {
++              BookActions::drawToast(renderer, tr(STR_SAVE_PROGRESS_FAILED));
++              return;
++            }
++            RECENT_BOOKS.removeByPath(book.path);
++            if (APP_STATE.openEpubPath == book.path) {
++              APP_STATE.openEpubPath.clear();
++              APP_STATE.saveToFile();
++            }
++            reloadAfterBookAction();
++            return;
++          }
+           case FileBrowserAction::RemoveFromRecents:
+             promptRemoveBook(book.path, book.title);
+             return;
+diff --git a/src/main.cpp b/src/main.cpp
+index b11d5395073b36c375ec297aea7b82c548328c3e..92bae4137639eabb11e04c8b4e417fcb062aa425 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -89,6 +89,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+ #include "MappedInputManager.h"
+ #include "OpdsServerStore.h"
+ #include "RecentBooksStore.h"
++#include "activities/home/RecentBookProgress.h"
+ #include "SdCardFontSystem.h"
+ #include "SilentRestart.h"
+ #include "activities/Activity.h"
+@@ -485,7 +486,8 @@ void silentRestartToManageFonts() { silentRestartToNetwork(NetworkBootTarget::MA
+
+ bool shouldReadestAutoSync(const std::string& epubPath) {
+   if (!SETTINGS.readestAutoSync || !READEST_STORE.hasCredentials()) return false;
+-  return !epubPath.empty() && FsHelpers::hasEpubExtension(epubPath) && Storage.exists(epubPath.c_str());
++  return !epubPath.empty() && FsHelpers::hasEpubExtension(epubPath) && Storage.exists(epubPath.c_str()) &&
++         !RecentBookProgress::hasResetEpubProgress(epubPath);
+ }
+
+ void silentRestartToReadestAutoSync(const ReadestAutoSync when, const std::string& epubPath,
