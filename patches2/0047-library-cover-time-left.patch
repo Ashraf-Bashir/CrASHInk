@@ -1,0 +1,199 @@
+diff --git a/src/activities/home/RecentBookProgress.cpp b/src/activities/home/RecentBookProgress.cpp
+index 14486043f08cab2c5bdb61be1fe2efe69ce1a7b6..db4e96d28f53781b007583aaa6cdabb424bb4a78 100644
+--- a/src/activities/home/RecentBookProgress.cpp
++++ b/src/activities/home/RecentBookProgress.cpp
+@@ -18,6 +18,7 @@
+ #include <string>
+
+ #include "RecentBooksStore.h"
++#include "activities/reader/BookReadingStats.h"
+ #include "activities/reader/EpubReaderUtils.h"
+ #include "util/FileContentEquals.h"
+
+@@ -33,6 +34,8 @@ constexpr uint8_t TXT_CACHE_VERSION = 4;
+ struct PercentEntry {
+   std::string path;
+   float percent = -1.0f;
++  uint32_t timeLeft = 0;
++  bool timeLeftLoaded = false;
+ };
+ std::array<PercentEntry, 64> percentCache;
+ size_t nextPercentSlot = 0;
+@@ -50,6 +53,7 @@ void rememberPercent(const std::string& cachePath, const float percent) {
+     entry = &percentCache[nextPercentSlot];
+     nextPercentSlot = (nextPercentSlot + 1) % percentCache.size();
+     entry->path = cachePath;
++    entry->timeLeftLoaded = false;
+   }
+   entry->percent = percent;
+ }
+@@ -287,6 +291,36 @@ float RecentBookProgress::loadCachedEpubPercent(const RecentBook& book) {
+   return percent;
+ }
+
++uint32_t RecentBookProgress::loadCachedEpubTimeLeft(const RecentBook& book) {
++  const float progress = loadCachedEpubPercent(book);
++  if (progress < 0.5f || progress >= 99.5f) return 0;
++  const auto cachePath = Epub::cachePathForFilePath(book.path, "/.crosspoint");
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  auto* entry = findPercent(cachePath);
++  if (!entry) return 0;  // The progress cache was invalidated between reads.
++  if (!entry->timeLeftLoaded) {
++    const auto resolved = Epub::resolveCachePathForFilePath(book.path, "/.crosspoint");
++    const auto stats = BookReadingStats::load(resolved);
++    entry->timeLeft = stats.isCompleted ? 0 : stats.estimatedTimeLeftSeconds;
++    entry->timeLeftLoaded = true;
++  }
++  return entry->timeLeft;
++}
++
++void RecentBookProgress::rememberEpubTimeLeft(const std::string& cachePath, const uint32_t seconds) {
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  if (auto* entry = findPercent(cachePath)) {
++    entry->timeLeft = seconds;
++    entry->timeLeftLoaded = true;
++  }
++}
++
++void RecentBookProgress::invalidateEpubTimeLeft(const std::string& bookPath) {
++  const auto cachePath = Epub::cachePathForFilePath(bookPath, "/.crosspoint");
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  if (auto* entry = findPercent(cachePath)) entry->timeLeftLoaded = false;
++}
++
+ void RecentBookProgress::saveCachedEpubPercent(const std::string& cachePath, const float progress) {
+   const std::lock_guard<std::mutex> lock(percentCacheMutex);
+   const auto* entry = findPercent(cachePath);
+diff --git a/src/activities/home/RecentBookProgress.h b/src/activities/home/RecentBookProgress.h
+index 76e0b6c0cfa3cead960477752ce70e5330dc5108..7153edaa30c1d094d33841c2082f1e8afb9317ed 100644
+--- a/src/activities/home/RecentBookProgress.h
++++ b/src/activities/home/RecentBookProgress.h
+@@ -1,5 +1,6 @@
+ #pragma once
+
++#include <cstdint>
+ #include <string>
+
+ class Epub;
+@@ -18,6 +19,10 @@ float loadPercent(const RecentBook& book);
+ // Loads the cached EPUB reading percentage without opening the EPUB.
+ // Returns -1.0f when progress is unavailable or the cache cannot be read.
+ float loadCachedEpubPercent(const RecentBook& book);
++// Load the last saved reader estimate once per warm cover cache entry.
++uint32_t loadCachedEpubTimeLeft(const RecentBook& book);
++void rememberEpubTimeLeft(const std::string& cachePath, uint32_t seconds);
++void invalidateEpubTimeLeft(const std::string& bookPath);
+ // Drop the in-memory copies after library or cache files change externally.
+ void invalidateEpubPercents();
+ // Reset only local reading position and its cached cover percentage.
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index b4f9aacde47edda07b0ba0a26751d79da6d3632b..d7ff0059ce53dc97dbcf197e353e19b5be4edec0 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -1488,7 +1488,7 @@ bool LibraryActivity::paintGridCover(fui::DrawTarget& target, const fui::Rect re
+                 available ? rowScratch.title.c_str() : tr(STR_LIBRARY_UNAVAILABLE), style);
+   }
+   target.stroke(rect, ink, 1, 0);
+-  if (slot < gridProgressLoaded) CoverProgressBadge::draw(target, rect, gridProgress[slot]);
++  if (slot < gridProgressLoaded) CoverProgressBadge::draw(target, rect, gridProgress[slot], gridTimeLeft[slot]);
+   return true;
+ }
+
+@@ -1509,6 +1509,9 @@ void LibraryActivity::loadGridPageCovers() {
+   if (gridProgressLoaded < visible) {
+     const bool available = readBook(gridPageStart + gridProgressLoaded, rowScratch);
+     const float saved = available ? RecentBookProgress::loadCachedEpubPercent(rowScratch) : -1.0f;
++    gridTimeLeft[gridProgressLoaded] = available && saved >= 0.5f
++                                          ? RecentBookProgress::loadCachedEpubTimeLeft(rowScratch)
++                                          : 0;
+     gridProgress[gridProgressLoaded++] = available ? std::max(0, static_cast<int>(saved + 0.5f)) : -1;
+     if (gridProgressLoaded == visible) requestUpdate();
+     return;
+@@ -1722,6 +1725,7 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+                     if (!BookActions::deleteBookStats(book.path)) {
+                       LOG_ERR("LIB", "Failed to delete book stats for: %s", book.path.c_str());
+                     } else {
++                      RecentBookProgress::invalidateEpubTimeLeft(book.path);
+                       BookActions::drawToast(renderer, tr(STR_BOOK_STATS_DELETED));
+                       delay(1000);
+                     }
+@@ -1753,6 +1757,7 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+             const size_t oldCount = before.size();
+             bool completed = false;
+             if (BookActions::toggleBookCompleted(book.path, book.title, completed)) {
++              RecentBookProgress::invalidateEpubTimeLeft(book.path);
+               if (sort == Sort::RecentlyRead) {
+                 const bool removed = RECENT_BOOKS.getBooks().size() < oldCount;
+                 recentCount = library::removeRecentRow(recentRows, recentCount, historyRow, removed,
+diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
+index ef9788133592a198a5a4415980965f750e59438c..ddc616db4090cf2ba2899d076b1dfcabe1717758 100644
+--- a/src/activities/library/LibraryActivity.h
++++ b/src/activities/library/LibraryActivity.h
+@@ -83,6 +83,7 @@ class LibraryActivity final : public Activity {
+   uint16_t dirtyCoverSlots = 0;
+   uint16_t failedCoverSlots = 0;
+   std::array<int8_t, 9> gridProgress{};
++  std::array<uint32_t, 9> gridTimeLeft{};
+   int gridProgressLoaded = 0;
+   uint64_t cachedViewKey = 0;
+   uint64_t viewCacheKey(bool recent) const;
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 5b8c1d72183ceaf6532664aab0c0b73e095a9f97..945f77e6d9648740e1329e4410fd4d4f09d0c53f 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -1703,7 +1703,10 @@ void EpubReaderActivity::finalizeReadingStatsOnExit() {
+   const uint32_t previousEstimate = stats.estimatedTimeLeftSeconds;
+   refreshCachedTimeLeftEstimate();
+   if (statsTrackingActive || paceDirty || pendingStatsCommit || stats.estimatedTimeLeftSeconds != previousEstimate) {
+-    if (stats.save(epub->getCachePath()) && (statsTrackingActive || pendingStatsCommit)) globalStats.save();
++    if (stats.save(epub->getCachePath())) {
++      RecentBookProgress::rememberEpubTimeLeft(epub->getCachePath(), stats.estimatedTimeLeftSeconds);
++      if (statsTrackingActive || pendingStatsCommit) globalStats.save();
++    }
+   }
+ }
+
+diff --git a/src/components/CoverProgressBadge.h b/src/components/CoverProgressBadge.h
+index b4bea7ee1f27c92ee1c6d89fd657a0e80a318fbc..c41d881cc402c58cdb8400f09abb6be86528109d 100644
+--- a/src/components/CoverProgressBadge.h
++++ b/src/components/CoverProgressBadge.h
+@@ -4,19 +4,35 @@
+
+ #include <algorithm>
+ #include <cstdio>
++#include <cstring>
++
++#include "activities/reader/ReadingStatsUtils.h"
+
+ namespace CoverProgressBadge {
+-inline void draw(freeink::ui::DrawTarget& target, const freeink::ui::Rect cover, const int percent) {
++inline void draw(freeink::ui::DrawTarget& target, const freeink::ui::Rect cover, const int percent,
++                 const uint32_t timeLeftSeconds = 0) {
+   namespace fui = freeink::ui;
+   if (percent < 0) return;
+-  char label[5];
+-  snprintf(label, sizeof(label), "%d%%", std::min(percent, 100));
++  char label[32];
++  const int percentLength = snprintf(label, sizeof(label), "%d%%", std::min(percent, 100));
++  if (timeLeftSeconds > 0) {
++    char duration[20];
++    formatCompactReadingDuration(timeLeftSeconds, duration, sizeof(duration));
++    // Compact the hours and minutes for the cover badge.
++    const char* space = std::strchr(duration, ' ');
++    if (space) std::memmove(duration + (space - duration), space + 1, std::strlen(space));
++    snprintf(label + percentLength, sizeof(label) - percentLength, " %s", duration);
++  }
+   fui::TextStyle style{};
+   style.font = fui::GfxRendererTarget::FONT_SMALL;
+   style.bold = true;
+   style.align = fui::TextAlign::Center;
+   constexpr int16_t inset = 4;
+-  const int width = target.measureText(style.font, "100%", style).width + 12;
++  int width = target.measureText(style.font, label, style).width + 12;
++  if (width + 2 * inset > cover.width && timeLeftSeconds > 0) {
++    label[percentLength] = '\0';
++    width = target.measureText(style.font, label, style).width + 12;
++  }
+   const int height = target.lineHeight(style.font) + 6;
+   if (width + 2 * inset > cover.width || height + 2 * inset > cover.height) return;
+   const fui::Rect badge{static_cast<int16_t>(cover.x + (cover.width - width) / 2),
