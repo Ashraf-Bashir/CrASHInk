@@ -1,0 +1,425 @@
+diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activities/reader/DictionaryWordSelectActivity.cpp
+index ac373ee48714fa568e886b8027fb3e4d8937cb93..58007b4c0680bc8ba32283d5d6d53c536a3c2073 100644
+--- a/src/activities/reader/DictionaryWordSelectActivity.cpp
++++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
+@@ -888,6 +888,7 @@ bool DictionaryWordSelectActivity::continueTouchSelectionOnNextPage() {
+   }
+
+   hasCrossPageSelection_ = true;
++  navigator.setTouchRangeContinuesFromPreviousPage(true);
+   crossPageFirstRequest_ = currentRequest;
+   crossPageLookupPrefix_ = std::move(prefix);
+   crossPageLookupWordCount_ = prefixWordCount;
+@@ -993,6 +994,7 @@ std::string DictionaryWordSelectActivity::finishTouchLookupPhrase() {
+
+ void DictionaryWordSelectActivity::resetCrossPageSelection() {
+   hasCrossPageSelection_ = false;
++  navigator.setTouchRangeContinuesFromPreviousPage(false);
+   crossPageFirstRequest_ = {};
+   crossPageLookupPrefix_.clear();
+   crossPageLookupWordCount_ = 0;
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 502a57e56e0368f499e4ec69ca7be6ddc64d14c4..5b8c1d72183ceaf6532664aab0c0b73e095a9f97 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -8265,7 +8265,7 @@ bool EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+       measured = true;
+     }
+     const int spacing = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(fontId);
+-    return std::max(spacing, inkHeight + ClippingHighlightGeometry::BoundaryInset);
++    return ClippingHighlightGeometry::ribbonHeight(spacing, inkHeight);
+   };
+
+   // At most 16 small row descriptors (192 bytes on the render stack).
+diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
+index b98b3d1f406a026eb6d47249aa9ffc4eed75455b..5bfc2160e7ef925ee3e9cb41dfcff8a2de866639 100644
+--- a/src/activities/reader/OnPageHighlightActivity.cpp
++++ b/src/activities/reader/OnPageHighlightActivity.cpp
+@@ -15,7 +15,7 @@
+ #include "HighlightWordSlices.h"
+ #include "PageWordGeometry.h"
+ #include "ReaderUtils.h"
+-#include "SelectionGap.h"
++#include "clippings/SelectionRibbon.h"
+ #include "fontIds.h"
+
+ namespace {
+@@ -98,6 +98,10 @@ bool OnPageHighlightActivity::visitLine(const PageTextLine& line, bool measure,
+   if (!line.block || line.isTableText) return false;
+   const auto& block = *line.block;
+   const uint16_t row = buildRow++;
++  const int readerFont = SETTINGS.getReaderFontId();
++  const int font = block.resolvedFontId(renderer, readerFont);
++  const int spacing = line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(readerFont);
++  const int ribbonHeight = measure ? 0 : ClippingHighlightGeometry::ribbonHeight(spacing, renderer.getFontInkHeight(font));
+   for (uint16_t i = 0; i < block.wordCount(); ++i) {
+     std::string token(block.wordText(i));
+     if (block.wordEndsWithInsertedHyphen(i) && !token.empty() && token.back() == '-') token.pop_back();
+@@ -108,8 +112,7 @@ bool OnPageHighlightActivity::visitLine(const PageTextLine& line, bool measure,
+       text += token;
+       text += ' ';
+     } else {
+-      const auto geometry = pageWordGeometry(renderer, SETTINGS.getReaderFontId(), line, block, i);
+-      const int font = block.resolvedFontId(renderer, SETTINGS.getReaderFontId());
++      const auto geometry = pageWordGeometry(renderer, readerFont, line, block, i);
+       const auto style = static_cast<EpdFontFamily::Style>(block.wordStyle(i) & ~EpdFontFamily::UNDERLINE);
+       const bool rtl = (BidiUtils::detectParagraphLevel(token.c_str(), block.getBlockStyle().isRtl ? 1 : 0) & 1) != 0;
+       const int rawX = block.wordXpos(i);
+@@ -136,7 +139,7 @@ bool OnPageHighlightActivity::visitLine(const PageTextLine& line, bool measure,
+             const int right = first == 0 && end == token.size() ? geometry.xOffset + geometry.width
+                               : std::min(geometry.xOffset + geometry.width, rawX + pieceRight);
+             word.rect = Rect{left + line.xPos + x, top + line.yPos, std::max(0, right - x),
+-                             line.lineHeight > 0 ? line.lineHeight : renderer.getLineHeight(SETTINGS.getReaderFontId())};
++                             ribbonHeight};
+             word.row = row;
+             word.rtl = rtl;
+             word.start = start;
+@@ -437,22 +440,26 @@ void OnPageHighlightActivity::render(RenderLock&&) {
+   lastHandle = Rect{};
+   Rect selection{};
+   int firstStemY = 0, lastStemY = 0;
++  if (ready && wordCount) {
++    SelectionRibbon::paintDelta(
++        static_cast<int>(wordCount),
++        [&](int i) {
++          const auto& r = words[i].rect;
++          return SelectionRibbon::WordRect{0, r.x, r.y, r.width, r.height};
++        },
++        [&](int a, int b) { return words[a].row == words[b].row && words[a].rect.y == words[b].rect.y; },
++        [&](int i, bool previous) {
++          if (previous && !incremental) return false;
++          const auto& selected = previous ? paintedRange : range;
++          return words[i].end >= selected.start && words[i].start <= selected.end;
++        },
++        range.start >= words[0].start, range.end <= words[wordCount - 1].end,
++        [&](const SelectionRibbon::GapRect& rect) { renderer.invertRect(rect.x, rect.y, rect.width, rect.height); });
++  }
+   for (size_t i = 0; ready && i < wordCount; ++i) {
+     const auto& w = words[i];
+     const bool selected = w.end >= range.start && w.start <= range.end;
+-    const bool wasSelected = incremental && w.end >= paintedRange.start && w.start <= paintedRange.end;
+     const auto& r = w.rect;
+-    if (selected != wasSelected) renderer.invertRect(r.x, r.y, r.width, r.height);
+-    if (i > 0 && words[i - 1].row == w.row) {
+-      const auto& previous = words[i - 1];
+-      const bool joined = selected && previous.end >= range.start && previous.start <= range.end;
+-      const bool wasJoined = wasSelected && previous.end >= paintedRange.start && previous.start <= paintedRange.end;
+-      if (joined != wasJoined) {
+-        const auto& p = previous.rect;
+-        const auto gap = SelectionGap::between({p.x, p.y, p.width, p.height}, {r.x, r.y, r.width, r.height});
+-        if (gap.width > 0) renderer.invertRect(gap.x, gap.y, gap.width, gap.height);
+-      }
+-    }
+     if (!selected) continue;
+     if (!selection.width)
+       selection = r;
+diff --git a/src/clippings/ClippingHighlightGeometry.h b/src/clippings/ClippingHighlightGeometry.h
+index b8727d36c78b4987095192729f50b6f73836aa69..15d0fb2bbed6f9819d43cc3cba47c11be30324cc 100644
+--- a/src/clippings/ClippingHighlightGeometry.h
++++ b/src/clippings/ClippingHighlightGeometry.h
+@@ -26,6 +26,9 @@ struct GapRect {
+ // A ribbon is continuous between wrapped lines. Only its outer boundary
+ // receives a gutter; spacing is never inserted between lines of one clipping.
+ inline constexpr int BoundaryInset = 1;
++inline int ribbonHeight(int spacing, int fontInkHeight) {
++  return std::max(spacing, fontInkHeight + BoundaryInset);
++}
+ // Keep the upper edge fixed; borrow the extra background row from the lower quote.
+ inline constexpr int HorizontalSeparator = 5;
+ struct RibbonRows {
+diff --git a/src/clippings/SelectionRibbon.h b/src/clippings/SelectionRibbon.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9a87198d4d394629044467b5d2162949f89a43c
+--- /dev/null
++++ b/src/clippings/SelectionRibbon.h
+@@ -0,0 +1,87 @@
++#pragma once
++
++#include "ClippingHighlightGeometry.h"
++
++namespace SelectionRibbon {
++using ClippingHighlightGeometry::GapRect;
++using ClippingHighlightGeometry::RibbonRows;
++using ClippingHighlightGeometry::WordRect;
++
++template <typename Paint>
++void paintDifference(const GapRect& a, const GapRect& b, const Paint& paint) {
++  if (a.width <= 0 || a.height <= 0) return;
++  const int left = std::max(a.x, b.x), right = std::min(a.x + a.width, b.x + b.width);
++  const int top = std::max(a.y, b.y), bottom = std::min(a.y + a.height, b.y + b.height);
++  if (right <= left || bottom <= top) {
++    paint(a);
++    return;
++  }
++  if (a.y < top) paint(GapRect{a.x, a.y, a.width, top - a.y});
++  if (bottom < a.y + a.height) paint(GapRect{a.x, bottom, a.width, a.y + a.height - bottom});
++  if (a.x < left) paint(GapRect{a.x, top, left - a.x, bottom - top});
++  if (right < a.x + a.width) paint(GapRect{right, top, a.x + a.width - right, bottom - top});
++}
++
++inline GapRect intersection(const GapRect& a, const GapRect& b) {
++  const int x = std::max(a.x, b.x), y = std::max(a.y, b.y);
++  return {x, y, std::max(0, std::min(a.x + a.width, b.x + b.width) - x),
++          std::max(0, std::min(a.y + a.height, b.y + b.height) - y)};
++}
++
++inline void includeWord(WordRect& line, const WordRect& word) {
++  if (word.width <= 0) return;
++  if (line.width == 0) {
++    line = word;
++    return;
++  }
++  const int right = std::max(line.x + line.width, word.x + word.width);
++  line.x = std::min(line.x, word.x);
++  line.width = right - line.x;
++  line.height = std::max(line.height, word.height);
++}
++
++// Use the saved ribbon's outer insets and continuous inter-word fill. Diff the
++// old and new bands so moving an edge does not repaint the unchanged range.
++template <typename RectAt, typename SameRow, typename Selected, typename Paint>
++void paintDelta(int count, const RectAt& rectAt, const SameRow& sameRow, const Selected& selected,
++                bool startsClipping, bool endsClipping, const Paint& paint) {
++  RibbonRows previousRows, nextRows;
++  for (int i = 0; i < count; ++i) {
++    const bool previous = selected(i, true), next = selected(i, false);
++    if (!previous && !next) continue;
++    const auto word = rectAt(i);
++    if (previous) previousRows.include(word.y, word.height);
++    if (next) nextRows.include(word.y, word.height);
++  }
++  GapRect previousOldBand, previousNewBand;
++  for (int first = 0; first < count;) {
++    WordRect previous, next;
++    int i = first;
++    do {
++      const bool wasSelected = selected(i, true), isSelected = selected(i, false);
++      if (wasSelected || isSelected) {
++        const auto word = rectAt(i);
++        if (wasSelected) includeWord(previous, word);
++        if (isSelected) includeWord(next, word);
++      }
++      ++i;
++    } while (i < count && sameRow(i - 1, i));
++    const auto oldBand = ClippingHighlightGeometry::ribbonMarker(previous, previousRows, true, true, startsClipping,
++                                                                endsClipping);
++    const auto newBand = ClippingHighlightGeometry::ribbonMarker(next, nextRows, true, true, startsClipping,
++                                                                endsClipping);
++    paintDifference(oldBand, newBand, paint);
++    paintDifference(newBand, oldBand, paint);
++
++    // Adjacent bands can overlap when the glyph ink is taller than the line
++    // spacing. Toggle their intersection once more to keep the union filled.
++    const auto oldOverlap = intersection(previousOldBand, oldBand);
++    const auto newOverlap = intersection(previousNewBand, newBand);
++    paintDifference(oldOverlap, newOverlap, paint);
++    paintDifference(newOverlap, oldOverlap, paint);
++    if (oldBand.width > 0) previousOldBand = oldBand;
++    if (newBand.width > 0) previousNewBand = newBand;
++    first = i;
++  }
++}
++}  // namespace SelectionRibbon
+diff --git a/src/util/WordSelectNavigator.cpp b/src/util/WordSelectNavigator.cpp
+index 0a7eceb771f7951274f9f36f598ae387abb5d859..da7b759b7f491a217ceaa31a6604a5923cdff059 100644
+--- a/src/util/WordSelectNavigator.cpp
++++ b/src/util/WordSelectNavigator.cpp
+@@ -8,7 +8,7 @@
+
+ #include "MappedInputManager.h"
+ #include "TextPool.h"
+-#include "activities/reader/SelectionGap.h"
++#include "clippings/SelectionRibbon.h"
+
+ namespace {
+ constexpr unsigned long WORD_REPEAT_START_MS = 500;
+@@ -83,7 +83,7 @@ void WordSelectNavigator::reset() {
+   wordRepeatActive = false;
+   pendingSnapIdx = -1;
+   snapshot_.clear();
+-  touchPaintedLo_ = touchPaintedHi_ = touchPaintedCursor_ = -1;
++  touchPaintedLo_ = touchPaintedHi_ = -1;
+ }
+
+ const WordSelectNavigator::WordInfo* WordSelectNavigator::getSelected() const {
+@@ -505,26 +505,30 @@ void WordSelectNavigator::invertTouchRange(const GfxRenderer& renderer, int line
+     const auto inside = [first, last](int i) { return i >= first && i <= last; };
+     return inside(index) || inside(word.continuationOf) || inside(word.continuationIndex);
+   };
+-  for (int i = 0; i < static_cast<int>(words.size()); ++i) {
+-    const auto* word = getWordAt(i);
+-    const bool now = selected(*word, i, lo, hi), before = selected(*word, i, oldLo, oldHi);
+-    if (now != before) renderer.invertRect(word->screenX, word->screenY, word->width, word->heightOr(lineHeight));
+-    const auto* previous = getWordAt(i - 1);
+-    if (!previous || previous->row != word->row || previous->isTableText || word->isTableText) continue;
+-    const bool joined = now && selected(*previous, i - 1, lo, hi);
+-    const bool wasJoined = before && selected(*previous, i - 1, oldLo, oldHi);
+-    if (joined != wasJoined) {
+-      const auto gap =
+-          SelectionGap::between({previous->screenX, previous->screenY, previous->width, previous->heightOr(lineHeight)},
+-                                {word->screenX, word->screenY, word->width, word->heightOr(lineHeight)});
+-      if (gap.width > 0) renderer.invertRect(gap.x, gap.y, gap.width, gap.height);
++  int lastFont = 0, inkHeight = 0;
++  bool measured = false;
++  const auto rectAt = [&](int i) {
++    const auto& word = *getWordAt(i);
++    if (!measured || word.fontId != lastFont) {
++      lastFont = word.fontId;
++      inkHeight = renderer.getFontInkHeight(lastFont);
++      measured = true;
+     }
+-  }
+-}
+-
+-void WordSelectNavigator::invertTouchCaret(const GfxRenderer& renderer, int lineHeight, int index) const {
+-  const auto* word = getWordAt(index);
+-  if (word) renderer.invertRect(word->screenX + word->width + 3, word->screenY, 2, word->heightOr(lineHeight));
++    return SelectionRibbon::WordRect{0, word.screenX, word.screenY, word.width,
++                                     ClippingHighlightGeometry::ribbonHeight(word.heightOr(lineHeight), inkHeight)};
++  };
++  SelectionRibbon::paintDelta(
++      static_cast<int>(words.size()), rectAt,
++      [&](int a, int b) {
++        const auto& left = *getWordAt(a);
++        const auto& right = *getWordAt(b);
++        return left.row == right.row && !left.isTableText && !right.isTableText;
++      },
++      [&](int i, bool previous) {
++        return selected(*getWordAt(i), i, previous ? oldLo : lo, previous ? oldHi : hi);
++      },
++      !touchRangeContinuesFromPreviousPage, true,
++      [&](const SelectionRibbon::GapRect& rect) { renderer.invertRect(rect.x, rect.y, rect.width, rect.height); });
+ }
+
+ void WordSelectNavigator::renderHighlight(const GfxRenderer& renderer, int lineHeight,
+@@ -532,7 +536,6 @@ void WordSelectNavigator::renderHighlight(const GfxRenderer& renderer, int lineH
+   if (inMultiSelectMode && touchDragCursorVisible) {
+     const int cursor = getCurrentFlatIndex();
+     invertTouchRange(renderer, lineHeight, std::min(anchorFlatIndex, cursor), std::max(anchorFlatIndex, cursor));
+-    invertTouchCaret(renderer, lineHeight, cursor);
+     return;
+   }
+   if (inMultiSelectMode) {
+@@ -632,20 +635,17 @@ std::optional<WordSelectNavigator::Rect> WordSelectNavigator::renderHighlightDif
+     GfxRenderer& renderer, int lineHeight, int prevWordIdx, int currWordIdx, const bool foregroundBlack) {
+   const auto* curr = getWordAt(currWordIdx);
+   if (!curr) return std::nullopt;
+-  if (prevWordIdx < 0) touchPaintedLo_ = touchPaintedHi_ = touchPaintedCursor_ = -1;
++  if (prevWordIdx < 0) touchPaintedLo_ = touchPaintedHi_ = -1;
+   if (inMultiSelectMode && touchDragCursorVisible) {
+     if (anchorFlatIndex < 0) return std::nullopt;
+     const int lo = std::min(anchorFlatIndex, currWordIdx), hi = std::max(anchorFlatIndex, currWordIdx);
+-    // XOR only words entering/leaving the range, using their existing page
+-    // pixels. No glyph redraw, page repaint, allocation or 4 KiB range snapshot.
++    // XOR only the bands' changed pixels. No glyph redraw, page repaint,
++    // allocation or 4 KiB range snapshot.
+     if (touchPaintedLo_ < 0 && prevWordIdx >= 0 && snapshot_.valid()) snapshot_.restore(renderer);
+     snapshot_.clear();
+-    invertTouchCaret(renderer, lineHeight, touchPaintedCursor_);
+     invertTouchRange(renderer, lineHeight, lo, hi, touchPaintedLo_, touchPaintedHi_);
+-    invertTouchCaret(renderer, lineHeight, currWordIdx);
+     touchPaintedLo_ = lo;
+     touchPaintedHi_ = hi;
+-    touchPaintedCursor_ = currWordIdx;
+     return computeDirtyRect(prevWordIdx, currWordIdx, lineHeight);
+   }
+   if (touchPaintedLo_ >= 0) return std::nullopt;  // mode changed: repaint the page once
+diff --git a/src/util/WordSelectNavigator.h b/src/util/WordSelectNavigator.h
+index 24c3fdf318559719a2a2e046d6aea89e473b3fd7..a9c313d405801bf0fab74772d15be1a43caac1fc 100644
+--- a/src/util/WordSelectNavigator.h
++++ b/src/util/WordSelectNavigator.h
+@@ -167,6 +167,7 @@ class WordSelectNavigator {
+   std::string finishTouchMultiSelect();
+
+   // Draw a small caret beside the active end of the selection as a drag cue.
++  void setTouchRangeContinuesFromPreviousPage(bool continues) { touchRangeContinuesFromPreviousPage = continues; }
+   void setTouchDragCursorVisible(bool visible) { touchDragCursorVisible = visible; }
+
+   // Process Confirm/Back for multi-select state machine.
+@@ -330,10 +331,10 @@ class WordSelectNavigator {
+   // renderHighlightDifferential to restore the framebuffer before drawing the
+   // next highlight, so a cursor move repaints only the affected regions.
+   HighlightSnapshot snapshot_;
+-  int touchPaintedLo_ = -1, touchPaintedHi_ = -1, touchPaintedCursor_ = -1;
++  int touchPaintedLo_ = -1, touchPaintedHi_ = -1;
++  bool touchRangeContinuesFromPreviousPage = false;
+   void invertTouchRange(const GfxRenderer& renderer, int lineHeight, int lo, int hi, int oldLo = -1,
+                         int oldHi = -1) const;
+-  void invertTouchCaret(const GfxRenderer& renderer, int lineHeight, int index) const;
+
+   // Single-word highlight draw. Used by both renderHighlight (for each word it
+   // chooses to highlight) and renderHighlightDifferential.
+diff --git a/test/drag_highlight/DragHighlightTest.cpp b/test/drag_highlight/DragHighlightTest.cpp
+index b5b131cf54d5ebefe57aa00d7c31c48871e16cbe..da6e050a43a3400dd8d8ab8648bc1080f0dec6b0 100644
+--- a/test/drag_highlight/DragHighlightTest.cpp
++++ b/test/drag_highlight/DragHighlightTest.cpp
+@@ -110,5 +110,32 @@ int main() {
+   assert(renderer.pixels[25*800+10]==0 && renderer.pixels[25*800+125]==0);
+   nav.selectWordAtPoint(25,25,20);assert(nav.renderHighlightDifferential(renderer,20,1,0,true));
+   assert(renderer.pixels[25*800+70]==0); // trimming removes the old gap too
++  nav.reset();
++  std::vector<WordSelectNavigator::WordInfo> tight(2);
++  for (int i = 0; i < 2; ++i) {
++    tight[i].screenX = 20;
++    tight[i].screenY = 20 + i * 20;
++    tight[i].width = 40;
++    tight[i].row = i;
++  }
++  nav.load(std::move(tight), {{20, 0, 1}, {40, 1, 1}}, "", false);
++  nav.setTouchDragCursorVisible(true);
++  nav.selectWordAtPoint(25, 25, 20);
++  assert(nav.beginTouchMultiSelect());
++  renderer.inkHeight = 23;
++  renderer.pixels.assign(renderer.pixels.size(), 0);
++  assert(nav.renderHighlightDifferential(renderer, 20, -1, 0, true));
++  assert(renderer.pixels[20 * 800 + 30] == 0);  // Settled top inset.
++  assert(renderer.pixels[42 * 800 + 30] == 1);  // Full font ink.
++  assert(renderer.pixels[43 * 800 + 30] == 0);  // Settled bottom inset.
++  assert(renderer.pixels[25 * 800 + 20] == 0 && renderer.pixels[25 * 800 + 59] == 0);
++  assert(renderer.pixels[25 * 800 + 63] == 0);  // No extra cursor beyond the ribbon.
++  nav.selectWordAtPoint(25, 45, 20);
++  assert(nav.renderHighlightDifferential(renderer, 20, 0, 1, true));
++  for (int y = 21; y < 63; ++y) assert(renderer.pixels[y * 800 + 30] == 1);
++  nav.selectWordAtPoint(25, 25, 20);
++  assert(nav.renderHighlightDifferential(renderer, 20, 1, 0, true));
++  for (int y = 21; y < 43; ++y) assert(renderer.pixels[y * 800 + 30] == 1);
++  for (int y = 43; y < 64; ++y) assert(renderer.pixels[y * 800 + 30] == 0);
+   std::cout << "Drag differential rendering checks passed\n";
+ }
+diff --git a/test/drag_highlight/stubs/GfxRenderer.h b/test/drag_highlight/stubs/GfxRenderer.h
+index 13b3907c3b1fb102517cc3f2622326399ff7a2c8..89141fcb841b7621772becfabf2aecda8fc0ff6a 100644
+--- a/test/drag_highlight/stubs/GfxRenderer.h
++++ b/test/drag_highlight/stubs/GfxRenderer.h
+@@ -12,6 +12,8 @@ class GfxRenderer {
+   enum class Orientation { Portrait, PortraitInverted, LandscapeClockwise, LandscapeCounterClockwise };
+   mutable std::vector<uint8_t> pixels = std::vector<uint8_t>(800 * 480, 0);
+   mutable unsigned snapshots = 0;
++  int inkHeight = 0;
++  int getFontInkHeight(int) const { return inkHeight; }
+   void invertRect(int x, int y, int w, int h) const {
+     for (int j=std::max(0,y); j<std::min(480,y+h); ++j)
+       for (int i=std::max(0,x); i<std::min(800,x+w); ++i) pixels[j*800+i]^=1;
+diff --git a/test/highlight_word_edit/DictionaryPageRenderTest.cpp b/test/highlight_word_edit/DictionaryPageRenderTest.cpp
+index fc28264e823f3fa41eddd0faff9bc88e5c9e6c77..c5d0addca808f5626071ec59389a7d539d2a444d 100644
+--- a/test/highlight_word_edit/DictionaryPageRenderTest.cpp
++++ b/test/highlight_word_edit/DictionaryPageRenderTest.cpp
+@@ -44,6 +44,7 @@ struct Navigator {
+  const char* getDisplay(const Word&) const {return "old";}
+  size_t getLookupSelectionWordCount() const {return 2;}
+  void releaseWorkingSet() {}
++ void setTouchRangeContinuesFromPreviousPage(bool) {}
+  int getCurrentFlatIndex() const {return 0;}
+  bool isMultiSelecting() const {return true;}
+  std::optional<int> renderHighlightDifferential(GfxRenderer&,int,int,int,bool) {++deltas;return 1;}
+diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word_edit/OnPageRenderTest.cpp
+index d14fd0a45a9f31b1f6f1dc15d2cace46cb821778..52656d8eddd0d459da1ee822c9780699afb253ff 100644
+--- a/test/highlight_word_edit/OnPageRenderTest.cpp
++++ b/test/highlight_word_edit/OnPageRenderTest.cpp
+@@ -9,6 +9,7 @@
+ #include "activities/reader/HighlightToolbar.h"
+ #include "activities/reader/HighlightWordSlices.h"
+ #include "activities/reader/SelectionGap.h"
++#include "clippings/SelectionRibbon.h"
+ #include "activities/reader/OnPageHighlightModel.h"
+ struct Rect {int x=0,y=0,width=0,height=0;};
+ enum class Color {White,LightGray,DarkGray,Black};
