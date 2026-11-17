@@ -825,10 +825,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8798bec5d3480ccf616e4ce315026445
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9af484b767
+index 0000000000000000000000000000000000000000..08128f137cbb127536aabd1566b6406ec5f37409
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2535 @@
+@@ -0,0 +1,2616 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2401,37 +2401,111 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +    commitDelete();
 +    return finish();
 +  }
++  returnToDepth(viewStack.size() - 1);
++}
++
++void WorkflowyDailyActivity::returnToDepth(size_t depth) {
++  if (depth >= viewStack.size()) return;
 +  {
 +    RenderLock lock(*this);
 +    ++generation;
++    if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
 +    requestedBranch.clear();
 +    rootCheckedAt = millis();
 +    awaitingOutline = false;
-+    auto previous = std::move(viewStack.back());
-+    viewStack.pop_back();
-+    const auto owner = std::find_if(previous.rows.begin(), previous.rows.end(),
-+                                    [&](const Node& node) { return node.id == zoomId; });
-+    if (!rows.empty() && rows.front().id == zoomId && owner != previous.rows.end()) {
-+      const auto depth = owner->depth;
-+      auto end = owner + 1;
-+      while (end != previous.rows.end() && end->depth > depth) ++end;
-+      *owner = std::move(rows.front());
-+      owner->depth = depth;
-+      const bool fits = previous.rows.size() - static_cast<size_t>(end - (owner + 1)) +
-+                        rows.size() - 1 <= MAX_CACHED_BRANCH_ROWS;
-+      const auto where = previous.rows.erase(owner + 1, end);
-+      if (fits) {
-+        for (auto i = rows.begin() + 1; i != rows.end(); ++i) i->depth += depth;
-+        previous.rows.insert(where, std::make_move_iterator(rows.begin() + 1), std::make_move_iterator(rows.end()));
++    while (viewStack.size() > depth) {
++      auto previous = std::move(viewStack.back());
++      viewStack.pop_back();
++      const auto owner = std::find_if(previous.rows.begin(), previous.rows.end(),
++                                      [&](const Node& node) { return node.id == zoomId; });
++      if (!rows.empty() && rows.front().id == zoomId && owner != previous.rows.end()) {
++        const auto depth = owner->depth;
++        auto end = owner + 1;
++        while (end != previous.rows.end() && end->depth > depth) ++end;
++        *owner = std::move(rows.front());
++        owner->depth = depth;
++        const bool fits = previous.rows.size() - static_cast<size_t>(end - (owner + 1)) +
++                          rows.size() - 1 <= MAX_CACHED_BRANCH_ROWS;
++        const auto where = previous.rows.erase(owner + 1, end);
++        if (fits) {
++          for (auto i = rows.begin() + 1; i != rows.end(); ++i) i->depth += depth;
++          previous.rows.insert(where, std::make_move_iterator(rows.begin() + 1), std::make_move_iterator(rows.end()));
++        }
 +      }
++      rows = std::move(previous.rows);
++      zoomId = std::move(previous.zoomId);
++      page = previous.page;
 +    }
-+    rows = std::move(previous.rows);
-+    zoomId = std::move(previous.zoomId);
-+    page = previous.page;
++    wrapAnchor = -1;
 +    layoutDirty = true;
 +    message = nullptr;
 +  }
 +  requestUpdate();
++}
++
++void WorkflowyDailyActivity::showBreadcrumbMenu() {
++  if (viewStack.size() < 3) return;
++  std::vector<std::string> ancestors;
++  ancestors.reserve(viewStack.size() - 2);
++  const int width = std::max(1, layout().width - 56);
++  for (size_t depth = 1; depth + 1 < viewStack.size(); ++depth) {
++    const auto& view = viewStack[depth];
++    const char* label = view.rows.empty() ? tr(STR_WORKFLOWY) : view.rows.front().title.c_str();
++    ancestors.push_back(renderer.truncatedText(UI_12_FONT_ID, label, width));
++  }
++  startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                            renderer, mappedInput, "WorkflowyAncestors", StrId::STR_WORKFLOWY,
++                            std::move(ancestors), 0, false, true),
++                         [this](const ActivityResult& result) {
++    if (!result.isCancelled) {
++      const int index = std::get<OptionSelectionResult>(result.data).index;
++      if (index >= 0) returnToDepth(static_cast<size_t>(index) + 1);
++    }
++  });
++}
++
++void WorkflowyDailyActivity::drawBreadcrumbs(const Layout& bounds, int right) {
++  const auto depth = viewStack.size();
++  if (depth == 0) return;
++  const int total = std::max(0, right - bounds.x);
++  const int dayWidth = std::min(92, total / 3);
++  const int moreWidth = depth > 2 ? std::min(38, total / 6) : 0;
++  const int parentWidth = depth > 1 ? (total - dayWidth - moreWidth) / 2 : 0;
++  breadcrumbHits = {depth, bounds.x + dayWidth, bounds.x + dayWidth + moreWidth,
++                     bounds.x + dayWidth + moreWidth + parentWidth};
++  const int y = bounds.top + 36;
++  const auto draw = [&](int left, int end, const char* label, bool ancestor) {
++    const int labelWidth = end - left - (ancestor ? 15 : 0);
++    if (labelWidth <= 0) return;
++    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, label, labelWidth);
++    renderer.drawText(SMALL_FONT_ID, left, y, fitted.c_str());
++    if (ancestor) renderer.drawText(SMALL_FONT_ID, end - 12, y, "›");
++  };
++  const char* day = date.empty() || date == "today" || date == isoDate(0) ? tr(STR_WORKFLOWY_TODAY) : date.c_str();
++  draw(bounds.x, breadcrumbHits.dayEnd, day, true);
++  if (moreWidth) draw(breadcrumbHits.dayEnd, breadcrumbHits.moreEnd, "...", true);
++  if (parentWidth) {
++    const auto& parent = viewStack.back();
++    draw(breadcrumbHits.moreEnd, breadcrumbHits.parentEnd,
++         parent.rows.empty() ? tr(STR_WORKFLOWY) : parent.rows.front().title.c_str(), true);
++  }
++  draw(breadcrumbHits.parentEnd, right, rows.empty() ? tr(STR_WORKFLOWY) : rows.front().title.c_str(), false);
++}
++
++bool WorkflowyDailyActivity::tapBreadcrumb(int x, int y) {
++  if (selecting || viewStack.empty()) return false;
++  const auto bounds = layout();
++  if (y < bounds.top + 28 || y >= bounds.rowTop || x < bounds.x) return false;
++  BreadcrumbHits hit;
++  {
++    RenderLock lock(*this);
++    hit = breadcrumbHits;
++  }
++  if (hit.depth == 0 || viewStack.size() != hit.depth || x >= hit.parentEnd) return false;
++  if (x < hit.dayEnd) returnToDepth(0);
++  else if (x < hit.moreEnd) showBreadcrumbMenu();
++  else returnToDepth(hit.depth - 1);
++  return true;
 +}
 +
 +bool WorkflowyDailyActivity::reorder(size_t source, size_t target, bool after, bool recordUndo) {
@@ -3023,6 +3097,10 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +      return showErrorDetails();
 +    }
 +  }
++  if (tapped && tapBreadcrumb(tapX, tapY)) {
++    tracking = false;
++    return;
++  }
 +  if (!selecting && tapped && tapArrow(tapX, tapY)) {
 +    tracking = false;
 +    return;
@@ -3052,7 +3130,6 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +  }
 +  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
 +      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
-+  if (!zoomId.empty() && y >= bounds.top + 30 && y < bounds.rowTop && x < bounds.x + ICON_TARGET) return back();
 +  const int headerRight = bounds.x + bounds.width;
 +  if (y >= bounds.top + 28 && y < bounds.rowTop && x >= headerRight - 2 * ICON_TARGET && x < headerRight) {
 +    if (x >= headerRight - ICON_TARGET) {
@@ -3140,6 +3217,7 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +  const auto bounds = layout();
 +  renderer.clearScreen();
 +  GUI.drawDisplayStatusBar(renderer, bounds.top);
++  breadcrumbHits = {};
 +  if (selecting) {
 +    const int cy = bounds.top + 46;
 +    const int left = bounds.x + 17;
@@ -3156,7 +3234,6 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +    if (date == isoDate(-1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_YESTERDAY);
 +    if (date == isoDate(0) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TODAY);
 +    if (date == isoDate(1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TOMORROW);
-+    if (!zoomId.empty()) heading = std::string("‹  ") + tr(STR_WORKFLOWY);
 +    unsigned completed = 0, totalTodos = 0;
 +    const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
 +    for (const auto& row : rows) {
@@ -3168,9 +3245,13 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +    char todoCount[24];
 +    snprintf(todoCount, sizeof(todoCount), "%u/%u", completed, totalTodos);
 +    const int countX = bounds.x + bounds.width - 2 * ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
-+    const auto fittedHeading = renderer.truncatedText(UI_12_FONT_ID, heading.c_str(), countX - bounds.x - 8,
++    if (zoomId.empty()) {
++      const auto fittedHeading = renderer.truncatedText(UI_12_FONT_ID, heading.c_str(), countX - bounds.x - 8,
 +                                                       EpdFontFamily::BOLD);
-+    renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
++      renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
++    } else {
++      drawBreadcrumbs(bounds, countX - 8);
++    }
 +    renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
 +    const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
 +    const int refreshX = cx - ICON_TARGET;
@@ -3366,10 +3447,10 @@ index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9a
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e841cf5f707d627fe3077855790978690cfd1741
+index 0000000000000000000000000000000000000000..135e338a87106189f4bac0bae37e3dd10c74667d
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,221 @@
 +#pragma once
 +
 +#include <atomic>
@@ -3545,6 +3626,12 @@ index 0000000000000000000000000000000000000000..e841cf5f707d627fe307785579097869
 +    bool operator==(const Layout&) const = default;
 +  };
 +  Layout laidOut{};
++  struct BreadcrumbHits {
++    size_t depth = 0;
++    int dayEnd = 0, moreEnd = 0, parentEnd = 0;
++  } breadcrumbHits;
++  void drawBreadcrumbs(const Layout& bounds, int right);
++  bool tapBreadcrumb(int x, int y);
 +  Layout layout() const;
 +  void layoutRows(const Layout& bounds);
 +  void setLoading(bool active);
@@ -3554,6 +3641,8 @@ index 0000000000000000000000000000000000000000..e841cf5f707d627fe307785579097869
 +  bool reorder(size_t source, size_t target, bool after, bool recordUndo = true);
 +  void zoom(size_t row);
 +  void back();
++  void returnToDepth(size_t depth);
++  void showBreadcrumbMenu();
 +  void nextPage(int delta, bool edge = false);
 +  void showMessage(const char* text);
 +  void showErrorDetails();

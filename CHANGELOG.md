@@ -2,6 +2,8 @@
 
 ### Added
 
+- Zoomed Workflowy items show a tappable breadcrumb with shortened ancestor names and an overflow menu.
+
 - Workflowy multi-select persists across pages and supports Select all, completion changes, moving to a date, and confirmed deletion.
 
 - Workflowy has a month calendar, a text-only editor that opens at the tapped character, and scrollable error details.
