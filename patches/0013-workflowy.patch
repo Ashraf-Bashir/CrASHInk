@@ -653,10 +653,10 @@ index 0000000000000000000000000000000000000000..8d7e545627fbd94feb289ed0c08eee87
 +};
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4d2ed8a799ca1632947c9183c200ee4fe962cb2e
+index 0000000000000000000000000000000000000000..030e8fa5cb9f68c523ae4ced49528ecded095eb3
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,649 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -664,7 +664,9 @@ index 0000000000000000000000000000000000000000..4d2ed8a799ca1632947c9183c200ee4f
 +#include <HalClock.h>
 +#include <I18n.h>
 +#include <Memory.h>
-+#include <SecureHttpClient.h>
++#include <Logging.h>
++#include <esp_crt_bundle.h>
++#include <esp_http_client.h>
 +#include <WiFi.h>
 +
 +#include <algorithm>
@@ -682,7 +684,6 @@ index 0000000000000000000000000000000000000000..4d2ed8a799ca1632947c9183c200ee4f
 +#include "components/UITheme.h"
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
-+#include "workflowy/WorkflowyRoot.h"
 +#include "workflowy/WorkflowySettings.h"
 +
 +namespace {
@@ -837,26 +838,56 @@ index 0000000000000000000000000000000000000000..4d2ed8a799ca1632947c9183c200ee4f
 +int WorkflowyDailyActivity::request(const char* method, const std::string& path, const std::string& body,
 +                                   uint8_t* response, size_t* received) {
 +  if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) {
-+    showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
-+    return 0;
++    return -2;
 +  }
-+  freeink::SecureHttpClient http;
-+  http.setCACert(WorkflowyRoot);
-+  http.setTimeout(8000);
-+  http.setReuse(false);
-+  http.setUserAgent("CrASHInk/Workflowy");
-+  if (!http.begin(std::string(API) + path)) return 0;
-+  http.addHeader("Authorization", "Bearer " + credential);
-+  if (!body.empty()) http.addHeader("Content-Type", "application/json");
-+  const int status = http.sendRequest(method, reinterpret_cast<const uint8_t*>(body.data()), body.size(),
-+                                    [response, received](const uint8_t* data, const size_t len) {
-+    if (!response) return true;
-+    if (len > MAX_RESPONSE - *received) return false;
-+    memcpy(response + *received, data, len);
-+    *received += len;
-+    return true;
-+  });
-+  return status >= 200 && status < 300 && !http.responseComplete() ? 0 : status;
++  struct Response {
++    uint8_t* buffer;
++    size_t* used;
++    bool overflow = false;
++  } sink{response, received};
++
++  const auto url = std::string(API) + path;
++  esp_http_client_config_t config{};
++  config.url = url.c_str();
++  config.method = strcmp(method, "GET") == 0 ? HTTP_METHOD_GET
++                  : strcmp(method, "DELETE") == 0 ? HTTP_METHOD_DELETE
++                                                  : HTTP_METHOD_POST;
++  config.crt_bundle_attach = esp_crt_bundle_attach;
++  config.user_agent = "CrASHInk/Workflowy";
++  config.timeout_ms = 12000;
++  config.disable_auto_redirect = true;
++  config.max_authorization_retries = -1;
++  config.user_data = &sink;
++  config.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
++    if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
++    auto& target = *static_cast<Response*>(event->user_data);
++    if (!target.buffer) return ESP_OK;
++    const auto length = static_cast<size_t>(event->data_len);
++    if (target.overflow || length > MAX_RESPONSE - *target.used) {
++      target.overflow = true;
++      return ESP_ERR_NO_MEM;
++    }
++    memcpy(target.buffer + *target.used, event->data, length);
++    *target.used += length;
++    return ESP_OK;
++  };
++
++  auto client = esp_http_client_init(&config);
++  if (!client) return 0;
++  const auto authorization = "Bearer " + credential;
++  auto result = esp_http_client_set_header(client, "Authorization", authorization.c_str());
++  if (result == ESP_OK && !body.empty()) {
++    result = esp_http_client_set_header(client, "Content-Type", "application/json");
++    if (result == ESP_OK) result = esp_http_client_set_post_field(client, body.data(), body.size());
++  }
++  if (result == ESP_OK) result = esp_http_client_perform(client);
++  const int status = esp_http_client_get_status_code(client);
++  const bool complete = esp_http_client_is_complete_data_received(client);
++  if (result != ESP_OK || status >= 400) {
++    LOG_ERR("WF", "Workflowy %s failed: transport=%s HTTP=%d", method, esp_err_to_name(result), status);
++  }
++  esp_http_client_cleanup(client);
++  return result == ESP_OK && !sink.overflow && (complete || !response) ? status : 0;
 +}
 +
 +bool WorkflowyDailyActivity::loadChildren(const std::string& parent, const unsigned depth, std::vector<Node>& result) {
@@ -869,7 +900,9 @@ index 0000000000000000000000000000000000000000..4d2ed8a799ca1632947c9183c200ee4f
 +  const int status = request("GET", "?parent_id=" + parent, {}, response.get(), &received);
 +  if (status == 404 && depth == 0) return true;
 +  if (status != 200) {
-+    showMessage(status == 401 || status == 403 ? tr(STR_WORKFLOWY_AUTH_FAILED) : tr(STR_WORKFLOWY_NETWORK_FAILED));
++    showMessage(status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
++                : status == 401 || status == 403 ? tr(STR_WORKFLOWY_AUTH_FAILED)
++                                                : tr(STR_WORKFLOWY_NETWORK_FAILED));
 +    return false;
 +  }
 +  JsonDocument filter;

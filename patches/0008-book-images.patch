@@ -580,9 +580,10 @@ diff --git a/src/activities/reader/EpubGrayscale.h b/src/activities/reader/EpubG
 
  // Preserves the live BW buffer and existing controller synchronization. False
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..ddc79ac6d19b40c44fd68248cdbce0635f0de80f 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -1259,6 +1259,7 @@
+@@ -1259,6 +1259,7 @@ void captureReaderSettings(EpubReaderActivity::ReaderSettingsSnapshot& out) {
    out.textAntiAliasing = SETTINGS.textAntiAliasing;
    out.textWeight = SETTINGS.textWeight;
    out.imageRendering = SETTINGS.imageRendering;
@@ -590,7 +591,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    out.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
    out.forceParagraphIndents = SETTINGS.forceParagraphIndents;
    out.focusReadingEnabled = SETTINGS.focusReadingEnabled;
-@@ -1298,6 +1299,7 @@
+@@ -1298,6 +1299,7 @@ void applyReaderSettings(const EpubReaderActivity::ReaderSettingsSnapshot& in) {
    SETTINGS.textWeight = in.textWeight < CrossPointSettings::TEXT_WEIGHT_COUNT ? in.textWeight : CrossPointSettings::WEIGHT_NORMAL;
    SETTINGS.imageRendering =
        in.imageRendering < CrossPointSettings::IMAGE_RENDERING_COUNT ? in.imageRendering : SETTINGS.imageRendering;
@@ -598,7 +599,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    SETTINGS.extraParagraphSpacing = in.extraParagraphSpacing ? 1 : 0;
    SETTINGS.forceParagraphIndents = in.forceParagraphIndents ? 1 : 0;
    SETTINGS.focusReadingEnabled = in.focusReadingEnabled ? 1 : 0;
-@@ -1330,10 +1332,15 @@
+@@ -1330,10 +1332,15 @@ constexpr std::array<uint8_t ReaderSettingsSnapshot::*, 18> READER_SETTING_FIELD
      &ReaderSettingsSnapshot::indexingMethod,
  };
  constexpr uint32_t SD_FONT_FAMILY_OVERRIDE = 1U << READER_SETTING_FIELDS.size();
@@ -617,7 +618,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
  constexpr uint32_t SAFE_MODE_SETTING_OVERRIDES = (1U << 9) | (1U << 15) | (1U << 16);
 
  uint32_t changedReaderSettingsMask(const ReaderSettingsSnapshot& current, const ReaderSettingsSnapshot& global) {
-@@ -1561,7 +1568,9 @@
+@@ -1561,7 +1568,9 @@ bool saveBookReaderSettingsFile(const std::string& cachePath, const BookReaderSe
                    writeReaderSettingsSnapshot(file, normalizedReaderSettings) &&
                    writeExact(file, data.dictionarySdFontFamilyName, sizeof(data.dictionarySdFontFamilyName)) &&
                    writeU8(file, data.dictionaryFontPointSize) &&
@@ -628,7 +629,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    file.close();
    if (!ok) {
      LOG_ERR("ERS", "Short write saving reader settings");
-@@ -7499,6 +7508,8 @@
+@@ -7499,6 +7508,8 @@ void EpubReaderActivity::prepareCurrentSectionForRelayout() {
  bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fontId, const int orientedMarginTop,
                                          const int orientedMarginRight, const int orientedMarginBottom,
                                          const int orientedMarginLeft, const bool updatePanel) {
@@ -637,20 +638,21 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
  #if CROSSINK_APP_CAP_TOUCH
    if (mappedInput.hasTouchHardware()) {
      if (!touchReaderPreviewAllocationAttempted) {
-@@ -7580,6 +7591,12 @@
+@@ -7580,6 +7591,13 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      needsImageGrayscale = false;
    }
    const bool pageHasImagesNeedingDecode = !deferImageLoading && pageHasImages && page->hasImagesNeedingDecode();
 +  auto combinedImagePlane = updatePanel && needsImageGrayscale && renderer.supportsCombinedGrayscale()
 +                                ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                                : HeapByteBuffer{};
-+  auto regionalImageMsb = combinedImagePlane && renderer.supportsRegionalGrayscale()
++  auto regionalImageMsb = combinedImagePlane && pageHasImagesNeedingDecode && foregroundBlack &&
++                                  renderer.supportsRegionalGrayscale()
 +                              ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                              : HeapByteBuffer{};
 
    const auto finalizeBufferComposition = [&]() {
      if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
-@@ -7601,6 +7618,8 @@
+@@ -7601,6 +7619,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      if (deferImageLoading) {
        page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
                                          /*renderCachedImages=*/false);
@@ -659,12 +661,12 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      } else {
        page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
      }
-@@ -7616,14 +7635,15 @@
+@@ -7616,14 +7636,15 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      }
      finalizeBufferComposition();
    };
 -  if (updatePanel && pageHasImagesNeedingDecode) {
-+  if (updatePanel && pageHasImagesNeedingDecode && !combinedImagePlane) {
++  if (updatePanel && pageHasImagesNeedingDecode && !combinedImagePlane && foregroundBlack) {
 +    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
      page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
      finalizeBufferComposition();
@@ -677,7 +679,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
      // Show the new page's placeholders before ZIP extraction or sidecar
      // materialization. The loan can overwrite the framebuffer, so rebuild
      // the complete page after returning it; the panel keeps the preview.
-@@ -7667,6 +7687,57 @@
+@@ -7667,47 +7688,70 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    if (!updatePanel) {
      return true;
    }
@@ -735,10 +737,10 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    const bool needsAnyGrayscale = needsTextGrayscale || needsImageGrayscale;
    const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
    const bool overlapRefresh =
-@@ -7674,15 +7745,13 @@
+       tiledGrayscale && !pageHasImages && pagesUntilFullRefresh > 1 && renderer.supportsAsyncGrayscaleBase();
    if (pageHasImages && !deferImageLoading) {
-     // Keep the legacy blank/base sequence unless the controller can transition
-     // directly to the complete image base.
+-    // Keep the legacy blank/base sequence unless the controller can transition
+-    // directly to the complete image base.
 -    int16_t imgX, imgY, imgW, imgH;
 -    if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
 -      const bool directImageBase = renderer.shouldSkipImageBlanking();
@@ -748,19 +750,29 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
 -      if (blankImage) {
 -        renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
 -      }
-+    const bool directImageBase = renderer.shouldSkipImageBlanking();
-+    // UC8179 can transition directly to the complete base. Other panels and
-+    // strong cleanup still blank images, but must never blank intervening text.
-+    const bool blankImage = !directImageBase || cleanImageBasePending;
-+    if (page->forEachImageRect([&](int16_t x, int16_t y, int16_t width, int16_t height) {
-+          if (blankImage) renderer.fillRect(x + orientedMarginLeft, y + orientedMarginTop, width, height, false);
-+        })) {
-       if (cleanImageBasePending) {
-         renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
-         cleanImageBasePending = false;
-@@ -7701,13 +7770,6 @@
+-      if (cleanImageBasePending) {
+-        renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
+-        cleanImageBasePending = false;
+-      }
+-      if (!directImageBase) {
+-        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+-      }
+-      if (blankImage) {
+-        // Restore the composed image after legacy blanking or strong cleanup.
+-        composePageBuffer();
+-      }
+-      // The restored image frame becomes the base for the grayscale image
+-      // planes below. On X3, use the same grayscale-aware base waveform as
+-      // text-only grayscale turns; other panels keep the FAST fallback behavior.
+-      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
++    // Send the composed image as the base. A separate blank image rectangle
++    // can appear as a black box when the panel or reader is inverted.
++    if (cleanImageBasePending) {
++      renderer.displayGrayscaleBase(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
++      cleanImageBasePending = false;
      } else {
-       renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
+-      renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
++      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
      }
 -    // The image's own page is handled above and doesn't count toward the full
 -    // refresh cadence. But the grayscale pass below leaves gray charge in the
@@ -772,7 +784,7 @@ diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reade
    } else if (needsAnyGrayscale) {
      if (pagesUntilFullRefresh <= 1) {
        // Cleanup turns still need the stronger HALF pass, but X3 grayscale
-@@ -8959,6 +9021,7 @@
+@@ -8959,6 +9003,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
      ImageBlock::setExtractor(nullptr, nullptr, nullptr);
    }
    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
@@ -1078,9 +1090,10 @@ new file mode 100644
 +Path(sys.argv[4]).write_text("void Reader::renderImageBase() {\n"+source[a:b]+"  }\n}\n")
 diff --git a/test/image_refresh_regions/ImageRefreshRegionsTest.cpp b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..5829d0de42ceab8f543a31fc53dae944fccd9fd8
 --- /dev/null
 +++ b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,54 @@
 +#include <algorithm>
 +#include <cassert>
 +#include <cstdint>
@@ -1103,59 +1116,37 @@ new file mode 100644
 +};
 +namespace HalDisplay {enum {FAST_REFRESH=1,HALF_REFRESH=2};}
 +struct Renderer {
-+ bool direct=false;int width=100,height=160;
-+ std::vector<uint8_t>pixels=std::vector<uint8_t>(width*height);
-+ std::vector<std::vector<uint8_t>>frames;
-+ std::vector<int>modes;
-+ bool shouldSkipImageBlanking()const{return direct;}
-+ int getScreenWidth()const{return width;}int getScreenHeight()const{return height;}
-+ void fillRect(int x,int y,int w,int h,bool state){
-+  for(int py=std::max(0,y);py<std::min(height,y+h);++py)
-+   for(int px=std::max(0,x);px<std::min(width,x+w);++px)pixels[py*width+px]=state;
++ std::vector<uint8_t> pixels = std::vector<uint8_t>(100 * 160);
++ std::vector<std::vector<uint8_t>> frames;
++ std::vector<int> modes;
++ void displayGrayscaleBase(int mode) {
++  frames.push_back(pixels);
++  modes.push_back(mode);
 + }
-+ void displayBuffer(int mode){frames.push_back(pixels);modes.push_back(mode);}
-+ void displayGrayscaleBase(int mode){displayBuffer(mode);}
 +};
 +struct Reader {
-+ Renderer renderer;std::unique_ptr<Page>page=std::make_unique<Page>();
-+ bool pageHasImages=true,deferImageLoading=false,cleanImageBasePending=false;
-+ int pagesUntilFullRefresh=3,orientedMarginLeft=3,orientedMarginTop=5,compositions=0;
-+ std::vector<uint8_t>composed;
-+ void composePageBuffer(){++compositions;renderer.pixels=composed;}
-+ int manualScreenRefreshMode(){return HalDisplay::HALF_REFRESH;}
++ Renderer renderer;
++ bool pageHasImages = true, deferImageLoading = false, cleanImageBasePending = false;
++ int pagesUntilFullRefresh = 3;
++ int manualScreenRefreshMode() { return HalDisplay::HALF_REFRESH; }
 + void renderImageBase();
 +};
 +#include "ImageRefresh.inc"
-+int main(){
-+ for(bool direct:{false,true})for(bool cleanup:{false,true}){
-+  Reader reader;reader.renderer.direct=direct;reader.cleanImageBasePending=cleanup;
-+  reader.page->elements.push_back(std::make_unique<PageImage>(8,10,8,8));
-+  reader.page->elements.push_back(std::make_unique<Element>()); // text is not an image region
-+  reader.page->elements.push_back(std::make_unique<PageImage>(11,100,8,8));
-+  reader.page->elements.push_back(std::make_unique<PageImage>(50,80,0,8));
-+  for(size_t i=0;i<reader.renderer.pixels.size();++i)reader.renderer.pixels[i]=(i%3!=0);
-+  reader.composed=reader.renderer.pixels;
++int main() {
++ for (bool cleanup : {false, true}) {
++  Reader reader;
++  reader.cleanImageBasePending = cleanup;
++  for (size_t i = 0; i < reader.renderer.pixels.size(); ++i) reader.renderer.pixels[i] = (i % 3 != 0);
++  const auto composed = reader.renderer.pixels;
 +  reader.renderImageBase();
-+  assert(reader.renderer.pixels==reader.composed);
-+  assert(reader.compositions==int(!direct||cleanup));
-+  assert(reader.pagesUntilFullRefresh==3&&!reader.cleanImageBasePending);
-+  for(const auto& frame:reader.renderer.frames)for(int y=0;y<160;++y)for(int x=0;x<100;++x){
-+   const bool image1=x>=11&&x<19&&y>=15&&y<23;
-+   const bool image2=x>=14&&x<22&&y>=105&&y<113;
-+   if(!image1&&!image2)assert(frame[y*100+x]==reader.composed[y*100+x]);
-+  }
-+  assert(reader.renderer.frames.back()==reader.composed);
++  assert(reader.renderer.frames.size() == 1);
++  assert(reader.renderer.frames.front() == composed);
++  assert(reader.renderer.modes.front() == (cleanup ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH));
++  assert(reader.pagesUntilFullRefresh == 3 && !reader.cleanImageBasePending);
 + }
-+ Reader clipped;
-+ clipped.page->elements.push_back(std::make_unique<PageImage>(-10,-10,12,12));
-+ clipped.page->elements.push_back(std::make_unique<PageImage>(96,156,20,20));
-+ clipped.composed=clipped.renderer.pixels;clipped.renderImageBase();
-+ assert(clipped.compositions==1);
-+ Reader large;large.page->elements.push_back(std::make_unique<PageImage>(0,0,80,100));
-+ large.composed=large.renderer.pixels;large.renderImageBase();assert(large.pagesUntilFullRefresh==1);
 + Page empty;empty.elements.push_back(std::make_unique<Element>());
 + int count=0;assert(!empty.forEachImageRect([&](int,int,int,int){++count;}));assert(count==0);
-+ std::cout<<"Separate image regions preserve every intervening text pixel in all base/cleanup modes\n";
++ std::cout<<"Image refresh sends the composed page without a blank rectangle\n";
 +}
 diff --git a/test/memory_policy/CMakeLists.txt b/test/memory_policy/CMakeLists.txt
 --- a/test/memory_policy/CMakeLists.txt
