@@ -379,18 +379,86 @@ diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.
 diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
 --- a/lib/hal/HalDisplay.cpp
 +++ b/lib/hal/HalDisplay.cpp
-@@ -173,6 +173,11 @@
+@@ -25,11 +25,6 @@
+
+ void HalDisplay::begin(bool seamless) {
+   HalSpiBus::Lock spiLock;
+-
+-  // Set X3-specific panel mode before initializing.
+-  if (gpio.deviceIsX3()) {
+-    einkDisplay.setDisplayX3();
+-  }
+
+   einkDisplay.begin();
+
+@@ -73,11 +68,8 @@
+ }
+
+ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
++  maskBwLightLeakBorder();
+   HalSpiBus::Lock spiLock;
+-
+-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+-    einkDisplay.requestResync(1);
+-  }
+
+   einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
+ }
+@@ -97,10 +89,7 @@
+ }
+
+ void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
+-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+-    einkDisplay.requestResync(1);
+-  }
+-
++  maskBwLightLeakBorder();
+   einkDisplay.displayBufferAsyncNoShadow(convertRefreshMode(mode));
+ }
+
+@@ -121,11 +110,8 @@
+ }
+
+ void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
++  maskBwLightLeakBorder();
+   HalSpiBus::Lock spiLock;
+-
+-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+-    einkDisplay.requestResync(1);
+-  }
+
+   einkDisplay.refreshDisplay(convertRefreshMode(mode), turnOffScreen);
+ }
+@@ -148,16 +134,7 @@
+ }
+
+ void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
+-  // X3: a HALF or FULL fallback means the caller wants a clean base (e.g. the
+-  // sleep cover, a full-screen swap from arbitrary prior content). Without
+-  // this, the X3 grayscale base takes its gentle differential happy path and
+-  // the prior home/reader frame ghosts through the soft aa_pre_bw_mid
+-  // waveform. Forcing a resync makes displayGrayscaleBase clear first,
+-  // matching displayBuffer(HALF)/displayBuffer(FULL).
+-  if (gpio.deviceIsX3() && fallback != RefreshMode::FAST_REFRESH) {
+-    einkDisplay.requestResync(1);
+-  }
+-
++  maskBwLightLeakBorder();
+   einkDisplay.displayGrayscaleBase(convertRefreshMode(fallback), turnOffScreen);
+ }
+
+@@ -172,6 +149,11 @@
+ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay.copyGrayscaleMsbBuffers(msbBuffer); }
 
  void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
-
++
 +bool HalDisplay::displayDirectGrayRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool turnOffScreen) {
 +  HalSpiBus::Lock spiLock;
 +  return einkDisplay.displayDirectGrayRegion({x, y, width, height}, turnOffScreen);
 +}
-+
+
  void HalDisplay::displayGrayBuffer(bool turnOffScreen) {
    HalSpiBus::Lock spiLock;
-   einkDisplay.displayGrayBuffer(turnOffScreen);
 diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
 --- a/lib/hal/HalDisplay.h
 +++ b/lib/hal/HalDisplay.h
@@ -452,7 +520,7 @@ diff --git a/src/SettingsList.h b/src/SettingsList.h
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -491,6 +491,7 @@
+@@ -487,6 +487,7 @@
        // Apply Night Mode to each activity's normal-polarity frame. SleepActivity
        // preserves it only for Quick Resume and clears it for other sleep screens.
        display.setInverted(SETTINGS.screenInverted != 0);
@@ -1174,3 +1242,23 @@ diff --git a/test/reader_drawer_model/ReaderDrawerModelTest.cpp b/test/reader_dr
  }
 
  TEST(ReaderDrawerModel, ChangeMaskSeparatesPreviewRelayoutAndOrientation) {
+diff --git a/src/activities/ScreenTransitionRefresh.h b/src/activities/ScreenTransitionRefresh.h
+--- a/src/activities/ScreenTransitionRefresh.h
++++ b/src/activities/ScreenTransitionRefresh.h
+@@ -1,7 +1,6 @@
+ #pragma once
+
+ #include <HalDisplay.h>
+-#include <HalGPIO.h>
+
+ #include <cstdint>
+
+@@ -15,7 +14,7 @@
+     const bool screenChanged = !hasRendered_ || screenState != lastScreenState_;
+     lastScreenState_ = screenState;
+     hasRendered_ = true;
+-    return screenChanged && !gpio.deviceIsX3() ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
++    return screenChanged ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+   }
+
+  private:

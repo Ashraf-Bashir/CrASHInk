@@ -1,6 +1,6 @@
 # crASHink patch application guide
 
-The X4 Pro build uses one patch directory. Apply the entire numbered series to a clean CrossInk checkout in filename order, then apply the SDK series to its FreeInk SDK submodule. The build workflow selects a stable CrossInk tag. The consolidated series was verified against CrossInk v1.6.1.
+The patch series targets the X4 Pro. PlatformIO provides release, debug, and simulator environments for that device. Apply the entire numbered series to a clean CrossInk checkout in filename order, then apply the SDK series to its FreeInk SDK submodule. The build workflow selects a stable CrossInk tag. The consolidated series was verified against CrossInk v1.6.1.
 
 ```sh
 # Run from the crASHink checkout.
@@ -21,7 +21,7 @@ Make changes in the owning patch. Shared source files can appear in several patc
 
 | Patch | Owns |
 |---|---|
-| `0000-settings-and-branding.patch` | Settings shell and crASHink branding |
+| `0000-settings-and-branding.patch` | X4 Pro build profiles, settings shell, and crASHink branding |
 | `0001-sd-storage-and-migration.patch` | Hidden SD paths and migration |
 | `0002-status-bar.patch` | Status icons and clock placement |
 | `0003-buttons-and-gestures.patch` | Shared buttons and gesture routing |

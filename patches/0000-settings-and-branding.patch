@@ -28,6 +28,23 @@ diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
      add(SettingInfo::String(StrId::STR_DEVICE_NAME, SETTINGS.deviceName, sizeof(SETTINGS.deviceName), "deviceName",
                              StrId::STR_CAT_SYSTEM));
      add(SettingInfo::Value(
+@@ -410,12 +412,10 @@
+       }
+     }
+
+-    if (!gpio.deviceIsX3()) {
+-      auto sleepScreenIt =
+-          std::find_if(v.begin(), v.end(), [](const SettingInfo& s) { return s.nameId == StrId::STR_SLEEP_SCREEN; });
+-      if (sleepScreenIt != v.end()) {
+-        removeEnumRawValue(*sleepScreenIt, static_cast<uint8_t>(CrossPointSettings::MINIMAL_STATS_SLEEP));
+-      }
++    auto sleepScreenIt =
++        std::find_if(v.begin(), v.end(), [](const SettingInfo& s) { return s.nameId == StrId::STR_SLEEP_SCREEN; });
++    if (sleepScreenIt != v.end()) {
++      removeEnumRawValue(*sleepScreenIt, static_cast<uint8_t>(CrossPointSettings::MINIMAL_STATS_SLEEP));
+     }
+     return v;
+   }();
 diff --git a/src/SettingsList.h b/src/SettingsList.h
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
@@ -248,3 +265,653 @@ diff --git a/src/images/Logo120.h b/src/images/Logo120.h
 -static_assert(sizeof(Logo120) == 1800, "Logo120 must be exactly 120x120 / 8 bytes");
 \ No newline at end of file
 +static_assert(sizeof(Logo120) == 1800, "Logo120 must be exactly 120x120 / 8 bytes");
+diff --git a/lib/hal/HalGPIO.cpp b/lib/hal/HalGPIO.cpp
+--- a/lib/hal/HalGPIO.cpp
++++ b/lib/hal/HalGPIO.cpp
+@@ -3,9 +3,6 @@
+ #include <HalGPIO.h>
+ #include <Logging.h>
+ #include <PowerManager.h>
+-#include <Preferences.h>
+-#include <SPI.h>
+-#include <XteinkDetect.h>
+ #include <esp_sleep.h>
+
+ #include <algorithm>
+@@ -23,154 +20,9 @@
+
+ namespace {
+ constexpr unsigned long BUTTON_DEBOUNCE_REPOLL_MS = 6;
+-// Poll cadence adapted from Sichroteph/YACP commit
+-// 6d1f10f4bae52d282a088f9b2e45aaac96da8377 (MIT).
+-constexpr unsigned long X3_USB_POLL_MS = 1000;
+-
+-// The X3-vs-X4 fingerprint (freeink::detectXteinkVerdict) only makes sense on
+-// Xteink hardware; other boards keep their compile-time BoardConfig profile.
+-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+-constexpr char HW_NAMESPACE[] = "cphw";
+-constexpr char NVS_KEY_DEV_OVERRIDE[] = "dev_ovr";  // 0=auto, 1=x4, 2=x3
+-constexpr char NVS_KEY_DEV_CACHED[] = "dev_det";    // 0=unknown, 1=x4, 2=x3
+-
+-enum class NvsDeviceValue : uint8_t { Unknown = 0, X4 = 1, X3 = 2 };
+-
+-NvsDeviceValue readNvsDeviceValue(const char* key, NvsDeviceValue defaultValue) {
+-  Preferences prefs;
+-  if (!prefs.begin(HW_NAMESPACE, true)) {
+-    return defaultValue;
+-  }
+-  const uint8_t raw = prefs.getUChar(key, static_cast<uint8_t>(defaultValue));
+-  prefs.end();
+-  if (raw > static_cast<uint8_t>(NvsDeviceValue::X3)) {
+-    return defaultValue;
+-  }
+-  return static_cast<NvsDeviceValue>(raw);
+-}
+-
+-void writeNvsDeviceValue(const char* key, NvsDeviceValue value) {
+-  Preferences prefs;
+-  if (!prefs.begin(HW_NAMESPACE, false)) {
+-    return;
+-  }
+-  prefs.putUChar(key, static_cast<uint8_t>(value));
+-  prefs.end();
+-}
+-
+-HalGPIO::DeviceType nvsToDeviceType(NvsDeviceValue value) {
+-  return value == NvsDeviceValue::X3 ? HalGPIO::DeviceType::X3 : HalGPIO::DeviceType::X4;
+-}
+-
+-HalGPIO::DeviceType detectDeviceTypeWithFingerprint() {
+-  // Explicit override for recovery/support:
+-  // 0 = auto, 1 = force X4, 2 = force X3
+-  const NvsDeviceValue overrideValue = readNvsDeviceValue(NVS_KEY_DEV_OVERRIDE, NvsDeviceValue::Unknown);
+-  if (overrideValue == NvsDeviceValue::X3 || overrideValue == NvsDeviceValue::X4) {
+-    LOG_INF("HW", "Device override active: %s", overrideValue == NvsDeviceValue::X3 ? "X3" : "X4");
+-    return nvsToDeviceType(overrideValue);
+-  }
+-
+-  const NvsDeviceValue cachedValue = readNvsDeviceValue(NVS_KEY_DEV_CACHED, NvsDeviceValue::Unknown);
+-  if (cachedValue == NvsDeviceValue::X3 || cachedValue == NvsDeviceValue::X4) {
+-    LOG_INF("HW", "Using cached device type: %s", cachedValue == NvsDeviceValue::X3 ? "X3" : "X4");
+-    return nvsToDeviceType(cachedValue);
+-  }
+-
+-  // No cache yet: run the SDK's X3 fingerprint probe and persist the result.
+-  uint8_t score1 = 0;
+-  uint8_t score2 = 0;
+-  const freeink::XteinkVerdict verdict = freeink::detectXteinkVerdict(&score1, &score2);
+-  LOG_INF("HW", "X3 probe scores: pass1=%u pass2=%u", score1, score2);
+-
+-  switch (verdict) {
+-    case freeink::XteinkVerdict::X3Confirmed:
+-      writeNvsDeviceValue(NVS_KEY_DEV_CACHED, NvsDeviceValue::X3);
+-      return HalGPIO::DeviceType::X3;
+-    case freeink::XteinkVerdict::X4Confirmed:
+-      writeNvsDeviceValue(NVS_KEY_DEV_CACHED, NvsDeviceValue::X4);
+-      return HalGPIO::DeviceType::X4;
+-    case freeink::XteinkVerdict::Inconclusive:
+-      break;
+-  }
+-
+-  // Conservative fallback for first boot with inconclusive probes; not cached,
+-  // so the next boot re-probes.
+-  return HalGPIO::DeviceType::X4;
+-}
+-
+-// --- X3 panel-controller fingerprint (UC8253 vs UC8279) ----------------------
+-// Newer X3 production units ship a UC8279d panel controller on the same board,
+-// glass and pins. The SDK probe reads the UC8279's VER/FLG registers over a
+-// bit-banged half-duplex SPI on the EPD pins; same override/cache scheme as
+-// the device fingerprint (values reuse NvsDeviceValue: 1 = UC8253, 2 = UC8279).
+-constexpr char NVS_KEY_EPD_OVERRIDE[] = "epd_ovr";  // 0=auto, 1=uc8253, 2=uc8279
+-constexpr char NVS_KEY_EPD_CACHED[] = "epd_det";    // 0=unknown, 1=uc8253, 2=uc8279
+-
+-bool detectX3DisplayIsUc8279() {
+-  const NvsDeviceValue overrideValue = readNvsDeviceValue(NVS_KEY_EPD_OVERRIDE, NvsDeviceValue::Unknown);
+-  if (overrideValue != NvsDeviceValue::Unknown) {
+-    LOG_INF("HW", "EPD controller override active: %s", overrideValue == NvsDeviceValue::X3 ? "UC8279" : "UC8253");
+-    return overrideValue == NvsDeviceValue::X3;
+-  }
+-
+-  const NvsDeviceValue cachedValue = readNvsDeviceValue(NVS_KEY_EPD_CACHED, NvsDeviceValue::Unknown);
+-  if (cachedValue != NvsDeviceValue::Unknown) {
+-    LOG_INF("HW", "Using cached EPD controller: %s", cachedValue == NvsDeviceValue::X3 ? "UC8279" : "UC8253");
+-    return cachedValue == NvsDeviceValue::X3;
+-  }
+-
+-  uint8_t ver[5] = {0};
+-  uint8_t flg = 0;
+-  const freeink::X3DisplayVerdict verdict = freeink::detectX3DisplayController(ver, &flg);
+-  LOG_INF("HW", "EPD probe: ver=%02X %02X %02X %02X %02X flg=%02X verdict=%u", ver[0], ver[1], ver[2], ver[3], ver[4],
+-          flg, static_cast<unsigned>(verdict));
+-  if (verdict == freeink::X3DisplayVerdict::Uc8279Confirmed) {
+-    writeNvsDeviceValue(NVS_KEY_EPD_CACHED, NvsDeviceValue::X3);
+-    return true;
+-  }
+-  if (verdict == freeink::X3DisplayVerdict::Uc8253Assumed) {
+-    writeNvsDeviceValue(NVS_KEY_EPD_CACHED, NvsDeviceValue::X4);
+-  }
+-  // Inconclusive: run as UC8253 (the shipping controller) but don't persist,
+-  // so a flaky first boot gets re-probed.
+-  return false;
+-}
+-
+-#endif  // FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+-
+ }  // namespace
+
+ void HalGPIO::begin() {
+-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+-#ifdef FORCE_DEVICE_X3
+-  _deviceType = DeviceType::X3;
+-  LOG_INF("HW", "Device override active via build flag: X3");
+-#else
+-  _deviceType = detectDeviceTypeWithFingerprint();
+-#endif
+-  // The panel-controller probe bit-bangs the EPD pins, so it must run before
+-  // SPI.begin() attaches them to the SPI matrix. I2C-only device fingerprint
+-  // above doesn't care about SPI ordering.
+-  const bool x3IsUc8279 = deviceIsX3() && detectX3DisplayIsUc8279();
+-  BoardConfig::selectDevice(!deviceIsX3() ? BoardConfig::Board::XteinkX4
+-                            : x3IsUc8279  ? BoardConfig::Board::XteinkX3Uc8279
+-                                          : BoardConfig::Board::XteinkX3);
+-
+-  // CrossInk's X3 override/cache remains authoritative. X4 has no equivalent
+-  // local override, so use the SDK's factory-aware controller selection before
+-  // SPI claims the display pins.
+-  if (deviceIsX4()) {
+-    freeink::applyXteinkDisplayController();
+-  }
+-
+-  SPI.begin(EPD_SCLK, SPI_MISO, EPD_MOSI, EPD_CS);
+-
+-  if (deviceIsX4()) {
+-    pinMode(BAT_GPIO0, INPUT);
+-    pinMode(UART0_RXD, INPUT);
+-  }
+-#endif
+   inputMgr.begin();
+ }
+
+@@ -185,15 +37,9 @@
+   }
+
+   usbStateChanged = false;
+-  const unsigned long now = millis();
+-  if (deviceIsX3() && usbStateSampled && now - lastUsbPollMs < X3_USB_POLL_MS) {
+-    return;
+-  }
+-
+   const bool connected = isUsbConnected();
+   usbStateChanged = (connected != lastUsbConnected);
+   lastUsbConnected = connected;
+-  lastUsbPollMs = now;
+   usbStateSampled = true;
+ }
+
+@@ -285,26 +131,9 @@
+   InputManager::setSharedConfirmPowerShortPressEmitsPower(enabled);
+ }
+
+-bool HalGPIO::isXteinkDevice() const {
+-  return BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3 ||
+-         BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3Uc8279 ||
+-         BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4 ||
+-         BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4Classic;
+-}
+-
+-bool HalGPIO::hasEdgeSideButtons() const {
+-  return BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3 ||
+-         BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4Pro ||
+-         BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4Classic;
+-}
++bool HalGPIO::hasEdgeSideButtons() const { return BoardConfig::isX4Pro(); }
+
+ bool HalGPIO::verifyPowerButtonWakeup(const bool shortPressWakes, const uint16_t longHoldMs) {
+-  // M5Paper v1.1 reaches setup after a normal wheel click has already been
+-  // released. Its hardware pull-ups make this ghost-wake debounce unnecessary.
+-  if (BoardConfig::isPaperMono() || BoardConfig::isM5PaperV11() || BoardConfig::ACTIVE.input.power < 0) {
+-    return true;
+-  }
+-
+   constexpr unsigned long POWER_WAKE_STABILITY_MS = 10;
+   const bool heldAtFirstSample = inputMgr.isPowerButtonPhysicallyPressed();
+   const unsigned long sampleStart = millis();
+@@ -360,14 +189,6 @@
+ #endif
+
+ bool HalGPIO::isUsbConnected() const {
+-#if FREEINK_DEVICE_X3
+-  if (deviceIsX3()) {
+-    // X3 has no USB-detect pin; infer external power from the gauge's charge
+-    // current via the SDK's BatteryMonitor (BQ27220 Current() > 0 = charging).
+-    static const BatteryMonitor battery;
+-    return battery.isCharging();
+-  }
+-#endif
+ #if FREEINK_DEVICE_X4PRO && !ARDUINO_USB_MODE
+   // X4 Pro uses native TinyUSB for its composite CDC+MSC device. The mounted
+   // state is the reliable bus-presence signal for this OTG configuration.
+@@ -399,14 +220,6 @@
+
+ bool HalGPIO::isUsbConnectedCached() const { return usbStateSampled ? lastUsbConnected : isUsbConnected(); }
+
+-bool HalGPIO::coldBootImpliesPowerButton() const {
+-  // These boards use a button-energized or otherwise known latch topology, so
+-  // a no-USB POWERON can be trusted as a power-button boot. Unknown/future
+-  // topologies must continue booting instead of risking an immediate sleep
+-  // after flashing or when charge detection is unavailable.
+-  return isXteinkDevice() || BoardConfig::isPaperMono() || BoardConfig::isSticky();
+-}
+-
+ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
+   const auto wakeupCause = esp_sleep_get_wakeup_cause();
+   const auto resetReason = esp_reset_reason();
+@@ -417,10 +230,6 @@
+       (wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1)) {
+     return WakeupReason::PowerButton;
+   }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected &&
+-      coldBootImpliesPowerButton()) {
+-    return WakeupReason::PowerButton;
+-  }
+   if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
+     return WakeupReason::AfterFlash;
+   }
+diff --git a/lib/hal/HalGPIO.h b/lib/hal/HalGPIO.h
+--- a/lib/hal/HalGPIO.h
++++ b/lib/hal/HalGPIO.h
+@@ -27,7 +27,6 @@
+   bool lastUsbConnected = false;
+   bool usbStateChanged = false;
+   bool usbStateSampled = false;
+-  unsigned long lastUsbPollMs = 0;
+
+  public:
+   // HAL-owned, normalized multi-touch representation. Activities must not
+@@ -65,18 +64,7 @@
+     unsigned long durationMs = 0;
+   };
+
+-  enum class DeviceType : uint8_t { X4, X3 };
+-
+- private:
+-  DeviceType _deviceType = DeviceType::X4;
+-
+- public:
+   HalGPIO() = default;
+-
+-  // Inline device type helpers for cleaner downstream checks
+-  inline bool deviceIsX3() const { return _deviceType == DeviceType::X3; }
+-  inline bool deviceIsX4() const { return _deviceType == DeviceType::X4; }
+-  bool isXteinkDevice() const;
+
+   // True when the board's page buttons sit on the left/right screen edges
+   // (X3, X4 Pro) rather than an off-screen vertical rocker. Drives side-hint
+@@ -151,7 +139,6 @@
+
+   // Whether a cold boot with no USB detected can be trusted to mean a held
+   // power button on the active board's power topology.
+-  bool coldBootImpliesPowerButton() const;
+
+   // Returns true once per edge (plug or unplug) since the last update()
+   bool wasUsbStateChanged() const;
+diff --git a/platformio.ini b/platformio.ini
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -1,5 +1,5 @@
+ [platformio]
+-default_envs = default, sticky, x4-pro, x4-classic
++default_envs = x4-pro
+ extra_configs = platformio.local.ini
+
+ [crossink]
+@@ -13,7 +13,7 @@
+ [base]
+ platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.37/platform-espressif32.zip
+ custom_i18n_builtin_langs = ${crossink.custom_i18n_builtin_langs}
+-board = esp32-c3-devkitm-1
++board = esp32-s3-devkitc1-n16r8
+ framework = arduino
+ monitor_speed = 115200
+ upload_speed = 921600
+@@ -130,74 +130,6 @@
+ ; disabling WiFi IRAM placement trades some throughput for more usable heap.
+ ; X4 Pro intentionally does not inherit this: its USB-OTG profile uses
+ ; pioarduino's complete prebuilt arduino_tinyusb component.
+-[firmware_tuned]
+-extends = base
+-; These managed ESP-IDF components support Arduino cloud, diagnostics, and
+-; radio-co-processor features that CrossInk does not use.
+-; X4 Pro intentionally keeps PioArduino's prebuilt component graph intact so
+-; its USB-OTG sdkconfig and arduino_tinyusb headers stay in sync.
+-custom_component_remove =
+-  espressif/esp_insights
+-  espressif/esp_rainmaker
+-  espressif/esp_diagnostics
+-  espressif/esp_diag_data_store
+-  espressif/esp_schedule
+-  espressif/esp_rcp_update
+-  espressif/esp_secure_cert_mgr
+-  espressif/cbor
+-custom_sdkconfig =
+-  CONFIG_ESP_TIMER_TASK_STACK_SIZE=4096
+-  CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=2560
+-  CONFIG_ESP_WIFI_IRAM_OPT=n
+-  CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+-  CONFIG_ARDUINO_SELECTIVE_COMPILATION=y
+-  CONFIG_ARDUINO_SELECTIVE_RainMaker=n
+-  CONFIG_ARDUINO_SELECTIVE_Insights=n
+-  CONFIG_ARDUINO_SELECTIVE_ESP_SR=n
+-  ; Xteink wake is a power-on reset, which otherwise verifies the whole app
+-  ; image before every wake. OTA validates the image before switching slots;
+-  ; non-power-on resets retain bootloader validation and OTA fallback coverage.
+-  CONFIG_BOOTLOADER_SKIP_VALIDATE_ON_POWER_ON=y
+-  ; mbedTLS stays for WPA2/WPA3 and the esp_http_client TLS path, but CrossInk
+-  ; only ever acts as a TLS client over TCP with mainstream ciphers.
+-
+-[env:default]
+-extends = firmware_tuned
+-custom_firmware_device_type = x3-x4
+-build_flags =
+-  ${base.build_flags}
+-  -DARDUINO_USB_MODE=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DFREEINK_DEVICE_X4=1
+-  -DFREEINK_DEVICE_X3=1
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  ; CROSSINK_VERSION is set by scripts/git_branch.py (includes current branch)
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x3-x4\"
+-  -DENABLE_SERIAL_LOG
+-  -DLOG_LEVEL=1 ; Set log level to debug for development builds
+-
+-[env:debug]
+-extends = firmware_tuned
+-custom_firmware_device_type = x3-x4
+-build_flags =
+-  ${base.build_flags}
+-  -DARDUINO_USB_MODE=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DFREEINK_DEVICE_X4=1
+-  -DFREEINK_DEVICE_X3=1
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  ; CROSSINK_VERSION injected by scripts/git_branch.py
+-  ; (uses $CROSSINK_RC_HASH env var in CI, or git short hash locally)
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x3-x4\"
+-  -DCROSSINK_BUILD_ENV=\"debug\"
+-  -DCROSSINK_SHOW_SLEEP_BUILD_INFO
+-  ; Appends battery telemetry to /battery_log.csv on wake and sleep, for
+-  ; diagnosing a gauge that misreports state of charge. Opt in for debug builds.
+-  ;-DCROSSINK_BATTERY_DIAG_LOG=1
+-  -DENABLE_SERIAL_LOG
+-  -DCROSSPOINT_WAIT_FOR_USB_SERIAL
+-  -DLOG_LEVEL=2 ; Set log level to debug for development builds
+-
+ [simulator-base]
+ platform = native
+ custom_i18n_builtin_langs = ${crossink.custom_i18n_builtin_langs}
+@@ -250,42 +182,6 @@
+   https://github.com/bitbank2/JPEGDEC.git#86282979224c8a32fd51e091ed5a35b0c699a52b
+   links2004/WebSockets @ 2.7.3
+
+-[env:simulator]
+-extends = simulator-base
+-build_flags =
+-  ${simulator-base.build_flags}
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x3-x4\"
+-
+-[env:simulator-X3]
+-extends = simulator-base
+-build_flags =
+-  ${simulator-base.build_flags}
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x3-x4\"
+-  -DSIMULATOR_DEVICE_X3
+-
+-[env:sticky-simulator]
+-extends = simulator-base
+-lib_deps =
+-  ${simulator-base.lib_deps}
+-  FreeInkFont=symlink://freeink-sdk/libs/font/FreeInkFont
+-
+-build_flags =
+-  -DCROSSINK_SCALABLE_FONTS=1
+-  -DFREEINK_FONT_ENABLE_AUTOHINT=1
+-  -DFREEINK_FONT_ENABLE_NATIVE_HINTING=1
+-  -DFREEINK_FONT_ENABLE_MONOCHROME=1
+-  ${simulator-base.build_flags}
+-  -DSIMULATOR_DEVICE_STICKY
+-  -DFREEINK_DEVICE_STICKY=1
+-  -DCROSSINK_APP_CAP_TOUCH=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"sticky\"
+-;   pio run -e sticky-simulator -t run_simulator
+-
+ ; --- Xteink X4 Pro simulator -----------------------------------------------
+ ; Use the simulator's native X4 Pro profile so it exposes its Home key and
+ ; PWM frontlight capabilities.
+@@ -306,85 +202,6 @@
+   -DCROSSINK_APP_CAP_USB_DRIVE=1
+   -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x4-pro\"
+ ;   pio run -e x4-pro-simulator -t run_simulator
+-
+-; --- Xteink X4 Classic simulator -------------------------------------------
+-; The X4 Classic uses the S3-era X4 panel and USB Drive support, but has
+-; physical buttons only: no touchscreen and no frontlight.
+-[env:x4-classic-simulator]
+-extends = simulator-base
+-build_flags =
+-  ${simulator-base.build_flags}
+-  -DSIMULATOR_DEVICE_X4_CLASSIC
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  -DCROSSINK_APP_CAP_USB_DRIVE=1
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x4-classic\"
+-;   pio run -e x4-classic-simulator -t run_simulator
+-
+-; --- Seeed Sticky - ESP32-S3R8, 3.97" 800x480 SSD1677 + GT911 touch -----------
+-; Different MCU family than the C3 envs (one binary per family). The SDK
+-; auto-enables CAP_TOUCH (GT911) and the BQ27220 gauge for this device. The
+-; framebuffer is placed in PSRAM to leave more internal DRAM for EPUB rendering.
+-;   pio run -e sticky -t upload
+-[env:sticky]
+-extends = firmware_tuned
+-lib_deps =
+-  ${base.lib_deps}
+-  FreeInkFont=symlink://freeink-sdk/libs/font/FreeInkFont
+-
+-custom_sdkconfig =
+-  ${firmware_tuned.custom_sdkconfig}
+-  ; Prefer PSRAM for medium EPUB allocations while leaving tiny hot objects internal.
+-  CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+-custom_firmware_device_type = sticky
+-board = esp32-s3-devkitc1-n16r8
+-board_build.mcu = esp32s3
+-build_flags =
+-  -DCROSSINK_SCALABLE_FONTS=1
+-  -DFREEINK_FONT_ENABLE_AUTOHINT=1
+-  -DFREEINK_FONT_ENABLE_NATIVE_HINTING=1
+-  -DFREEINK_FONT_ENABLE_MONOCHROME=1
+-  ${base.build_flags}
+-  -DARDUINO_USB_MODE=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DFREEINK_DEVICE_STICKY=1
+-  -DCROSSINK_APP_CAP_TOUCH=1
+-  -DFREEINK_FB_PSRAM=1
+-  ; CROSSINK_VERSION is set by scripts/git_branch.py so RC builds include the
+-  ; commit hash shown in Settings > System.
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"sticky\"
+-  -DENABLE_SERIAL_LOG
+-  -DLOG_LEVEL=1
+-
+-[env:sticky-debug]
+-extends = firmware_tuned
+-lib_deps =
+-  ${base.lib_deps}
+-  FreeInkFont=symlink://freeink-sdk/libs/font/FreeInkFont
+-
+-custom_sdkconfig =
+-  ${firmware_tuned.custom_sdkconfig}
+-  ; Prefer PSRAM for medium EPUB allocations while leaving tiny hot objects internal.
+-  CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+-custom_firmware_device_type = sticky
+-board = esp32-s3-devkitc1-n16r8
+-board_build.mcu = esp32s3
+-build_flags =
+-  -DCROSSINK_SCALABLE_FONTS=1
+-  -DFREEINK_FONT_ENABLE_AUTOHINT=1
+-  -DFREEINK_FONT_ENABLE_NATIVE_HINTING=1
+-  -DFREEINK_FONT_ENABLE_MONOCHROME=1
+-  ${base.build_flags}
+-  -DARDUINO_USB_MODE=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=0
+-  -DFREEINK_DEVICE_STICKY=1
+-  -DCROSSINK_APP_CAP_TOUCH=1
+-  -DFREEINK_FB_PSRAM=1
+-  ; CROSSINK_VERSION injected by scripts/git_branch.py
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"sticky\"
+-  -DENABLE_SERIAL_LOG
+-  -DCROSSPOINT_WAIT_FOR_USB_SERIAL
+-  -DCROSSINK_SHOW_SLEEP_BUILD_INFO
+-  -DLOG_LEVEL=2
+
+ ; --- Xteink X4 Pro - ESP32-S3R8, 4.2" 800x480 SSD1677 + GT911 touch ---------
+ ; The framebuffer lives in PSRAM. The SDK profile also enables its SDMMC slot,
+@@ -461,66 +278,3 @@
+   -DENABLE_SERIAL_LOG
+   -DCROSSPOINT_WAIT_FOR_USB_SERIAL
+   -DLOG_LEVEL=2
+-
+-; --- Xteink X4 Classic - ESP32-S3R8, 4.2" 800x480, buttons only ------------
+-; Shares the X4 Pro's panel, SDMMC slot, USB Drive support, and PSRAM-backed
+-; framebuffer, but has no touchscreen or frontlight. Its SDK profile exposes
+-; two edge page-turn buttons plus four front buttons.
+-[env:x4-classic]
+-extends = base
+-lib_deps =
+-  ${base.lib_deps}
+-  FreeInkFont=symlink://freeink-sdk/libs/font/FreeInkFont
+-
+-custom_firmware_device_type = x4-classic
+-board = esp32-s3-devkitc1-n16r8
+-board_build.mcu = esp32s3
+-board_build.arduino.memory_type = dio_opi
+-build_flags =
+-  -DCROSSINK_SCALABLE_FONTS=1
+-  -DFREEINK_FONT_ENABLE_AUTOHINT=1
+-  -DFREEINK_FONT_ENABLE_NATIVE_HINTING=1
+-  -DFREEINK_FONT_ENABLE_MONOCHROME=1
+-  ${base.build_flags}
+-  -DFREEINK_DEVICE_X4CLASSIC=1
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  -DFREEINK_CAP_USB_MSC=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=1
+-  -DARDUINO_USB_MODE=1
+-  -DUSB_PRODUCT=\"CrossInk_X4_Classic\"
+-  -DUSB_MANUFACTURER=\"CrossInk\"
+-  -DFREEINK_FB_PSRAM=1
+-  -DUSE_BLOCK_DEVICE_INTERFACE=1
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x4-classic\"
+-  -DENABLE_SERIAL_LOG
+-  -DLOG_LEVEL=1
+-
+-[env:x4-classic-debug]
+-extends = base
+-lib_deps =
+-  ${base.lib_deps}
+-  FreeInkFont=symlink://freeink-sdk/libs/font/FreeInkFont
+-
+-custom_firmware_device_type = x4-classic
+-board = esp32-s3-devkitc1-n16r8
+-board_build.mcu = esp32s3
+-board_build.arduino.memory_type = dio_opi
+-build_flags =
+-  -DCROSSINK_SCALABLE_FONTS=1
+-  -DFREEINK_FONT_ENABLE_AUTOHINT=1
+-  -DFREEINK_FONT_ENABLE_NATIVE_HINTING=1
+-  -DFREEINK_FONT_ENABLE_MONOCHROME=1
+-  ${base.build_flags}
+-  -DFREEINK_DEVICE_X4CLASSIC=1
+-  -DCROSSINK_APP_CAP_TOUCH=0
+-  -DFREEINK_CAP_USB_MSC=1
+-  -DCROSSINK_APP_CAP_USB_DRIVE=1
+-  -DARDUINO_USB_MODE=1
+-  -DUSB_PRODUCT=\"CrossInk_X4_Classic\"
+-  -DUSB_MANUFACTURER=\"CrossInk\"
+-  -DFREEINK_FB_PSRAM=1
+-  -DUSE_BLOCK_DEVICE_INTERFACE=1
+-  -DCROSSINK_FIRMWARE_DEVICE_TYPE=\"x4-classic\"
+-  -DENABLE_SERIAL_LOG
+-  -DCROSSPOINT_WAIT_FOR_USB_SERIAL
+-  -DLOG_LEVEL=2
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -243,16 +243,7 @@
+
+ }  // namespace
+
+-const char* CrossPointSettings::getDefaultDeviceName() {
+-#if (defined(FREEINK_DEVICE_X4CLASSIC) && FREEINK_DEVICE_X4CLASSIC) || defined(SIMULATOR_DEVICE_X4_CLASSIC)
+-  return "X4 Classic";
+-#endif
+-  if (BoardConfig::isSticky()) return "Sticky";
+-  if (BoardConfig::isX4Pro()) return "CrossInk X4 Pro";
+-  if (gpio.deviceIsX3()) return "CrossInk X3";
+-  if (gpio.deviceIsX4()) return "CrossInk X4";
+-  return "CrossInk";
+-}
++const char* CrossPointSettings::getDefaultDeviceName() { return "CrossInk X4 Pro"; }
+
+ const char* CrossPointSettings::getEffectiveDeviceName() const {
+   return isValidDeviceName(deviceName) ? deviceName : getDefaultDeviceName();
+diff --git a/src/activities/reader/TxtReaderActivity.h b/src/activities/reader/TxtReaderActivity.h
+--- a/src/activities/reader/TxtReaderActivity.h
++++ b/src/activities/reader/TxtReaderActivity.h
+@@ -103,11 +103,7 @@
+   bool isReaderActivity() const override { return true; }
+   bool isBookReaderActivity() const override { return true; }
+   bool usesFullScreenReaderVerticalSwipes() const override {
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-    return true;
+-#else
+     return false;
+-#endif
+   }
+   bool canSnapshotForSleepOverlay() const override { return true; }
+   bool allowPowerAsConfirmInReaderMode() const override { return quickActionsPopup.isActive(); }
+diff --git a/src/activities/reader/XtcReaderActivity.h b/src/activities/reader/XtcReaderActivity.h
+--- a/src/activities/reader/XtcReaderActivity.h
++++ b/src/activities/reader/XtcReaderActivity.h
+@@ -116,11 +116,7 @@
+   bool isReaderActivity() const override { return true; }
+   bool isBookReaderActivity() const override { return true; }
+   bool usesFullScreenReaderVerticalSwipes() const override {
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-    return true;
+-#else
+     return false;
+-#endif
+   }
+   void onInputLockChanged(bool locked) override;
+   bool handleQuickLockUnlock(QuickLockTrigger trigger) override;
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -657,14 +657,10 @@
+   doc["rssi"] = apMode ? 0 : WiFi.RSSI();
+   doc["freeHeap"] = ESP.getFreeHeap();
+   doc["uptime"] = millis() / 1000;
+-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+-  doc["device"] = gpio.deviceIsX3() ? "X3" : "X4";
+-#else
+ #ifdef SIMULATOR
+   doc["device"] = "Simulator";
+ #else
+   doc["device"] = BoardConfig::ACTIVE.name;
+-#endif
+ #endif
+
+   char snBuf[33] = {0};

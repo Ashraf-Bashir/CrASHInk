@@ -64,6 +64,42 @@ diff --git a/src/MappedInputManager.cpp b/src/MappedInputManager.cpp
    // Back = left-to-right swipe starting near the left edge. Edge-anchored so that
    // mid-screen horizontal swipes stay available to activities that consume
    // SwipeDir::Left/Right (e.g. percent selection, image viewer).
+@@ -776,35 +773,21 @@
+
+ bool MappedInputManager::wasReaderMenuGesture() const {
+   const SwipeDir direction = wasSwipe();
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-  return direction == SwipeDir::Up;
+-#else
+   return hasHomeKeyHardware() ? direction == SwipeDir::Up : direction == SwipeDir::Down;
+-#endif
+ }
+
+ bool MappedInputManager::wasReaderHomeGesture() const {
+   // X4 Pro's capacitive Home key remains the reader's Home action. Only the
+   // touch gesture changes in reader mode: other touch boards use an upward
+   // swipe across the page.
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-  // Sticky uses swipe up for the bottom reader drawer and swipe down for the
+-  // reader-details panel. Home remains available from that panel's header.
+-  return false;
+-#else
+   if (hasHomeKeyHardware()) {
+     return wasHomeGesture();
+   }
+   return wasSwipe() == SwipeDir::Up;
+-#endif
+ }
+
+ bool MappedInputManager::wasReaderLightPanelGesture() const {
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-  return wasSwipe() == SwipeDir::Down;
+-#else
+   return hasHomeKeyHardware() && wasSwipe() == SwipeDir::Down;
+-#endif
+ }
+
+ bool MappedInputManager::wasHomeGesture() const {
 diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
 --- a/src/SettingsList.cpp
 +++ b/src/SettingsList.cpp
@@ -275,7 +311,7 @@ diff --git a/src/activities/reader/SideButtonShortcuts.h b/src/activities/reader
 diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
 --- a/src/network/CrossPointWebServer.cpp
 +++ b/src/network/CrossPointWebServer.cpp
-@@ -1585,7 +1585,8 @@
+@@ -1581,7 +1581,8 @@
      doc.clear();
      doc["key"] = s.key;
      if (isSideButtonActionSetting(s)) {
@@ -393,3 +429,77 @@ new file mode 100644
 +assert '&CrossPointSettings::pageTurnGesture' not in settings
 +assert '&CrossPointSettings::previousPageGesture' not in settings
 +print('Swipe-only routing passed: legacy settings, LTR/RTL, taps, disabled touch, settings removal.')
+diff --git a/include/DeviceCapabilities.h b/include/DeviceCapabilities.h
+--- a/include/DeviceCapabilities.h
++++ b/include/DeviceCapabilities.h
+@@ -6,7 +6,8 @@
+
+ inline bool deviceHasEdgeSideButtons(const HalGPIO& gpio) {
+ #ifdef SIMULATOR
+-  return gpio.deviceIsX3();
++  (void)gpio;
++  return false;
+ #else
+   return gpio.hasEdgeSideButtons();
+ #endif
+@@ -15,10 +16,11 @@
+ // Menu navigation follows physical placement without changing the legacy
+ // layout rules used by sliders, step controls, and side-button hints.
+ inline bool deviceUsesHorizontalSideButtonsForMenus(const HalGPIO& gpio) {
+-#if defined(SIMULATOR_DEVICE_X4_PRO) || defined(SIMULATOR_DEVICE_X4_CLASSIC)
++#if defined(SIMULATOR_DEVICE_X4_PRO)
++  (void)gpio;
+   return true;
+ #else
+-  return deviceHasEdgeSideButtons(gpio) || gpio.deviceIsX3();
++  return deviceHasEdgeSideButtons(gpio);
+ #endif
+ }
+
+@@ -31,14 +33,5 @@
+ #endif
+ }
+
+-// Touch readers can safely dedicate both side buttons to a chord because Back
+-// and Confirm remain available on-screen. X4 Classic has the same two edge
+-// buttons plus a separate four-button front cluster, so it has the same escape
+-// path without a touchscreen.
+-inline bool deviceSupportsSideButtonChord(const HalGPIO& gpio) {
+-#if CROSSINK_APP_DEVICE_X4CLASSIC || defined(SIMULATOR_DEVICE_X4_CLASSIC)
+-  return true;
+-#else
+-  return gpio.hasTouch();
+-#endif
+-}
++// Back and Confirm stay available on screen while a side-button chord is active.
++inline bool deviceSupportsSideButtonChord(const HalGPIO& gpio) { return gpio.hasTouch(); }
+diff --git a/src/GlobalActions.h b/src/GlobalActions.h
+--- a/src/GlobalActions.h
++++ b/src/GlobalActions.h
+@@ -11,11 +11,6 @@
+ // Keep its manual shortcut on the clean HALF waveform used before the manual
+ // refresh change; X3 and every other device retain the explicit full refresh.
+ inline HalDisplay::RefreshMode manualScreenRefreshMode() {
+-#if FREEINK_DEVICE_X4
+-  if (gpio.deviceIsX4()) {
+-    return HalDisplay::HALF_REFRESH;
+-  }
+-#endif
+   return HalDisplay::FULL_REFRESH;
+ }
+
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -52,11 +52,7 @@
+ constexpr uint32_t FILE_TRANSFER_RETURN_TO_READER = 1U << 8;
+
+ constexpr bool hasStickyReaderDetailsPanel() {
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-  return true;
+-#else
+   return false;
+-#endif
+ }
+
+ uint32_t fileTransferBootPayload(const NetworkMode mode, const bool returnToReader) {

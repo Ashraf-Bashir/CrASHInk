@@ -51,7 +51,7 @@ diff --git a/platformio.ini b/platformio.ini
    bitbank2/PNGdec @ 1.1.6
    https://github.com/bitbank2/JPEGDEC.git#86282979224c8a32fd51e091ed5a35b0c699a52b
    links2004/WebSockets @ 2.7.3
-@@ -246,6 +247,7 @@
+@@ -178,6 +179,7 @@
    NearbyTransfer=symlink://freeink-sdk/libs/network/NearbyTransfer
    bblanchon/ArduinoJson @ 7.4.2
    ricmoo/QRCode @ ^0.0.1
@@ -471,6 +471,19 @@ diff --git a/src/activities/boot_sleep/SleepActivity.cpp b/src/activities/boot_s
    renderDefaultSleepScreen();
  }
 
+@@ -961,11 +953,7 @@
+   }
+   // Only the moon differs from the displayed frame, so a differential FAST
+   // update avoids the flashing clean pass on an inverted night-mode page.
+-  if (gpio.deviceIsX3()) {
+-    renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
+-  } else {
+-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+-  }
++  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+ }
+
+ void SleepActivity::renderBlankSleepScreen() const {
 diff --git a/src/activities/boot_sleep/SleepGif.cpp b/src/activities/boot_sleep/SleepGif.cpp
 new file mode 100644
 --- /dev/null
@@ -695,7 +708,153 @@ diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library
 diff --git a/src/main.cpp b/src/main.cpp
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1775,6 +1775,23 @@
+@@ -1081,41 +1081,6 @@
+   return true;
+ }
+
+-static bool preflightSleepFrameBuffer() {
+-  if (!Storage.exists(SLEEP_FRAME_FILE)) return false;
+-
+-  HalFile file;
+-  if (!Storage.openFileForRead("SLP", SLEEP_FRAME_FILE, file)) {
+-    LOG_ERR("SLP", "Failed to open Quick Resume frame for preflight");
+-    Storage.remove(SLEEP_FRAME_FILE);
+-    return false;
+-  }
+-
+-#ifdef SIMULATOR
+-  // The simulator's legacy display stub has no X3 runtime geometry. This path
+-  // is unreachable there because it cannot identify a UC8279 X3 profile.
+-  const size_t expectedSize = HalDisplay::BUFFER_SIZE;
+-#else
+-  const size_t expectedSize = EInkDisplay::X3_BUFFER_SIZE;
+-#endif
+-  const size_t actualSize = file.fileSize();
+-  file.close();
+-  if (SleepWakePolicy::hasValidSavedFrame(true, actualSize, expectedSize)) return true;
+-
+-  LOG_ERR("SLP", "Invalid Quick Resume frame: expected=%u actual=%u", static_cast<unsigned>(expectedSize),
+-          static_cast<unsigned>(actualSize));
+-  Storage.remove(SLEEP_FRAME_FILE);
+-  return false;
+-}
+-
+-bool shouldClearX4WakeGhosting() {
+-#if FREEINK_DEVICE_X4
+-  return gpio.deviceIsX4();
+-#else
+-  return false;
+-#endif
+-}
+-
+ // Wake validation runs before the SD card and its settings file are available.
+ // Mirror the one setting that changes its behavior while entering sleep, so a
+ // permitted short wake press can pass verification even after the button has
+@@ -1407,17 +1372,10 @@
+   halTiltSensor.begin();
+   halClock.begin();
+
+-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+-  LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : "X4");
+-  LOG_INF("BOOT", "Post-GPIO diagnostic: device=%s usb=%d silentReboot=%d silentTarget=%lu",
+-          gpio.deviceIsX3() ? "X3" : "X4", gpio.isUsbConnected() ? 1 : 0, isSilentReboot ? 1 : 0,
+-          static_cast<unsigned long>(snapshotTarget));
+-#else
+ #ifdef SIMULATOR
+   LOG_INF("MAIN", "Device: Simulator");
+ #else
+   LOG_INF("MAIN", "Device: %s", BoardConfig::ACTIVE.name);
+-#endif
+ #endif
+
+   LOG_INF("BOOT", "Wake route: %s", wakeupRouteName(wakeupReason));
+@@ -1552,17 +1510,10 @@
+                             : isSilentReboot   ? BootResume::Silent
+                             : skipSplashOnWake ? BootResume::SplashlessWake
+                                                : BootResume::Splash;
+-  bool isUc8279X3 = false;
+-#ifndef SIMULATOR
+-  isUc8279X3 = gpio.deviceIsX3() && BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3Uc8279;
+-#endif
+-  const bool hasValidSleepFrame = resume == BootResume::SplashlessWake && isUc8279X3 && preflightSleepFrameBuffer();
+-  const bool shouldRestoreSleepFrame =
+-      resume == BootResume::SplashlessWake && (isUc8279X3 ? hasValidSleepFrame : Storage.exists(SLEEP_FRAME_FILE));
++  const bool shouldRestoreSleepFrame = resume == BootResume::SplashlessWake && Storage.exists(SLEEP_FRAME_FILE);
+   bool allowFastInitialReaderRefresh = false;
+-  bool x4WakeCanFastPaint = false;
+-
+-  setupDisplayAndFonts(SleepWakePolicy::shouldInitializeSeamlessly(resume, isUc8279X3, hasValidSleepFrame),
++
++  setupDisplayAndFonts(SleepWakePolicy::shouldInitializeSeamlessly(resume),
+                        resume != BootResume::Network, useReaderRenderStack);
+   logBootHeap("display and font resolver ready");
+
+@@ -1582,38 +1533,10 @@
+       APP_STATE.showBootScreen = true;
+       APP_STATE.saveToFile();
+       if (shouldRestoreSleepFrame && loadSleepFrameBuffer()) {
+-        if (gpio.deviceIsX3()) {
+-          // begin() clears the X3 controller RAM. Restore the saved frame as
+-          // the baseline for the first reader paint without refreshing the panel.
+-          renderer.cleanupGrayscaleWithFrameBuffer();
+-          allowFastInitialReaderRefresh = true;
+-        }
+ #ifndef SIMULATOR
+-        else if (display.restoreVisibleFrame()) {
+-          // Quick Resume left this exact frame on the glass. Rebuild the panel's
+-          // old-image plane so the first Home/reader paint only drives changed
+-          // pixels, including removal of the sleep moon.
+-          allowFastInitialReaderRefresh = true;
+-          x4WakeCanFastPaint = true;
+-        }
+-#endif
+-      } else if (isUc8279X3 && hasValidSleepFrame) {
+-        // The frame passed the size preflight but could not be read after display
+-        // setup. Do one clean, device-specific recovery rather than painting
+-        // differentially against an invalid controller baseline.
+-        LOG_ERR("BOOT", "Quick Resume frame load failed; rebuilding UC8279 X3 display baseline");
+-        Storage.remove(SLEEP_FRAME_FILE);
+-        renderer.clearScreen();
+-        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+-      } else if (shouldClearX4WakeGhosting() && SETTINGS.fadingFix != 0) {
+-        LOG_INF("BOOT", "X4 wake: clearing retained sleep image with half refresh");
+-        renderer.clearScreen();
+-        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+-        // The explicit HALF refresh above has already established a clean panel
+-        // baseline, so the reader's first page can use its fast initial cycle
+-        // instead of repeating the cleanup waveform.
+-        allowFastInitialReaderRefresh = true;
+-        x4WakeCanFastPaint = true;
++        // Restore the panel baseline so the first paint updates only changed pixels.
++        allowFastInitialReaderRefresh = display.restoreVisibleFrame();
++#endif
+       }
+       break;
+     case BootResume::Splash:
+@@ -1732,20 +1655,12 @@
+     // target == home (or reader with no open book): land on home — don't fall
+     // through to the sleep-wake "resume reader" logic, which fires on stale
+     // openEpubPath + lastSleepFromReader from a prior session.
+-    // X4's HALF refresh is the same single-pass clean transition already used
+-    // by network screens. Keep X3's existing full refresh behavior unchanged.
+-    const auto homeRefreshMode = gpio.deviceIsX3() ? HalDisplay::FULL_REFRESH : HalDisplay::HALF_REFRESH;
+-    activityManager.goHome(HomeMenuItem::NONE, homeRefreshMode);
++    activityManager.goHome(HomeMenuItem::NONE, HalDisplay::HALF_REFRESH);
+   } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
+              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
+     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
+     // crashed (indicated by readerActivityLoadCount > 0)
+-    // On X4, use the first Home paint to clean the retained sleep image.
+-    const auto homeRefreshMode =
+-        resume == BootResume::SplashlessWake && shouldClearX4WakeGhosting() && !x4WakeCanFastPaint
+-            ? HalDisplay::HALF_REFRESH
+-            : HalDisplay::FAST_REFRESH;
+-    activityManager.goHome(HomeMenuItem::NONE, homeRefreshMode);
++    activityManager.goHome(HomeMenuItem::NONE, HalDisplay::FAST_REFRESH);
+   } else {
+     // Clear app state to avoid getting into a boot loop if the epub doesn't load
+     const auto path = APP_STATE.openEpubPath;
+@@ -1775,6 +1690,23 @@
    allowSleepAt = millis() + 2000;
  }
 
@@ -719,7 +878,7 @@ diff --git a/src/main.cpp b/src/main.cpp
  void loop() {
    static unsigned long maxLoopDuration = 0;
    const unsigned long loopStartTime = millis();
-@@ -1841,16 +1858,45 @@
+@@ -1841,16 +1773,45 @@
      logSerial.printf("SCREENSHOT_END\n");
    }
 
@@ -768,7 +927,7 @@ diff --git a/src/main.cpp b/src/main.cpp
    if (userInputReceived || activityManager.preventAutoSleep()) {
      lastActivityTime = millis();         // Reset inactivity timer
      powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
-@@ -1864,6 +1910,17 @@
+@@ -1864,6 +1825,17 @@
    // a page turn, refresh, or other short power-button action.
    if (wakePowerReleasePending && !gpio.isPressed(HalGPIO::BTN_POWER)) {
      wakePowerReleasePending = false;
@@ -786,7 +945,7 @@ diff --git a/src/main.cpp b/src/main.cpp
      return;
    }
 
-@@ -1888,10 +1945,11 @@
+@@ -1888,10 +1860,11 @@
    const auto sideButtonShortcutResult = buttonShortcutController.updateUpDown(
        millis(), gpio.isPressed(HalGPIO::BTN_UP), gpio.isPressed(HalGPIO::BTN_DOWN), configuredSideButtonChordAction(),
        touchscreenEscapeHatch, modalOwnsInput);
@@ -799,7 +958,7 @@ diff --git a/src/main.cpp b/src/main.cpp
 
    const bool powerPressed = gpio.isPressed(HalGPIO::BTN_POWER);
    const bool chordButtonPressed = gpio.isPressed(HalGPIO::BTN_UP);
-@@ -1936,7 +1994,6 @@
+@@ -1936,7 +1909,6 @@
        lastActivityTime = millis();
        return;
      }
@@ -807,7 +966,7 @@ diff --git a/src/main.cpp b/src/main.cpp
      if (sleepTimeoutMs > 0 && buttonShortcutController.shouldQuickLockSleep(millis(), sleepTimeoutMs)) {
        LOG_DBG("SLP", "Quick Lock timeout triggered after %lu ms", sleepTimeoutMs);
        APP_STATE.quickLockResumePending = true;
-@@ -1949,6 +2006,12 @@
+@@ -1949,6 +1921,12 @@
        lastActivityTime = millis();
      }
      mappedInputManager.clearInjectedReleases();
@@ -820,7 +979,7 @@ diff --git a/src/main.cpp b/src/main.cpp
      return;
    }
 
-@@ -1968,16 +2031,5 @@
+@@ -1968,17 +1946,6 @@
    if (handleX4ProHomeKeyShortcuts()) {
      // Simulator Home-key events bypass HalGPIO's raw touch activity signal.
      activityManager.notifyUserInput();
@@ -837,3 +996,88 @@ diff --git a/src/main.cpp b/src/main.cpp
 -    lastActivityTime = millis();
      return;
    }
+
+diff --git a/lib/hal/HalTiltSensor.h b/lib/hal/HalTiltSensor.h
+--- a/lib/hal/HalTiltSensor.h
++++ b/lib/hal/HalTiltSensor.h
+@@ -39,11 +39,7 @@
+   unsigned long _wakeMs = 0;       // Timestamp of last wake() for stabilization
+
+   // Tuning constants
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-  static constexpr float RATE_THRESHOLD_DPS = 200.0f;  // Stay below the Sticky IMU's ±245 dps range
+-#else
+   static constexpr float RATE_THRESHOLD_DPS = 270.0f;  // Deg/sec speed to trigger flick
+-#endif
+   static constexpr float NEUTRAL_RATE_DPS = 50.0f;         // Must stop moving below this rate before next trigger
+   static constexpr unsigned long COOLDOWN_MS = 600;        // Minimum ms between triggers
+   static constexpr unsigned long POLL_INTERVAL_MS = 50;    // 20 Hz polling
+diff --git a/src/util/SleepWakePolicy.h b/src/util/SleepWakePolicy.h
+--- a/src/util/SleepWakePolicy.h
++++ b/src/util/SleepWakePolicy.h
+@@ -12,14 +12,6 @@
+   SplashlessWake,
+ };
+
+-constexpr bool hasValidSavedFrame(const bool exists, const size_t actualSize, const size_t expectedSize) {
+-  return exists && actualSize == expectedSize;
+-}
+-
+-// A UC8279 X3 can skip its initial resync only after a saved Quick Resume frame
+-// has been verified. Other resume paths retain their existing behavior.
+-constexpr bool shouldInitializeSeamlessly(const Resume resume, const bool isUc8279X3, const bool hasValidFrame) {
+-  return resume != Resume::Splash && !(resume == Resume::SplashlessWake && isUc8279X3 && !hasValidFrame);
+-}
++constexpr bool shouldInitializeSeamlessly(const Resume resume) { return resume != Resume::Splash; }
+
+ }  // namespace SleepWakePolicy
+diff --git a/test/sleep_wake_policy/SleepWakePolicyTest.cpp b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
+--- a/test/sleep_wake_policy/SleepWakePolicyTest.cpp
++++ b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
+@@ -2,40 +2,12 @@
+
+ #include "SleepWakePolicy.h"
+
+-namespace {
+-constexpr size_t kExpectedFrameBytes = 52272;
++TEST(SleepWakePolicy, X4ProColdBootUsesNormalInitialization) {
++  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash));
+ }
+
+-TEST(SleepWakePolicy, Uc8279X3OrdinaryWakeWithoutFrameIsNotSeamless) {
+-  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/false));
++TEST(SleepWakePolicy, X4ProResumePathsUseSeamlessInitialization) {
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent));
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Network));
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake));
+ }
+-
+-TEST(SleepWakePolicy, Uc8279X3QuickResumeWithValidFrameIsSeamless) {
+-  const bool validFrame =
+-      SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes, kExpectedFrameBytes);
+-  EXPECT_TRUE(validFrame);
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                          /*isUc8279X3=*/true, validFrame));
+-}
+-
+-TEST(SleepWakePolicy, ColdBootIsNotSeamless) {
+-  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash,
+-                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/true));
+-}
+-
+-TEST(SleepWakePolicy, SilentRestartRetainsExistingSeamlessBehavior) {
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent,
+-                                                          /*isUc8279X3=*/true, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, OtherProfilesRetainExistingSplashlessBehavior) {
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                          /*isUc8279X3=*/false, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, MissingOrWrongSizedFrameIsInvalid) {
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/false, kExpectedFrameBytes, kExpectedFrameBytes));
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes - 1, kExpectedFrameBytes));
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes + 1, kExpectedFrameBytes));
+-}
