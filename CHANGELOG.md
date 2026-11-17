@@ -1,3 +1,14 @@
+## [Unreleased]
+
+### Added
+
+- Workflowy wrapped outlines support inline editing at the tapped character and adding items above or below a sibling. An item starting with `[]` becomes a todo.
+- Workflowy has first, previous, next, and last page controls, and vertical swipes can turn pages during requests.
+
+### Changed
+
+- Workflowy prefetches one level below visible rows and checks for changes in the background. Todo checkboxes have square corners, and adjacent tags keep separate backgrounds.
+
 ## [v1.5.1] - 2026-09-10
 
 ### Added
