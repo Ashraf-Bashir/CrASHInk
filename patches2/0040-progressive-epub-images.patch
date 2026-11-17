@@ -1,0 +1,161 @@
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index 29f1da69ec2c508554504f6e493357d7a5e53cc5..ebe39738ce8cf55efeb170a0a6cc1c82f5cd4e70 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -3445,6 +3445,31 @@ bool GfxRenderer::supportsCombinedGrayscale() const {
+ #endif
+ }
+
++bool GfxRenderer::supportsRegionalGrayscale() const {
++#ifdef SIMULATOR
++  return false;
++#else
++  return !display.isInverted() && display.grayscaleCapabilities(HalDisplay::GrayscaleMode::Direct).regionalDirect;
++#endif
++}
++
++bool GfxRenderer::displayDirectGrayRegion(int x, int y, int width, int height) const {
++#ifdef SIMULATOR
++  return false;
++#else
++  if (width <= 0 || height <= 0) return false;
++  int ax, ay, bx, by;
++  screenToPanel(x, y, ax, ay);
++  screenToPanel(x + width - 1, y + height - 1, bx, by);
++  const int x0 = std::max(0, std::min(ax, bx));
++  const int y0 = std::max(0, std::min(ay, by));
++  const int x1 = std::min<int>(panelWidth - 1, std::max(ax, bx));
++  const int y1 = std::min<int>(panelHeight - 1, std::max(ay, by));
++  if (x1 < x0 || y1 < y0) return true;  // The image is completely outside the viewport.
++  return display.displayDirectGrayRegion(x0, y0, x1 - x0 + 1, y1 - y0 + 1, fadingFix);
++#endif
++}
++
+ bool GfxRenderer::beginCombinedGrayscale() const {
+   if (!supportsCombinedGrayscale()) return false;
+   return supportsDirectGrayscale() ? displayDirectGrayscaleBase() : displayAbsoluteGrayscaleBase();
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index 885bf93545ea5f37d5fb5e016299387846bb5eb5..f31092781c5357bb6341bf94ec9d7d29ce6e0e4e 100644
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -361,6 +361,8 @@ class GfxRenderer {
+   // does not define it.
+   bool supportsDirectGrayscale() const;
+   bool supportsCombinedGrayscale() const;
++  bool supportsRegionalGrayscale() const;
++  bool displayDirectGrayRegion(int x, int y, int width, int height) const;
+   bool beginCombinedGrayscale() const;
+   bool displayDirectGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
+   RenderMode getRenderMode() const { return renderMode; }
+diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
+index 2a442cd546acfb9730b1597a11caa631a699e08c..75021852984952ce3d1b780efdbe21d9c9ee4049 100644
+--- a/lib/hal/HalDisplay.cpp
++++ b/lib/hal/HalDisplay.cpp
+@@ -224,6 +224,11 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
+
+ void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
+
++bool HalDisplay::displayDirectGrayRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool turnOffScreen) {
++  HalSpiBus::Lock spiLock;
++  return einkDisplay.displayDirectGrayRegion({x, y, width, height}, turnOffScreen);
++}
++
+ void HalDisplay::displayGrayBuffer(bool turnOffScreen) {
+   HalSpiBus::Lock spiLock;
+   einkDisplay.displayGrayBuffer(turnOffScreen);
+diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
+index 670b14ce808e546ba7dba9241f4c0e79d54545ba..da0694f77ef689071b798a61ee38a5935d1401d7 100644
+--- a/lib/hal/HalDisplay.h
++++ b/lib/hal/HalDisplay.h
+@@ -103,6 +103,7 @@ class HalDisplay {
+   void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
+   void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
+
++  bool displayDirectGrayRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool turnOffScreen);
+   void displayGrayBuffer(bool turnOffScreen = false);
+
+   // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index cfbdbae4e187bbf8dddecee8ff9daa0cdcd26b06..502a57e56e0368f499e4ec69ca7be6ddc64d14c4 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -7612,6 +7612,9 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   auto combinedImagePlane = updatePanel && needsImageGrayscale && renderer.supportsCombinedGrayscale()
+                                 ? makePsramByteBufferNoThrow(renderer.getBufferSize())
+                                 : HeapByteBuffer{};
++  auto regionalImageMsb = combinedImagePlane && renderer.supportsRegionalGrayscale()
++                              ? makePsramByteBufferNoThrow(renderer.getBufferSize())
++                              : HeapByteBuffer{};
+
+   const auto finalizeBufferComposition = [&]() {
+     if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
+@@ -7633,6 +7636,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+     if (deferImageLoading) {
+       page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
+                                         /*renderCachedImages=*/false);
++    } else if (regionalImageMsb) {
++      page->renderText(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     } else {
+       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     }
+@@ -7656,7 +7661,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+     renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+   }
+-  if (pageHasImages && !deferImageLoading) {
++  if (pageHasImages && !deferImageLoading && !regionalImageMsb) {
+     // Show the new page's placeholders before ZIP extraction or sidecar
+     // materialization. The loan can overwrite the framebuffer, so rebuild
+     // the complete page after returning it; the panel keeps the preview.
+@@ -7700,6 +7705,51 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   if (!updatePanel) {
+     return true;
+   }
++  if (regionalImageMsb) {
++    // Paint the text immediately. Image decoding/upload happens after the text
++    // is visible, and the panel only drives the individual image windows.
++    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
++    const auto frameSize = renderer.getBufferSize();
++    if (pageHasImagesNeedingDecode) {
++      std::memcpy(combinedImagePlane.get(), renderer.getFrameBuffer(), frameSize);
++      GfxRenderer::FrameBufferLoan loan(renderer);
++      page->prepareImageCaches();
++      loan.end();
++      std::memcpy(renderer.getFrameBuffer(), combinedImagePlane.get(), frameSize);
++    }
++
++    bool rendered = renderer.displayDirectGrayscaleBase();
++    if (rendered) {
++      auto renderImagePlane = [&](const GfxRenderer::RenderMode mode, uint8_t* plane) {
++        std::memcpy(plane, renderer.getFrameBuffer(), frameSize);
++        renderer.setRenderMode(mode);
++        renderer.beginStripTarget(plane, 0, renderer.getDisplayHeight());
++        page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
++        renderer.endStripTarget();
++      };
++      renderImagePlane(GfxRenderer::GRAYSCALE_LSB, combinedImagePlane.get());
++      renderImagePlane(GfxRenderer::GRAYSCALE_MSB, regionalImageMsb.get());
++      bool firstRegion = true;
++      page->forEachImageRect([&](int16_t x, int16_t y, int16_t width, int16_t height) {
++        if (!rendered) return;
++        if (!firstRegion) rendered = renderer.displayDirectGrayscaleBase();
++        firstRegion = false;
++        if (!rendered) return;
++        renderer.copyGrayscaleLsbBuffers(combinedImagePlane.get());
++        renderer.copyGrayscaleMsbBuffers(regionalImageMsb.get());
++        rendered = renderer.displayDirectGrayRegion(x + orientedMarginLeft, y + orientedMarginTop, width, height);
++      });
++      rendered = rendered && !firstRegion;
++      renderer.setRenderMode(GfxRenderer::BW);
++    }
++    regionalImageMsb.reset();
++    page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
++    renderer.cleanupGrayscaleWithFrameBuffer();
++    if (rendered) {
++      cleanImageBasePending = false;
++      return true;
++    }
++  }
+   if (EpubGrayscale::runCombinedImagePass(renderer, *page, fontId, orientedMarginLeft, orientedMarginTop,
+                                          combinedImagePlane.get())) {
+     cleanImageBasePending = false;
