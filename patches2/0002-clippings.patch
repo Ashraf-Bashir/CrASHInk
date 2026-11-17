@@ -199,7 +199,7 @@ index 5dc5d57e20e9149df98710a832271b7ef75a48c7..abec5af76a67e52640d7de7c77e3a38f
 +
 +STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT: "Highlight %u (preview unavailable)"
 diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
-index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a0bce76df 100644
+index f6d2facba67725863b90441ca2583eceb67f1977..d4b2cb40463c1c49a3c84e5b68b687868bbc9499 100644
 --- a/src/ClippingStore.cpp
 +++ b/src/ClippingStore.cpp
 @@ -3,6 +3,7 @@
@@ -210,16 +210,35 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
  #include <Serialization.h>
  #include <Utf8.h>
  #include <uzlib.h>
-@@ -22,6 +23,8 @@ constexpr uint8_t VERSION = 4;
+@@ -11,6 +12,7 @@
+ #include <array>
+ #include <cstring>
+ #include <functional>
++#include <utility>
+
+ #include "clippings/ClippingPreview.h"
+
+@@ -22,6 +24,19 @@ constexpr uint8_t VERSION = 4;
  constexpr size_t INITIAL_CLIPPING_RESERVE = 4;
  constexpr char CLIPPINGS_DIR[] = "/.crosspoint/clippings";
  constexpr size_t TEXT_COPY_BUFFER_SIZE = 128;
 +// Internal RAM left free when the clipping list has to grow without PSRAM.
 +constexpr uint32_t CLIPPING_LIST_INTERNAL_HEADROOM = 16U * 1024U;
++
++// Keep the persisted records in book order. Compare page fractions so
++// highlights from other font sizes and Readest's virtual pages interleave.
++bool occursBefore(const Clipping& a, const Clipping& b) {
++  if (a.spineIndex != b.spineIndex) return a.spineIndex < b.spineIndex;
++  const uint32_t first = static_cast<uint32_t>(a.startPage) * std::max<uint16_t>(1, b.pageCount);
++  const uint32_t second = static_cast<uint32_t>(b.startPage) * std::max<uint16_t>(1, a.pageCount);
++  if (first != second) return first < second;
++  if (a.paragraphIndex != b.paragraphIndex) return a.paragraphIndex < b.paragraphIndex;
++  return a.startWordIndex < b.startWordIndex;
++}
 
  struct ClippingFileHeader {
    std::string title;
-@@ -74,6 +77,30 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
+@@ -74,6 +89,30 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
    return true;
  }
 
@@ -250,7 +269,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
  bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
    std::array<uint8_t, TEXT_COPY_BUFFER_SIZE> buffer{};
    while (length > 0) {
-@@ -90,33 +117,130 @@ bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
+@@ -90,33 +129,142 @@ bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
  }
  }  // namespace
 
@@ -365,17 +384,28 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
 +      loadFailed_ = true;
 +      return false;
 +    }
++    persistOccurrenceOrder();
      return true;
    }
--
--  return readFromFile();
 +  // A transient SD failure must not expose a prefix of the records as if it
 +  // were the full book. Retry once after the first reader has closed.
 +  for (int attempt = 0; attempt < 2; ++attempt) {
 +    loadFailed_ = false;
-+    if (readFromFile()) return true;
++    if (readFromFile()) {
++      persistOccurrenceOrder();
++      return true;
++    }
 +  }
 +  return false;
++}
+
+-  return readFromFile();
++void ClippingStore::persistOccurrenceOrder() {
++  if (std::is_sorted(clippings.begin(), clippings.end(), occursBefore)) return;
++  std::sort(clippings.begin(), clippings.end(), occursBefore);
++  dirty = true;
++  // Offsets still refer to the intact old file until an atomic rewrite succeeds.
++  if (!saveToFile()) LOG_ERR("CLIP", "Could not persist clipping order");
  }
 
  void ClippingStore::unload() {
@@ -383,10 +413,13 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    if (dirty) saveToFile();
    std::vector<Clipping>().swap(clippings);
    bookFilePath.clear();
-@@ -132,11 +256,27 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+@@ -131,12 +279,29 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+                                                     const uint16_t startWordIndex, const uint16_t endWordIndex,
                                                      const uint16_t wordCount, const char* chapterTitle,
                                                      const uint16_t paragraphIndex, const std::string& text,
-                                                     const uint16_t tableSelection, const uint32_t layoutSignature) {
+-                                                    const uint16_t tableSelection, const uint32_t layoutSignature) {
++                                                    const uint16_t tableSelection, const uint32_t layoutSignature,
++                                                    size_t* addedIndex) {
 +  ++contentRevision_;
 +  if (loadFailed_) return AddResult::SaveFailed;
    if (clippings.size() >= CLIPPING_MAX_PER_BOOK) {
@@ -411,7 +444,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    Clipping clipping;
    clipping.spineIndex = spineIndex;
    clipping.startPage = startPage;
-@@ -149,13 +289,21 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+@@ -149,22 +314,101 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
    clipping.timestamp = static_cast<uint32_t>(millis() / 1000UL);
    clipping.layoutSignature = layoutSignature;
    clipping.tableSelection = tableSelection;
@@ -421,21 +454,28 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    const size_t cappedLength = std::min(text.size(), CLIPPING_TEXT_MAX);
    clipping.textLength = static_cast<uint16_t>(utf8SafeTruncateBuffer(text.data(), static_cast<int>(cappedLength)));
 
-   clippings.push_back(std::move(clipping));
-+  // Appending writes only this clipping. A full rewrite copies every saved
-+  // clipping's text, which grows with the book's whole clipping history.
+-  clippings.push_back(std::move(clipping));
+-  dirty = true;
+-  if (!writeToFile(&text, clippings.size() - 1)) {
+-    clippings.pop_back();
+-    dirty = true;
++  const auto at = std::upper_bound(clippings.begin(), clippings.end(), clipping, occursBefore);
++  const size_t index = static_cast<size_t>(at - clippings.begin());
++  clippings.insert(at, std::move(clipping));
++  // Highlighting forward stays an append. An out-of-order highlight uses the
++  // existing atomic writer to insert the new record in its persisted slot.
 +  const bool wasDirty = dirty;
-+  if (appendLastToFile(text, title)) {
-+    dirty = wasDirty;
++  if (!wasDirty && index + 1 == clippings.size() && appendLastToFile(text, title)) {
++    if (addedIndex) *addedIndex = index;
 +    return AddResult::Added;
 +  }
-   dirty = true;
--  if (!writeToFile(&text, clippings.size() - 1)) {
-+  if (!writeToFile(&text, clippings.size() - 1, nullptr, title)) {
-     clippings.pop_back();
-     dirty = true;
++  if (!writeToFile(&text, index, nullptr, title)) {
++    clippings.erase(clippings.begin() + index);
++    dirty = wasDirty;
      return AddResult::SaveFailed;
-@@ -164,7 +312,76 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+   }
+   dirty = false;
++  if (addedIndex) *addedIndex = index;
    return AddResult::Added;
  }
 
@@ -512,7 +552,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    if (index >= clippings.size()) return false;
    Clipping clipping = std::move(clippings[index]);
    clippings.erase(clippings.begin() + index);
-@@ -177,6 +394,26 @@ bool ClippingStore::removeClippingAt(const size_t index) {
+@@ -177,6 +421,26 @@ bool ClippingStore::removeClippingAt(const size_t index) {
    return true;
  }
 
@@ -539,7 +579,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
  const Clipping* ClippingStore::clippingAt(const size_t index) const {
    if (index >= clippings.size()) return nullptr;
    return &clippings[index];
-@@ -220,32 +457,37 @@ bool ClippingStore::readClippingText(const size_t index, std::string& out) const
+@@ -220,32 +484,37 @@ bool ClippingStore::readClippingText(const size_t index, std::string& out) const
    return readClippingText(*clipping, out);
  }
 
@@ -588,7 +628,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    if (!dirty) return true;
    if (writeToFile()) {
      dirty = false;
-@@ -255,16 +497,27 @@ bool ClippingStore::saveToFile() {
+@@ -255,16 +524,27 @@ bool ClippingStore::saveToFile() {
  }
 
  void ClippingStore::clearAll() {
@@ -618,7 +658,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    out.clear();
    FsFile f;
    if (!Storage.openFileForRead("CLIP", path, f)) {
-@@ -291,6 +544,8 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+@@ -291,6 +571,8 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
      f.close();
      return false;
    }
@@ -627,7 +667,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
 
    out.reserve(count);
    for (uint16_t i = 0; i < count; ++i) {
-@@ -314,16 +569,11 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+@@ -314,16 +596,11 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
        LOG_ERR("CLIP", "Clipping file truncated at table selection, record %u: %s", i, path.c_str());
        return false;
      }
@@ -645,7 +685,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
      if (version == LEGACY_VERSION) {
        uint32_t textLen = 0;
        if (!serialization::tryReadPod(f, textLen)) {
-@@ -333,6 +583,9 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+@@ -333,6 +610,9 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
        }
        clipping.textOffset = static_cast<uint32_t>(f.position());
        clipping.textLength = static_cast<uint16_t>(std::min<uint32_t>(textLen, CLIPPING_TEXT_MAX));
@@ -655,7 +695,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
        if (textLen > 0 && !f.seekCur(textLen)) {
          f.close();
          LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
-@@ -350,6 +603,9 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+@@ -350,6 +630,9 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
          return false;
        }
        clipping.textOffset = static_cast<uint32_t>(f.position());
@@ -665,7 +705,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
        if (clipping.textLength > 0 && !f.seekCur(clipping.textLength)) {
          f.close();
          LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
-@@ -364,7 +620,8 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
+@@ -364,7 +647,8 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
  }
 
  bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
@@ -675,7 +715,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    Storage.mkdir("/.crosspoint");
    Storage.mkdir(CLIPPINGS_DIR);
 
-@@ -395,7 +652,9 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+@@ -395,7 +679,9 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
      return false;
    }
 
@@ -686,7 +726,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    std::vector<uint32_t> newTextOffsets;
    newTextOffsets.reserve(count);
    std::vector<uint16_t> newTextLengths;
-@@ -410,17 +669,23 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+@@ -410,17 +696,23 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
      return false;
    }
 
@@ -720,7 +760,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
        LOG_ERR("CLIP", "Failed to write clipping record %u: %s", i, storeFilePath.c_str());
        f.close();
        if (source) source.close();
-@@ -428,7 +693,6 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+@@ -428,7 +720,6 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
        return false;
      }
 
@@ -728,7 +768,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
      const uint16_t textLen = clipping.textLength;
      if (!serialization::tryWritePod(f, textLen)) {
        LOG_ERR("CLIP", "Failed to write clipping text length %u: %s", i, tmpPath.c_str());
-@@ -481,9 +745,12 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
+@@ -481,9 +772,12 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
    if (replacingDestination && Storage.exists(backupPath.c_str())) {
      Storage.remove(backupPath.c_str());
    }
@@ -744,7 +784,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    }
    return true;
  }
-@@ -533,11 +800,13 @@ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std
+@@ -533,11 +827,13 @@ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std
 
    ClippingStore reader;
    std::vector<Clipping> migratedClippings;
@@ -759,7 +799,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    writer.bookFilePath = newFilePath;
    writer.bookTitle = title;
    writer.bookAuthor = author;
-@@ -613,7 +882,8 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+@@ -613,7 +909,8 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
 
    ClippingStore reader;
    std::vector<Clipping> migratedClippings;
@@ -769,7 +809,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
      LOG_ERR("CLIP", "Failed to load source clippings for rename: %s", migration.sourcePath.c_str());
      return false;
    }
-@@ -644,6 +914,7 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+@@ -644,6 +941,7 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
 
    migration.active = true;
    ClippingStore writer;
@@ -778,7 +818,7 @@ index f6d2facba67725863b90441ca2583eceb67f1977..48e2bec8b3587e0c9e67b3e12f5cf80a
    writer.bookTitle = title;
    writer.bookAuthor = author;
 diff --git a/src/ClippingStore.h b/src/ClippingStore.h
-index e739a8c739a7d81798b6bee28785947de7d66f9a..08c1f57a499a4cab92152adb91c37bfe1eeefa3e 100644
+index e739a8c739a7d81798b6bee28785947de7d66f9a..e8a319f941f07b3173f5d2fe1f4131212f467a24 100644
 --- a/src/ClippingStore.h
 +++ b/src/ClippingStore.h
 @@ -5,12 +5,17 @@
@@ -843,7 +883,8 @@ index e739a8c739a7d81798b6bee28785947de7d66f9a..08c1f57a499a4cab92152adb91c37bfe
    AddResult addClipping(uint16_t spineIndex, uint16_t startPage, uint16_t endPage, uint16_t pageCount,
                          uint16_t startWordIndex, uint16_t endWordIndex, uint16_t wordCount, const char* chapterTitle,
                          uint16_t paragraphIndex, const std::string& text, uint16_t tableSelection,
-                         uint32_t layoutSignature);
+-                        uint32_t layoutSignature);
++                        uint32_t layoutSignature, size_t* addedIndex = nullptr);
    bool removeClippingAt(size_t index);
 +  // Drops every clipping whose flag is set with a single store rewrite. On a
 +  // failed save nothing changes and false is returned.
@@ -869,7 +910,13 @@ index e739a8c739a7d81798b6bee28785947de7d66f9a..08c1f57a499a4cab92152adb91c37bfe
 
    static bool hasAnyClippings();
    static bool getAllClippedBooks(std::vector<ClippedBookEntry>& out);
-@@ -114,12 +139,19 @@ class ClippingStore {
+@@ -109,17 +134,25 @@ class ClippingStore {
+  private:
+   static ClippingStore instance;
+
++  void persistOccurrenceOrder();
+   std::vector<Clipping> clippings;
+   std::string bookFilePath;
    std::string bookTitle;
    std::string bookAuthor;
    std::string storeFilePath;
@@ -3454,10 +3501,10 @@ index 92fd512cac87f4486107cc7f5e0bf2199a289f7e..e0012e419e92c69fb97ba1c5209bea5e
  };
 diff --git a/src/activities/reader/HighlightChapterGroups.h b/src/activities/reader/HighlightChapterGroups.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3d6929d046a88e6426618cf58f9be65134826ad3
+index 0000000000000000000000000000000000000000..5befea651a8de85a3b2928f9b26be09e42415506
 --- /dev/null
 +++ b/src/activities/reader/HighlightChapterGroups.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,63 @@
 +#pragma once
 +#include <algorithm>
 +#include <cstdint>
@@ -3485,9 +3532,11 @@ index 0000000000000000000000000000000000000000..3d6929d046a88e6426618cf58f9be651
 +    for (const auto& group : groups)
 +      if (group.open) opened.push_back(group.chapter);
 +    entries = std::move(values);
-+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
++    const auto groupOrder = [](const Entry& a, const Entry& b) {
 +      return a.chapter != b.chapter ? a.chapter < b.chapter : a.clipping < b.clipping;
-+    });
++    };
++    if (!std::is_sorted(entries.begin(), entries.end(), groupOrder))
++      std::sort(entries.begin(), entries.end(), groupOrder);
 +    size_t count = 0;
 +    for (size_t i = 0; i < entries.size(); ++i)
 +      if (i == 0 || entries[i].chapter != entries[i - 1].chapter) ++count;
@@ -5583,10 +5632,10 @@ index 0000000000000000000000000000000000000000..dc37389e6aef97e8a10c3782a95ed657
 +};
 diff --git a/src/clippings/HighlightMerge.cpp b/src/clippings/HighlightMerge.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..5600106bd607f9aff2d28f792e63581900c4e19c
+index 0000000000000000000000000000000000000000..f8361a12186b9360a73365d1dbf03ab15d72431e
 --- /dev/null
 +++ b/src/clippings/HighlightMerge.cpp
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,132 @@
 +#include "HighlightMerge.h"
 +
 +#include <Logging.h>
@@ -5714,10 +5763,9 @@ index 0000000000000000000000000000000000000000..5600106bd607f9aff2d28f792e635819
 +      return Result::Added;
 +    }
 +  }
-+  index = CLIPPINGS.clippingCount();
 +  return CLIPPINGS.addClipping(metadata.spineIndex, metadata.startPage, metadata.endPage, metadata.pageCount,
 +                               metadata.startWordIndex, metadata.endWordIndex, metadata.wordCount, chapterTitle,
-+                               metadata.paragraphIndex, text, metadata.tableSelection, metadata.layoutSignature);
++                               metadata.paragraphIndex, text, metadata.tableSelection, metadata.layoutSignature, &index);
 +}
 +}  // namespace HighlightMerge
 diff --git a/src/clippings/HighlightMerge.h b/src/clippings/HighlightMerge.h
@@ -7650,10 +7698,10 @@ index 0000000000000000000000000000000000000000..31dc03b0a9449728840f979ab2328159
 +add_test(NAME clipping_store_safety COMMAND clipping_store_safety_test)
 diff --git a/test/clipping_store_safety/ClippingStoreSafetyTest.cpp b/test/clipping_store_safety/ClippingStoreSafetyTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b3ddb303c71d73f06ffe7cb5eda280e57a8d35d1
+index 0000000000000000000000000000000000000000..78299412026aac892334743ea32e9e1a2c541ab9
 --- /dev/null
 +++ b/test/clipping_store_safety/ClippingStoreSafetyTest.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,208 @@
 +#include <algorithm>
 +#include <cassert>
 +#include <cstdint>
@@ -7802,6 +7850,20 @@ index 0000000000000000000000000000000000000000..b3ddb303c71d73f06ffe7cb5eda280e5
 +  assert(files == before && writes == previousWrites && appends == previousAppends);
 +}
 +int main() {
++  {
++    ClippingStore clips;
++    files.clear();
++    assert(clips.loadForBook("book.epub", "Book", "Author", "epub"));
++    for (const uint16_t word : {uint16_t{7}, uint16_t{1}, uint16_t{4}}) {
++      size_t inserted = SIZE_MAX;
++      assert(clips.addClipping(0, 2, 2, 12, word, word + 1, 2, "Chapter", 0, "clipping", UINT16_MAX, 17,
++                               &inserted) == ClippingStore::AddResult::Added);
++      assert(clips.getClippings()[inserted].startWordIndex == word);
++    }
++    assert(clips.getClippings()[0].startWordIndex == 1);
++    assert(clips.getClippings()[1].startWordIndex == 4);
++    assert(clips.getClippings()[2].startWordIndex == 7);
++  }
 +  size_t truncations = 0;
 +  for (uint8_t version = 1; version <= 4; ++version) {
 +    const auto valid = database(version);
@@ -7850,7 +7912,7 @@ index 0000000000000000000000000000000000000000..b3ddb303c71d73f06ffe7cb5eda280e5
 +}
 diff --git a/test/clipping_store_safety/ExtractStoreSafety.py b/test/clipping_store_safety/ExtractStoreSafety.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6d757260fc423f6f8b848ed1771d8b7f97074838
+index 0000000000000000000000000000000000000000..45bfbf360f9aae902f5fec9dff910e6b06a4b207
 --- /dev/null
 +++ b/test/clipping_store_safety/ExtractStoreSafety.py
 @@ -0,0 +1,14 @@
@@ -7863,7 +7925,7 @@ index 0000000000000000000000000000000000000000..6d757260fc423f6f8b848ed1771d8b7f
 +    return source[start:end]
 +constants = source[source.index('constexpr uint8_t LEGACY_VERSION'):source.index('struct ClippingFileHeader')]
 +methods = [
-+ 'bool ClippingStore::loadForBook(', 'bool ClippingStore::readFromFile() {',
++ 'bool ClippingStore::loadForBook(', 'void ClippingStore::persistOccurrenceOrder()', 'bool ClippingStore::readFromFile() {',
 + 'bool ClippingStore::readFromFile(const std::string& path,', 'bool ClippingStore::saveToFile()',
 + 'bool ClippingStore::updateClippingText(', 'ClippingStore::AddResult ClippingStore::addClipping(',
 + 'bool ClippingStore::removeClippingAt(', 'bool ClippingStore::removeClippings(', 'void ClippingStore::clearAll()']
@@ -9821,10 +9883,10 @@ index 0000000000000000000000000000000000000000..68dab30a188cef56113d0fe09e364599
 +}
 diff --git a/test/highlight_word_edit/merge_stubs/ClippingStore.h b/test/highlight_word_edit/merge_stubs/ClippingStore.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..b80f1d0075a8ec7ce075e3ce1dbc7f8532b93c3d
+index 0000000000000000000000000000000000000000..05492fda1152b376448f076e998c6f3b50455ecb
 --- /dev/null
 +++ b/test/highlight_word_edit/merge_stubs/ClippingStore.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,77 @@
 +#pragma once
 +#include <algorithm>
 +#include <cstdint>
@@ -9852,7 +9914,7 @@ index 0000000000000000000000000000000000000000..b80f1d0075a8ec7ce075e3ce1dbc7f85
 +  }
 +  ClippingStore::AddResult addClipping(uint16_t spine, uint16_t start, uint16_t end, uint16_t pages, uint16_t first,
 +                                       uint16_t last, uint16_t words, const char*, uint16_t paragraph,
-+                                       const std::string& text, uint16_t table, uint32_t layout) {
++                                       const std::string& text, uint16_t table, uint32_t layout, size_t* index = nullptr) {
 +    if (failSave) return ClippingStore::AddResult::SaveFailed;
 +    Clipping clip;
 +    clip.spineIndex = spine;
@@ -9866,6 +9928,7 @@ index 0000000000000000000000000000000000000000..b80f1d0075a8ec7ce075e3ce1dbc7f85
 +    clip.tableSelection = table;
 +    clip.layoutSignature = layout;
 +    clip.text = text;
++    if (index) *index = records.size();
 +    records.push_back(clip);
 +    ++writes;
 +    ++adds;
