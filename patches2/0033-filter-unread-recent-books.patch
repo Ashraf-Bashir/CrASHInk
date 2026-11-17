@@ -1,0 +1,141 @@
+diff --git a/lib/LibraryIndex/LibraryViewCache.cpp b/lib/LibraryIndex/LibraryViewCache.cpp
+index 5cc3cabc13d3bea2337bd45fb9c1c53b6847f180..dd537a83242088037686f3466fe20853800d85d3 100644
+--- a/lib/LibraryIndex/LibraryViewCache.cpp
++++ b/lib/LibraryIndex/LibraryViewCache.cpp
+@@ -78,6 +78,11 @@ bool saveViewCache(bool recent, uint64_t key, uint16_t sourceCount, uint16_t cou
+   }
+   return true;
+ }
++void invalidateRecentViewCache() {
++  const char* file = path(true);
++  if (Storage.exists(file) && !Storage.remove(file)) LOG_ERR("LIB", "Cannot invalidate Library recents");
++}
++
+ void invalidateViewCache() {
+   for (const char* file : {"/crashink/library/library-filter.cache", "/crashink/library/library-recents.cache"})
+     if (Storage.exists(file) && !Storage.remove(file)) LOG_ERR("LIB", "Cannot invalidate library view cache");
+diff --git a/lib/LibraryIndex/LibraryViewCache.h b/lib/LibraryIndex/LibraryViewCache.h
+index 5a83945426232bc07bdfbdee1b54e82f6f34c231..ebb3fe70000f76a88a83ce25e302d380e52d6055 100644
+--- a/lib/LibraryIndex/LibraryViewCache.h
++++ b/lib/LibraryIndex/LibraryViewCache.h
+@@ -9,4 +9,5 @@ bool loadViewCache(bool recent, uint64_t key, uint16_t sourceCount, uint16_t& co
+ bool saveViewCache(bool recent, uint64_t key, uint16_t sourceCount, uint16_t count, const void* data, size_t bytes,
+                    uint16_t processed = UINT16_MAX);
+ void invalidateViewCache();
++void invalidateRecentViewCache();
+ }  // namespace library
+diff --git a/src/activities/home/RecentBookProgress.cpp b/src/activities/home/RecentBookProgress.cpp
+index 5ca02b0b136796dcb357864b30f45466b4ed57b5..19f2dcda6ba3a9cfa0aa6cf5d6d9bdbedc7e4316 100644
+--- a/src/activities/home/RecentBookProgress.cpp
++++ b/src/activities/home/RecentBookProgress.cpp
+@@ -3,6 +3,7 @@
+ #include <Epub.h>
+ #include <FsHelpers.h>
+ #include <HalStorage.h>
++#include <LibraryViewCache.h>
+ #include <Logging.h>
+ #include <Serialization.h>
+ #include <Txt.h>
+@@ -288,9 +289,13 @@ float RecentBookProgress::loadCachedEpubPercent(const RecentBook& book) {
+
+ void RecentBookProgress::saveCachedEpubPercent(const std::string& cachePath, const float progress) {
+   const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  const auto* entry = findPercent(cachePath);
++  const float previous = entry ? entry->percent : loadCachedEpubPercentFromCachePath(cachePath);
+   if (saveCachedEpubPercentToCachePath(cachePath, progress)) {
+     const auto basisPoints = static_cast<uint16_t>(clampProgressPercent(progress) * 100.0f + 0.5f);
+-    rememberPercent(cachePath, static_cast<float>(basisPoints) / 100.0f);
++    const float saved = static_cast<float>(basisPoints) / 100.0f;
++    rememberPercent(cachePath, saved);
++    if ((previous >= 0.5f) != (saved >= 0.5f)) library::invalidateRecentViewCache();
+   }
+ }
+
+@@ -298,6 +303,7 @@ void RecentBookProgress::invalidateEpubPercents() {
+   const std::lock_guard<std::mutex> lock(percentCacheMutex);
+   for (auto& entry : percentCache) entry.path.clear();
+   nextPercentSlot = 0;
++  library::invalidateRecentViewCache();
+ }
+
+ void RecentBookProgress::saveCachedEpubPercent(const Epub& epub, const int spineIndex, const int currentPage,
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index e4118dcc54e221a551843ec5114ae446ac052f7d..8726105697ff16ff6c216cd2c8132076112d2d52 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -313,38 +313,17 @@ void LibraryActivity::resolveRecents() {
+     }
+   }
+   warmedCoverView = 0;
+-  if (!query.empty() || SETTINGS.libraryHideFinishedBooks) {
+-    filterWork = makeUniqueNoThrow<FilterWork>();
+-    if (!filterWork) {
+-      LOG_ERR("LIB", "Cannot allocate recent filter scratch");
+-      filterFailed = true;
+-      return;
+-    }
+-    filterWork->cursor = resumeRow;
+-    filterWork->needle = library::fold(query);
+-    filterWork->combined.reserve(2 * UINT8_MAX + 1);
+-    filterWork->folded.reserve(2 * UINT8_MAX + 1);
++  // Saved progress is checked one book at a time after the first paint.
++  filterWork = makeUniqueNoThrow<FilterWork>();
++  if (!filterWork) {
++    LOG_ERR("LIB", "Cannot allocate recent filter scratch");
++    filterFailed = true;
+     return;
+   }
+-  const auto& books = RECENT_BOOKS.getBooks();
+-  const std::string needle = library::fold(query);
+-  std::string combined;
+-  std::string folded;
+-  for (size_t row = 0; row < books.size() && recentCount < RecentBooksStore::MAX_RECENT_BOOKS; ++row) {
+-    const auto& book = books[row];
+-    if (library::fileTypeFor(book.path) != library::FileEpub) continue;
+-    if (!needle.empty()) {
+-      readRecentBook(row, rowScratch);
+-      combined.assign(rowScratch.title);
+-      combined.push_back(' ');
+-      combined.append(rowScratch.author);
+-      library::foldInto(combined, folded);
+-      if (!library::matchesQuery(folded, needle)) continue;
+-    }
+-    if (SETTINGS.libraryHideFinishedBooks && BookActions::isBookCompleted(book.path)) continue;
+-    recentRows[recentCount++] = static_cast<uint16_t>(row);
+-  }
+-  library::saveViewCache(true, cachedViewKey, books.size(), recentCount, recentRows, sizeof(recentRows));
++  filterWork->cursor = resumeRow;
++  filterWork->needle = library::fold(query);
++  filterWork->combined.reserve(2 * UINT8_MAX + 1);
++  filterWork->folded.reserve(2 * UINT8_MAX + 1);
+ }
+
+ void LibraryActivity::advanceRecentFilter() {
+@@ -363,6 +342,7 @@ void LibraryActivity::advanceRecentFilter() {
+       library::foldInto(filterWork->combined, filterWork->folded);
+       include = library::matchesQuery(filterWork->folded, filterWork->needle);
+     }
++    if (include) include = RecentBookProgress::loadCachedEpubPercent(book) >= 0.5f;
+     if (include && SETTINGS.libraryHideFinishedBooks) include = !BookActions::isBookCompleted(book.path);
+     if (include) recentRows[recentCount++] = static_cast<uint16_t>(row);
+   }
+@@ -469,6 +449,8 @@ uint64_t LibraryActivity::viewCacheKey(const bool recent) const {
+                                  SETTINGS.libraryUseMetadata};
+   add(preferences, sizeof(preferences));
+   if (recent) {
++    constexpr uint8_t progressFilterVersion = 1;
++    add(&progressFilterVersion, sizeof(progressFilterVersion));
+     for (const auto& book : RECENT_BOOKS.getBooks()) {
+       add(book.path.data(), book.path.size());
+       const char zero = 0;
+@@ -1505,9 +1487,6 @@ bool LibraryActivity::paintGridCover(fui::DrawTarget& target, const fui::Rect re
+                 available ? rowScratch.title.c_str() : tr(STR_LIBRARY_UNAVAILABLE), style);
+   }
+   target.stroke(rect, ink, 1, 0);
+-  if (slot < gridProgressLoaded) {
+-    const int percent = gridProgress[slot];
+-    if (sort != Sort::RecentlyRead || percent > 0) CoverProgressBadge::draw(target, rect, percent);
+-  }
++  if (slot < gridProgressLoaded) CoverProgressBadge::draw(target, rect, gridProgress[slot]);
+   return true;
+ }
