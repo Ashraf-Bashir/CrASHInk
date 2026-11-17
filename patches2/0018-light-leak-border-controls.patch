@@ -1,0 +1,87 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f7fcb5b031655b0338b6e0fbe4447ac7f6163ef2..b3fc012b45aa00a14c60a5ff0a02f964a3906302 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,8 @@
+
+ ### Fixed
+
++- Light-leak border widths can be increased or decreased directly in Display settings.
++
+ - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
+
+ - Marking a book finished updates Library rows without restarting its filter; shifted history indices no longer leave stale covers. Swipes suppress delayed taps and physical page buttons page cover views. Home cover grid swipes through all retained reading history while keeping the current book featured.
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index ac3407d299a6b9a36035aa71080fec0957c8616d..c61440a4e510d34d798d78ed892113bf2761c05f 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -256,6 +256,13 @@ fui::BitmapRef frontlightScheduleEndpointIcon(const SettingInfo& setting) {
+   return {};
+ }
+
++bool isLightLeakBorderSetting(const SettingInfo& setting) {
++  return setting.valuePtr == &CrossPointSettings::lightLeakTop ||
++         setting.valuePtr == &CrossPointSettings::lightLeakRight ||
++         setting.valuePtr == &CrossPointSettings::lightLeakBottom ||
++         setting.valuePtr == &CrossPointSettings::lightLeakLeft;
++}
++
+ bool isTwoFingerSwipeSetting(const uint8_t CrossPointSettings::* const valuePtr) {
+   return valuePtr == &CrossPointSettings::twoFingerSwipeUp || valuePtr == &CrossPointSettings::twoFingerSwipeDown ||
+          valuePtr == &CrossPointSettings::twoFingerSwipeLeft || valuePtr == &CrossPointSettings::twoFingerSwipeRight;
+@@ -1074,6 +1081,10 @@ void SettingsActivity::toggleCurrentSetting() {
+     openScreenMarginPicker(setting);
+     return;
+   }
++  if (isLightLeakBorderSetting(setting)) {
++    openLightLeakBorderPicker(setting);
++    return;
++  }
+   if (setting.valuePtr == &CrossPointSettings::readingIdleTimeThresholdUnits) {
+     openIdleTimeThresholdPicker();
+     return;
+@@ -1338,6 +1349,24 @@ void SettingsActivity::openSleepTimeoutPicker() {
+       });
+ }
+
++void SettingsActivity::openLightLeakBorderPicker(const SettingInfo& setting) {
++  const auto edge = setting.valuePtr;
++  startActivityForResult(
++      std::make_unique<IntervalSelectionActivity>(
++          renderer, mappedInput, "LightLeakBorderInterval", setting.nameId, SETTINGS.*edge, setting.valueRange.min,
++          setting.valueRange.max, setting.valueRange.step, 4, StrId::STR_NONE_OPT,
++          /*readerActivity=*/false, /*allowPowerAsConfirm=*/false, /*ignoreInitialConfirmRelease=*/true,
++          /*showPercentValue=*/false, StrId::STR_NONE_OPT, /*overrideDisabledReaderTouchscreen=*/false,
++          /*showTouchHeaderBackButton=*/true, /*valueFormatter=*/nullptr, /*tapStep=*/1, /*useReaderSlider=*/true),
++      [this, edge](const ActivityResult& result) {
++        if (!result.isCancelled) {
++          SETTINGS.*edge = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
++          SETTINGS.saveToFile();
++        }
++        requestUpdate();
++      });
++}
++
+ void SettingsActivity::openLineHeightPicker() {
+   startActivityForResult(
+       std::make_unique<IntervalSelectionActivity>(
+@@ -1668,6 +1697,7 @@ void SettingsActivity::render(RenderLock&&) {
+                       (*currentSettings)[selectedSettingIndex - 1].type == SettingType::ACTION ||
+                       (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_FONT_FAMILY ||
+                       (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_TIME_TO_SLEEP ||
++                      isLightLeakBorderSetting((*currentSettings)[selectedSettingIndex - 1]) ||
+                       (*currentSettings)[selectedSettingIndex - 1].type == SettingType::STRING ||
+                       (*currentSettings)[selectedSettingIndex - 1].valuePtr == &CrossPointSettings::lineHeightPercent ||
+                       (*currentSettings)[selectedSettingIndex - 1].valuePtr ==
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 0029e4a59b646271e2d54162a9e269dadb86f032..95e56f56c1a3c532f50f95a59346b99b6762dadc 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -322,6 +322,7 @@ class SettingsActivity final : public Activity {
+   void openIdleTimeThresholdPicker();
+   void toggleCurrentSetting();
+   void openSleepTimeoutPicker();
++  void openLightLeakBorderPicker(const SettingInfo& setting);
+   void openLineHeightPicker();
+   void openFrontlightScheduleTimePicker(uint16_t CrossPointSettings::* valuePtr, StrId titleId);
+   void openStringEditor(const SettingInfo& setting);
