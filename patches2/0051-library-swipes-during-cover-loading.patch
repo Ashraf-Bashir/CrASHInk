@@ -1,0 +1,87 @@
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index e6d5133154125e6192aa060b848f703be7fb1f8e..9043f7bc50ec9907e7d1f00cd60c6f5436f2c006 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -849,15 +849,16 @@ void LibraryActivity::latchInput() {
+     touchStartX = touchLastX = x;
+     touchStartY = touchLastY = y;
+   }
++  constexpr int TAP_SLOP_PX = 28;
++  constexpr int DRAG_SCROLL_PX = 40;
+   if (touchTracking && mappedInput.isScreenTouchHeld(x, y)) {
+     touchLastX = x;
+     touchLastY = y;
+-    if (std::max(std::abs(x - touchStartX), std::abs(y - touchStartY)) > 28) touchMoved = true;
++    if (std::max(std::abs(x - touchStartX), std::abs(y - touchStartY)) > TAP_SLOP_PX) touchMoved = true;
+   }
+   const bool released = mappedInput.wasScreenTouchReleased();
+   const int travelX = std::abs(touchLastX - touchStartX);
+   const int travelY = std::abs(touchLastY - touchStartY);
+-  constexpr int DRAG_SCROLL_PX = 60;
+   // Classify before queuing any release. SDK flicks can arrive without a
+   // final held sample, and can coincide with a tap/long-press notification.
+   auto swipe = mappedInput.wasSwipe();
+@@ -870,10 +871,9 @@ void LibraryActivity::latchInput() {
+   }
+   auto snap = touchSnapshotFrom(mappedInput);
+   const bool navigated = swipe != MappedInputManager::SwipeDir::None;
+-  if (navigated || touchMoved ||
+-      (released && touchTracking &&
+-       std::max(std::abs(snap.touchX - touchStartX), std::abs(snap.touchY - touchStartY)) > 28))
+-    touchCancelled = true;
++  // Release coordinates from the SDK are the touch-down point. Only trust
++  // a tap if we saw the contact begin and its sampled motion stayed in slop.
++  if (navigated || touchMoved || (snap.touchReleased && !touchTracking)) touchCancelled = true;
+   const bool cancelled = touchCancelled;
+   if (snap.touchPressed && !cancelled) queueInput(Type::TouchPress, snap.touchX, snap.touchY);
+   if (navigated || (snap.touchReleased && cancelled)) {
+@@ -953,6 +953,9 @@ void LibraryActivity::loop() {
+     handleInput(input);
+     return;
+   }
++  // Keep sampling the finger while it moves. An SD read here can miss the
++  // motion samples and leave the controller with only a tap-sized contact.
++  if (touchTracking) return;
+   // One metadata entry per idle input cycle; no ZIP parsing or automatic rebuild.
+   advanceFilter();
+   pollLibraryChanges();
+diff --git a/test/library_thumbnails/LibraryTouchTest.cpp b/test/library_thumbnails/LibraryTouchTest.cpp
+index 4260f1d324f942edcd7f40eae79d2ffd1d5cd9a8..cb05c0a8b42a654eb0caa68eb211017d485b203f 100644
+--- a/test/library_thumbnails/LibraryTouchTest.cpp
++++ b/test/library_thumbnails/LibraryTouchTest.cpp
+@@ -74,7 +74,7 @@ TEST(LibraryTouch, SlowHorizontalDragPagesAndCannotOpenCover) {
+   input.x = 150;
+   screen.captureTouch();
+   input.down = false;
+-  input.x = 50;
++  input.x = 106;
+   input.snap = {};
+   screen.captureTouch();
+   screen.pending.clear();
+@@ -108,7 +108,9 @@ TEST(LibraryTouch, MovingAwayAndBackCancelsTapButStationaryHoldKeepsMenu) {
+   ASSERT_TRUE(screen.pending.pop(event));
+   EXPECT_EQ(event.x, -1);
+   screen = LibraryActivity{};
+-  screen.mappedInput.released = true;
++  screen.mappedInput.down = true;
++  screen.captureTouch();
++  screen.mappedInput.down = false;
+   screen.mappedInput.snap = {false, true, true, 100, 100};
+   screen.captureTouch();
+   ASSERT_TRUE(screen.pending.pop(event));
+@@ -146,3 +148,15 @@ TEST(LibraryTouch, ReleaseAfterEarlierFlickStaysCancelledUntilFreshContact) {
+   ASSERT_TRUE(screen.pending.pop(event));
+   EXPECT_EQ(event.x, 100);
+ }
++
++TEST(LibraryTouch, ReleaseWithoutTrackedContactCannotOpenCover) {
++  LibraryActivity screen;
++  screen.mappedInput.released = true;
++  screen.mappedInput.snap = {false, true, false, 100, 100};
++  screen.captureTouch();
++  LibraryInputBuffer::Event event;
++  ASSERT_TRUE(screen.pending.pop(event));
++  EXPECT_EQ(event.type, Type::TouchRelease);
++  EXPECT_EQ(event.x, -1);
++  EXPECT_FALSE(screen.pending.pop(event));
++}
