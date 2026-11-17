@@ -1,0 +1,101 @@
+diff --git a/lib/hal/HalFrontlight.cpp b/lib/hal/HalFrontlight.cpp
+index 2abea91af2bc5a2e37653eb202cc0bb19708fb19..4a44a1357f11f67bd4c4f42caa719f74ffa06a64 100644
+--- a/lib/hal/HalFrontlight.cpp
++++ b/lib/hal/HalFrontlight.cpp
+@@ -8,6 +8,9 @@ void HalFrontlight::begin(const uint8_t brightness, const uint8_t warmth, const
+   if (!manager.present()) {
+     return;
+   }
++#ifdef FREEINK_FRONTLIGHT_LS
++  manager.releaseOnWake();
++#endif
+   manager.begin();
+   lastBrightness = brightness > 100 ? 100 : brightness;
+   manager.setColorTemperature(warmth > 100 ? 100 : warmth);
+@@ -34,3 +37,11 @@ void HalFrontlight::setOn(const bool on) {
+   lit = on;
+   manager.setBrightness(lit ? lastBrightness : 0);
+ }
++
++void HalFrontlight::prepareForDeepSleep() {
++  if (!manager.present()) return;
++  setOn(false);
++#ifdef FREEINK_FRONTLIGHT_LS
++  manager.park();
++#endif
++}
+diff --git a/lib/hal/HalFrontlight.h b/lib/hal/HalFrontlight.h
+index 723c767e35e5c6f0764125ff8771ffe8b4496f7b..a37047ef6fce197355cb396f337a60eba6872abf 100644
+--- a/lib/hal/HalFrontlight.h
++++ b/lib/hal/HalFrontlight.h
+@@ -22,6 +22,7 @@ class HalFrontlight {
+   // Warm/cool mix, 0 = cool .. 100 = warm. No-op on single-channel boards.
+   void setWarmth(uint8_t warmPercent);
+   void setOn(bool on);
++  void prepareForDeepSleep();
+
+   uint8_t brightness() const { return lastBrightness; }
+   uint8_t warmth() const { return manager.colorTemperature(); }
+diff --git a/platformio.ini b/platformio.ini
+index 567780f8590b57b940a3be59ca130d96425ecd1b..f896ea3dd3c412f556ae645c6cafc9c7bb3b95a4 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -414,6 +414,7 @@ build_flags =
+   -DFREEINK_FONT_ENABLE_MONOCHROME=1
+   ${base.build_flags}
+   -DFREEINK_DEVICE_X4PRO=1
++  -DFREEINK_FRONTLIGHT_LS=1
+   -DCROSSINK_APP_CAP_TOUCH=1
+   -DFREEINK_CAP_USB_MSC=1
+   -DCROSSINK_APP_CAP_USB_DRIVE=1
+@@ -447,6 +448,7 @@ build_flags =
+   -DFREEINK_FONT_ENABLE_MONOCHROME=1
+   ${base.build_flags}
+   -DFREEINK_DEVICE_X4PRO=1
++  -DFREEINK_FRONTLIGHT_LS=1
+   -DCROSSINK_APP_CAP_TOUCH=1
+   -DFREEINK_CAP_USB_MSC=1
+   -DCROSSINK_APP_CAP_USB_DRIVE=1
+diff --git a/src/main.cpp b/src/main.cpp
+index daaaaf8bc860a13f294900644dee24ee12618a4d..a9f3c44380a803f46f7b161fc4aff4664ae06beb 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1170,6 +1170,10 @@ void enterDeepSleep(bool fromTimeout) {
+   // can be written again until the next wake.
+   BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Sleep, BoardConfig::ACTIVE.name);
+
++  // Keep the light off even if Readest sync requires a temporary network boot.
++  // The user's wake preference stays in settings.
++  Frontlight.setOn(false);
++
+   // "Readest Auto-Sync": the sleep screen is on the panel. Reboot into the lean
+   // network mode to sync the book that was open, then sleep from there.
+   if (!readestSleepSyncBoot && shouldReadestAutoSync(leavingBook)) {
+@@ -1188,6 +1192,7 @@ void enterDeepSleep(bool fromTimeout) {
+   mirrorWakeShortPressToNvs();
+   LOG_DBG("MAIN", "Entering deep sleep");
+
++  Frontlight.prepareForDeepSleep();
+   powerManager.startDeepSleep(gpio);
+ }
+
+@@ -1216,6 +1221,7 @@ void enterDeepSleepAfterReadestSync(const bool keepSleepFrame) {
+   display.deepSleep();
+   mirrorWakeShortPressToNvs();
+   LOG_DBG("MAIN", "Entering deep sleep after Readest sync");
++  Frontlight.prepareForDeepSleep();
+   powerManager.startDeepSleep(gpio);
+ }
+
+@@ -1916,5 +1922,11 @@ void loop() {
+       lastActivityTime = millis();
+     }
+     mappedInputManager.clearInjectedReleases();
++    // Quick Lock bypasses the normal idle loop below. Yield between unlock
++    // polls and apply the same clock reduction while the display is static.
++    if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
++      powerManager.setPowerSaving(true);
++    }
++    delay(20);
+     return;
+   }
