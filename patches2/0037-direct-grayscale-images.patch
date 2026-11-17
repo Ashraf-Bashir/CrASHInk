@@ -188,7 +188,7 @@ index bcae0a6e17d4e78715b00b632b5b1fbb44a39917..28ac298b9379d130e4649cb356b7d96c
 
  // Preserves the live BW buffer and existing controller synchronization. False
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index a2cb50143a2928062c8f350e4655c7ecb79508d3..9cb5cccf3cd3a1cbd439fe79c5a18fcd98023ef5 100644
+index a2cb50143a2928062c8f350e4655c7ecb79508d3..1243a1885cb2f3c8d69496119534dae5386f411a 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -7605,6 +7605,9 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
@@ -210,21 +210,41 @@ index a2cb50143a2928062c8f350e4655c7ecb79508d3..9cb5cccf3cd3a1cbd439fe79c5a18fcd
      const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
      page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
      finalizeBufferComposition();
-@@ -7693,6 +7696,14 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7693,6 +7696,12 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    if (!updatePanel) {
      return true;
    }
 +  if (EpubGrayscale::runCombinedImagePass(renderer, *page, fontId, orientedMarginLeft, orientedMarginTop,
 +                                         combinedImagePlane.get())) {
-+    // The next BW page still needs to clear the panel's retained gray charge.
 +    cleanImageBasePending = false;
-+    pagesUntilFullRefresh = 1;
 +    return true;
 +  }
 +  combinedImagePlane.reset();
    const bool needsAnyGrayscale = needsTextGrayscale || needsImageGrayscale;
    const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
    const bool overlapRefresh =
+@@ -7725,21 +7734,6 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+     } else {
+       renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
+     }
+-    // The image's own page is handled above and doesn't count toward the full
+-    // refresh cadence. But the grayscale pass below leaves gray charge in the
+-    // image region that a plain fast diff on the *next* page can't clear, so
+-    // text there ghosts gray (#2190). Force the next ordinary page onto the
+-    // HALF ghost-cleanup path, which drives every pixel to its target
+-    // regardless of residue.
+-    // Small inline images (icons, symbols set in a line of text) leave too little
+-    // gray charge to ghost, so they skip the forced cleanup and the whole-panel
+-    // flash that comes with it. Only pages whose images cover at least 1/20 of
+-    // the screen force it.
+-    const int32_t screenArea = static_cast<int32_t>(renderer.getScreenWidth()) * renderer.getScreenHeight();
+-    const bool smallImagesOnly = page->imageArea() * 20 < screenArea;
+-    if (!smallImagesOnly) {
+-      pagesUntilFullRefresh = 1;
+-    }
+   } else if (needsAnyGrayscale) {
+     if (pagesUntilFullRefresh <= 1) {
+       // Cleanup turns still need the stronger HALF pass, but X3 grayscale
 diff --git a/test/epub_grayscale/CMakeLists.txt b/test/epub_grayscale/CMakeLists.txt
 index b7555ba1b07ee331d85f362826af9a9ebb765a04..4b584972d13b90b681b0a5f9410c93c0bd3b3fe4 100644
 --- a/test/epub_grayscale/CMakeLists.txt
