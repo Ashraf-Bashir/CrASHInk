@@ -818,10 +818,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8798bec5d3480ccf616e4ce315026445
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4cf43c28d8ffcaabc7d2ba4f22528e71792b5743
+index 0000000000000000000000000000000000000000..848b2b5e5af13ba2815ccab3b451a84c8565d038
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2247 @@
+@@ -0,0 +1,2258 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1041,7 +1041,8 @@ index 0000000000000000000000000000000000000000..4cf43c28d8ffcaabc7d2ba4f22528e71
 +  void loop() override {
 +    using Button = MappedInputManager::Button;
 +    using Swipe = MappedInputManager::SwipeDir;
-+    if (mappedInput.wasReleased(Button::Back) || TouchHeaderBackButton::wasTapped(mappedInput, renderer)) return finish();
++    if (mappedInput.wasReleased(Button::Back) || mappedInput.wasReleased(Button::Confirm) ||
++        TouchHeaderBackButton::wasTapped(mappedInput, renderer)) return finish();
 +    const auto button = doneButton();
 +    if (mappedInput.wasTapInRect(button.x, button.y, button.width, button.height)) return finish();
 +    const auto swipe = mappedInput.wasSwipe();
@@ -2675,6 +2676,7 @@ index 0000000000000000000000000000000000000000..4cf43c28d8ffcaabc7d2ba4f22528e71
 +      else requestUpdate();
 +    }
 +  }
++  if (isErrorNotice(message) && mappedInput.wasReleased(Button::Confirm)) return showErrorDetails();
 +  if (mappedInput.wasReleased(Button::Up)) return nextPage(-1);
 +  if (mappedInput.wasReleased(Button::Down)) return nextPage(1);
 +  int x = 0, y = 0;
@@ -2780,9 +2782,9 @@ index 0000000000000000000000000000000000000000..4cf43c28d8ffcaabc7d2ba4f22528e71
 +  }
 +  if (tapped && isErrorNotice(message)) {
 +    const auto bounds = layout();
-+    if (tapY >= bounds.rowBottom && tapY < bounds.footer &&
-+        tapX >= bounds.x + bounds.width / 4 && tapX < bounds.x + bounds.width * 3 / 4) {
++    if (tapY >= bounds.rowBottom && tapY < bounds.footer && tapX >= bounds.x && tapX < bounds.x + bounds.width) {
 +      tracking = false;
++      mappedInput.suppressCurrentTouchContact();
 +      return showErrorDetails();
 +    }
 +  }
@@ -2997,23 +2999,32 @@ index 0000000000000000000000000000000000000000..4cf43c28d8ffcaabc7d2ba4f22528e71
 +    renderer.drawRoundedRect(x, bounds.top + 5, width, 24, 1, 7, true);
 +    renderer.drawText(SMALL_FONT_ID, x + 8, bounds.top + 8, status);
 +  }
-+  if (saving || connectingWifi || awaitingOutline || !requestedBranch.empty() || message || total > 1 || placements.empty()) {
++  const bool error = isErrorNotice(message);
++  if (error) {
++    const int buttonWidth = std::max(84, renderer.getTextWidth(SMALL_FONT_ID, tr(STR_MORE)) + 30);
++    const int buttonX = bounds.x + bounds.width - buttonWidth;
++    const int buttonY = bounds.rowBottom + 2;
++    const int buttonHeight = bounds.footer - buttonY - 3;
++    const int textY = buttonY + (buttonHeight - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
++    const auto summary = renderer.truncatedText(SMALL_FONT_ID, message, bounds.width - buttonWidth - 16);
++    renderer.drawText(SMALL_FONT_ID, bounds.x + 6, textY, summary.c_str());
++    renderer.drawRoundedRect(buttonX, buttonY, buttonWidth, buttonHeight, 1, 4, true);
++    renderer.drawText(SMALL_FONT_ID, buttonX + 9, textY, tr(STR_MORE));
++    const int tip = buttonX + buttonWidth - 9, mid = buttonY + buttonHeight / 2;
++    renderer.drawLine(tip - 5, mid - 4, tip, mid);
++    renderer.drawLine(tip, mid, tip - 5, mid + 4);
++  } else if (saving || connectingWifi || awaitingOutline || !requestedBranch.empty() ||
++             message || total > 1 || placements.empty()) {
 +    char pages[24];
 +    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
-+    const bool error = isErrorNotice(message);
-+    const char* footer = error ? message : saving ? tr(STR_WORKFLOWY_SENDING)
++    const char* footer = saving ? tr(STR_WORKFLOWY_SENDING)
 +                       : (connectingWifi || awaitingOutline || !requestedBranch.empty()) ? tr(STR_LOADING_POPUP)
 +                       : message ? message : (placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : pages);
 +    const int textY = bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5;
 +    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
 +    renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
-+    if (error) {
-+      const int width = renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str());
-+      const int x = bounds.x + (bounds.width - width) / 2;
-+      renderer.drawLine(x, bounds.footer - 3, x + width, bounds.footer - 3);
-+    }
 +  }
-+  if (total > 1) {
++  if (!error && total > 1) {
 +    const int y = (bounds.rowBottom + bounds.footer) / 2;
 +    for (const int direction : {-1, 1}) {
 +      const bool enabled = direction < 0 ? page > 0 : page + 1 < total;
