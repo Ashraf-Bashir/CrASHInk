@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- Workflowy Calendar, Refresh, and selection accept recognized taps without requiring a separate touch edge. Selected rows are shaded light gray.
+
 - Workflowy vertical swipes take precedence over tap-to-edit.
 
 - Workflowy closes background reads before sending a foreground save. Errors show in a tappable banner with scrollable details, and Undo stays visible when unavailable.
