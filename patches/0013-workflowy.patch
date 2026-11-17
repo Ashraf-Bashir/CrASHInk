@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..48fe15952a0a58fc74fda1a60fd07b674b66c8d0 100644
+index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..a5d6d6f54380ed59384d6ae330500a8896f2c262 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -609,6 +609,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..48fe15952a0a58fc74fda1a60fd07b67
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1078,3 +1096,40 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1078,3 +1096,41 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -81,6 +81,7 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..48fe15952a0a58fc74fda1a60fd07b67
 +STR_WORKFLOWY_RESPONSE_DETAILS: "The response was invalid or too large to read."
 +STR_WORKFLOWY_COMPLETE_FAILED: "Could not mark the item done"
 +STR_WORKFLOWY_UNCOMPLETE_FAILED: "Could not mark the item undone"
++STR_WORKFLOWY_MOVE_TOP: "Move to top"
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -818,10 +819,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8798bec5d3480ccf616e4ce315026445
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078824db468
+index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953e9320cbd
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2259 @@
+@@ -0,0 +1,2302 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1949,13 +1950,16 @@ index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078
 +  const int complete = rows[row].todo ? static_cast<int>(options.size()) : -1;
 +  if (complete >= 0)
 +    options.emplace_back(rows[row].done ? tr(STR_WORKFLOWY_MARK_UNDONE) : tr(STR_WORKFLOWY_MARK_DONE));
++  const int moveTop = (zoomId.empty() || row != 0) && moveOrigin(row).after ? static_cast<int>(options.size()) : -1;
++  if (moveTop >= 0) options.emplace_back(tr(STR_WORKFLOWY_MOVE_TOP));
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
 +                             0, false, true),
-+                         [this, row, complete](const ActivityResult& result) {
++                         [this, row, complete, moveTop](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const int selected = std::get<OptionSelectionResult>(result.data).index;
 +    const auto id = rows[row].id;
++    if (moveTop >= 0 && selected == moveTop) return moveToTop(row);
 +    if (complete >= 0 && selected == complete) return toggle(row);
 +    if (selected == 0) return edit(row);
 +    if (selected == 5 || selected == 6) return edit(row, selected == 5 ? -1 : 1);
@@ -2486,6 +2490,40 @@ index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078
 +  return origin;
 +}
 +
++void WorkflowyDailyActivity::moveToTop(size_t row) {
++  if (pendingSave || rows[row].id == zoomId) return;
++  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  const auto id = rows[row].id;
++  const auto origin = moveOrigin(row);
++  if (!origin.after) return;
++  JsonDocument update;
++  update["parent_id"] = origin.parent;
++  update["position"] = "top";
++  queueSave("/" + id + "/move", encode(update), false, [this, id, origin](const Save& save) {
++    if (save.status < 200 || save.status >= 300) return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++    {
++      RenderLock lock(*this);
++      const auto rotateBranch = [&](std::vector<Node>& outline) {
++        const auto item = std::find_if(outline.begin(), outline.end(), [&](const Node& node) { return node.id == id; });
++        if (item == outline.end()) return;
++        const auto depth = item->depth;
++        auto first = item;
++        while (first != outline.begin() && std::prev(first)->depth >= depth) --first;
++        auto end = item + 1;
++        while (end != outline.end() && end->depth > depth) ++end;
++        std::rotate(first, item, end);
++      };
++      rotateBranch(rows);
++      for (auto& view : viewStack) rotateBranch(view.rows);
++      const auto moved = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++      if (moved != rows.end()) wrapAnchor = static_cast<int>(moved - rows.begin());
++      layoutDirty = true;
++      message = nullptr;
++    }
++    offerUndo([this, id, origin] { return restoreMove(id, origin); });
++  });
++}
++
 +bool WorkflowyDailyActivity::restoreMove(const std::string& id, const MoveOrigin& origin) {
 +  if (!moveNode(id, origin.parent)) return false;
 +  removeNode(id);
@@ -2861,24 +2899,27 @@ index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078
 +  const int row = rowAt(x, y);
 +  if (row < 0) return;
 +  const int indent = std::min<unsigned>(rows[row].depth, 8) * 16;
-+  if (held) actions(row);
-+  else if (rows[row].todo && x < bounds.x + indent + 30) toggle(row);
-+  else {
-+    size_t cursor = std::string::npos;
-+    {
-+      RenderLock lock(*this);
-+      const auto end = page + 1 < pageStarts.size() ? pageStarts[page + 1] : placements.size();
-+      for (auto i = pageStarts[page]; i < end; ++i) {
-+        const auto& placement = placements[i];
-+        if (placement.row != static_cast<size_t>(row) || y < placement.top || y >= placement.bottom) continue;
++  if (held) return actions(row);
++  size_t cursor = std::string::npos;
++  bool checkboxHit = false;
++  {
++    RenderLock lock(*this);
++    const auto end = page + 1 < pageStarts.size() ? pageStarts[page + 1] : placements.size();
++    for (auto i = pageStarts[page]; i < end; ++i) {
++      const auto& placement = placements[i];
++      if (placement.row != static_cast<size_t>(row) || y < placement.top || y >= placement.bottom) continue;
++      const bool firstFragment = i == 0 || placements[i - 1].row != placement.row;
++      checkboxHit = firstFragment && rows[row].todo && x < bounds.x + indent + 30;
++      if (!checkboxHit) {
 +        const auto line = std::min(placement.lineCount - 1,
 +                                  static_cast<size_t>(std::max(0, y - placement.top - 6) / bounds.lineHeight));
 +        cursor = cursorAt(rows[row].title, outlineLines[placement.firstLine + line], x - bounds.x - indent - 25);
-+        break;
 +      }
++      break;
 +    }
-+    edit(row, 0, cursor);
 +  }
++  if (checkboxHit) return toggle(row);
++  edit(row, 0, cursor);
 +}
 +
 +void WorkflowyDailyActivity::render(RenderLock&&) {
@@ -2924,16 +2965,19 @@ index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int start = bounds.x + indent;
 +    if (node.depth) renderer.drawLine(start - 7, y - 5, start - 7, placement.bottom - 1);
-+    if (node.todo) {
-+      if (node.done) {
-+        renderer.fillRect(start + 1, y + 4, 18, 18);
-+        renderer.drawLine(start + 5, y + 12, start + 8, y + 15, 2, false);
-+        renderer.drawLine(start + 8, y + 15, start + 14, y + 8, 2, false);
++    const bool firstFragment = i == 0 || placements[i - 1].row != placement.row;
++    if (firstFragment) {
++      if (node.todo) {
++        if (node.done) {
++          renderer.fillRect(start + 1, y + 4, 18, 18);
++          renderer.drawLine(start + 5, y + 12, start + 8, y + 15, 2, false);
++          renderer.drawLine(start + 8, y + 15, start + 14, y + 8, 2, false);
++        } else {
++          renderer.drawRect(start + 1, y + 4, 18, 18);
++        }
 +      } else {
-+        renderer.drawRect(start + 1, y + 4, 18, 18);
++        renderer.fillRoundedRect(start + 6, y + 10, 7, 7, 3, Color::Black);
 +      }
-+    } else {
-+      renderer.fillRect(start + 6, y + 11, 5, 5);
 +    }
 +    const int textX = start + 25;
 +    const auto title = std::string_view(node.title);
@@ -2972,7 +3016,7 @@ index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078
 +      const int marker = dropAfter || dropInside ? placement.bottom - 1 : placement.top;
 +      renderer.drawLine(start + (dropInside ? 16 : 0), marker, bounds.x + bounds.width - 1, marker, 2, true);
 +    }
-+    if (!node.leaf && node.id != zoomId) {
++    if (firstFragment && !node.leaf && node.id != zoomId) {
 +      paintedArrows.push_back({node.id, placement.top, placement.bottom});
 +      const int tipX = bounds.x + bounds.width - 10;
 +      const int xs[3] = {tipX - 5, tipX + 4, tipX - 5};
@@ -3063,30 +3107,30 @@ index 0000000000000000000000000000000000000000..43fdaad2a29d1af1fea70d9bc230a078
 +  renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
 +  renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
 +  x = iconX(3);
-+  if (undoReady) renderer.fillRoundedRect(x - 15, iconY - 13, 30, 26, 4, Color::Black);
 +  const int undoWidth = undoReady ? 2 : 1;
-+  renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, !undoReady);
-+  renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, !undoReady);
-+  renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, undoWidth, !undoReady);
-+  renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, undoWidth, !undoReady);
-+  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, !undoReady);
-+  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, !undoReady);
++  renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, true);
++  renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, true);
++  renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, undoWidth, true);
++  renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, undoWidth, true);
++  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, true);
++  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
 +  x = iconX(4);
-+  if (wrapItems) renderer.fillRoundedRect(x - 15, iconY - 13, 30, 26, 4, Color::LightGray);
-+  renderer.drawLine(x - 9, iconY - 6, x + 8, iconY - 6, 2, true);
-+  renderer.drawLine(x + 8, iconY - 6, x + 8, iconY + 3, 2, true);
-+  renderer.drawLine(x - 7, iconY + 3, x + 8, iconY + 3, 2, true);
-+  renderer.drawLine(x - 7, iconY + 3, x - 3, iconY - 1, 2, true);
-+  renderer.drawLine(x - 7, iconY + 3, x - 3, iconY + 7, 2, true);
++  const int wrapWidth = wrapItems ? 2 : 1;
++  renderer.drawLine(x - 11, iconY - 7, x + 4, iconY - 7, wrapWidth, true);
++  renderer.drawLine(x - 11, iconY, x + 2, iconY, wrapWidth, true);
++  renderer.drawLine(x - 11, iconY + 7, x - 3, iconY + 7, wrapWidth, true);
++  renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
++  renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
++  renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
 +  if (loading) GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
 +  else renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..289cc45906eedac38936311cdd9f7a7e6ded4013
+index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa4241bb18e8
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,197 @@
 +#pragma once
 +
 +#include <atomic>
@@ -3178,6 +3222,7 @@ index 0000000000000000000000000000000000000000..289cc45906eedac38936311cdd9f7a7e
 +    bool after;
 +  };
 +  MoveOrigin moveOrigin(size_t source) const;
++  void moveToTop(size_t row);
 +  bool restoreMove(const std::string& id, const MoveOrigin& origin);
 +  bool reorderSiblings(const std::string& parentId, const std::string& parentNode, unsigned depth,
 +                       std::string sourceId, std::string targetId, bool after, bool recordUndo);

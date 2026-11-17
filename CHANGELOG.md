@@ -6,11 +6,11 @@
 - Workflowy supports Undo for completion, reordering, and moving. An eight-second Undo window precedes permanent deletion.
 - Drag a Workflowy row down and right to nest it under a sibling. The drop line shows the new level.
 - Offline captures are saved to the SD card and sent on reconnect. A header badge shows the pending count.
-- Workflowy can add items above or below a sibling. An item starting with `[]` becomes a todo.
+- Workflowy can add items above or below a sibling and move an item to the top of its sibling list. An item starting with `[]` becomes a todo.
 
 ### Changed
 
-- The date, completed count, Calendar, and Refresh are at the top. Back, Show completed, Add, Undo, and Wrap are at the bottom. Wrapped items use the remaining page space and show three dots when they continue.
+- The date, completed count, Calendar, and Refresh are at the top. Back, Show completed, Add, Undo, and Wrap are at the bottom. Wrapped items use the remaining page space and show three dots after the last visible text when they continue. The next fragment starts with text. Wrap and Back use distinct icons without a fill.
 - Workflowy tries saved Wi-Fi networks in the background. Text edits, new items, checkboxes, and queued captures save without blocking the outline.
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
