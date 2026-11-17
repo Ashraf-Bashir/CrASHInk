@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..373ea596c82ca7616426149f2eef1bf628c9fb82 100644
+index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..fa4d09d66341c8ac346e4116bbdbfc344adfc1c7 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -609,6 +609,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..373ea596c82ca7616426149f2eef1bf6
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1078,3 +1096,30 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1078,3 +1096,39 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -71,6 +71,15 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..373ea596c82ca7616426149f2eef1bf6
 +STR_WORKFLOWY_OUTBOX_SENT: "Already in Workflowy"
 +STR_WORKFLOWY_OUTBOX_RETRY: "Send again"
 +STR_WORKFLOWY_ORDER_CHANGED: "Parent restored. Order changed."
++STR_WORKFLOWY_MARK_DONE: "Mark done"
++STR_WORKFLOWY_MARK_UNDONE: "Mark undone"
++STR_WORKFLOWY_COMPLETED_HIDDEN: "Completed items are hidden"
++STR_WORKFLOWY_ERROR_DETAILS: "Workflowy error details"
++STR_WORKFLOWY_LOCAL_SAVE_DETAILS: "Check the SD card and the Workflowy key used to queue these items."
++STR_WORKFLOWY_NO_WIFI_DETAILS: "The device is disconnected from Wi-Fi."
++STR_WORKFLOWY_CLOCK_DETAILS: "The device needs a valid clock to connect securely."
++STR_WORKFLOWY_RATE_LIMIT: "Workflowy is limiting requests. Try again shortly."
++STR_WORKFLOWY_RESPONSE_DETAILS: "The response was invalid or too large to read."
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -159,6 +168,19 @@ index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882
    bool readClippingPreview(size_t index, std::string& out) const;
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
+diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
+index c8632d51a6c0eea1826a12e30bcdc227c0437854..af1bb210b0bb1ec5a15751a11c6b1eb46e5798f4 100644
+--- a/src/activities/ActivityResult.h
++++ b/src/activities/ActivityResult.h
+@@ -18,6 +18,8 @@ struct WifiResult {
+
+ struct KeyboardResult {
+   std::string text;
++  bool alternate = false;
++  bool itemMenu = false;
+ };
+
+ struct MenuResult {
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
 index 9043f7bc50ec9907e7d1f00cd60c6f5436f2c006..c378a8a89cb7b6e620e6900e8e611395662dd6fe 100644
 --- a/src/activities/library/LibraryActivity.cpp
@@ -665,7 +687,7 @@ index 0000000000000000000000000000000000000000..8d7e545627fbd94feb289ed0c08eee87
 +  void complete(const char* message);
 +};
 diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
-index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..0b71280cac61e6a30913b0caf447c4b58771e657 100644
+index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c546135082ea8ac7 100644
 --- a/src/activities/util/KeyboardEntryActivity.cpp
 +++ b/src/activities/util/KeyboardEntryActivity.cpp
 @@ -137,7 +137,7 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
@@ -677,404 +699,218 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..0b71280cac61e6a30913b0caf447c4b5
    layoutId = inputType == InputType::Url ? fui::KeyboardLayoutId::QwertyEn : keyboard_layouts::startingLayout();
    const uint16_t enabledLayouts = keyboard_layouts::enabled();
    showLangKey = (enabledLayouts & (enabledLayouts - 1)) != 0;
-@@ -440,6 +440,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
-   // Key taps are the overwhelmingly common case; they land on the keyboard,
-   // never the text field, so skip the wrap/measure work entirely.
-   if (y >= keyboardRect().y) return InputFieldTouchTarget::None;
-+  if (inlineHit) {
-+    return inlineHit(text, x, y, position) ? InputFieldTouchTarget::Cursor : InputFieldTouchTarget::None;
-+  }
+@@ -435,6 +435,18 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
+   return best < firstCharEnd ? firstCharEnd : best;
+ }
 
-   const int pageWidth = renderer.getScreenWidth();
-   const auto& metrics = UITheme::getInstance().getMetrics();
-@@ -785,186 +788,192 @@ void KeyboardEntryActivity::render(RenderLock&&) {
++int KeyboardEntryActivity::firstVisibleInputLine(std::string& display, int width, int capacity) const {
++  if (!itemMenu) return 0;
++  int first = 0, start = 0, before = 0;
++  while (start < static_cast<int>(display.size())) {
++    const int end = lineBreakEnd(display, start, width);
++    if (end >= static_cast<int>(display.size()) || cursorPos < static_cast<size_t>(end)) break;
++    start = end;
++    if (++before >= capacity) first = lineBreakEnd(display, first, width);
++  }
++  return first;
++}
++
+ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTouchTargetFromPoint(
+     const int x, const int y, size_t& position) const {
+   // Key taps are the overwhelmingly common case; they land on the keyboard,
+@@ -464,7 +476,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+   const bool centerText = metrics.keyboardCenteredText;
+   std::string displayText = displayTextForCurrentState();
+
+-  int lineStartIdx = 0;
++  const int capacity = std::max(1, (keyboardRect().y - inputStartY - 6) / lineHeight);
++  int lineStartIdx = firstVisibleInputLine(displayText, maxLineWidth, capacity);
+   int lineY = inputStartY;
+   int lastLineStartIdx = 0;
+   int lastLineEndIdx = static_cast<int>(displayText.length());
+@@ -516,7 +529,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+       return InputFieldTouchTarget::Cursor;
+     }
+
+-    if (lineEndIdx == static_cast<int>(displayText.length())) {
++    if (lineEndIdx == static_cast<int>(displayText.length()) ||
++        (itemMenu && lineY + lineHeight >= inputStartY + capacity * lineHeight)) {
+       break;
+     }
+
+@@ -562,6 +576,21 @@ void KeyboardEntryActivity::loop() {
+     return;
+   }
+
++  if (itemMenu) {
++    const auto action = itemMenuRect();
++    if (mappedInput.wasTapInRect(action.x, action.y, action.width, action.height)) {
++      onComplete(text, false, true);
++      return;
++    }
++  }
++  if (alternateAction) {
++    const auto action = alternateActionRect();
++    if (mappedInput.wasTapInRect(action.x, action.y, action.width, action.height)) {
++      onComplete(text, true);
++      return;
++    }
++  }
++
+   int tx = 0;
+   int ty = 0;
+
+@@ -785,6 +814,11 @@ void KeyboardEntryActivity::render(RenderLock&&) {
    const auto pageWidth = renderer.getScreenWidth();
    const auto& metrics = UITheme::getInstance().getMetrics();
 
--  const Rect header{0, metrics.topPadding, pageWidth, TouchHeaderBackButton::height(metrics, mappedInput)};
--  if (mappedInput.hasTouchHardware()) {
--    TouchHeaderBackButton::draw(renderer, header, title.c_str(), false);
--  } else {
--    GUI.drawHeader(renderer, header, title.c_str());
--  }
--
-   const int lineHeight = inputLineHeight;
-   const int inputStartY = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput) +
-                           metrics.verticalSpacing + metrics.verticalSpacing * 4 + metrics.keyboardVerticalOffset;
-   int inputHeight = 0;
++  const int lineHeight = inputLineHeight;
++  const int inputStartY = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput) +
++                          metrics.verticalSpacing + metrics.verticalSpacing * 4 + metrics.keyboardVerticalOffset;
++  int inputHeight = 0;
 +  const fui::Rect kbRect = keyboardRect();
-+  if (inlineRender) {
-+    inlineRender(text, cursorPos, kbRect.y);
-+    const Rect header{0, metrics.topPadding, pageWidth, TouchHeaderBackButton::height(metrics, mappedInput)};
-+    TouchHeaderBackButton::draw(renderer, header, title.c_str(), false);
-+  } else {
-+    const Rect header{0, metrics.topPadding, pageWidth, TouchHeaderBackButton::height(metrics, mappedInput)};
-+    if (mappedInput.hasTouchHardware()) {
-+      TouchHeaderBackButton::draw(renderer, header, title.c_str(), false);
-+    } else {
-+      GUI.drawHeader(renderer, header, title.c_str());
-+    }
+   const Rect header{0, metrics.topPadding, pageWidth, TouchHeaderBackButton::height(metrics, mappedInput)};
+   if (mappedInput.hasTouchHardware()) {
+     TouchHeaderBackButton::draw(renderer, header, title.c_str(), false);
+@@ -792,10 +826,6 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+     GUI.drawHeader(renderer, header, title.c_str());
+   }
 
--  std::string displayText = displayTextForCurrentState();
+-  const int lineHeight = inputLineHeight;
+-  const int inputStartY = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput) +
+-                          metrics.verticalSpacing + metrics.verticalSpacing * 4 + metrics.keyboardVerticalOffset;
+-  int inputHeight = 0;
 
--  const bool isPassword = (inputType == InputType::Password);
--  int availableWidth = pageWidth;
--  // Clear the side-button hint gutters, which only render on edge-button boards without touch.
--  if (deviceUsesSideButtonHintGutters(gpio)) {
--    availableWidth -= 2 * metrics.sideButtonHintsWidth;
--  }
--  const int effectiveMargin = (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2;
--  const int toggleGap = isPassword ? 4 : 0;
--  const int toggleReserve = isPassword ? std::max(renderer.getTextWidth(UI_12_FONT_ID, "[abc]"),
--                                                  renderer.getTextWidth(UI_12_FONT_ID, "[***]")) +
--                                             toggleGap
--                                       : 0;
--  const int textAreaWidth = pageWidth - 2 * effectiveMargin - toggleReserve;
--  const int maxLineWidth = textAreaWidth;
--  const bool centerText = metrics.keyboardCenteredText;
-+    std::string displayText = displayTextForCurrentState();
+   std::string displayText = displayTextForCurrentState();
 
--  // The cursor spans a whole code point: a lone byte of it renders as a replacement glyph.
--  // Masking is per byte, so displayText keeps text's length and the same span applies to both.
--  const size_t cursorCharBytes = (cursorPos < text.length()) ? utf8Next(text, cursorPos) - cursorPos : 0;
--  char cursorChar[8] = {};         // the character under the cursor
--  char displayCursorChar[8] = {};  // same span of displayText, masked for passwords
--  if (cursorCharBytes > 0) {
--    const size_t n = std::min(cursorCharBytes, sizeof(cursorChar) - 1);
--    memcpy(cursorChar, text.data() + cursorPos, n);
--    memcpy(displayCursorChar, displayText.data() + cursorPos, n);
--  }
-+    const bool isPassword = (inputType == InputType::Password);
-+    int availableWidth = pageWidth;
-+    // Clear the side-button hint gutters, which only render on edge-button boards without touch.
-+    if (deviceUsesSideButtonHintGutters(gpio)) {
-+      availableWidth -= 2 * metrics.sideButtonHintsWidth;
-+    }
-+    const int effectiveMargin = (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2;
-+    const int toggleGap = isPassword ? 4 : 0;
-+    const int toggleReserve = isPassword ? std::max(renderer.getTextWidth(UI_12_FONT_ID, "[abc]"),
-+                                                    renderer.getTextWidth(UI_12_FONT_ID, "[***]")) +
-+                                               toggleGap
-+                                         : 0;
-+    const int textAreaWidth = pageWidth - 2 * effectiveMargin - toggleReserve;
-+    const int maxLineWidth = textAreaWidth;
-+    const bool centerText = metrics.keyboardCenteredText;
-+
-+    // The cursor spans a whole code point: a lone byte of it renders as a replacement glyph.
-+    // Masking is per byte, so displayText keeps text's length and the same span applies to both.
-+    const size_t cursorCharBytes = (cursorPos < text.length()) ? utf8Next(text, cursorPos) - cursorPos : 0;
-+    char cursorChar[8] = {};         // the character under the cursor
-+    char displayCursorChar[8] = {};  // same span of displayText, masked for passwords
-+    if (cursorCharBytes > 0) {
-+      const size_t n = std::min(cursorCharBytes, sizeof(cursorChar) - 1);
-+      memcpy(cursorChar, text.data() + cursorPos, n);
-+      memcpy(displayCursorChar, displayText.data() + cursorPos, n);
-+    }
-
--  int cursorCharWidth = 6;
--  if (cursorCharBytes > 0) {
--    int w = renderer.getTextWidth(UI_12_FONT_ID, cursorChar);
--    if (w > cursorCharWidth) cursorCharWidth = w;
--  }
-+    int cursorCharWidth = 6;
-+    if (cursorCharBytes > 0) {
-+      int w = renderer.getTextWidth(UI_12_FONT_ID, cursorChar);
-+      if (w > cursorCharWidth) cursorCharWidth = w;
-+    }
+@@ -832,7 +862,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+     if (w > cursorCharWidth) cursorCharWidth = w;
+   }
 
 -  int lineStartIdx = 0;
--  int textWidth = 0;
--  int cursorPixelX = effectiveMargin;
--  int cursorLineY = inputStartY;
--  bool cursorDrawn = false;
-+    int lineStartIdx = 0;
-+    int textWidth = 0;
-+    int cursorPixelX = effectiveMargin;
-+    int cursorLineY = inputStartY;
-+    bool cursorDrawn = false;
-+
-+    while (true) {
-+      const int lineEndIdx = lineBreakEnd(displayText, lineStartIdx, maxLineWidth);
-+      const std::string lineText = displayText.substr(lineStartIdx, lineEndIdx - lineStartIdx);
-+      textWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, lineText.c_str(), EpdFontFamily::REGULAR);
-+      {
-+        const bool isRtl = rangeIsRtl(displayText, lineStartIdx, lineEndIdx);
-+        const int lineStartX = centerText ? effectiveMargin + (maxLineWidth - textWidth) / 2 : effectiveMargin;
-+        const bool isLastLine = (lineEndIdx == static_cast<int>(displayText.length()));
-+        bool isCursorLine = false;
-+        if (!cursorDrawn && cursorPos >= lineStartIdx &&
-+            (isLastLine ? cursorPos <= lineEndIdx : cursorPos < lineEndIdx)) {
-+          std::string beforeCursor;
-+          if (isPassword && !passwordVisible && cursorMode) {
-+            beforeCursor = std::string(cursorPos - lineStartIdx, '*');
-+          } else {
-+            beforeCursor = displayText.substr(lineStartIdx, cursorPos - lineStartIdx);
-+          }
-+          int beforeWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeCursor.c_str(), EpdFontFamily::REGULAR);
-+          int throughCursorWidth = beforeWidth;
-+          int kernOffset = 0;
-+          if (cursorCharBytes > 0) {
-+            std::string beforeAndCursor = beforeCursor + displayCursorChar;
-+            throughCursorWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeAndCursor.c_str(), EpdFontFamily::REGULAR);
-+            int charAdvance = renderer.getTextAdvanceX(UI_12_FONT_ID, displayCursorChar, EpdFontFamily::REGULAR);
-+            kernOffset = throughCursorWidth - beforeWidth - charAdvance;
-+          }
-+          if (isRtl) {
-+            const int logicalWidth = cursorMode && cursorCharBytes > 0 ? throughCursorWidth : beforeWidth;
-+            cursorPixelX = lineStartX + textWidth - logicalWidth;
-+          } else {
-+            cursorPixelX = lineStartX + beforeWidth + kernOffset;
-+          }
-+          cursorLineY = inputStartY + inputHeight;
-+          cursorDrawn = true;
-+          isCursorLine = true;
-+        }
-
--  while (true) {
--    const int lineEndIdx = lineBreakEnd(displayText, lineStartIdx, maxLineWidth);
--    const std::string lineText = displayText.substr(lineStartIdx, lineEndIdx - lineStartIdx);
--    textWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, lineText.c_str(), EpdFontFamily::REGULAR);
--    {
--      const bool isRtl = rangeIsRtl(displayText, lineStartIdx, lineEndIdx);
--      const int lineStartX = centerText ? effectiveMargin + (maxLineWidth - textWidth) / 2 : effectiveMargin;
--      const bool isLastLine = (lineEndIdx == static_cast<int>(displayText.length()));
--      bool isCursorLine = false;
--      if (!cursorDrawn && cursorPos >= lineStartIdx &&
--          (isLastLine ? cursorPos <= lineEndIdx : cursorPos < lineEndIdx)) {
--        std::string beforeCursor;
--        if (isPassword && !passwordVisible && cursorMode) {
--          beforeCursor = std::string(cursorPos - lineStartIdx, '*');
-+        if (isCursorLine && cursorMode && isPassword && !passwordVisible && !togglePos) {
-+          // Draw text in 3 parts to avoid block cursor overflowing onto next char.
-+          // displayText uses '*' for all chars; actual char may be wider than '*'.
-+          // Part 1: chars before cursor position
-+          const std::string part1 = displayText.substr(lineStartIdx, cursorPos - lineStartIdx);
-+          renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, part1.c_str());
-+          // Part 2: skip cursor slot (block + actual char drawn later)
-+          // Part 3: chars after cursor position (skip char under cursor), starting at cursorPixelX + cursorCharWidth
-+          const int afterStart = static_cast<int>(cursorPos + cursorCharBytes);
-+          const int afterEnd = lineEndIdx;
-+          if (afterStart < afterEnd) {
-+            const std::string part3 = displayText.substr(afterStart, afterEnd - afterStart);
-+            renderer.drawText(UI_12_FONT_ID, cursorPixelX + cursorCharWidth, inputStartY + inputHeight, part3.c_str());
-+          }
-         } else {
--          beforeCursor = displayText.substr(lineStartIdx, cursorPos - lineStartIdx);
-+          renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
-         }
--        int beforeWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeCursor.c_str(), EpdFontFamily::REGULAR);
--        int throughCursorWidth = beforeWidth;
--        int kernOffset = 0;
--        if (cursorCharBytes > 0) {
--          std::string beforeAndCursor = beforeCursor + displayCursorChar;
--          throughCursorWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeAndCursor.c_str(), EpdFontFamily::REGULAR);
--          int charAdvance = renderer.getTextAdvanceX(UI_12_FONT_ID, displayCursorChar, EpdFontFamily::REGULAR);
--          kernOffset = throughCursorWidth - beforeWidth - charAdvance;
-+        if (lineEndIdx == static_cast<int>(displayText.length())) {
-+          break;
-         }
--        if (isRtl) {
--          const int logicalWidth = cursorMode && cursorCharBytes > 0 ? throughCursorWidth : beforeWidth;
--          cursorPixelX = lineStartX + textWidth - logicalWidth;
--        } else {
--          cursorPixelX = lineStartX + beforeWidth + kernOffset;
--        }
--        cursorLineY = inputStartY + inputHeight;
--        cursorDrawn = true;
--        isCursorLine = true;
--      }
-
--      if (isCursorLine && cursorMode && isPassword && !passwordVisible && !togglePos) {
--        // Draw text in 3 parts to avoid block cursor overflowing onto next char.
--        // displayText uses '*' for all chars; actual char may be wider than '*'.
--        // Part 1: chars before cursor position
--        const std::string part1 = displayText.substr(lineStartIdx, cursorPos - lineStartIdx);
--        renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, part1.c_str());
--        // Part 2: skip cursor slot (block + actual char drawn later)
--        // Part 3: chars after cursor position (skip char under cursor), starting at cursorPixelX + cursorCharWidth
--        const int afterStart = static_cast<int>(cursorPos + cursorCharBytes);
--        const int afterEnd = lineEndIdx;
--        if (afterStart < afterEnd) {
--          const std::string part3 = displayText.substr(afterStart, afterEnd - afterStart);
--          renderer.drawText(UI_12_FONT_ID, cursorPixelX + cursorCharWidth, inputStartY + inputHeight, part3.c_str());
--        }
--      } else {
--        renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
-+        inputHeight += lineHeight;
-+        lineStartIdx = lineEndIdx;
++  const int capacity = std::max(1, (kbRect.y - inputStartY - 6) / lineHeight);
++  int lineStartIdx = firstVisibleInputLine(displayText, maxLineWidth, capacity);
+   int textWidth = 0;
+   int cursorPixelX = effectiveMargin;
+   int cursorLineY = inputStartY;
+@@ -892,7 +923,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+       } else {
+         renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
        }
 -      if (lineEndIdx == static_cast<int>(displayText.length())) {
--        break;
--      }
--
--      inputHeight += lineHeight;
--      lineStartIdx = lineEndIdx;
-     }
--  }
-
--  const int fieldWidth = (inputHeight > 0) ? maxLineWidth : textWidth;
--  const int lineMargin = effectiveMargin;
--  GUI.drawTextField(renderer, Rect{0, inputStartY, pageWidth, inputHeight}, fieldWidth, cursorMode, lineMargin,
--                    pageWidth - 2 * lineMargin);
-+    const int fieldWidth = (inputHeight > 0) ? maxLineWidth : textWidth;
-+    const int lineMargin = effectiveMargin;
-+    GUI.drawTextField(renderer, Rect{0, inputStartY, pageWidth, inputHeight}, fieldWidth, cursorMode, lineMargin,
-+                      pageWidth - 2 * lineMargin);
-
--  if (cursorMode && !togglePos && cursorPos <= displayText.length()) {
--    static constexpr int blockPadding = 1;
--    renderer.fillRect(cursorPixelX - blockPadding, cursorLineY, cursorCharWidth + blockPadding * 2, lineHeight, true);
--    if (cursorCharBytes > 0) {
--      renderer.drawText(UI_12_FONT_ID, cursorPixelX, cursorLineY, cursorChar, false);
-+    if (cursorMode && !togglePos && cursorPos <= displayText.length()) {
-+      static constexpr int blockPadding = 1;
-+      renderer.fillRect(cursorPixelX - blockPadding, cursorLineY, cursorCharWidth + blockPadding * 2, lineHeight, true);
-+      if (cursorCharBytes > 0) {
-+        renderer.drawText(UI_12_FONT_ID, cursorPixelX, cursorLineY, cursorChar, false);
-+      }
-+    } else if (cursorPos <= displayText.length()) {
-+      static constexpr int serifW = 3;
-+      const int cX = cursorPixelX;
-+      const int cY = cursorLineY;
-+      const int cBottom = cursorLineY + lineHeight - 1;
-+      renderer.fillRect(cX, cY, 2, lineHeight, true);
-+      renderer.drawLine(cX - serifW, cY, cX - 1, cY, 2, true);
-+      renderer.drawLine(cX + 1, cY, cX + serifW, cY, 2, true);
-+      renderer.drawLine(cX - serifW, cBottom, cX - 1, cBottom, 2, true);
-+      renderer.drawLine(cX + 1, cBottom, cX + serifW, cBottom, 2, true);
-     }
--  } else if (cursorPos <= displayText.length()) {
--    static constexpr int serifW = 3;
--    const int cX = cursorPixelX;
--    const int cY = cursorLineY;
--    const int cBottom = cursorLineY + lineHeight - 1;
--    renderer.fillRect(cX, cY, 2, lineHeight, true);
--    renderer.drawLine(cX - serifW, cY, cX - 1, cY, 2, true);
--    renderer.drawLine(cX + 1, cY, cX + serifW, cY, 2, true);
--    renderer.drawLine(cX - serifW, cBottom, cX - 1, cBottom, 2, true);
--    renderer.drawLine(cX + 1, cBottom, cX + serifW, cBottom, 2, true);
--  }
-
--  if (isPassword) {
--    const char* toggleLabel = passwordVisible ? "[***]" : "[abc]";
--    const int toggleWidth = renderer.getTextWidth(UI_12_FONT_ID, toggleLabel);
--    const int toggleX = pageWidth - effectiveMargin - toggleWidth;
--    const int toggleY = inputStartY + inputHeight;
--    const bool toggleSelected = cursorMode && togglePos;
-+    if (isPassword) {
-+      const char* toggleLabel = passwordVisible ? "[***]" : "[abc]";
-+      const int toggleWidth = renderer.getTextWidth(UI_12_FONT_ID, toggleLabel);
-+      const int toggleX = pageWidth - effectiveMargin - toggleWidth;
-+      const int toggleY = inputStartY + inputHeight;
-+      const bool toggleSelected = cursorMode && togglePos;
-
--    if (toggleSelected) {
--      renderer.fillRect(toggleX - 2, toggleY, toggleWidth + 5, lineHeight + 3, true);
--      renderer.drawText(UI_12_FONT_ID, toggleX, toggleY, toggleLabel, false);
--    } else {
--      renderer.drawText(UI_12_FONT_ID, toggleX, toggleY, toggleLabel, true);
-+      if (toggleSelected) {
-+        renderer.fillRect(toggleX - 2, toggleY, toggleWidth + 5, lineHeight + 3, true);
-+        renderer.drawText(UI_12_FONT_ID, toggleX, toggleY, toggleLabel, false);
-+      } else {
-+        renderer.drawText(UI_12_FONT_ID, toggleX, toggleY, toggleLabel, true);
-+      }
-     }
--  }
-
--  if (!mappedInput.hasTouchHardware() && hintVisible && !text.empty()) {
--    const int hintLh = renderer.getLineHeight(SMALL_FONT_ID);
--    const int underlineY = inputStartY + inputHeight + lineHeight + metrics.verticalSpacing;
--    const int hintY = underlineY + 4;
--    if (cursorMode) {
--      int hintLineY = hintY;
--      if (inputType == InputType::Password && togglePos) {
--        renderer.drawCenteredText(
--            SMALL_FONT_ID, hintLineY,
--            passwordVisible ? tr(STR_KB_HINT_TOGGLE_HIDE_PASSWORD) : tr(STR_KB_HINT_TOGGLE_SHOW_PASSWORD), true);
--        hintLineY += hintLh;
--        renderer.drawCenteredText(SMALL_FONT_ID, hintLineY, tr(STR_KB_HINT_RETURN_CURSOR), true);
--      } else {
--        renderer.drawCenteredText(SMALL_FONT_ID, hintLineY, tr(STR_KB_HINT_MOVE_CURSOR), true);
--        hintLineY += hintLh;
--        if (inputType == InputType::Password) {
--          const char* passTip = passwordVisible ? tr(STR_KB_HINT_HIDE_PASSWORD) : tr(STR_KB_HINT_SHOW_PASSWORD);
--          renderer.drawCenteredText(SMALL_FONT_ID, hintLineY, passTip, true);
-+    if (!mappedInput.hasTouchHardware() && hintVisible && !text.empty()) {
-+      const int hintLh = renderer.getLineHeight(SMALL_FONT_ID);
-+      const int underlineY = inputStartY + inputHeight + lineHeight + metrics.verticalSpacing;
-+      const int hintY = underlineY + 4;
-+      if (cursorMode) {
-+        int hintLineY = hintY;
-+        if (inputType == InputType::Password && togglePos) {
-+          renderer.drawCenteredText(
-+              SMALL_FONT_ID, hintLineY,
-+              passwordVisible ? tr(STR_KB_HINT_TOGGLE_HIDE_PASSWORD) : tr(STR_KB_HINT_TOGGLE_SHOW_PASSWORD), true);
-+          hintLineY += hintLh;
-+          renderer.drawCenteredText(SMALL_FONT_ID, hintLineY, tr(STR_KB_HINT_RETURN_CURSOR), true);
-+        } else {
-+          renderer.drawCenteredText(SMALL_FONT_ID, hintLineY, tr(STR_KB_HINT_MOVE_CURSOR), true);
-+          hintLineY += hintLh;
-+          if (inputType == InputType::Password) {
-+            const char* passTip = passwordVisible ? tr(STR_KB_HINT_HIDE_PASSWORD) : tr(STR_KB_HINT_SHOW_PASSWORD);
-+            renderer.drawCenteredText(SMALL_FONT_ID, hintLineY, passTip, true);
-+          }
-         }
-+      } else {
-+        renderer.drawCenteredText(SMALL_FONT_ID, hintY, tr(STR_KB_HINT_EDIT_ENTRY), true);
++      if (lineEndIdx == static_cast<int>(displayText.length()) ||
++          (itemMenu && inputHeight + lineHeight >= capacity * lineHeight)) {
+         break;
        }
--    } else {
--      renderer.drawCenteredText(SMALL_FONT_ID, hintY, tr(STR_KB_HINT_EDIT_ENTRY), true);
+
+@@ -964,7 +996,25 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      }
--  }
+   }
 
 -  const fui::Rect kbRect = keyboardRect();
++  if (itemMenu && mappedInput.hasTouchHardware()) {
++    const auto menu = itemMenuRect();
++    const int x = menu.x + menu.width / 2, y = menu.y + menu.height / 2;
++    for (const int dx : {-7, 0, 7}) renderer.fillRect(x + dx - 1, y - 1, 3, 3);
++  }
++  if (alternateAction && mappedInput.hasTouchHardware()) {
++    const auto action = alternateActionRect();
++    renderer.drawRect(action.x, action.y + 2, action.width, action.height - 4);
++    const int x = action.x + 8, y = action.y + (action.height - 16) / 2;
++    renderer.drawRect(x, y, 16, 16);
++    if (alternateChecked) {
++      renderer.fillRect(x, y, 16, 16);
++      renderer.drawLine(x + 3, y + 8, x + 6, y + 11, 2, false);
++      renderer.drawLine(x + 6, y + 11, x + 12, y + 4, 2, false);
++    }
++    const auto label = renderer.truncatedText(SMALL_FONT_ID, alternateAction, action.width - 32);
++    renderer.drawText(SMALL_FONT_ID, x + 22,
++                      action.y + (action.height - renderer.getLineHeight(SMALL_FONT_ID)) / 2, label.c_str());
 +  }
    const int keysHeight = std::min(keyboardKeysHeight(metrics, currentLayout().rowCount, mappedInput.hasTouchHardware()),
                                    static_cast<int>(kbRect.height));
    const auto orientation = renderer.getOrientation();
+@@ -1138,8 +1188,25 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+   renderer.displayBuffer();
+ }
+
+-void KeyboardEntryActivity::onComplete(std::string text) {
+-  setResult(KeyboardResult{std::move(text)});
++fui::Rect KeyboardEntryActivity::alternateActionRect() const {
++  const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++  int top, right, bottom, left;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  constexpr int width = 120;
++  return {static_cast<int16_t>(header.width - right - width - (itemMenu ? 50 : 8)), static_cast<int16_t>(header.y),
++          width, static_cast<int16_t>(header.height)};
++}
++
++fui::Rect KeyboardEntryActivity::itemMenuRect() const {
++  const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++  int top, right, bottom, left;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  return {static_cast<int16_t>(header.width - right - 50), static_cast<int16_t>(header.y), 46,
++          static_cast<int16_t>(header.height)};
++}
++
++void KeyboardEntryActivity::onComplete(std::string text, bool alternate, bool openItemMenu) {
++  setResult(KeyboardResult{std::move(text), alternate, openItemMenu});
+   finish();
+ }
+
 diff --git a/src/activities/util/KeyboardEntryActivity.h b/src/activities/util/KeyboardEntryActivity.h
-index 5335aef83dbecd89835ed12f65ce8085a31f071f..8bcb2d9996eac96a60d1c08867c607c3e8878318 100644
+index 5335aef83dbecd89835ed12f65ce8085a31f071f..476246f9c8d6f6c924eb1d2d1c1dd272da110a84 100644
 --- a/src/activities/util/KeyboardEntryActivity.h
 +++ b/src/activities/util/KeyboardEntryActivity.h
-@@ -1,4 +1,6 @@
+@@ -1,4 +1,5 @@
  #pragma once
 +
-+#include <functional>
  #include <FreeInkUIGfxRenderer.h>
  #include <GfxRenderer.h>
 
-@@ -29,6 +31,14 @@ class KeyboardEntryActivity : public Activity {
+@@ -29,6 +30,13 @@ class KeyboardEntryActivity : public Activity {
          inputType(inputType),
          minLength(minLength) {}
 
-+  using InlineRender = std::function<void(const std::string&, size_t, int)>;
-+  using InlineHit = std::function<bool(const std::string&, int, int, size_t&)>;
-+  void setInlineField(InlineRender render, InlineHit hit, size_t cursor) {
-+    inlineRender = std::move(render);
-+    inlineHit = std::move(hit);
-+    initialCursor = cursor;
++  void showItemMenu() { itemMenu = true; }
++  void setInitialCursor(size_t cursor) { initialCursor = cursor; }
++  void setAlternateAction(const char* label, bool checked) {
++    alternateAction = label;
++    alternateChecked = checked;
 +  }
 +
    void onEnter() override;
    void onExit() override;
    void loop() override;
-@@ -37,6 +47,9 @@ class KeyboardEntryActivity : public Activity {
+@@ -37,6 +45,10 @@ class KeyboardEntryActivity : public Activity {
    uint8_t inputPollDelayMs() const override { return mappedInput.hasTouchHardware() ? 2 : 10; }
 
   private:
-+  InlineRender inlineRender;
-+  InlineHit inlineHit;
++  const char* alternateAction = nullptr;
++  bool alternateChecked = false;
++  bool itemMenu = false;
 +  size_t initialCursor = std::string::npos;
    std::string title;
    std::string text;
    size_t maxLength;
+@@ -106,7 +118,10 @@ class KeyboardEntryActivity : public Activity {
+
+   enum class InputFieldTouchTarget { None, Cursor, PasswordToggle };
+
+-  void onComplete(std::string text);
++  void onComplete(std::string text, bool alternate = false, bool openItemMenu = false);
++  freeink::ui::Rect alternateActionRect() const;
++  freeink::ui::Rect itemMenuRect() const;
++  int firstVisibleInputLine(std::string& display, int width, int capacity) const;
+   void onCancel();
+   InputFieldTouchTarget inputFieldTouchTargetFromPoint(int x, int y, size_t& position) const;
+   std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b95426c0c
+index 0000000000000000000000000000000000000000..056fe45747400c9e218f6abc54297ec65c22188c
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,1742 @@
+@@ -0,0 +1,1969 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1101,6 +937,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +#include "activities/util/ConfirmationActivity.h"
 +#include "activities/util/KeyboardEntryActivity.h"
 +#include "activities/util/OptionSelectionActivity.h"
++#include "components/TouchHeaderBackButton.h"
 +#include "components/UITheme.h"
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
@@ -1108,6 +945,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +
 +namespace {
 +constexpr size_t MAX_ROWS = 1024;
++constexpr size_t MAX_PREFETCH_ROWS = 220;
 +constexpr unsigned long SYNC_INTERVAL = 120000;
 +constexpr size_t MAX_RESPONSE = 384 * 1024;
 +constexpr int ROW_HEIGHT = 39;
@@ -1139,16 +977,186 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  return text;
 +}
 +
++int monthLength(int year, int month) {
++  constexpr int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
++  return days[month - 1] + (month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
++}
++
 +bool validDate(const std::string& date) {
 +  int y = 0, m = 0, d = 0;
 +  if (date.size() != 10 || date[4] != '-' || date[7] != '-' ||
 +      sscanf(date.c_str(), "%4d-%2d-%2d", &y, &m, &d) != 3 || y < 1900 || y > 9999 || m < 1 || m > 12 || d < 1)
 +    return false;
-+  const int days[] = {31, 28 + (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)), 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 +  char canonical[16];
 +  snprintf(canonical, sizeof(canonical), "%04d-%02d-%02d", y, m, d);
-+  return d <= days[m - 1] && date == canonical;
++  return d <= monthLength(y, m) && date == canonical;
 +}
++
++class WorkflowyDatePicker final : public Activity {
++ public:
++  WorkflowyDatePicker(GfxRenderer& renderer, MappedInputManager& input, StrId title,
++                     const std::string& date, const std::string& today)
++      : Activity("WorkflowyDatePicker", renderer, input), title(title), date(date), today(today) {
++    sscanf(date.c_str(), "%4d-%2d", &year, &month);
++  }
++
++  bool allowGlobalHomeSwipeGesture() const override { return false; }
++
++  void loop() override {
++    using Button = MappedInputManager::Button;
++    using Swipe = MappedInputManager::SwipeDir;
++    if (mappedInput.wasReleased(Button::Back) || TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
++      ActivityResult result;
++      result.isCancelled = true;
++      setResult(std::move(result));
++      return finish();
++    }
++    Swipe swipe = Swipe::None;
++    int x, y, endX, endY;
++    mappedInput.wasSwipeWithPoints(swipe, x, y, endX, endY);
++    if (swipe == Swipe::Left || mappedInput.wasReleased(Button::Down)) return shiftMonth(1);
++    if (swipe == Swipe::Right || mappedInput.wasReleased(Button::Up)) return shiftMonth(-1);
++    if (!mappedInput.wasScreenTapped(x, y)) return;
++    const auto grid = layout();
++    if (y >= grid.nav && y < grid.nav + 44) {
++      if (x >= grid.left && x < grid.left + 54) return shiftMonth(-1);
++      if (x >= grid.right - 54 && x < grid.right) return shiftMonth(1);
++    }
++    if (y < grid.top || y >= grid.top + grid.cellHeight * 6 || x < grid.left || x >= grid.right) return;
++    const int column = (x - grid.left) * 7 / (grid.right - grid.left);
++    const int day = (y - grid.top) / grid.cellHeight * 7 + column - firstColumn() + 1;
++    if (day < 1 || day > monthLength(year, month)) return;
++    char selected[16];
++    snprintf(selected, sizeof(selected), "%04d-%02d-%02d", year, month, day);
++    setResult(KeyboardResult{selected});
++    finish();
++  }
++
++  void render(RenderLock&&) override {
++    renderer.clearScreen();
++    TouchHeaderBackButton::draw(renderer, TouchHeaderBackButton::headerRect(renderer, mappedInput),
++                               I18n::getInstance().get(title), false);
++    const auto grid = layout();
++    constexpr StrId months[] = {StrId::STR_MONTH_JAN, StrId::STR_MONTH_FEB, StrId::STR_MONTH_MAR,
++                                StrId::STR_MONTH_APR, StrId::STR_MONTH_MAY, StrId::STR_MONTH_JUN,
++                                StrId::STR_MONTH_JUL, StrId::STR_MONTH_AUG, StrId::STR_MONTH_SEP,
++                                StrId::STR_MONTH_OCT, StrId::STR_MONTH_NOV, StrId::STR_MONTH_DEC};
++    constexpr StrId week[] = {StrId::STR_STATS_MON, StrId::STR_STATS_TUE, StrId::STR_STATS_WED, StrId::STR_STATS_THU,
++                              StrId::STR_STATS_FRI, StrId::STR_STATS_SAT, StrId::STR_STATS_SUN};
++    const auto heading = std::string(I18n::getInstance().get(months[month - 1])) + " " + std::to_string(year);
++    renderer.drawCenteredText(UI_12_FONT_ID, grid.nav + 10, heading.c_str(), true, EpdFontFamily::BOLD);
++    for (const int direction : {-1, 1}) {
++      const int x = direction < 0 ? grid.left + 25 : grid.right - 25;
++      const int y = grid.nav + 21;
++      renderer.drawLine(x - direction * 4, y - 6, x + direction * 4, y, 2, true);
++      renderer.drawLine(x + direction * 4, y, x - direction * 4, y + 6, 2, true);
++    }
++    const auto boundary = [&](int column) { return grid.left + (column * (grid.right - grid.left) + 6) / 7; };
++    for (int col = 0; col < 7; ++col) {
++      const char* label = I18n::getInstance().get(week[col]);
++      const auto width = renderer.getTextWidth(SMALL_FONT_ID, label);
++      renderer.drawText(SMALL_FONT_ID, (boundary(col) + boundary(col + 1) - width) / 2, grid.top - 25, label);
++    }
++    const int offset = firstColumn();
++    const int fontHeight = renderer.getLineHeight(UI_12_FONT_ID);
++    for (int day = 1; day <= monthLength(year, month); ++day) {
++      const int cell = offset + day - 1;
++      const int col = cell % 7;
++      const int x = boundary(col);
++      const int width = boundary(col + 1) - x;
++      const int y = grid.top + (cell / 7) * grid.cellHeight;
++      char iso[16];
++      snprintf(iso, sizeof(iso), "%04d-%02d-%02d", year, month, day);
++      const bool selected = date == iso;
++      if (selected) renderer.fillRoundedRect(x + 3, y + 3, width - 6, grid.cellHeight - 6, 4, Color::Black);
++      else if (today == iso) renderer.drawRoundedRect(x + 3, y + 3, width - 6, grid.cellHeight - 6, 1, 4, true);
++      char label[4];
++      snprintf(label, sizeof(label), "%d", day);
++      renderer.drawText(UI_12_FONT_ID, x + (width - renderer.getTextWidth(UI_12_FONT_ID, label)) / 2,
++                        y + (grid.cellHeight - fontHeight) / 2, label, !selected);
++    }
++    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++  }
++
++ private:
++  struct Grid { int left, right, nav, top, cellHeight; };
++  StrId title;
++  std::string date, today;
++  int year = 2026, month = 1;
++
++  Grid layout() const {
++    int top, right, bottom, left;
++    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++    const int nav = std::max(top + 44, header.y + header.height + 5);
++    const int gridTop = nav + 72;
++    const int cellHeight = std::clamp((renderer.getScreenHeight() - bottom - gridTop - 8) / 6, 24, 50);
++    return {left + 12, renderer.getScreenWidth() - right - 12, nav, gridTop, cellHeight};
++  }
++
++  int firstColumn() const {
++    // Gregorian weekday, with Monday in the first column.
++    constexpr int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
++    const int y = year - (month < 3);
++    return (y + y / 4 - y / 100 + y / 400 + offsets[month - 1]) % 7;
++  }
++
++  void shiftMonth(int delta) {
++    const int index = std::clamp(year * 12 + month - 1 + delta, 1900 * 12, 9999 * 12 + 11);
++    {
++      RenderLock lock(*this);
++      year = index / 12;
++      month = index % 12 + 1;
++    }
++    requestUpdate();
++  }
++};
++
++bool isErrorNotice(const char* text) {
++  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED) && text != tr(STR_WORKFLOWY_COMPLETED_HIDDEN);
++}
++
++class WorkflowyErrorDetails final : public Activity {
++ public:
++  WorkflowyErrorDetails(GfxRenderer& renderer, MappedInputManager& input, const char* summary, std::string details)
++      : Activity("WorkflowyErrorDetails", renderer, input), summary(summary), details(std::move(details)) {}
++
++  void loop() override {
++    if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
++        TouchHeaderBackButton::wasTapped(mappedInput, renderer)) finish();
++  }
++
++  void render(RenderLock&&) override {
++    renderer.clearScreen();
++    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++    TouchHeaderBackButton::draw(renderer, header, tr(STR_WORKFLOWY_ERROR_DETAILS), false);
++    int top, right, bottom, left;
++    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++    int y = std::max(top, header.y + header.height) + 14;
++    std::vector<workflowy::TextSpan> lines;
++    const int width = renderer.getScreenWidth() - left - right - 24;
++    const auto draw = [&](std::string_view text, EpdFontFamily::Style style) {
++      lines.clear();
++      workflowy::wrapOutlineText(text, width, [&](std::string_view line) {
++        return renderer.getTextWidth(UI_12_FONT_ID, std::string(line).c_str(), style);
++      }, lines);
++      for (const auto [begin, end] : lines) {
++        renderer.drawText(UI_12_FONT_ID, left + 12, y, std::string(text.substr(begin, end - begin)).c_str(), true, style);
++        y += renderer.getLineHeight(UI_12_FONT_ID) + 6;
++      }
++    };
++    draw(summary, EpdFontFamily::BOLD);
++    if (!details.empty()) {
++      y += 12;
++      draw(details, EpdFontFamily::REGULAR);
++    }
++    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++  }
++
++ private:
++  const char* summary;
++  std::string details;
++};
 +
 +std::string plainTitle(const char* value) {
 +  std::string title;
@@ -1176,6 +1184,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +      title += c == '\r' || c == '\n' || c == '\t' ? ' ' : c;
 +    }
 +  }
++  workflowy::dropEmoji(title);
 +  return title;
 +}
 +
@@ -1219,6 +1228,12 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +}
 +
 +void WorkflowyDailyActivity::onExit() {
++  if (prefetch) {
++    prefetch->cancel.store(true, std::memory_order_relaxed);
++    const auto started = millis();
++    while (!prefetch->ready.load(std::memory_order_acquire) && millis() - started < 250) vTaskDelay(1);
++    prefetch.reset();
++  }
 +  if (ownsWifi) {
 +    WiFi.disconnect(false, false);
 +    WiFi.mode(WIFI_OFF);
@@ -1232,6 +1247,26 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    message = text;
 +  }
 +  requestUpdate();
++}
++
++void WorkflowyDailyActivity::showErrorDetails() {
++  if (!isErrorNotice(message)) return;
++  std::string details;
++  if (message == tr(STR_WORKFLOWY_OUTBOX_ACCOUNT) || message == tr(STR_WORKFLOWY_SAVE_FAILED)) {
++    details = tr(STR_WORKFLOWY_LOCAL_SAVE_DETAILS);
++  } else if (!online || message == tr(STR_WORKFLOWY_CLOCK_FAILED) || lastStatus == -2) {
++    details = !online ? tr(STR_WORKFLOWY_NO_WIFI_DETAILS) : tr(STR_WORKFLOWY_CLOCK_DETAILS);
++  } else if (lastStatus >= 400) {
++    details = "HTTP " + std::to_string(lastStatus);
++    if (lastStatus == 401 || lastStatus == 403) details += " · " + std::string(tr(STR_WORKFLOWY_AUTH_FAILED));
++    if (lastStatus == 429) details += " · " + std::string(tr(STR_WORKFLOWY_RATE_LIMIT));
++  } else if (lastTransport != ESP_OK) {
++    details = esp_err_to_name(lastTransport);
++  } else if (lastStatus == -3) {
++    details = tr(STR_WORKFLOWY_RESPONSE_DETAILS);
++  }
++  startActivityForResult(std::make_unique<WorkflowyErrorDetails>(renderer, mappedInput, message, std::move(details)),
++                         [](const ActivityResult&) {});
 +}
 +
 +void WorkflowyDailyActivity::connect() {
@@ -1302,12 +1337,20 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +
 +int WorkflowyDailyActivity::request(const char* method, const std::string& path, const std::string& body,
 +                                   uint8_t* response, size_t* received, size_t capacity) {
-+  return requestWhilePaging([&] { return requestWithKey(credential, method, path, body, response, received, capacity); });
++  int transport = 0;
++  const int status = requestWhilePaging([&] {
++    return requestWithKey(credential, method, path, body, response, received, capacity, nullptr, nullptr, &transport);
++  });
++  lastStatus = status;
++  lastTransport = transport;
++  return status;
 +}
 +
 +int WorkflowyDailyActivity::requestWithKey(const std::string& key, const char* method, const std::string& path,
 +                                          const std::string& body, uint8_t* response, size_t* received,
-+                                          size_t capacity) {
++                                          size_t capacity, HeapByteBuffer* growable,
++                                          const std::atomic<bool>* cancel, int* transport) {
++  if (cancel && cancel->load(std::memory_order_relaxed)) return -4;
 +  if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) {
 +    return -2;
 +  }
@@ -1315,8 +1358,10 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    uint8_t* buffer;
 +    size_t* used;
 +    size_t capacity;
++    HeapByteBuffer* growable;
++    const std::atomic<bool>* cancel;
 +    bool overflow = false;
-+  } sink{response, received, capacity};
++  } sink{response, received, capacity, growable, cancel};
 +
 +  const auto url = std::string(API) + path;
 +  esp_http_client_config_t config{};
@@ -1326,16 +1371,29 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +                                                  : HTTP_METHOD_POST;
 +  config.crt_bundle_attach = esp_crt_bundle_attach;
 +  config.user_agent = "CrASHInk/Workflowy";
-+  config.timeout_ms = 12000;
++  config.timeout_ms = cancel ? 5000 : 12000;
 +  config.disable_auto_redirect = true;
 +  config.max_authorization_retries = -1;
 +  config.user_data = &sink;
 +  config.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
-+    if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
 +    auto& target = *static_cast<Response*>(event->user_data);
-+    if (!target.buffer) return ESP_OK;
++    if (target.cancel && target.cancel->load(std::memory_order_relaxed)) return ESP_FAIL;
++    if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
++    if (!target.buffer && !target.growable) return ESP_OK;
 +    const auto length = static_cast<size_t>(event->data_len);
-+    if (target.overflow || length > target.capacity - *target.used) {
++    const auto needed = *target.used + length;
++    if (!target.overflow && target.growable && needed > target.capacity && needed <= MAX_RESPONSE) {
++      const size_t expanded = std::max(needed, std::min(MAX_RESPONSE, std::max<size_t>(4096, target.capacity * 2)));
++      auto* resized = static_cast<uint8_t*>(
++          heap_caps_realloc(target.buffer, expanded, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++      if (resized) {
++        target.growable->release();
++        target.growable->reset(resized);
++        target.buffer = resized;
++        target.capacity = expanded;
++      }
++    }
++    if (target.overflow || needed > target.capacity) {
 +      target.overflow = true;
 +      return ESP_ERR_NO_MEM;
 +    }
@@ -1345,7 +1403,10 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  };
 +
 +  auto client = esp_http_client_init(&config);
-+  if (!client) return 0;
++  if (!client) {
++    if (transport) *transport = ESP_ERR_NO_MEM;
++    return 0;
++  }
 +  const auto authorization = "Bearer " + key;
 +  auto result = esp_http_client_set_header(client, "Authorization", authorization.c_str());
 +  if (result == ESP_OK && !body.empty()) {
@@ -1359,11 +1420,20 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    LOG_ERR("WF", "Workflowy %s failed: transport=%s HTTP=%d", method, esp_err_to_name(result), status);
 +  }
 +  esp_http_client_cleanup(client);
-+  return result == ESP_OK && !sink.overflow && (complete || !response) ? status : 0;
++  if (transport) {
++    *transport = sink.overflow ? ESP_ERR_NO_MEM
++                 : result == ESP_OK && !complete && (response || growable) ? ESP_ERR_HTTP_INCOMPLETE_DATA
++                                                                          : result;
++  }
++  if (cancel && cancel->load(std::memory_order_relaxed)) return -4;
++  return result == ESP_OK && !sink.overflow && (complete || (!response && !growable)) ? status : 0;
 +}
 +
 +bool WorkflowyDailyActivity::loadChildren(const std::string& parent, unsigned depth, std::vector<Node>& result) {
-+  const int status = requestWhilePaging([&] { return fetchChildren(credential, parent, depth, result); });
++  int transport = 0;
++  const int status = requestWhilePaging([&] { return fetchChildren(credential, parent, depth, result, nullptr, &transport); });
++  lastStatus = status;
++  lastTransport = transport;
 +  if (status == 200) return true;
 +  showMessage(status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
 +              : status == -3 ? tr(STR_WORKFLOWY_DAILY_READ_FAILED)
@@ -1372,13 +1442,13 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +}
 +
 +int WorkflowyDailyActivity::fetchChildren(const std::string& key, const std::string& parent, unsigned depth,
-+                                         std::vector<Node>& result) {
-+  auto response = makePsramByteBufferNoThrow(MAX_RESPONSE);
-+  if (!response) return -3;
++                                         std::vector<Node>& result, const std::atomic<bool>* cancel, int* transport) {
++  HeapByteBuffer response;
 +  size_t received = 0;
-+  const int status = requestWithKey(key, "GET", "?parent_id=" + parent, {}, response.get(), &received, MAX_RESPONSE);
++  const int status = requestWithKey(key, "GET", "?parent_id=" + parent, {}, nullptr, &received, 0, &response, cancel, transport);
 +  if (status == 404 && depth == 0) return 200;
 +  if (status != 200) return status;
++  if (!response) return -3;
 +  JsonDocument filter;
 +  auto node = filter["nodes"][0];
 +  node["id"] = true;
@@ -1508,7 +1578,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  if (!changed && current == end) return false;
 +  size_t retained = 0;
 +  std::vector<Node> rebuilt;
-+  rebuilt.reserve(end - first);
++  rebuilt.reserve(std::max(static_cast<size_t>(end - first), siblings.size()));
 +  for (auto node : siblings) {
 +    node.depth = depth;
 +    const auto old = std::find_if(first, end, [&](const Node& candidate) {
@@ -1557,11 +1627,12 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +
 +void WorkflowyDailyActivity::toggle(const size_t row) {
 +  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  if (!rows[row].todo) return;
 +  const bool completed = rows[row].done;
 +  setLoading(true);
 +  const int status = request("POST", "/" + rows[row].id + (completed ? "/uncomplete" : "/complete"), {});
 +  setLoading(false);
-+  if (status != 200) {
++  if (status < 200 || status >= 300) {
 +    showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +    return;
 +  }
@@ -1599,6 +1670,8 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    {
 +      RenderLock lock(*this);
 +      rows[row].expanded = !rows[row].expanded;
++      if (rows[row].expanded) revealParent = row;
++      message = nullptr;
 +      layoutDirty = true;
 +    }
 +    requestUpdate();
@@ -1619,6 +1692,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    rows[row].childrenConfirmed = !rows[row].leaf;
 +    rows[row].checkedAt = millis();
 +    rows[row].expanded = !children.empty();
++    if (rows[row].expanded) revealParent = row;
 +    layoutDirty = true;
 +    rows.insert(rows.begin() + row + 1, std::make_move_iterator(children.begin()), std::make_move_iterator(children.end()));
 +    message = nullptr;
@@ -1635,27 +1709,17 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  const std::string parent = relative ? (parentIndex < 0 ? "" : rows[parentIndex].id) : zoomId;
 +  auto keyboard = std::make_unique<KeyboardEntryActivity>(
 +      renderer, mappedInput, adding ? tr(STR_WORKFLOWY_ADD) : tr(STR_EDIT), initial, 512);
-+  if (wrapItems) {
-+    inlineLines.clear();
-+    keyboard->setInlineField(
-+        [this, row, relative, adding](const auto& draft, size_t caret, int bottom) {
-+          renderInline(row, relative, adding, draft, caret, bottom);
-+        },
-+        [this](const std::string& draft, int x, int y, size_t& caret) {
-+          RenderLock lock(*this);
-+          for (const auto& line : inlineLines) {
-+            if (y >= line.y && y < line.y + line.height) {
-+              caret = cursorAt(draft, line.text, x - line.x);
-+              return true;
-+            }
-+          }
-+          return false;
-+        },
-+        cursor);
++  keyboard->setInitialCursor(cursor);
++  if (!adding) keyboard->showItemMenu();
++  if (!adding && rows[row].todo) {
++    keyboard->setAlternateAction(rows[row].done ? tr(STR_WORKFLOWY_MARK_UNDONE) : tr(STR_WORKFLOWY_MARK_DONE),
++                                 rows[row].done);
 +  }
 +  startActivityForResult(std::move(keyboard), [this, id, initial, parent, row, adding, relative](const ActivityResult& result) {
 +    if (result.isCancelled) return;
-+    auto text = std::get<KeyboardResult>(result.data).text;
++    const auto& entered = std::get<KeyboardResult>(result.data);
++    auto text = entered.text;
++    workflowy::dropEmoji(text);
 +    const auto first = text.find_first_not_of(" ");
 +    const bool makeTodo = first != std::string::npos && (text.compare(first, 2, "[]") == 0 ||
 +                                                         text.compare(first, 3, "[ ]") == 0);
@@ -1663,7 +1727,12 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +      const auto start = text.find_first_not_of(" ", first + (text[first + 1] == ']' ? 2 : 3));
 +      text = start == std::string::npos ? "" : text.substr(start);
 +    }
-+    if (text.find_first_not_of(" \t\r\n") == std::string::npos || (text == initial && !makeTodo)) return;
++    if (text == initial && !makeTodo) {
++      if (entered.alternate) toggle(row);
++      else if (entered.itemMenu) actions(row);
++      return;
++    }
++    if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
 +    JsonDocument update;
 +    update["name"] = escapedTitle(text, adding);
 +    if (makeTodo) update["layoutMode"] = "todo";
@@ -1718,12 +1787,17 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +        if (anchor != rows.end() && newRow < rows.size()) reorder(newRow, anchor - rows.begin(), relative > 0);
 +      }
 +    } else {
-+      RenderLock lock(*this);
-+      rows[row].title = text;
-+      if (makeTodo) rows[row].todo = true;
-+      syncNode(rows[row]);
-+      layoutDirty = true;
-+      message = nullptr;
++      {
++        RenderLock lock(*this);
++        rows[row].title = text;
++        if (makeTodo) rows[row].todo = true;
++        syncNode(rows[row]);
++        layoutDirty = true;
++        message = nullptr;
++      }
++      if (entered.alternate) toggle(row);
++      else if (entered.itemMenu) actions(row);
++      else requestUpdate();
 +    }
 +  });
 +}
@@ -1743,66 +1817,6 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  return caret;
 +}
 +
-+void WorkflowyDailyActivity::renderInline(size_t row, int relative, bool adding, const std::string& draft,
-+                                         size_t cursor, int bottom) {
-+  const auto bounds = layout();
-+  inlineLines.clear();
-+  const int lineHeight = bounds.lineHeight;
-+  auto measure = [&](std::string_view text) {
-+    return renderer.getTextWidth(UI_12_FONT_ID, std::string(text).c_str());
-+  };
-+  const auto depth = row < rows.size() ? rows[row].depth : zoomId.empty() ? 0 : 1;
-+  const int start = bounds.x + std::min<unsigned>(depth, 8) * 16;
-+  const int textX = start + 25;
-+  std::vector<workflowy::TextSpan> lines;
-+  workflowy::wrapOutlineText(draft, bounds.x + bounds.width - textX - ROW_ARROW_TARGET, measure, lines);
-+  size_t cursorLine = 0;
-+  while (cursorLine + 1 < lines.size() && cursor >= lines[cursorLine + 1].begin) ++cursorLine;
-+  const int top = bounds.top + 62;
-+  const size_t capacity = std::max(1, (bottom - top) / lineHeight - 1);
-+  const auto first = cursorLine >= capacity ? cursorLine + 1 - capacity : 0;
-+  const auto count = std::min(capacity, lines.size() - first);
-+  int y = top;
-+  const auto drawNeighbour = [&](size_t index) {
-+    const auto& node = rows[index];
-+    const int x = bounds.x + std::min<unsigned>(node.depth, 8) * 16;
-+    if (node.todo) renderer.drawRect(x + 1, y + 4, 18, 18);
-+    else renderer.fillRect(x + 6, y + 11, 5, 5);
-+    const auto text = renderer.truncatedText(UI_12_FONT_ID, node.title.c_str(), bounds.x + bounds.width - x - 25);
-+    renderer.drawText(UI_12_FONT_ID, x + 25, y, text.c_str());
-+    y += lineHeight;
-+  };
-+  const auto anchor = std::find_if(placements.begin(), placements.end(),
-+                                   [&](const Placement& entry) { return entry.row == row; });
-+  if (count + 1 < capacity && !placements.empty()) {
-+    if (anchor == placements.end()) drawNeighbour(placements.back().row);
-+    else if (relative > 0) drawNeighbour(anchor->row);
-+    else if (anchor != placements.begin()) drawNeighbour(std::prev(anchor)->row);
-+  }
-+  if (adding || (row < rows.size() && rows[row].todo)) renderer.drawRect(start + 1, y + 4, 18, 18);
-+  else renderer.fillRect(start + 6, y + 11, 5, 5);
-+  for (size_t i = first; i < first + count; ++i) {
-+    const auto [begin, end] = lines[i];
-+    inlineLines.push_back({lines[i], textX, y, lineHeight});
-+    const auto text = draft.substr(begin, end - begin);
-+    renderer.drawText(UI_12_FONT_ID, textX, y, text.c_str());
-+    if (i == cursorLine) {
-+      const int cursorX = textX + measure(std::string_view(draft).substr(begin, std::clamp(cursor, begin, end) - begin));
-+      renderer.fillRect(cursorX, y, 2, lineHeight);
-+    }
-+    y += lineHeight;
-+  }
-+  renderer.drawLine(textX, y, bounds.x + bounds.width - ROW_ARROW_TARGET, y);
-+  if (y + 2 * lineHeight < bottom && anchor != placements.end()) {
-+    if (relative < 0) drawNeighbour(anchor->row);
-+    else {
-+      const auto next = std::find_if(std::next(anchor), placements.end(),
-+                                     [&](const Placement& entry) { return entry.row != row; });
-+      if (next != placements.end()) drawNeighbour(next->row);
-+    }
-+  }
-+}
-+
 +void WorkflowyDailyActivity::actions(const size_t row) {
 +  std::vector<std::string> options{
 +      tr(STR_EDIT), tr(STR_WORKFLOWY_ZOOM), tr(STR_WORKFLOWY_MOVE_DATE),
@@ -1811,13 +1825,17 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    options.emplace_back(tr(STR_WORKFLOWY_ADD_ABOVE));
 +    options.emplace_back(tr(STR_WORKFLOWY_ADD_BELOW));
 +  }
++  const int complete = rows[row].todo ? static_cast<int>(options.size()) : -1;
++  if (complete >= 0)
++    options.emplace_back(rows[row].done ? tr(STR_WORKFLOWY_MARK_UNDONE) : tr(STR_WORKFLOWY_MARK_DONE));
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
 +                             0, false, true),
-+                         [this, row](const ActivityResult& result) {
++                         [this, row, complete](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const int selected = std::get<OptionSelectionResult>(result.data).index;
 +    const auto id = rows[row].id;
++    if (complete >= 0 && selected == complete) return toggle(row);
 +    if (selected == 0) return edit(row);
 +    if (selected == 5 || selected == 6) return edit(row, selected == 5 ? -1 : 1);
 +    if (selected == 1) return zoom(row);
@@ -1895,39 +1913,12 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +
 +void WorkflowyDailyActivity::chooseDate(std::string moveId) {
 +  const auto title = moveId.empty() ? StrId::STR_WORKFLOWY_SHOW_DATE : StrId::STR_WORKFLOWY_MOVE_DATE;
-+  std::vector<std::string> choices{tr(STR_WORKFLOWY_YESTERDAY), tr(STR_WORKFLOWY_TODAY), tr(STR_WORKFLOWY_TOMORROW),
-+                                   tr(STR_WORKFLOWY_CHOOSE_DATE)};
-+  int selectedDate = 1;
-+  if (moveId.empty()) {
-+    if (date == "today" || date.empty() || date == isoDate(0)) selectedDate = 1;
-+    else if (date == isoDate(-1)) selectedDate = 0;
-+    else if (date == "tomorrow" || date == isoDate(1)) selectedDate = 2;
-+    else {
-+      selectedDate = 3;
-+      choices.back() += "  " + date;
-+    }
-+  }
-+  startActivityForResult(std::make_unique<OptionSelectionActivity>(
-+                             renderer, mappedInput, "WorkflowyDate", title, std::move(choices), selectedDate, false, true),
-+                         [this, title, moveId = std::move(moveId)](const ActivityResult& result) {
-+    if (result.isCancelled) return;
-+    const int selected = std::get<OptionSelectionResult>(result.data).index;
-+    if (selected < 0 || selected > 3) return;
-+    if (selected != 3) {
-+      const auto target = isoDate(selected - 1);
-+      if (target.empty() && selected == 0) showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
-+      else moveToDate(moveId, target.empty() ? (selected == 1 ? "today" : "tomorrow") : target);
-+      return;
-+    }
-+    startActivityForResult(std::make_unique<KeyboardEntryActivity>(
-+                               renderer, mappedInput, I18n::getInstance().get(title),
-+                               validDate(date) ? date : "", 10),
-+                           [this, moveId](const ActivityResult& entered) {
-+      if (entered.isCancelled) return;
-+      const auto& target = std::get<KeyboardResult>(entered.data).text;
-+      if (validDate(target)) moveToDate(moveId, target);
-+      else showMessage(tr(STR_WORKFLOWY_INVALID_DATE));
-+    });
++  const auto today = isoDate(0);
++  const auto selected = validDate(date) ? date : date == "tomorrow" ? isoDate(1) : today;
++  if (selected.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++  startActivityForResult(std::make_unique<WorkflowyDatePicker>(renderer, mappedInput, title, selected, today),
++                         [this, moveId = std::move(moveId)](const ActivityResult& result) {
++    if (!result.isCancelled) moveToDate(moveId, std::get<KeyboardResult>(result.data).text);
 +  });
 +}
 +
@@ -1945,12 +1936,15 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  {
 +    RenderLock lock(*this);
 +    loading = active;
-+    if (active) ++generation;
-+    else {
++    if (active) {
++      ++generation;
++      if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
++    } else {
 +      tracking = false;
 +      dragging = false;
 +      dragRow = dropRow = -1;
-+      mappedInput.suppressCurrentTouchContact();
++      int x, y;
++      if (mappedInput.isScreenTouchHeld(x, y)) mappedInput.suppressCurrentTouchContact();
 +    }
 +  }
 +  if (active) requestUpdateAndWait();
@@ -2010,6 +2004,23 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    wrapAnchor = -1;
 +  }
 +  page = std::min(page, pageStarts.size() - 1);
++  if (revealParent >= 0 && static_cast<size_t>(revealParent) < rows.size()) {
++    const size_t parent = revealParent;
++    const auto end = std::find_if(rows.begin() + parent + 1, rows.end(),
++                                  [&](const Node& node) { return node.depth <= rows[parent].depth; });
++    const auto limit = static_cast<size_t>(end - rows.begin());
++    const auto child = std::find_if(placements.begin(), placements.end(),
++                                    [&](const Placement& entry) { return entry.row > parent && entry.row < limit; });
++    if (child != placements.end()) {
++      const auto index = static_cast<size_t>(child - placements.begin());
++      const auto childPage = static_cast<size_t>(std::upper_bound(pageStarts.begin(), pageStarts.end(), index) -
++                                                 pageStarts.begin() - 1);
++      if (childPage > page) page = childPage;
++    } else if (limit > parent + 1 && !showDone) {
++      message = tr(STR_WORKFLOWY_COMPLETED_HIDDEN);
++    }
++  }
++  revealParent = -1;
 +}
 +
 +int WorkflowyDailyActivity::rowAt(const int x, const int y) const {
@@ -2049,25 +2060,30 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  if (rows[row].id == zoomId) return;
 +  Node root = rows[row];
 +  std::vector<Node> focused;
-+  if (row + 1 < rows.size() && rows[row + 1].depth > root.depth) {
-+    auto end = rows.begin() + row + 1;
-+    while (end != rows.end() && end->depth > root.depth) ++end;
-+    focused.assign(rows.begin() + row + 1, end);
-+    for (auto& node : focused) node.depth -= root.depth;
-+  } else if (!root.leaf) {
++  const bool cached = row + 1 < rows.size() && rows[row + 1].depth > root.depth;
++  if (!cached && !root.leaf) {
 +    setLoading(true);
 +    const bool loaded = loadChildren(root.id, 1, focused);
 +    setLoading(false);
 +    if (!loaded) return;
 +  }
-+  root.depth = 0;
-+  root.leaf = focused.empty();
-+  root.childrenConfirmed = !root.leaf;
-+  root.checkedAt = millis();
-+  root.expanded = !root.leaf;
-+  focused.insert(focused.begin(), std::move(root));
 +  {
 +    RenderLock lock(*this);
++    if (cached) {
++      const auto first = rows.begin() + row + 1;
++      auto end = first;
++      while (end != rows.end() && end->depth > root.depth) ++end;
++      focused.reserve(end - first + 1);
++      focused.insert(focused.end(), std::make_move_iterator(first), std::make_move_iterator(end));
++      rows.erase(first, end);
++      for (auto& node : focused) node.depth -= root.depth;
++    }
++    root.depth = 0;
++    root.leaf = focused.empty();
++    root.childrenConfirmed = !root.leaf;
++    root.checkedAt = millis();
++    root.expanded = !root.leaf;
++    focused.insert(focused.begin(), std::move(root));
 +    ++generation;
 +    rootCheckedAt = millis();
 +    awaitingOutline = false;
@@ -2093,6 +2109,25 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    awaitingOutline = false;
 +    auto previous = std::move(viewStack.back());
 +    viewStack.pop_back();
++    const auto owner = std::find_if(previous.rows.begin(), previous.rows.end(),
++                                    [&](const Node& node) { return node.id == zoomId; });
++    if (!rows.empty() && rows.front().id == zoomId && owner != previous.rows.end()) {
++      const auto depth = owner->depth;
++      auto end = owner + 1;
++      while (end != previous.rows.end() && end->depth > depth) ++end;
++      const bool expanded = owner->expanded;
++      *owner = std::move(rows.front());
++      owner->depth = depth;
++      owner->expanded = expanded && !owner->leaf;
++      const bool fits = previous.rows.size() - static_cast<size_t>(end - (owner + 1)) +
++                        rows.size() - 1 <= MAX_ROWS;
++      if (!fits) owner->expanded = false;
++      const auto where = previous.rows.erase(owner + 1, end);
++      if (fits) {
++        for (auto i = rows.begin() + 1; i != rows.end(); ++i) i->depth += depth;
++        previous.rows.insert(where, std::make_move_iterator(rows.begin() + 1), std::make_move_iterator(rows.end()));
++      }
++    }
 +    rows = std::move(previous.rows);
 +    zoomId = std::move(previous.zoomId);
 +    page = previous.page;
@@ -2267,7 +2302,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  }
 +  retryOutboxAt = millis() + (status >= 200 && status < 300 ? 350 : 30000);
 +  if (status >= 200 && status < 300) loadDay();
-+  else requestUpdate();
++  else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +}
 +
 +void WorkflowyDailyActivity::reviewCapture() {
@@ -2380,7 +2415,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  {
 +    std::unique_ptr<std::shared_ptr<Prefetch>> holder(static_cast<std::shared_ptr<Prefetch>*>(argument));
 +    auto& job = **holder;
-+    job.status = fetchChildren(job.key, job.target, job.depth, job.children);
++    job.status = fetchChildren(job.key, job.target, job.depth, job.children, &job.cancel, &job.transport);
 +    job.ready.store(true, std::memory_order_release);
 +  }
 +  vTaskDelete(nullptr);
@@ -2399,6 +2434,8 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +        rootCheckedAt = now;
 +        if (awaitingOutline) {
 +          awaitingOutline = false;
++          lastStatus = job->status;
++          lastTransport = job->transport;
 +          changed = true;
 +          message = job->status == 200 ? nullptr
 +                    : job->status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
@@ -2408,9 +2445,17 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +        }
 +      }
 +      if (job->status == 200) {
-+        changed |= replaceSiblings(rows, job->parent, job->children);
-+        for (auto& view : viewStack) {
-+          if (!job->parent.empty() || view.zoomId.empty()) replaceSiblings(view.rows, job->parent, job->children);
++        const auto owner = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == job->parent; });
++        const bool alreadyCached = owner != rows.end() && std::next(owner) != rows.end() &&
++                                   std::next(owner)->depth > owner->depth;
++        const bool fits = rows.size() + job->children.size() <= MAX_PREFETCH_ROWS;
++        if (job->root || alreadyCached || fits || job->children.empty()) {
++          changed |= replaceSiblings(rows, job->parent, job->children);
++        } else if (owner != rows.end()) {
++          changed |= !owner->childrenConfirmed || owner->leaf;
++          owner->checkedAt = now;
++          owner->leaf = false;
++          owner->childrenConfirmed = true;
 +        }
 +        layoutDirty |= changed;
 +      } else {
@@ -2553,7 +2598,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  }
 +  if (swipe == Swipe::None && release && tracking) {
 +    const int dx = lastX - touchX, dy = lastY - touchY;
-+    if (std::max(std::abs(dx), std::abs(dy)) >= 40)
++    if (std::max(std::abs(dx), std::abs(dy)) >= 60)
 +      swipe = std::abs(dx) > std::abs(dy) ? (dx < 0 ? Swipe::Left : Swipe::Right) : (dy < 0 ? Swipe::Up : Swipe::Down);
 +  }
 +  if (swipe != Swipe::None) {
@@ -2571,13 +2616,12 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +      if (online && !pendingDelete.empty() && static_cast<long>(millis() - deleteAt) >= 0) commitDelete();
 +      else if (online && pendingCount && !outboxUncertain && !prefetch &&
 +               static_cast<long>(millis() - retryOutboxAt) >= 0) flushCapture();
-+      else pollPrefetch();
++      else if (now - touchAt >= 180) pollPrefetch();
 +    }
 +    return;
 +  }
 +  tracking = false;
-+  if (moved) return;
-+  const bool held = millis() - touchAt >= 550;
++  const bool held = !moved && millis() - touchAt >= 550;
 +  if (!held && !mappedInput.wasScreenTapped(x, y)) return;
 +  x = touchX;
 +  y = touchY;
@@ -2585,15 +2629,28 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
 +      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
 +  if (!zoomId.empty() && y >= bounds.top + 30 && y < bounds.rowTop && x < bounds.x + ICON_TARGET) return back();
-+  if (undoReady && y >= bounds.top + 28 && y < bounds.rowTop &&
-+      x >= bounds.x + bounds.width - 2 * ICON_TARGET && x < bounds.x + bounds.width - ICON_TARGET) return undo();
++  if (y >= bounds.top + 28 && y < bounds.rowTop &&
++      x >= bounds.x + bounds.width - 2 * ICON_TARGET && x < bounds.x + bounds.width - ICON_TARGET) {
++    {
++      RenderLock lock(*this);
++      showDone = !showDone;
++      message = nullptr;
++      layoutDirty = true;
++      if (page < pageStarts.size() && pageStarts[page] < placements.size())
++        wrapAnchor = static_cast<int>(placements[pageStarts[page]].row);
++    }
++    requestUpdate();
++    return;
++  }
 +  if (y < bounds.rowTop && x >= bounds.x + bounds.width - ICON_TARGET) {
 +    if (!credential.empty() && !rows.empty()) chooseDate();
 +    else if (!credential.empty() && !date.empty() && hasActiveStationWifiConnection()) chooseDate();
 +    return;
 +  }
-+  if (y >= bounds.rowBottom && y < bounds.footer && pageStarts.size() > 1) {
++  if (y >= bounds.rowBottom && y < bounds.footer) {
 +    const int zone = (x - bounds.x) * 8 / bounds.width;
++    if (!awaitingOutline && isErrorNotice(message) && zone >= 2 && zone <= 5) return showErrorDetails();
++    if (pageStarts.size() <= 1) return;
 +    if (zone >= 0 && zone < 2) return nextPage(-1, zone == 0);
 +    if (zone >= 6 && zone < 8) return nextPage(1, zone == 7);
 +  }
@@ -2606,15 +2663,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +      else step = Step::Start;
 +    }
 +    if (control == 2 && !credential.empty() && !date.empty()) edit(rows.size());
-+    if (control == 3) {
-+      {
-+        RenderLock lock(*this);
-+        showDone = !showDone;
-+        layoutDirty = true;
-+        page = 0;
-+      }
-+      requestUpdate();
-+    }
++    if (control == 3 && undoReady) return undo();
 +    if (control == 4) {
 +      {
 +        RenderLock lock(*this);
@@ -2635,7 +2684,7 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  else if (rows[row].todo && x < bounds.x + indent + 30) toggle(row);
 +  else {
 +    size_t cursor = std::string::npos;
-+    if (wrapItems) {
++    {
 +      RenderLock lock(*this);
 +      const auto end = page + 1 < pageStarts.size() ? pageStarts[page + 1] : placements.size();
 +      for (auto i = pageStarts[page]; i < end; ++i) {
@@ -2660,30 +2709,33 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  if (date == isoDate(0) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TODAY);
 +  if (date == isoDate(1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TOMORROW);
 +  if (!zoomId.empty()) heading = std::string("‹  ") + tr(STR_WORKFLOWY);
-+  unsigned remaining = 0, totalTodos = 0;
++  unsigned completed = 0, totalTodos = 0;
 +  const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
 +  for (const auto& row : rows) {
 +    if (row.depth == outlineDepth && row.todo) {
 +      ++totalTodos;
-+      if (!row.done) ++remaining;
++      if (row.done) ++completed;
 +    }
 +  }
 +  char todoCount[24];
-+  snprintf(todoCount, sizeof(todoCount), "%u/%u", remaining, totalTodos);
-+  const int countX = bounds.x + bounds.width - (undoReady ? 2 : 1) * ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
++  snprintf(todoCount, sizeof(todoCount), "%u/%u", completed, totalTodos);
++  const int countX = bounds.x + bounds.width - 2 * ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
 +  const auto fittedHeading = renderer.truncatedText(UI_12_FONT_ID, heading.c_str(), countX - bounds.x - 8,
 +                                                     EpdFontFamily::BOLD);
 +  renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
 +  renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
 +  const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
-+  if (undoReady) {
-+    const int ux = cx - ICON_TARGET;
-+    renderer.drawLine(ux - 10, cy - 3, ux + 4, cy - 3, 2, true);
-+    renderer.drawLine(ux + 4, cy - 3, ux + 9, cy + 2, 2, true);
-+    renderer.drawLine(ux + 9, cy + 2, ux + 4, cy + 8, 2, true);
-+    renderer.drawLine(ux + 4, cy + 8, ux - 3, cy + 8, 2, true);
-+    renderer.drawLine(ux - 10, cy - 3, ux - 4, cy - 9, 2, true);
-+    renderer.drawLine(ux - 10, cy - 3, ux - 4, cy + 3, 2, true);
++  const int viewX = cx - ICON_TARGET;
++  const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
++  const int eyeY[] = {cy, cy - 4, cy - 6, cy - 4, cy, cy + 4, cy + 6, cy + 4};
++  for (int i = 0; i < 8; ++i) {
++    const int next = (i + 1) % 8;
++    renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next]);
++  }
++  renderer.fillRect(viewX - 2, cy - 2, 5, 5);
++  if (!showDone) {
++    renderer.drawLine(viewX - 10, cy + 8, viewX + 10, cy - 8, 2, false);
++    renderer.drawLine(viewX - 11, cy + 7, viewX + 9, cy - 9, 2, true);
 +  }
 +  renderer.drawRect(cx - 10, cy - 9, 21, 19);
 +  renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
@@ -2772,7 +2824,14 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
 +    const char* footer = awaitingOutline ? tr(STR_LOADING_POPUP)
 +                                         : message ? message : (placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : pages);
-+    renderer.drawCenteredText(SMALL_FONT_ID, bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 2, footer);
++    const int textY = bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5;
++    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
++    renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
++    if (!awaitingOutline && isErrorNotice(message)) {
++      const int width = renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str());
++      const int x = bounds.x + (bounds.width - width) / 2;
++      renderer.drawLine(x, bounds.footer - 3, x + width, bounds.footer - 3);
++    }
 +  }
 +  if (total > 1) {
 +    const int y = (bounds.rowBottom + bounds.footer) / 2;
@@ -2802,27 +2861,31 @@ index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b
 +  renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
 +  renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
 +  x = iconX(3);
-+  renderer.drawRect(x - 9, iconY - 9, 18, 18);
-+  if (showDone) {
-+    renderer.drawLine(x - 5, iconY, x - 1, iconY + 4, 2, true);
-+    renderer.drawLine(x - 1, iconY + 4, x + 5, iconY - 4, 2, true);
++  if (undoReady) {
++    renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, 2, true);
++    renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, 2, true);
++    renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, 2, true);
++    renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, 2, true);
++    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, 2, true);
++    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, 2, true);
 +  }
 +  x = iconX(4);
 +  if (wrapItems) renderer.fillRoundedRect(x - 15, iconY - 13, 30, 26, 4, Color::LightGray);
-+  renderer.drawLine(x - 9, iconY - 6, x + 8, iconY - 6, 2, true);
-+  renderer.drawLine(x + 8, iconY - 6, x + 8, iconY + 3, 2, true);
-+  renderer.drawLine(x - 7, iconY + 3, x + 8, iconY + 3, 2, true);
-+  renderer.drawLine(x - 7, iconY + 3, x - 3, iconY - 1, 2, true);
-+  renderer.drawLine(x - 7, iconY + 3, x - 3, iconY + 7, 2, true);
++  renderer.drawLine(x - 10, iconY - 7, x + 7, iconY - 7, 2, true);
++  renderer.drawLine(x - 10, iconY, x + 1, iconY, 2, true);
++  renderer.drawLine(x - 10, iconY + 7, x + 7, iconY + 7, 2, true);
++  renderer.drawLine(x + 10, iconY - 5, x + 10, iconY + 2);
++  renderer.drawLine(x + 8, iconY, x + 10, iconY + 2);
++  renderer.drawLine(x + 12, iconY, x + 10, iconY + 2);
 +  if (loading) GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
 +  else renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe96355755143f
+index 0000000000000000000000000000000000000000..4ec3d6b0bc7cd6d0b2c93d51e2c60afa22c5b7fa
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,164 @@
 +#pragma once
 +
 +#include <atomic>
@@ -2830,6 +2893,8 @@ index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe9635
 +#include <memory>
 +#include <string>
 +#include <vector>
++
++#include <Memory.h>
 +
 +#include "activities/Activity.h"
 +#include "workflowy/WorkflowyOutlineLayout.h"
@@ -2867,6 +2932,7 @@ index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe9635
 +  bool showDone = false;
 +  bool wrapItems = true;
 +  int wrapAnchor = -1;
++  int revealParent = -1;
 +  size_t page = 0;
 +  int touchX = 0;
 +  int touchY = 0;
@@ -2922,7 +2988,8 @@ index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe9635
 +    unsigned depth = 0, generation = 0;
 +    bool root = false;
 +    std::atomic<bool> ready{false};
-+    int status = 0;
++    std::atomic<bool> cancel{false};
++    int status = 0, transport = 0;
 +    std::vector<Node> children;
 +  };
 +  std::shared_ptr<Prefetch> prefetch;
@@ -2957,6 +3024,8 @@ index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe9635
 +  void back();
 +  void nextPage(int delta, bool edge = false);
 +  void showMessage(const char* text);
++  void showErrorDetails();
++  int lastStatus = 0, lastTransport = 0;
 +  void connect();
 +  void editKey();
 +  int request(const char* method, const std::string& path, const std::string& body, uint8_t* response = nullptr,
@@ -2967,21 +3036,17 @@ index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe9635
 +  void removeNode(const std::string& id, bool moveToCurrentDay = false);
 +  bool replaceSiblings(std::vector<Node>& outline, const std::string& parent, const std::vector<Node>& siblings);
 +  static int requestWithKey(const std::string& key, const char* method, const std::string& path,
-+                            const std::string& body, uint8_t* response, size_t* received, size_t capacity);
++                            const std::string& body, uint8_t* response, size_t* received, size_t capacity, HeapByteBuffer* growable = nullptr,
++                            const std::atomic<bool>* cancel = nullptr, int* transport = nullptr);
 +  static int fetchChildren(const std::string& key, const std::string& parent, unsigned depth,
-+                           std::vector<Node>& result);
++                           std::vector<Node>& result, const std::atomic<bool>* cancel = nullptr,
++                           int* transport = nullptr);
 +  void loadDay();
 +  void toggle(size_t row);
 +  void expand(size_t row);
 +  void actions(size_t row);
 +  void edit(size_t row, int relative = 0, size_t cursor = std::string::npos);
 +  size_t cursorAt(std::string_view text, workflowy::TextSpan line, int width) const;
-+  struct InlineLine {
-+    workflowy::TextSpan text;
-+    int x, y, height;
-+  };
-+  std::vector<InlineLine> inlineLines;
-+  void renderInline(size_t row, int relative, bool adding, const std::string& draft, size_t cursor, int bottom);
 +  void chooseDate(std::string moveId = {});
 +  void moveToDate(const std::string& id, const std::string& target);
 +};
@@ -3032,13 +3097,14 @@ index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfc
 +inline constexpr freeink::Icon workflowyIcon{32, 32, 16, workflowyBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..b4879696c1df2661768cd2e82e67a9cd664c92ce
+index 0000000000000000000000000000000000000000..668419fb74552abe69a268825bb87d4d10a5bd95
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,120 @@
 +#pragma once
 +
 +#include <cstddef>
++#include <string>
 +#include <string_view>
 +#include <vector>
 +
@@ -3054,6 +3120,39 @@ index 0000000000000000000000000000000000000000..b4879696c1df2661768cd2e82e67a9cd
 +    ++at;
 +  } while (at < text.size() && (static_cast<unsigned char>(text[at]) & 0xc0) == 0x80);
 +  return at;
++}
++
++inline void dropEmoji(std::string& text) {
++  size_t write = 0;
++  for (size_t at = 0; at < text.size();) {
++    const auto end = nextCharacter(text, at);
++    const auto first = static_cast<unsigned char>(text[at]);
++    unsigned cp = first;
++    if (end - at > 1 && end - at <= 4) {
++      cp &= 0x7fu >> (end - at);
++      for (auto i = at + 1; i < end; ++i) cp = (cp << 6) | (static_cast<unsigned char>(text[i]) & 0x3f);
++    }
++    const bool key = first == '#' || first == '*' || (first >= '0' && first <= '9');
++    if (key && end == at + 1) {
++      auto tail = end;
++      if (text.compare(tail, 3, "\xef\xb8\x8f") == 0) tail += 3;
++      if (text.compare(tail, 3, "\xe2\x83\xa3") == 0) {
++        at = tail + 3;
++        continue;
++      }
++    }
++    const bool emoji = (cp >= 0x1f000 && cp <= 0x1faff) || ((cp >= 0x2600 && cp <= 0x27bf) &&
++                        ((cp != 0x2713 && cp != 0x2714 && cp != 0x2715 && cp != 0x2716) ||
++                         text.compare(end, 3, "\xef\xb8\x8f") == 0)) ||
++                       (cp >= 0x23e9 && cp <= 0x23fa) ||
++                       (cp >= 0xe0020 && cp <= 0xe007f) || cp == 0xfe0f || cp == 0x200d ||
++                       cp == 0x231a || cp == 0x231b || cp == 0x2b50 || cp == 0x2b55;
++    if (!emoji) {
++      for (auto i = at; i < end; ++i) text[write++] = text[i];
++    }
++    at = end;
++  }
++  text.resize(write);
 +}
 +
 +// Return byte spans so a tag split across lines keeps its original identity.

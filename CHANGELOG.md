@@ -2,16 +2,22 @@
 
 ### Added
 
-- Workflowy can undo completion, reorder, and move actions. An eight-second Undo window precedes permanent deletion.
-- Drag a Workflowy row down and right to nest it under a sibling. The drop line shifts right to show the new level.
+- Workflowy has a month calendar for browsing and moving items, a single-item editor with completion and item actions, and a tap-to-open error details screen.
+- Workflowy supports Undo for completion, reordering, and moving. An eight-second Undo window precedes permanent deletion.
+- Drag a Workflowy row down and right to nest it under a sibling. The drop line shows the new level.
 - Offline Workflowy captures are saved to the SD card and sent on reconnect. A header badge shows offline status and the pending count.
-
-- Workflowy wrapped outlines support inline editing at the tapped character and adding items above or below a sibling. An item starting with `[]` becomes a todo.
-- Workflowy has first, previous, next, and last page controls, and vertical swipes can turn pages during requests.
+- Workflowy can add items above or below a sibling. An item starting with `[]` becomes a todo.
+- Workflowy has first, previous, next, and last page controls. Vertical swipes can turn pages during requests.
 
 ### Changed
 
-- Workflowy prefetches one level below visible rows and checks for changes in the background. Todo checkboxes have square corners, and adjacent tags keep separate backgrounds.
+- In Workflowy the todo count shows completed over total. Undo appears in the bottom toolbar, show-completed sits by the calendar, and wrapping has its own text icon. Workflowy omits emoji on the device.
+- Workflowy reads one level below visible rows and checks for changes in the background. Hidden prefetching is capped, network response buffers grow on demand, and zoomed branches are moved between views. Leaving Workflowy cancels pending fetches.
+- Todo checkboxes have square corners, and adjacent tags keep separate backgrounds.
+
+### Fixed
+
+- Workflowy accepts fresh taps after requests, tolerates finger roll on checkboxes and arrows, and reveals children on the next page when a branch expands across a page break.
 
 ## [v1.5.1] - 2026-09-10
 
