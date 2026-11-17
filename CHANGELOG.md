@@ -17,7 +17,8 @@
 
 ### Fixed
 
-- Workflowy accepts fresh taps after requests, tolerates finger roll on checkboxes and arrows, and reveals children on the next page when a branch expands across a page break.
+- Workflowy gives arrow taps priority over prefetch, keeps the parent arrow reachable after expansion, and joins its network worker before returning to the Library.
+- The Library and Workflowy handle taps on their frontlight, reader touch, Readest, and saved-items status icons.
 
 ## [v1.5.1] - 2026-09-10
 
