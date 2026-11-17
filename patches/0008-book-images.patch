@@ -49,9 +49,10 @@ diff --git a/lib/Epub/Epub/Page.h b/lib/Epub/Epub/Page.h
 
    // Get bounding box of all images on the page (union of image rects)
 diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlock.cpp
+index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16dadb0bc1b 100644
 --- a/lib/Epub/Epub/blocks/ImageBlock.cpp
 +++ b/lib/Epub/Epub/blocks/ImageBlock.cpp
-@@ -269,7 +269,7 @@
+@@ -269,7 +269,7 @@ bool renderCachedPixels(GfxRenderer& renderer, const uint8_t* pixels, const uint
 
    const int bytesPerRow = (cachedWidth + 3) / 4;
    DirectPixelWriter pw;
@@ -60,7 +61,7 @@ diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlo
    for (int row = clip.y0; row < clip.y1; ++row) {
      const uint8_t* rowBuffer = pixels + static_cast<size_t>(row) * bytesPerRow;
      pw.beginRow(y + row);
-@@ -361,7 +361,7 @@
+@@ -361,7 +361,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
    }
 
    DirectPixelWriter pw;
@@ -69,7 +70,7 @@ diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlo
 
    const size_t dataOffset = 4U + static_cast<size_t>(clip.y0) * static_cast<size_t>(bytesPerRowInt);
    if (!cacheFile.seek(dataOffset)) {
-@@ -464,10 +464,8 @@
+@@ -464,10 +464,8 @@ void ImageBlock::releaseSessionPixelCache() {
  }
 
  void ImageBlock::renderPlaceholder(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) const {
@@ -82,16 +83,22 @@ diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlo
  }
 
  void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) {
-@@ -514,7 +512,7 @@
+@@ -511,10 +509,13 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
+     return;
+   }
+
++  // A transparent background uses the page polarity, so a dark page shows light image ink.
++  const bool preservePolarity = !renderer.invertImages() && !renderer.transparentImageBackground();
++
    // Try to render from cache first
    std::string cachePath = getCachePath(imagePath);
    if (renderFromCache(renderer, cachePath, x, y, width, height)) {
 -    renderer.preserveImagePolarity(x, y, width, height);
-+    if (!renderer.invertImages()) renderer.preserveImagePolarity(x, y, width, height);
++    if (preservePolarity) renderer.preserveImagePolarity(x, y, width, height);
      return;  // Successfully rendered from cache
    }
 
-@@ -543,6 +541,7 @@
+@@ -543,6 +544,7 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
    config.maxWidth = width;
    config.maxHeight = height;
    config.useGrayscale = true;
@@ -99,16 +106,17 @@ diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlo
    config.useDithering = true;
    config.performanceMode = false;
    config.useExactDimensions = true;  // Use pre-calculated dimensions to avoid rounding mismatches
-@@ -569,7 +568,7 @@
+@@ -569,7 +571,7 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
      return;
    }
 
 -  renderer.preserveImagePolarity(x, y, width, height);
-+  if (!renderer.invertImages()) renderer.preserveImagePolarity(x, y, width, height);
++  if (preservePolarity) renderer.preserveImagePolarity(x, y, width, height);
  }
 
  bool ImageBlock::serialize(FsFile& file) {
 diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/converters/DirectPixelWriter.h
+index debe10c9037d4cf9a38794031d3f5ac5f934b712..1dc6bd0c1f54e1f613b983eb51ce6e624168527b 100644
 --- a/lib/Epub/Epub/converters/DirectPixelWriter.h
 +++ b/lib/Epub/Epub/converters/DirectPixelWriter.h
 @@ -1,13 +1,13 @@
@@ -128,16 +136,17 @@ diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/conver
  //
  // Caller is responsible for ensuring (outX, outY) are within screen bounds.
  // ImageBlock::render() already validates this before entering the pixel loop,
-@@ -15,6 +15,8 @@
+@@ -15,6 +15,9 @@
  struct DirectPixelWriter {
    uint8_t* fb;
    GfxRenderer::RenderMode mode;
 +  bool absolute;
++  bool transparentBackground;
 +  uint8_t contrast;
    uint16_t displayWidthBytes;  // Runtime framebuffer stride (X4: 100, X3: 99)
    // Active write target: for tiled grayscale, fb is the band scratch, originY is
    // the band's top physical row, and clipRows is the band height. Off-band
-@@ -33,11 +35,13 @@
+@@ -33,11 +36,14 @@ struct DirectPixelWriter {
    // Row-precomputed: the Y-dependent portion of the physical coords
    int rowPhyXBase, rowPhyYBase;
 
@@ -148,11 +157,12 @@ diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/conver
      clipRows = renderer.getWriteRows();
      mode = renderer.getRenderMode();
 +    absolute = renderer.grayPlanesAreAbsolute();
++    transparentBackground = renderer.transparentImageBackground();
 +    contrast = imageContrast;
      displayWidthBytes = renderer.getDisplayWidthBytes();
 
      const int phyW = renderer.getDisplayWidth();
-@@ -103,30 +107,20 @@
+@@ -103,31 +109,23 @@ struct DirectPixelWriter {
    // Must be called after beginRow() for the current row.
    // No bounds checking — caller guarantees coordinates are valid.
    inline void writePixel(int logicalX, uint8_t pixelValue) const {
@@ -174,6 +184,8 @@ diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/conver
 -        break;
 -      default:
 -        return;
++    // Leave page pixels intact under white areas, including in absolute gray planes.
++    if (transparentBackground && pixelValue == 3) return;
 +    const int phyX = rowPhyXBase + logicalX * phyXStepX;
 +    const int phyY = rowPhyYBase + logicalX * phyYStepX;
 +    pixelValue = applyImageContrast(pixelValue, contrast, phyX, phyY);
@@ -188,12 +200,13 @@ diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/conver
      }
 
      if (!draw) return;
--
+
 -    const int phyX = rowPhyXBase + logicalX * phyXStepX;
 -    const int phyY = rowPhyYBase + logicalX * phyYStepX;
-
+-
      // Band-local row. The unsigned compare drops both off-band pixels (strip
      // mode) and any out-of-frame row (full-frame mode) in one branch.
+     const int sy = phyY - originY;
 diff --git a/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h b/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h
 --- a/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h
 +++ b/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h
@@ -310,9 +323,10 @@ diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
    absoluteGrayPlanes = false;
  #ifdef SIMULATOR
 diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index 1074ecce03413a49979152e0d0c5956211daccce..19ce6ace713f13ff891e273102df2f6ed8731860 100644
 --- a/lib/GfxRenderer/GfxRenderer.h
 +++ b/lib/GfxRenderer/GfxRenderer.h
-@@ -24,6 +24,7 @@
+@@ -24,6 +24,7 @@ class SdCardFont;
  #include <vector>
 
  #include "Bitmap.h"
@@ -320,7 +334,15 @@ diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
 
  namespace glyphBitmap {
  struct Frame;
-@@ -353,6 +354,10 @@
+@@ -84,6 +85,7 @@ class GfxRenderer {
+   // Only set for book text (see TextWeightScope); UI text is always drawn as-is.
+   mutable int8_t textWeight_ = 0;
+   uint8_t imageContrast_ = NORMAL_IMAGE_CONTRAST;
++  bool transparentImageBackground_ = false;
+   // Reader images drawn as a negative in Dark Mode (see setInvertImages). Reader pages only; covers ignore it.
+   mutable bool invertImages_ = false;
+   mutable int textClipLeft_ = 0;
+@@ -353,12 +355,18 @@ class GfxRenderer {
    // The GrayscaleMode enum stays out of this header: the simulator's HalDisplay
    // does not define it.
    bool supportsDirectGrayscale() const;
@@ -331,7 +353,15 @@ diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
    bool displayDirectGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
    RenderMode getRenderMode() const { return renderMode; }
    int8_t getTextWeight() const { return textWeight_; }
-@@ -389,8 +394,8 @@
+   void setTextWeight(const int8_t weight) const { textWeight_ = weight < -2 ? -2 : (weight > 2 ? 2 : weight); }
+   void setImageContrast(uint8_t contrast) { imageContrast_ = contrast; }
+   uint8_t getImageContrast() const { return imageContrast_; }
++  void setTransparentImageBackground(bool enabled) { transparentImageBackground_ = enabled; }
++  bool transparentImageBackground() const { return transparentImageBackground_; }
+   // When set, images inside book pages are not pre-inverted for Dark Mode, so the panel's
+   // frame inversion shows them as a negative. The reader sets this before drawing a page;
+   // it only affects ImageBlock, never covers or sleep screens.
+@@ -389,8 +397,8 @@ class GfxRenderer {
    // `fallback`).
    void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH,
                              bool turnOffScreen = false) const;
@@ -365,13 +395,15 @@ new file mode 100644
 +  return static_cast<uint8_t>((level == 2) == stronger ? level + 1 : level - 1);
 +}
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index dc631727a74d04962643bb5a51ce628aa48520c4..ea158c133c4d856fe3b48efdfb714af3fdb62660 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -171,6 +171,8 @@
+@@ -171,6 +171,9 @@ STR_IMAGES: "Images"
  STR_IMAGES_DISPLAY: "Display"
  STR_IMAGES_PLACEHOLDER: "Placeholder"
  STR_IMAGES_SUPPRESS: "Suppress"
 +STR_IMAGE_CONTRAST: "Image Contrast"
++STR_TRANSPARENT_IMAGE_BACKGROUND: "Transparent Image Background"
 +STR_INVERT_IMAGES_DARK: "Invert Images in Dark Mode"
  STR_TOUCH_READER_CONTROLS: "Touch Reader Controls"
  STR_TAP_AND_SWIPE: "Tap & Swipe"
@@ -471,60 +503,70 @@ diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
 
    // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index a091acf49617d86e0429c9e2ca6410ac8fc58457..7fd6739383c1ae896fc7436c85df32d38df04d78 100644
 --- a/src/CrossPointSettings.h
 +++ b/src/CrossPointSettings.h
-@@ -665,6 +665,9 @@
+@@ -665,6 +665,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
    uint8_t readingIdleTimeThresholdUnits = 30;
    // Image rendering mode in EPUB reader
    uint8_t imageRendering = IMAGES_DISPLAY;
 +  // In Dark Mode, draw reader images as a negative (off = images keep their own colours).
 +  uint8_t invertImagesDark = 0;
 +  uint8_t imageContrast = 100;
++  uint8_t transparentImageBackground = 0;
    // Long-press Confirm (menu button) quick action in reader (0 = off)
    uint8_t longPressMenuAction = LONG_MENU_OFF;
    // Long-press Back quick action in reader (defaults to the historical file browser shortcut)
 diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
+index 6e947ad72d36fb2dc56f63b83898cf6295c4423a..47ba0d9460d342075d564cb6e25f028bd6cf744d 100644
 --- a/src/SettingsList.cpp
 +++ b/src/SettingsList.cpp
-@@ -122,6 +122,10 @@
+@@ -122,6 +122,12 @@ const std::vector<SettingInfo>& getBaseSettingsList() {
      add(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                            {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
                            "imageRendering", StrId::STR_CAT_READER));
 +    add(SettingInfo::Value(StrId::STR_IMAGE_CONTRAST, &CrossPointSettings::imageContrast,
 +                           {0, 200, 5}, "imageContrast", StrId::STR_CAT_READER));
++    add(SettingInfo::Toggle(StrId::STR_TRANSPARENT_IMAGE_BACKGROUND, &CrossPointSettings::transparentImageBackground,
++                            "transparentImageBackground", StrId::STR_CAT_READER));
 +    add(SettingInfo::Toggle(StrId::STR_INVERT_IMAGES_DARK, &CrossPointSettings::invertImagesDark, "invertImagesDark",
 +                            StrId::STR_CAT_READER));
      add(SettingInfo::Toggle(StrId::STR_TOUCH_READER_CONTROLS, &CrossPointSettings::touchReaderControls,
                              "touchReaderControls", StrId::STR_CAT_READER));
      add(SettingInfo::Toggle(StrId::STR_DISABLE_TOUCHSCREEN, &CrossPointSettings::disableReaderTouchscreen,
 diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 2ff41f9ff60fc1796a30a6973305e47a9de4968a..4a2339a523d539be6b35eecda9191c3d33fa1603 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
-@@ -765,7 +765,7 @@
+@@ -765,7 +765,7 @@ inline void addSettingByName(std::vector<SettingInfo>& target, const std::vector
 
  inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<SettingInfo>& allSettings) {
    std::vector<SettingInfo> readerSettings;
 -  readerSettings.reserve(12);
-+  readerSettings.reserve(13);
++  readerSettings.reserve(15);
    readerSettings.push_back(SettingInfo::Submenu(StrId::STR_READER_FONT_OPTIONS, SettingAction::ReaderFontOptions));
    readerSettings.push_back(SettingInfo::Submenu(StrId::STR_READER_PAGE_LAYOUT, SettingAction::ReaderPageLayout));
    readerSettings.push_back(SettingInfo::Action(StrId::STR_STATUS_BARS, SettingAction::CustomiseStatusBar));
-@@ -774,6 +774,7 @@
+@@ -774,6 +774,9 @@ inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<
    addSettingByName(readerSettings, allSettings, StrId::STR_EMBEDDED_STYLE);
    addSettingByName(readerSettings, allSettings, StrId::STR_HIGHLIGHT_COLOR);
    addSettingByName(readerSettings, allSettings, StrId::STR_IMAGES);
++  addSettingByName(readerSettings, allSettings, StrId::STR_IMAGE_CONTRAST);
++  addSettingByName(readerSettings, allSettings, StrId::STR_TRANSPARENT_IMAGE_BACKGROUND);
 +  addSettingByName(readerSettings, allSettings, StrId::STR_INVERT_IMAGES_DARK);
    addSettingByName(readerSettings, allSettings, StrId::STR_FOCUS_READING);
    addSettingByName(readerSettings, allSettings, StrId::STR_GUIDE_READING);
    addSettingByName(readerSettings, allSettings, StrId::STR_DICTIONARY);
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index cd652d64a7c7419e6b10b32b78f2e45d006c9fb7..af4c800a4dbeb1d893dce67929a1dd8132dffda6 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -487,6 +487,7 @@
+@@ -487,6 +487,8 @@ void ActivityManager::renderTaskLoop() {
        // Apply Night Mode to each activity's normal-polarity frame. SleepActivity
        // preserves it only for Quick Resume and clears it for other sleep screens.
        display.setInverted(SETTINGS.screenInverted != 0);
 +      renderer.setImageContrast(SETTINGS.imageContrast);
++      renderer.setTransparentImageBackground(SETTINGS.transparentImageBackground != 0);
        currentActivity->render(std::move(lock));
        restoredActivityNeedsRender = false;
      }
