@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..a5d6d6f54380ed59384d6ae330500a8896f2c262 100644
+index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..ac812fa69e2dbae0dae7ddfd3e4a9a397be5dabe 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -609,6 +609,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..a5d6d6f54380ed59384d6ae330500a88
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1078,3 +1096,41 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1078,3 +1096,47 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -82,6 +82,12 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..a5d6d6f54380ed59384d6ae330500a88
 +STR_WORKFLOWY_COMPLETE_FAILED: "Could not mark the item done"
 +STR_WORKFLOWY_UNCOMPLETE_FAILED: "Could not mark the item undone"
 +STR_WORKFLOWY_MOVE_TOP: "Move to top"
++STR_WORKFLOWY_MOVE_BOTTOM: "Move to bottom"
++STR_WORKFLOWY_SELECT_MULTIPLE: "Select multiple"
++STR_WORKFLOWY_SELECT_ALL: "Select all"
++STR_WORKFLOWY_SELECTION_COUNT: "%u selected"
++STR_WORKFLOWY_BULK_ACTIONS: "Bulk actions"
++STR_WORKFLOWY_BULK_DELETE: "Permanently delete %u selected items?"
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -819,10 +825,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8798bec5d3480ccf616e4ce315026445
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953e9320cbd
+index 0000000000000000000000000000000000000000..c37b24063cbb08f611f05c5320645b9af484b767
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2302 @@
+@@ -0,0 +1,2535 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -869,6 +875,8 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +constexpr int ROW_HEIGHT = 39;
 +constexpr int ICON_TARGET = 44;
 +constexpr int ROW_ARROW_TARGET = 34;
++constexpr char CONTINUATION[] = "...";
++constexpr int CONTINUATION_GAP = 3;
 +constexpr char OUTBOX[] = "/.crashink/.workflowy-outbox.json";
 +constexpr size_t OUTBOX_LIMIT = 24 * 1024;
 +constexpr size_t OUTBOX_ITEMS = 24;
@@ -1426,7 +1434,7 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +
 +void WorkflowyDailyActivity::saveTask(void* argument) {
 +  auto& save = *static_cast<Save*>(argument);
-+  save.status = requestWithKey(save.key, "POST", save.path, save.body,
++  save.status = requestWithKey(save.key, save.method, save.path, save.body,
 +                               save.captureResponse ? save.response.data() : nullptr,
 +                               &save.received, save.response.size(), nullptr, nullptr, &save.transport, &save.error);
 +  save.ready.store(true, std::memory_order_release);
@@ -1434,7 +1442,7 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +}
 +
 +bool WorkflowyDailyActivity::queueSave(std::string path, std::string body, bool capture,
-+                                       std::function<void(const Save&)> finish) {
++                                       std::function<void(const Save&)> finish, const char* method) {
 +  if (pendingSave) return false;
 +  auto save = makeUniqueNoThrow<Save>();
 +  if (!save) {
@@ -1447,6 +1455,7 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  save->body = std::move(body);
 +  save->captureResponse = capture;
 +  save->finish = std::move(finish);
++  save->method = method;
 +  pendingSave = std::move(save);
 +  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
 +  {
@@ -1737,6 +1746,7 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    }
 +    node.leaf = old->leaf;
 +    node.childrenConfirmed = old->childrenConfirmed;
++    node.selected = old->selected;
 +    auto lastChild = old + 1;
 +    while (lastChild != end && lastChild->depth > depth) ++lastChild;
 +    const size_t count = lastChild - (old + 1);
@@ -1938,6 +1948,139 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  return caret;
 +}
 +
++bool WorkflowyDailyActivity::selectionEligible(const Node& node) const {
++  return node.depth == (zoomId.empty() ? 0u : 1u) && node.id != pendingDelete && (showDone || !node.done);
++}
++
++size_t WorkflowyDailyActivity::selectionCount() const {
++  return std::count_if(rows.begin(), rows.end(), [](const Node& row) { return row.selected; });
++}
++
++void WorkflowyDailyActivity::cancelSelection() {
++  bulkAction = BulkAction::None;
++  {
++    RenderLock lock(*this);
++    selecting = false;
++    for (auto& row : rows) row.selected = false;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::toggleSelection(size_t row) {
++  if (pendingSave || bulkAction != BulkAction::None || !selectionEligible(rows[row])) return;
++  {
++    RenderLock lock(*this);
++    rows[row].selected = !rows[row].selected;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::selectAll() {
++  if (pendingSave || bulkAction != BulkAction::None) return;
++  {
++    RenderLock lock(*this);
++    for (auto& row : rows) row.selected = selectionEligible(row);
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::showBulkMenu() {
++  if (selectionCount() == 0 || pendingSave || bulkAction != BulkAction::None) return;
++  const bool hasTodo = std::any_of(rows.begin(), rows.end(),
++                                   [&](const Node& row) { return row.todo && row.selected; });
++  std::vector<std::string> choices;
++  if (hasTodo) {
++    choices.emplace_back(tr(STR_WORKFLOWY_MARK_DONE));
++    choices.emplace_back(tr(STR_WORKFLOWY_MARK_UNDONE));
++  }
++  choices.emplace_back(tr(STR_WORKFLOWY_MOVE_DATE));
++  choices.emplace_back(tr(STR_DELETE));
++  startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                            renderer, mappedInput, "WorkflowyBulk", StrId::STR_WORKFLOWY_BULK_ACTIONS,
++                            std::move(choices), 0, false, true),
++                         [this, hasTodo](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    int selected = std::get<OptionSelectionResult>(result.data).index;
++    if (hasTodo) {
++      if (selected == 0) return startBulk(BulkAction::Done);
++      if (selected == 1) return startBulk(BulkAction::Undone);
++      selected -= 2;
++    }
++    if (selected == 0) {
++      const auto today = isoDate(0);
++      const auto current = validDate(date) ? date : today;
++      if (current.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++      startActivityForResult(std::make_unique<WorkflowyDatePicker>(renderer, mappedInput,
++                                 StrId::STR_WORKFLOWY_MOVE_DATE, current, today),
++                             [this](const ActivityResult& picked) {
++        if (!picked.isCancelled) startBulk(BulkAction::MoveDate, std::get<KeyboardResult>(picked.data).text);
++      });
++    } else if (selected == 1) {
++      char prompt[64];
++      snprintf(prompt, sizeof(prompt), tr(STR_WORKFLOWY_BULK_DELETE), static_cast<unsigned>(selectionCount()));
++      startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_DELETE), prompt),
++                             [this](const ActivityResult& confirmed) {
++        if (!confirmed.isCancelled) startBulk(BulkAction::Delete);
++      });
++    }
++  });
++}
++
++void WorkflowyDailyActivity::startBulk(BulkAction action, std::string target) {
++  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  if (pendingSave || bulkAction != BulkAction::None) return;
++  bulkAction = action;
++  bulkDate = std::move(target);
++  nextBulkItem();
++}
++
++void WorkflowyDailyActivity::nextBulkItem() {
++  if (bulkAction == BulkAction::None) return;
++  const bool changeCompletion = bulkAction == BulkAction::Done || bulkAction == BulkAction::Undone;
++  const bool done = bulkAction == BulkAction::Done;
++  const auto item = std::find_if(rows.begin(), rows.end(), [&](const Node& row) {
++    return row.selected && (!changeCompletion || (row.todo && row.done != done));
++  });
++  if (item == rows.end()) {
++    bulkAction = BulkAction::None;
++    cancelSelection();
++    return;
++  }
++  const auto id = item->id;
++  std::string path = "/" + id, body;
++  if (changeCompletion) {
++    path += done ? "/complete" : "/uncomplete";
++  } else if (bulkAction == BulkAction::MoveDate) {
++    JsonDocument update;
++    update["parent_id"] = bulkDate;
++    update["position"] = "bottom";
++    path += "/move";
++    body = encode(update);
++  }
++  const auto action = bulkAction;
++  if (!queueSave(std::move(path), std::move(body), false, [this, id, done, changeCompletion, action](const Save& save) {
++    if (save.status < 200 || save.status >= 300) {
++      bulkAction = BulkAction::None;
++      return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++    }
++    {
++      RenderLock lock(*this);
++      for (auto& row : rows) {
++        if (row.id == id) row.selected = false;
++      }
++    }
++    if (changeCompletion) updateCompletion(id, done);
++    else if (action == BulkAction::MoveDate) {
++      const bool sameDay = bulkDate == date || (date == "today" && bulkDate == isoDate(0)) ||
++                           (date == "tomorrow" && bulkDate == isoDate(1));
++      removeNode(id, sameDay);
++    } else {
++      removeNode(id);
++    }
++    nextBulkItem();
++  }, action == BulkAction::Delete ? "DELETE" : "POST")) bulkAction = BulkAction::None;
++}
++
 +void WorkflowyDailyActivity::actions(const size_t row) {
 +  if (pendingSave) return;
 +  std::vector<std::string> options{
@@ -1950,16 +2093,32 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  const int complete = rows[row].todo ? static_cast<int>(options.size()) : -1;
 +  if (complete >= 0)
 +    options.emplace_back(rows[row].done ? tr(STR_WORKFLOWY_MARK_UNDONE) : tr(STR_WORKFLOWY_MARK_DONE));
-+  const int moveTop = (zoomId.empty() || row != 0) && moveOrigin(row).after ? static_cast<int>(options.size()) : -1;
++  const bool movable = zoomId.empty() || row != 0;
++  const int moveTop = movable && moveOrigin(row).after ? static_cast<int>(options.size()) : -1;
 +  if (moveTop >= 0) options.emplace_back(tr(STR_WORKFLOWY_MOVE_TOP));
++  const auto next = std::find_if(rows.begin() + row + 1, rows.end(),
++                                 [&](const Node& node) { return node.depth <= rows[row].depth; });
++  const int moveBottom = movable && next != rows.end() && next->depth == rows[row].depth
++                             ? static_cast<int>(options.size()) : -1;
++  if (moveBottom >= 0) options.emplace_back(tr(STR_WORKFLOWY_MOVE_BOTTOM));
++  const int multi = selectionEligible(rows[row]) ? static_cast<int>(options.size()) : -1;
++  if (multi >= 0) options.emplace_back(tr(STR_WORKFLOWY_SELECT_MULTIPLE));
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
 +                             0, false, true),
-+                         [this, row, complete, moveTop](const ActivityResult& result) {
++                         [this, row, complete, moveTop, moveBottom, multi](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const int selected = std::get<OptionSelectionResult>(result.data).index;
 +    const auto id = rows[row].id;
-+    if (moveTop >= 0 && selected == moveTop) return moveToTop(row);
++    if (multi >= 0 && selected == multi) {
++      {
++        RenderLock lock(*this);
++        selecting = true;
++      }
++      return toggleSelection(row);
++    }
++    if (moveTop >= 0 && selected == moveTop) return moveToBoundary(row, false);
++    if (moveBottom >= 0 && selected == moveBottom) return moveToBoundary(row, true);
 +    if (complete >= 0 && selected == complete) return toggle(row);
 +    if (selected == 0) return edit(row);
 +    if (selected == 5 || selected == 6) return edit(row, selected == 5 ? -1 : 1);
@@ -2087,18 +2246,34 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  const int firstLineHeight = std::max(ROW_HEIGHT, bounds.lineHeight + 12);
 +  int y = bounds.rowTop;
 +  const unsigned visibleDepth = zoomId.empty() ? 0 : 1;
-+  for (size_t i = 0; i < rows.size(); ++i) {
++  const auto placeRow = [&](size_t i) {
 +    const auto& node = rows[i];
 +    if (node.depth > visibleDepth || node.id == pendingDelete ||
-+        (!pendingDelete.empty() && pendingDelete == zoomId)) continue;
-+    if (node.done && !showDone && (i != 0 || zoomId.empty())) continue;
++        (!pendingDelete.empty() && pendingDelete == zoomId)) return;
++    if (node.done && !showDone && (i != 0 || zoomId.empty())) return;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int width = std::max(1, bounds.width - indent - 25 - ROW_ARROW_TARGET);
 +    size_t first = outlineLines.size();
 +    if (wrapItems) {
-+      workflowy::wrapOutlineText(node.title, width, [&](std::string_view text) {
++      const auto measure = [&](std::string_view text) {
 +        return renderer.getTextWidth(UI_12_FONT_ID, std::string(text).c_str());
-+      }, outlineLines);
++      };
++      workflowy::wrapOutlineText(node.title, width, measure, outlineLines);
++      const auto capacityAt = [&](int top) {
++        return static_cast<size_t>(std::max(1, 1 + (bounds.rowBottom - top - firstLineHeight) / bounds.lineHeight));
++      };
++      const auto firstCapacity = capacityAt(y + firstLineHeight <= bounds.rowBottom ? y : bounds.rowTop);
++      if (outlineLines.size() - first > firstCapacity) {
++        const auto fullCapacity = capacityAt(bounds.rowTop);
++        const int allowance = renderer.getTextWidth(UI_12_FONT_ID, CONTINUATION) + CONTINUATION_GAP;
++        outlineLines.resize(first);
++        workflowy::wrapOutlineTextByLine(node.title, [&](size_t line) {
++          const bool leading = line >= firstCapacity && (line - firstCapacity) % fullCapacity == 0;
++          const bool trailing = line < firstCapacity ? line + 1 == firstCapacity
++                                                     : (line - firstCapacity + 1) % fullCapacity == 0;
++          return std::max(1, width - (static_cast<int>(leading) + static_cast<int>(trailing)) * allowance);
++        }, measure, outlineLines);
++      }
 +    } else {
 +      outlineLines.push_back({0, node.title.size()});
 +    }
@@ -2113,6 +2288,16 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +      placements.push_back({i, first, count, y, y + height});
 +      first += count;
 +      y += height;
++    }
++  };
++  const size_t firstItem = !zoomId.empty() && !rows.empty() ? 1 : 0;
++  if (firstItem) placeRow(0);
++  for (size_t i = firstItem; i < rows.size(); ++i) {
++    if (!rows[i].done) placeRow(i);
++  }
++  if (showDone) {
++    for (size_t i = firstItem; i < rows.size(); ++i) {
++      if (rows[i].done) placeRow(i);
 +    }
 +  }
 +  if (wrapAnchor >= 0) {
@@ -2490,16 +2675,15 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  return origin;
 +}
 +
-+void WorkflowyDailyActivity::moveToTop(size_t row) {
++void WorkflowyDailyActivity::moveToBoundary(size_t row, bool bottom) {
 +  if (pendingSave || rows[row].id == zoomId) return;
 +  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const auto id = rows[row].id;
 +  const auto origin = moveOrigin(row);
-+  if (!origin.after) return;
 +  JsonDocument update;
 +  update["parent_id"] = origin.parent;
-+  update["position"] = "top";
-+  queueSave("/" + id + "/move", encode(update), false, [this, id, origin](const Save& save) {
++  update["position"] = bottom ? "bottom" : "top";
++  queueSave("/" + id + "/move", encode(update), false, [this, id, origin, bottom](const Save& save) {
 +    if (save.status < 200 || save.status >= 300) return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +    {
 +      RenderLock lock(*this);
@@ -2507,11 +2691,17 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +        const auto item = std::find_if(outline.begin(), outline.end(), [&](const Node& node) { return node.id == id; });
 +        if (item == outline.end()) return;
 +        const auto depth = item->depth;
-+        auto first = item;
-+        while (first != outline.begin() && std::prev(first)->depth >= depth) --first;
 +        auto end = item + 1;
 +        while (end != outline.end() && end->depth > depth) ++end;
-+        std::rotate(first, item, end);
++        if (bottom) {
++          auto last = end;
++          while (last != outline.end() && last->depth >= depth) ++last;
++          std::rotate(item, end, last);
++        } else {
++          auto first = item;
++          while (first != outline.begin() && std::prev(first)->depth >= depth) --first;
++          std::rotate(first, item, end);
++        }
 +      };
 +      rotateBranch(rows);
 +      for (auto& view : viewStack) rotateBranch(view.rows);
@@ -2691,7 +2881,10 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +void WorkflowyDailyActivity::loop() {
 +  using Button = MappedInputManager::Button;
 +  using Swipe = MappedInputManager::SwipeDir;
-+  if (mappedInput.wasReleased(Button::Back)) return back();
++  if (mappedInput.wasReleased(Button::Back)) {
++    if (selecting) return cancelSelection();
++    return back();
++  }
 +  if (step == Step::Start) return connect();
 +  if (step == Step::Load) return loadDay();
 +  if (step != Step::Ready || loading) return;
@@ -2722,6 +2915,7 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    tracking = true;
 +    dragRow = -1;
 +    moved = false;
++    peakY = 0;
 +    touchX = lastX = x;
 +    touchY = lastY = y;
 +    touchAt = millis();
@@ -2730,7 +2924,8 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    lastX = x;
 +    lastY = y;
 +    const int dx = std::abs(x - touchX), dy = std::abs(y - touchY);
-+    if (!moved && dragRow < 0 && millis() - touchAt >= 550) dragRow = rowAt(touchX, touchY);
++    if (dy > std::abs(peakY)) peakY = y - touchY;
++    if (!selecting && !moved && dragRow < 0 && millis() - touchAt >= 550) dragRow = rowAt(touchX, touchY);
 +    moved |= std::max(dx, dy) > 26;
 +    if (online && dragRow >= 0 && (dragging || dy > 26)) {
 +      dragging = true;
@@ -2774,15 +2969,17 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    return;
 +  }
 +  if (swipe == Swipe::None && release && tracking) {
-+    const int dx = lastX - touchX, dy = lastY - touchY;
-+    if (std::max(std::abs(dx), std::abs(dy)) >= 60)
-+      swipe = std::abs(dx) > std::abs(dy) ? (dx < 0 ? Swipe::Left : Swipe::Right) : (dy < 0 ? Swipe::Up : Swipe::Down);
++    const int dx = lastX - touchX;
++    if (std::abs(peakY) >= 28 && std::abs(peakY) >= std::abs(dx))
++      swipe = peakY < 0 ? Swipe::Up : Swipe::Down;
++    else if (std::abs(dx) >= 60)
++      swipe = dx < 0 ? Swipe::Left : Swipe::Right;
 +  }
 +  if (swipe != Swipe::None) {
 +    const int row = sdkSwipe ? rowAt(swipeX, swipeY) : rowAt(touchX, touchY);
 +    tracking = false;
 +    if (swipe == Swipe::Up || swipe == Swipe::Down) return nextPage(swipe == Swipe::Up ? 1 : -1);
-+    if (row >= 0) {
++    if (!selecting && row >= 0) {
 +      if (swipe == Swipe::Right) toggle(row);
 +      else actions(row);
 +    }
@@ -2826,7 +3023,7 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +      return showErrorDetails();
 +    }
 +  }
-+  if (tapped && tapArrow(tapX, tapY)) {
++  if (!selecting && tapped && tapArrow(tapX, tapY)) {
 +    tracking = false;
 +    return;
 +  }
@@ -2846,6 +3043,13 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  x = touchX;
 +  y = touchY;
 +  const auto bounds = layout();
++  if (selecting && y >= bounds.top + 28 && y < bounds.rowTop && !held) {
++    const int right = bounds.x + bounds.width;
++    if (x < bounds.x + ICON_TARGET) return cancelSelection();
++    if (x >= right - ICON_TARGET) return showBulkMenu();
++    if (x >= right - ICON_TARGET - 104) return selectAll();
++    return;
++  }
 +  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
 +      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
 +  if (!zoomId.empty() && y >= bounds.top + 30 && y < bounds.rowTop && x < bounds.x + ICON_TARGET) return back();
@@ -2874,6 +3078,10 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    if (zone >= 6 && zone < 8) return nextPage(1, zone == 7);
 +  }
 +  if (y >= bounds.footer) {
++    if (selecting) {
++      if (x < bounds.x + bounds.width / 5) cancelSelection();
++      return;
++    }
 +    const int control = std::clamp((x - bounds.x) * 5 / bounds.width, 0, 4);
 +    if (control == 0) return back();
 +    if (control == 2) {
@@ -2897,7 +3105,11 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    return;
 +  }
 +  const int row = rowAt(x, y);
-+  if (row < 0) return;
++  if (row < 0 || moved) return;
++  if (selecting) {
++    if (!held) toggleSelection(row);
++    return;
++  }
 +  const int indent = std::min<unsigned>(rows[row].depth, 8) * 16;
 +  if (held) return actions(row);
 +  size_t cursor = std::string::npos;
@@ -2913,7 +3125,9 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +      if (!checkboxHit) {
 +        const auto line = std::min(placement.lineCount - 1,
 +                                  static_cast<size_t>(std::max(0, y - placement.top - 6) / bounds.lineHeight));
-+        cursor = cursorAt(rows[row].title, outlineLines[placement.firstLine + line], x - bounds.x - indent - 25);
++        const int prefix = !firstFragment && line == 0
++                               ? renderer.getTextWidth(UI_12_FONT_ID, CONTINUATION) + CONTINUATION_GAP : 0;
++        cursor = cursorAt(rows[row].title, outlineLines[placement.firstLine + line], x - bounds.x - indent - 25 - prefix);
 +      }
 +      break;
 +    }
@@ -2926,33 +3140,46 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +  const auto bounds = layout();
 +  renderer.clearScreen();
 +  GUI.drawDisplayStatusBar(renderer, bounds.top);
-+  std::string heading = date.empty() || date == "today" ? tr(STR_WORKFLOWY_TODAY) : date;
-+  if (date == isoDate(-1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_YESTERDAY);
-+  if (date == isoDate(0) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TODAY);
-+  if (date == isoDate(1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TOMORROW);
-+  if (!zoomId.empty()) heading = std::string("‹  ") + tr(STR_WORKFLOWY);
-+  unsigned completed = 0, totalTodos = 0;
-+  const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
-+  for (const auto& row : rows) {
-+    if (row.depth == outlineDepth && row.todo) {
-+      ++totalTodos;
-+      if (row.done) ++completed;
++  if (selecting) {
++    const int cy = bounds.top + 46;
++    const int left = bounds.x + 17;
++    const int right = bounds.x + bounds.width;
++    renderer.drawLine(left - 6, cy - 6, left + 6, cy + 6, 2, true);
++    renderer.drawLine(left + 6, cy - 6, left - 6, cy + 6, 2, true);
++    char summary[40];
++    snprintf(summary, sizeof(summary), tr(STR_WORKFLOWY_SELECTION_COUNT), static_cast<unsigned>(selectionCount()));
++    renderer.drawText(UI_12_FONT_ID, bounds.x + ICON_TARGET, cy - 12, summary);
++    renderer.drawText(SMALL_FONT_ID, right - ICON_TARGET - 96, cy - 9, tr(STR_WORKFLOWY_SELECT_ALL));
++    for (const int dx : {-7, 0, 7}) renderer.fillRect(right - 22 + dx, cy - 1, 3, 3);
++  } else {
++    std::string heading = date.empty() || date == "today" ? tr(STR_WORKFLOWY_TODAY) : date;
++    if (date == isoDate(-1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_YESTERDAY);
++    if (date == isoDate(0) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TODAY);
++    if (date == isoDate(1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TOMORROW);
++    if (!zoomId.empty()) heading = std::string("‹  ") + tr(STR_WORKFLOWY);
++    unsigned completed = 0, totalTodos = 0;
++    const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
++    for (const auto& row : rows) {
++      if (row.depth == outlineDepth && row.todo) {
++        ++totalTodos;
++        if (row.done) ++completed;
++      }
 +    }
++    char todoCount[24];
++    snprintf(todoCount, sizeof(todoCount), "%u/%u", completed, totalTodos);
++    const int countX = bounds.x + bounds.width - 2 * ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
++    const auto fittedHeading = renderer.truncatedText(UI_12_FONT_ID, heading.c_str(), countX - bounds.x - 8,
++                                                       EpdFontFamily::BOLD);
++    renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
++    renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
++    const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
++    const int refreshX = cx - ICON_TARGET;
++    renderer.drawText(UI_12_FONT_ID, refreshX - 8, cy - 13, "↻");
++    renderer.drawRect(cx - 10, cy - 9, 21, 19);
++    renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
++    renderer.drawLine(cx - 5, cy - 12, cx - 5, cy - 6);
++    renderer.drawLine(cx + 5, cy - 12, cx + 5, cy - 6);
 +  }
-+  char todoCount[24];
-+  snprintf(todoCount, sizeof(todoCount), "%u/%u", completed, totalTodos);
-+  const int countX = bounds.x + bounds.width - 2 * ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
-+  const auto fittedHeading = renderer.truncatedText(UI_12_FONT_ID, heading.c_str(), countX - bounds.x - 8,
-+                                                     EpdFontFamily::BOLD);
-+  renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
-+  renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
-+  const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
-+  const int refreshX = cx - ICON_TARGET;
-+  renderer.drawText(UI_12_FONT_ID, refreshX - 8, cy - 13, "↻");
-+  renderer.drawRect(cx - 10, cy - 9, 21, 19);
-+  renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
-+  renderer.drawLine(cx - 5, cy - 12, cx - 5, cy - 6);
-+  renderer.drawLine(cx + 5, cy - 12, cx + 5, cy - 6);
 +  renderer.drawLine(bounds.x, bounds.rowTop - 4, bounds.x + bounds.width - 1, bounds.rowTop - 4);
 +  layoutRows(bounds);
 +  paintedPage = page;
@@ -2966,7 +3193,14 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    const int start = bounds.x + indent;
 +    if (node.depth) renderer.drawLine(start - 7, y - 5, start - 7, placement.bottom - 1);
 +    const bool firstFragment = i == 0 || placements[i - 1].row != placement.row;
-+    if (firstFragment) {
++    if (firstFragment && selecting && selectionEligible(node)) {
++      renderer.drawRect(start + 1, y + 4, 18, 18);
++      if (node.selected) {
++        renderer.fillRect(start + 1, y + 4, 18, 18);
++        renderer.drawLine(start + 5, y + 12, start + 8, y + 15, 2, false);
++        renderer.drawLine(start + 8, y + 15, start + 14, y + 8, 2, false);
++      }
++    } else if (firstFragment && !selecting) {
 +      if (node.todo) {
 +        if (node.done) {
 +          renderer.fillRect(start + 1, y + 4, 18, 18);
@@ -2985,6 +3219,9 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    for (size_t line = 0; line < placement.lineCount; ++line) {
 +      auto span = outlineLines[placement.firstLine + line];
 +      const int lineY = y + static_cast<int>(line) * bounds.lineHeight;
++      const bool leading = !firstFragment && line == 0;
++      const int prefix = leading ? renderer.getTextWidth(UI_12_FONT_ID, CONTINUATION) + CONTINUATION_GAP : 0;
++      const int lineX = textX + prefix;
 +      std::string text;
 +      if (wrapItems) {
 +        text = title.substr(span.begin, span.end - span.begin);
@@ -2998,25 +3235,25 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +      };
 +      workflowy::forEachTag(title, [&](workflowy::TextSpan tag) {
 +        if (tag.end <= span.begin || tag.begin >= span.end) return;
-+        const int startX = textX + measure(std::max(tag.begin, span.begin));
-+        const int endX = textX + measure(std::min(tag.end, span.end));
++        const int startX = lineX + measure(std::max(tag.begin, span.begin));
++        const int endX = lineX + measure(std::min(tag.end, span.end));
 +        if (endX - startX > 2)
 +          renderer.fillRectDither(startX + 1, lineY, endX - startX - 2, bounds.lineHeight, Color::LightGray);
 +      });
-+      renderer.drawText(UI_12_FONT_ID, textX, lineY, text.c_str());
-+      if (node.done)
-+        renderer.drawLine(textX, lineY + 12, textX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()), lineY + 12);
-+      if (continues && line + 1 == placement.lineCount) {
-+        const int dotX = textX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()) + 3;
-+        const int dotY = lineY + renderer.getFontAscenderSize(UI_12_FONT_ID) - 2;
-+        for (const int dx : {0, 4, 8}) renderer.fillRect(dotX + dx, dotY, 2, 2);
++      if (leading) renderer.drawText(UI_12_FONT_ID, textX, lineY, CONTINUATION);
++      renderer.drawText(UI_12_FONT_ID, lineX, lineY, text.c_str());
++      if (node.done || (continues && line + 1 == placement.lineCount)) {
++        const int tail = lineX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str());
++        if (node.done) renderer.drawLine(lineX, lineY + 12, tail, lineY + 12);
++        if (continues && line + 1 == placement.lineCount)
++          renderer.drawText(UI_12_FONT_ID, tail + CONTINUATION_GAP, lineY, CONTINUATION);
 +      }
 +    }
 +    if (static_cast<int>(placement.row) == dropRow) {
 +      const int marker = dropAfter || dropInside ? placement.bottom - 1 : placement.top;
 +      renderer.drawLine(start + (dropInside ? 16 : 0), marker, bounds.x + bounds.width - 1, marker, 2, true);
 +    }
-+    if (firstFragment && !node.leaf && node.id != zoomId) {
++    if (!selecting && firstFragment && !node.leaf && node.id != zoomId) {
 +      paintedArrows.push_back({node.id, placement.top, placement.bottom});
 +      const int tipX = bounds.x + bounds.width - 10;
 +      const int xs[3] = {tipX - 5, tipX + 4, tipX - 5};
@@ -3085,52 +3322,54 @@ index 0000000000000000000000000000000000000000..7d194dd9c70731006a60e671dd4d5953
 +    }
 +  }
 +  renderer.drawLine(bounds.x, bounds.footer, bounds.x + bounds.width - 1, bounds.footer);
-+  const int iconY = bounds.footer + 23;
-+  const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / 10; };
-+  int x = iconX(0);
-+  renderer.drawLine(x - 9, iconY, x + 9, iconY, 2, true);
-+  renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, 2, true);
-+  renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, 2, true);
-+  const int viewX = iconX(1);
-+  const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
-+  const int eyeY[] = {iconY, iconY - 4, iconY - 6, iconY - 4, iconY, iconY + 4, iconY + 6, iconY + 4};
-+  for (int i = 0; i < 8; ++i) {
-+    const int next = (i + 1) % 8;
-+    renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next]);
++  if (!selecting) {
++    const int iconY = bounds.footer + 23;
++    const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / 10; };
++    int x = iconX(0);
++    renderer.drawLine(x - 9, iconY, x + 9, iconY, 2, true);
++    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, 2, true);
++    renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, 2, true);
++    const int viewX = iconX(1);
++    const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
++    const int eyeY[] = {iconY, iconY - 4, iconY - 6, iconY - 4, iconY, iconY + 4, iconY + 6, iconY + 4};
++    for (int i = 0; i < 8; ++i) {
++      const int next = (i + 1) % 8;
++      renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next]);
++    }
++    renderer.fillRect(viewX - 2, iconY - 2, 5, 5);
++    if (!showDone) {
++      renderer.drawLine(viewX - 10, iconY + 8, viewX + 10, iconY - 8, 2, false);
++      renderer.drawLine(viewX - 11, iconY + 7, viewX + 9, iconY - 9, 2, true);
++    }
++    x = iconX(2);
++    renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
++    renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
++    x = iconX(3);
++    const int undoWidth = undoReady ? 2 : 1;
++    renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, true);
++    renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, true);
++    renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, undoWidth, true);
++    renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, undoWidth, true);
++    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, true);
++    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
++    x = iconX(4);
++    const int wrapWidth = wrapItems ? 2 : 1;
++    renderer.drawLine(x - 11, iconY - 7, x + 4, iconY - 7, wrapWidth, true);
++    renderer.drawLine(x - 11, iconY, x + 2, iconY, wrapWidth, true);
++    renderer.drawLine(x - 11, iconY + 7, x - 3, iconY + 7, wrapWidth, true);
++    renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
++    renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
++    renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
 +  }
-+  renderer.fillRect(viewX - 2, iconY - 2, 5, 5);
-+  if (!showDone) {
-+    renderer.drawLine(viewX - 10, iconY + 8, viewX + 10, iconY - 8, 2, false);
-+    renderer.drawLine(viewX - 11, iconY + 7, viewX + 9, iconY - 9, 2, true);
-+  }
-+  x = iconX(2);
-+  renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
-+  renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
-+  x = iconX(3);
-+  const int undoWidth = undoReady ? 2 : 1;
-+  renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, true);
-+  renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, true);
-+  renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, undoWidth, true);
-+  renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, undoWidth, true);
-+  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, true);
-+  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
-+  x = iconX(4);
-+  const int wrapWidth = wrapItems ? 2 : 1;
-+  renderer.drawLine(x - 11, iconY - 7, x + 4, iconY - 7, wrapWidth, true);
-+  renderer.drawLine(x - 11, iconY, x + 2, iconY, wrapWidth, true);
-+  renderer.drawLine(x - 11, iconY + 7, x - 3, iconY + 7, wrapWidth, true);
-+  renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
-+  renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
-+  renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
 +  if (loading) GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
 +  else renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa4241bb18e8
+index 0000000000000000000000000000000000000000..e841cf5f707d627fe3077855790978690cfd1741
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,213 @@
 +#pragma once
 +
 +#include <atomic>
@@ -3164,6 +3403,7 @@ index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa42
 +    bool done = false;
 +    bool leaf = false;
 +    bool childrenConfirmed = false;
++    bool selected = false;
 +  };
 +
 +  enum class Step { Start, Waiting, Load, Ready };
@@ -3184,12 +3424,25 @@ index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa42
 +  unsigned long touchAt = 0;
 +  bool tracking = false;
 +  bool moved = false;
++  int peakY = 0;
 +  bool loading = false;
 +  bool layoutDirty = true;
 +  int dragRow = -1;
 +  int dropRow = -1;
 +  bool dropAfter = false;
 +  bool dropInside = false;
++  enum class BulkAction { None, Done, Undone, MoveDate, Delete };
++  bool selecting = false;
++  BulkAction bulkAction = BulkAction::None;
++  std::string bulkDate;
++  bool selectionEligible(const Node& node) const;
++  size_t selectionCount() const;
++  void cancelSelection();
++  void toggleSelection(size_t row);
++  void selectAll();
++  void showBulkMenu();
++  void startBulk(BulkAction action, std::string target = {});
++  void nextBulkItem();
 +  bool online = false;
 +  bool connectingWifi = false;
 +  unsigned long wifiStartedAt = 0;
@@ -3222,7 +3475,7 @@ index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa42
 +    bool after;
 +  };
 +  MoveOrigin moveOrigin(size_t source) const;
-+  void moveToTop(size_t row);
++  void moveToBoundary(size_t row, bool bottom);
 +  bool restoreMove(const std::string& id, const MoveOrigin& origin);
 +  bool reorderSiblings(const std::string& parentId, const std::string& parentNode, unsigned depth,
 +                       std::string sourceId, std::string targetId, bool after, bool recordUndo);
@@ -3249,6 +3502,7 @@ index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa42
 +    std::string key, path, body, error;
 +    std::array<uint8_t, 256> response{};
 +    size_t received = 0;
++    const char* method = "POST";
 +    bool captureResponse = false, started = false;
 +    std::atomic<bool> ready{false};
 +    int status = 0, transport = 0;
@@ -3258,7 +3512,8 @@ index 0000000000000000000000000000000000000000..84264d6903fba35b7cb3e06b8d83fa42
 +  bool saving = false;
 +  bool leaveAfterSave = false;
 +  static void saveTask(void* argument);
-+  bool queueSave(std::string path, std::string body, bool capture, std::function<void(const Save&)> finish);
++  bool queueSave(std::string path, std::string body, bool capture, std::function<void(const Save&)> finish,
++                 const char* method = "POST");
 +  bool pollSave();
 +  void recordServerError(int status, int transport, const std::string& errorBody, const std::string& key);
 +  void updateCompletion(const std::string& id, bool done);
@@ -3375,10 +3630,10 @@ index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfc
 +inline constexpr freeink::Icon workflowyIcon{32, 32, 16, workflowyBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..668419fb74552abe69a268825bb87d4d10a5bd95
+index 0000000000000000000000000000000000000000..2bb96dbc44c7c6b5c0f0fa7ba0a79e78b4e19d2b
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,126 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -3434,8 +3689,8 @@ index 0000000000000000000000000000000000000000..668419fb74552abe69a268825bb87d4d
 +}
 +
 +// Return byte spans so a tag split across lines keeps its original identity.
-+template <typename Measure>
-+void wrapOutlineText(std::string_view text, int width, Measure measure, std::vector<TextSpan>& lines) {
++template <typename Width, typename Measure>
++void wrapOutlineTextByLine(std::string_view text, Width lineWidth, Measure measure, std::vector<TextSpan>& lines) {
 +  const auto initialSize = lines.size();
 +  size_t begin = 0;
 +  while (begin < text.size()) {
@@ -3443,6 +3698,7 @@ index 0000000000000000000000000000000000000000..668419fb74552abe69a268825bb87d4d
 +      ++begin;
 +      continue;
 +    }
++    const int width = lineWidth(lines.size() - initialSize);
 +    size_t end = begin;
 +    size_t word = begin;
 +    while (word < text.size()) {
@@ -3465,6 +3721,11 @@ index 0000000000000000000000000000000000000000..668419fb74552abe69a268825bb87d4d
 +    begin = end;
 +  }
 +  if (lines.size() == initialSize) lines.push_back({0, 0});
++}
++
++template <typename Measure>
++void wrapOutlineText(std::string_view text, int width, Measure measure, std::vector<TextSpan>& lines) {
++  wrapOutlineTextByLine(text, [width](size_t) { return width; }, measure, lines);
 +}
 +
 +inline bool tagCharacter(unsigned char c) {
