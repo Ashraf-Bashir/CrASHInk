@@ -1,7 +1,21 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c009dc98c2b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+
+ ### Added
+
++- The Library opens your Workflowy daily outline. Page vertically, swipe left for item actions, and swipe right to toggle completion.
++
+ - Display settings offer light grey, dark grey, and solid saved highlights, with contrasting text and a White option in Dark Mode.
+
+ - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 7673ef1f57d707c59d1d3174130a97bf4a320da0..291a4c3aa2613c60272f5fa512c7030e5391d65d 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -608,6 +608,24 @@
+@@ -608,6 +608,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
  STR_SAVE_CLIPPING: "Create Clipping"
  STR_VIEW_CLIPPINGS: "View Clippings"
  STR_CLIPPINGS: "Clippings"
@@ -26,10 +40,41 @@ diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
+@@ -1077,3 +1095,17 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+ STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
+ STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
+ STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
++
++STR_WORKFLOWY: "Workflowy"
++STR_WORKFLOWY_ADD: "Add item"
++STR_WORKFLOWY_MOVE_DATE: "Move to date"
++STR_WORKFLOWY_SHOW_DATE: "Show date"
++STR_WORKFLOWY_CHOOSE_DATE: "Enter date (YYYY-MM-DD)"
++STR_WORKFLOWY_INVALID_DATE: "Use a valid date (YYYY-MM-DD)"
++STR_WORKFLOWY_YESTERDAY: "Yesterday"
++STR_WORKFLOWY_TODAY: "Today"
++STR_WORKFLOWY_TOMORROW: "Tomorrow"
++STR_WORKFLOWY_TO_BULLET: "Convert to bullet"
++STR_WORKFLOWY_TO_TODO: "Convert to todo"
++STR_WORKFLOWY_DAILY_READ_FAILED: "Could not load Workflowy items"
++STR_WORKFLOWY_EMPTY: "No visible items"
+diff --git a/platformio.ini b/platformio.ini
+index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -138,6 +138,7 @@ custom_run_simulator_target_owner = project
+ lib_compat_mode = off
+ build_src_filter =
+   +<*>
++  -<activities/workflowy/>
+   -<network/FirmwareBoardTag.cpp>
+   -<network/FirmwareFlasher.cpp>
+   -<network/OtaBootSwitch.cpp>
 diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+index 0245eec70e9ad390f23cfb19bd796537d1237753..823e952591381fd2c406f85b19356d089e858161 100644
 --- a/src/ClippingStore.cpp
 +++ b/src/ClippingStore.cpp
-@@ -695,6 +695,14 @@
+@@ -695,6 +695,14 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
          return false;
        }
      }
@@ -44,7 +89,7 @@ diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
      out.push_back(std::move(clipping));
    }
 
-@@ -703,8 +711,10 @@
+@@ -703,8 +711,10 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
  }
 
  bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
@@ -57,7 +102,7 @@ diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
    Storage.mkdir(CLIPPINGS_DIR);
 
    const std::string tmpPath = storeFilePath + ".tmp";
-@@ -791,7 +801,16 @@
+@@ -791,7 +801,16 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
      } else if (textLen > 0) {
        wroteText = source && source.seek(clipping.textOffset) && copyBytes(source, f, textLen);
      }
@@ -76,9 +121,10 @@ diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
        f.close();
        if (source) source.close();
 diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882e11a9633 100644
 --- a/src/ClippingStore.h
 +++ b/src/ClippingStore.h
-@@ -48,7 +48,9 @@
+@@ -48,7 +48,9 @@ struct Clipping {
    uint32_t timestamp = 0;
    uint32_t layoutSignature = 0;
    uint32_t textOffset = 0;
@@ -88,7 +134,7 @@ diff --git a/src/ClippingStore.h b/src/ClippingStore.h
    uint16_t tableSelection = UINT16_MAX;
    // Session-only migration state, intentionally omitted from the on-disk
    // record.
-@@ -117,6 +119,11 @@
+@@ -117,6 +119,11 @@ class ClippingStore {
    bool cacheResolvedLayoutRange(size_t index, uint16_t page, uint16_t startWord, uint16_t endWord,
                                  uint32_t layoutSignature);
    bool readClippingText(size_t index, std::string& out) const;
@@ -100,15 +146,76 @@ diff --git a/src/ClippingStore.h b/src/ClippingStore.h
    bool readClippingPreview(size_t index, std::string& out) const;
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index 9043f7bc50ec9907e7d1f00cd60c6f5436f2c006..c378a8a89cb7b6e620e6900e8e611395662dd6fe 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -24,6 +24,10 @@
+ #include "CrossPointState.h"
+ #include "GlobalActions.h"
+ #include "activities/ActivityManager.h"
++#ifndef SIMULATOR
++#include "activities/workflowy/WorkflowyDailyActivity.h"
++#include "workflowy/WorkflowyIcon.h"
++#endif
+ #include "activities/home/BookActions.h"
+ #include "activities/home/FileBrowserActionActivity.h"
+ #include "activities/home/RecentBookProgress.h"
+@@ -58,7 +62,12 @@ constexpr int HEADER_CONTROL_SIZE = 44;
+ constexpr int HEADER_CONTROL_GAP = 10;
+ constexpr int NAV_HEIGHT = 48;
+ constexpr int NAV_FIRST = 10;
+-constexpr int NAV_COUNT = 4;
++constexpr int NAV_COUNT =
++#ifdef SIMULATOR
++    4;
++#else
++    5;
++#endif
+ constexpr int BATCH_CANCEL_CONTROL = NAV_FIRST + NAV_COUNT;
+ constexpr int BATCH_APPLY_CONTROL = BATCH_CANCEL_CONTROL + 1;
+ int gridColumns() { return CoverGridLayout::Columns; }
+@@ -786,6 +795,10 @@ void LibraryActivity::activateControl(const int control) {
+   if (control == NAV_FIRST + 1) activityManager.goToFileTransfer();
+   if (control == NAV_FIRST + 2) activityManager.goToFileBrowser();
+   if (control == NAV_FIRST + 3) activityManager.goToSettings();
++#ifndef SIMULATOR
++  if (control == NAV_FIRST + 4)
++    startActivityForResult(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput), {});
++#endif
+ }
+
+ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+@@ -1054,7 +1067,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+     } else if (!mappedInput.hasTouchHardware()) {
+       static constexpr StrId choices[] = {StrId::STR_LIBRARY, StrId::STR_FILE_TRANSFER, StrId::STR_BROWSE,
+                                           StrId::STR_SETTINGS_SHORT};
+-      actionPopup.show(StrId::STR_LIBRARY, choices, NAV_COUNT, 0,
++      actionPopup.show(StrId::STR_LIBRARY, choices, std::size(choices), 0,
+                        [this](int selected) { activateControl(NAV_FIRST + selected); });
+       requestUpdate();
+     }
+@@ -1281,7 +1294,11 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+                                                 static_cast<int16_t>(bounds[3])});
+   if (touch && !selectingBooks) {
+     static constexpr const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32,
+-                                                   &icon_folder_32, &icon_lyra_settings_32};
++                                                   &icon_folder_32, &icon_lyra_settings_32,
++#ifndef SIMULATOR
++                                                   &workflowyIcon,
++#endif
++    };
+     const int width = renderer.getScreenWidth() - bounds[1] - bounds[3];
+     const int y = renderer.getScreenHeight() - bounds[2] - NAV_HEIGHT;
+     const auto ink = fui::Paint::solid(fui::Color::Black);
 diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
+index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..fcdf106d44a58bf049df2dcb3bb13f617d68dc82 100644
 --- a/src/activities/reader/EpubReaderClippingListActivity.cpp
 +++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
-@@ -36,6 +36,15 @@
-
- Rect clippingHeaderRect(const Rect& safe, const ThemeMetrics& metrics, const MappedInputManager& mappedInput) {
+@@ -38,6 +38,15 @@ Rect clippingHeaderRect(const Rect& safe, const ThemeMetrics& metrics, const Map
    return Rect{safe.x, safe.y + metrics.topPadding, safe.width, TouchHeaderBackButton::height(metrics, mappedInput)};
-+}
-+
+ }
+
 +Rect colorFilterButton(const Rect& header) {
 +  return Rect{header.x + header.width - 92, header.y + header.height - 42, 88, 40};
 +}
@@ -116,14 +223,17 @@ diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/acti
 +Rect shareClippingsButton(const Rect& header) {
 +  const auto filter = colorFilterButton(header);
 +  return Rect{filter.x - 52, filter.y, 48, filter.height};
- }
-
++}
++
  Rect touchDetailOpenButtonRect(const Rect& safe, const ThemeMetrics& metrics) {
+   const int sidePadding = std::min(metrics.contentSidePadding, std::max(0, safe.width / 2 - 1));
+   return Rect{safe.x + sidePadding, safe.y + safe.height - metrics.verticalSpacing - TOUCH_DETAIL_BUTTON_HEIGHT,
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..c25613d91b2d6afab3e58c18fd84c2121802859f
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,359 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -147,15 +257,17 @@ new file mode 100644
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
 +#include "workflowy/WorkflowyRoot.h"
++#include "workflowy/WorkflowySettings.h"
 +
 +namespace {
 +constexpr char API_URL[] = "https://workflowy.com/api/v1/nodes";
 +constexpr char DEFAULT_DESTINATION[] = "3dbd4508b236";
-+constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
 +constexpr char DEST_FILE[] = "/.crashink/workflowy.destination";
-+constexpr size_t KEY_MAX = 256;
 +constexpr size_t DEST_MAX = 128;
 +
++}  // namespace
++
++namespace workflowy {
 +std::string readSetting(const char* path, size_t limit) {
 +  FsFile file;
 +  const auto backup = std::string(path) + ".bak";
@@ -187,6 +299,14 @@ new file mode 100644
 +  if (hadPrevious) Storage.remove(backup.c_str());
 +  return true;
 +}
++
++}  // namespace workflowy
++
++namespace {
++using workflowy::KEY_FILE;
++using workflowy::KEY_MAX;
++using workflowy::readSetting;
++using workflowy::writeSetting;
 +
 +std::string oneLine(std::string value) {
 +  for (char& ch : value)
@@ -475,6 +595,7 @@ new file mode 100644
 +}
 diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..8d7e545627fbd94feb289ed0c08eee8786ab53ee
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.h
 @@ -0,0 +1,52 @@
@@ -530,8 +651,748 @@ new file mode 100644
 +  void sendNext();
 +  void complete(const char* message);
 +};
+diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d2ed8a799ca1632947c9183c200ee4fe962cb2e
+--- /dev/null
++++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
+@@ -0,0 +1,616 @@
++#include "WorkflowyDailyActivity.h"
++
++#include <ArduinoJson.h>
++#include <GfxRenderer.h>
++#include <HalClock.h>
++#include <I18n.h>
++#include <Memory.h>
++#include <SecureHttpClient.h>
++#include <WiFi.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iterator>
++#include <ctime>
++
++#include "MappedInputManager.h"
++#include "activities/network/WifiSelectionActivity.h"
++#include "activities/util/ConfirmationActivity.h"
++#include "activities/util/KeyboardEntryActivity.h"
++#include "activities/util/OptionSelectionActivity.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++#include "network/WifiUtils.h"
++#include "workflowy/WorkflowyRoot.h"
++#include "workflowy/WorkflowySettings.h"
++
++namespace {
++constexpr size_t MAX_ROWS = 1024;
++constexpr size_t MAX_RESPONSE = 384 * 1024;
++constexpr int ROW_HEIGHT = 39;
++constexpr int ICON_TARGET = 44;
++constexpr int ROW_ARROW_TARGET = 34;
++constexpr char API[] = "https://workflowy.com/api/v1/nodes";
++
++// Keep response and parsed fields out of the internal heap used by Wi-Fi/TLS.
++struct ResponseAllocator final : ArduinoJson::Allocator {
++  void* allocate(size_t size) override { return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
++  void deallocate(void* ptr) override { heap_caps_free(ptr); }
++  void* reallocate(void* ptr, size_t size) override {
++    return heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++  }
++};
++
++std::string isoDate(const int offset) {
++  const auto utc = halClock.utcNowMs();
++  if (!utc) return {};
++  const time_t local = utc / 1000 + (static_cast<int>(SETTINGS.clockUtcOffsetQ) - 48) * 900L + offset * 86400L;
++  tm date{};
++  if (!gmtime_r(&local, &date)) return {};
++  char text[16];
++  strftime(text, sizeof(text), "%Y-%m-%d", &date);
++  return text;
++}
++
++bool validDate(const std::string& date) {
++  int y = 0, m = 0, d = 0;
++  if (date.size() != 10 || date[4] != '-' || date[7] != '-' ||
++      sscanf(date.c_str(), "%4d-%2d-%2d", &y, &m, &d) != 3 || y < 1900 || y > 9999 || m < 1 || m > 12 || d < 1)
++    return false;
++  const int days[] = {31, 28 + (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)), 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
++  char canonical[16];
++  snprintf(canonical, sizeof(canonical), "%04d-%02d-%02d", y, m, d);
++  return d <= days[m - 1] && date == canonical;
++}
++
++std::string plainTitle(const char* value) {
++  std::string title;
++  while (*value) {
++    if (*value == '<') {
++      const char* end = strchr(value, '>');
++      if (end) {
++        value = end + 1;
++        continue;
++      }
++    }
++    bool entity = false;
++    for (const auto& [name, character] : {std::pair{"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'},
++                                           {"&quot;", '"'}, {"&#39;", '\''}, {"&nbsp;", ' '}}) {
++      const auto len = strlen(name);
++      if (strncmp(value, name, len) == 0) {
++        title += character;
++        value += len;
++        entity = true;
++        break;
++      }
++    }
++    if (!entity) {
++      const char c = *value++;
++      title += c == '\r' || c == '\n' || c == '\t' ? ' ' : c;
++    }
++  }
++  return title;
++}
++
++std::string escapedTitle(const std::string& text, const bool creating) {
++  std::string output;
++  for (const char c : text) {
++    if (!creating && c == '&') output += "&amp;";
++    else if (!creating && c == '<') output += "&lt;";
++    else if (!creating && c == '>') output += "&gt;";
++    else if (creating && strchr("\\*_[]-`#<>~", c)) {
++      output += '\\';
++      output += c;
++    } else output += c == '\r' || c == '\n' ? ' ' : c;
++  }
++  return output;
++}
++
++std::string encode(JsonDocument& doc) {
++  std::string body;
++  serializeJson(doc, body);
++  return body;
++}
++}  // namespace
++
++WorkflowyDailyActivity::WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input)
++    : Activity("WorkflowyDaily", renderer, input) {}
++
++void WorkflowyDailyActivity::onEnter() {
++  Activity::onEnter();
++  credential = workflowy::readSetting(workflowy::KEY_FILE, workflowy::KEY_MAX);
++  date = isoDate(0);
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::onExit() {
++  if (ownsWifi) {
++    WiFi.disconnect(false, false);
++    WiFi.mode(WIFI_OFF);
++  }
++  Activity::onExit();
++}
++
++void WorkflowyDailyActivity::showMessage(const char* text) {
++  {
++    RenderLock lock(*this);
++    message = text;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::connect() {
++  if (credential.empty()) {
++    editKey();
++  } else if (hasActiveStationWifiConnection()) {
++    step = Step::Load;
++  } else {
++    ownsWifi = true;
++    step = Step::Waiting;
++    startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
++                           [this](const ActivityResult& result) {
++      const auto* wifi = std::get_if<WifiResult>(&result.data);
++      step = !result.isCancelled && wifi && wifi->connected ? Step::Load : Step::Ready;
++      if (step == Step::Ready) showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++    });
++  }
++}
++
++void WorkflowyDailyActivity::editKey() {
++  step = Step::Waiting;
++  startActivityForResult(std::make_unique<KeyboardEntryActivity>(
++                             renderer, mappedInput, tr(STR_WORKFLOWY_API_KEY), "", workflowy::KEY_MAX, InputType::Password),
++                         [this](const ActivityResult& result) {
++    step = Step::Ready;
++    if (result.isCancelled) return;
++    const auto& key = std::get<KeyboardResult>(result.data).text;
++    if (key.empty() || !workflowy::writeSetting(workflowy::KEY_FILE, key)) {
++      showMessage(tr(STR_WORKFLOWY_SAVE_FAILED));
++      return;
++    }
++    credential = key;
++    step = Step::Start;
++  });
++}
++
++int WorkflowyDailyActivity::request(const char* method, const std::string& path, const std::string& body,
++                                   uint8_t* response, size_t* received) {
++  if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) {
++    showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++    return 0;
++  }
++  freeink::SecureHttpClient http;
++  http.setCACert(WorkflowyRoot);
++  http.setTimeout(8000);
++  http.setReuse(false);
++  http.setUserAgent("CrASHInk/Workflowy");
++  if (!http.begin(std::string(API) + path)) return 0;
++  http.addHeader("Authorization", "Bearer " + credential);
++  if (!body.empty()) http.addHeader("Content-Type", "application/json");
++  const int status = http.sendRequest(method, reinterpret_cast<const uint8_t*>(body.data()), body.size(),
++                                    [response, received](const uint8_t* data, const size_t len) {
++    if (!response) return true;
++    if (len > MAX_RESPONSE - *received) return false;
++    memcpy(response + *received, data, len);
++    *received += len;
++    return true;
++  });
++  return status >= 200 && status < 300 && !http.responseComplete() ? 0 : status;
++}
++
++bool WorkflowyDailyActivity::loadChildren(const std::string& parent, const unsigned depth, std::vector<Node>& result) {
++  auto response = makePsramByteBufferNoThrow(MAX_RESPONSE);
++  if (!response) {
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    return false;
++  }
++  size_t received = 0;
++  const int status = request("GET", "?parent_id=" + parent, {}, response.get(), &received);
++  if (status == 404 && depth == 0) return true;
++  if (status != 200) {
++    showMessage(status == 401 || status == 403 ? tr(STR_WORKFLOWY_AUTH_FAILED) : tr(STR_WORKFLOWY_NETWORK_FAILED));
++    return false;
++  }
++  JsonDocument filter;
++  auto node = filter["nodes"][0];
++  node["id"] = true;
++  node["name"] = true;
++  node["priority"] = true;
++  node["completed"] = true;
++  node["data"]["layoutMode"] = true;
++  ResponseAllocator allocator;
++  JsonDocument doc(&allocator);
++  if (deserializeJson(doc, response.get(), received, DeserializationOption::Filter(filter)) || !doc["nodes"].is<JsonArray>()) {
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    return false;
++  }
++  const auto nodes = doc["nodes"].as<JsonArrayConst>();
++  if (nodes.size() > MAX_ROWS) {
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    return false;
++  }
++  result.reserve(nodes.size());
++  for (const auto value : nodes) {
++    std::string id = value["id"] | "";
++    if (id.empty() || id.find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos) continue;
++    result.push_back({std::move(id), plainTitle(value["name"] | ""), depth, value["priority"] | 0,
++                      strcmp(value["data"]["layoutMode"] | "", "todo") == 0, value["completed"] | false});
++  }
++  std::stable_sort(result.begin(), result.end(), [](const Node& a, const Node& b) { return a.priority < b.priority; });
++  return true;
++}
++
++void WorkflowyDailyActivity::loadDay() {
++  showMessage(tr(STR_LOADING));
++  if (date.empty()) {
++    auto today = isoDate(0);
++    RenderLock lock(*this);
++    date = today.empty() ? "today" : std::move(today);
++  }
++  requestUpdateAndWait();
++  std::vector<Node> loaded;
++  if (loadChildren(date, 0, loaded)) {
++    RenderLock lock(*this);
++    rows = std::move(loaded);
++    page = std::min(page, std::max<size_t>(1, (visibleCount() + layout().rowsPerPage - 1) / layout().rowsPerPage) - 1);
++    message = nullptr;
++  }
++  step = Step::Ready;
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::toggle(const size_t row) {
++  const bool completed = rows[row].done;
++  const int status = request("POST", "/" + rows[row].id + (completed ? "/uncomplete" : "/complete"), {});
++  if (status != 200) {
++    showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++    return;
++  }
++  {
++    RenderLock lock(*this);
++    rows[row].done = !completed;
++    message = nullptr;
++  }
++  nextPage(0);
++}
++
++void WorkflowyDailyActivity::expand(const size_t row) {
++  if (rows[row].leaf) return;
++  const auto depth = rows[row].depth;
++  if (rows[row].expanded) {
++    {
++      RenderLock lock(*this);
++      auto first = rows.begin() + row + 1;
++      auto end = std::find_if(first, rows.end(), [depth](const Node& node) { return node.depth <= depth; });
++      rows.erase(first, end);
++      rows[row].expanded = false;
++    }
++    nextPage(0);
++    return;
++  }
++  std::vector<Node> children;
++  if (!loadChildren(rows[row].id, depth + 1, children)) return;
++  if (rows.size() + children.size() > MAX_ROWS) {
++    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++    return;
++  }
++  {
++    RenderLock lock(*this);
++    rows[row].leaf = children.empty();
++    rows[row].expanded = !children.empty();
++    rows.insert(rows.begin() + row + 1, std::make_move_iterator(children.begin()), std::make_move_iterator(children.end()));
++    message = nullptr;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::edit(const size_t row) {
++  const bool adding = row >= rows.size();
++  const std::string id = adding ? "" : rows[row].id;
++  const std::string initial = adding ? "" : rows[row].title;
++  startActivityForResult(std::make_unique<KeyboardEntryActivity>(
++                             renderer, mappedInput, adding ? tr(STR_WORKFLOWY_ADD) : tr(STR_EDIT), initial, 512),
++                         [this, id, initial, row, adding](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    const auto& text = std::get<KeyboardResult>(result.data).text;
++    if (text.find_first_not_of(" \t\r\n") == std::string::npos || text == initial) return;
++    JsonDocument update;
++    update["name"] = escapedTitle(text, adding);
++    if (adding) {
++      update["parent_id"] = date;
++      update["layoutMode"] = "todo";
++      update["position"] = "bottom";
++    }
++    const int status = request("POST", adding ? "" : "/" + id, encode(update));
++    if (status < 200 || status >= 300) {
++      showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++      return;
++    }
++    if (adding) {
++      step = Step::Load;
++    } else {
++      RenderLock lock(*this);
++      rows[row].title = text;
++      message = nullptr;
++    }
++  });
++}
++
++void WorkflowyDailyActivity::actions(const size_t row) {
++  std::vector<std::string> options{
++      tr(STR_EDIT), tr(STR_WORKFLOWY_MOVE_DATE),
++      rows[row].todo ? tr(STR_WORKFLOWY_TO_BULLET) : tr(STR_WORKFLOWY_TO_TODO), tr(STR_DELETE)};
++  startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
++                             0, false, true),
++                         [this, row](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    const int selected = std::get<OptionSelectionResult>(result.data).index;
++    const auto id = rows[row].id;
++    if (selected == 0) return edit(row);
++    if (selected == 1) return chooseDate(id);
++    if (selected == 2) {
++      const bool todo = !rows[row].todo;
++      JsonDocument update;
++      update["layoutMode"] = todo ? "todo" : "bullets";
++      if (request("POST", "/" + id, encode(update)) == 200) {
++        RenderLock lock(*this);
++        rows[row].todo = todo;
++        message = nullptr;
++      } else {
++        showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++      }
++    } else if (selected == 3) {
++      startActivityForResult(std::make_unique<ConfirmationActivity>(
++                                 renderer, mappedInput, tr(STR_DELETE), rows[row].title),
++                             [this, id](const ActivityResult& confirmation) {
++        if (confirmation.isCancelled) return;
++        if (request("DELETE", "/" + id, {}) == 200) step = Step::Load;
++        else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++      });
++    }
++  });
++}
++
++void WorkflowyDailyActivity::moveToDate(const std::string& id, const std::string& target) {
++  if (id.empty()) {
++    if (date == target) return;
++    {
++      RenderLock lock(*this);
++      date = target;
++      page = 0;
++      rows.clear();
++    }
++    step = Step::Load;
++    return;
++  }
++  JsonDocument update;
++  update["parent_id"] = target;
++  update["position"] = "bottom";
++  if (request("POST", "/" + id + "/move", encode(update)) == 200) step = Step::Load;
++  else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++}
++
++void WorkflowyDailyActivity::chooseDate(std::string moveId) {
++  const auto title = moveId.empty() ? StrId::STR_WORKFLOWY_SHOW_DATE : StrId::STR_WORKFLOWY_MOVE_DATE;
++  std::vector<std::string> choices{tr(STR_WORKFLOWY_YESTERDAY), tr(STR_WORKFLOWY_TODAY), tr(STR_WORKFLOWY_TOMORROW),
++                                   tr(STR_WORKFLOWY_CHOOSE_DATE)};
++  startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                             renderer, mappedInput, "WorkflowyDate", title, std::move(choices), 1, false, true),
++                         [this, title, moveId = std::move(moveId)](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    const int selected = std::get<OptionSelectionResult>(result.data).index;
++    if (selected < 0 || selected > 3) return;
++    if (selected != 3) {
++      const auto target = isoDate(selected - 1);
++      if (target.empty() && selected == 0) showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++      else moveToDate(moveId, target.empty() ? (selected == 1 ? "today" : "tomorrow") : target);
++      return;
++    }
++    startActivityForResult(std::make_unique<KeyboardEntryActivity>(
++                               renderer, mappedInput, I18n::getInstance().get(title),
++                               validDate(date) ? date : "", 10),
++                           [this, moveId](const ActivityResult& entered) {
++      if (entered.isCancelled) return;
++      const auto& target = std::get<KeyboardResult>(entered.data).text;
++      if (validDate(target)) moveToDate(moveId, target);
++      else showMessage(tr(STR_WORKFLOWY_INVALID_DATE));
++    });
++  });
++}
++
++WorkflowyDailyActivity::Layout WorkflowyDailyActivity::layout() const {
++  int top, right, bottom, left;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  const int rowTop = top + 74;
++  const int footer = renderer.getScreenHeight() - bottom - 52;
++  const int pageLabel = renderer.getLineHeight(SMALL_FONT_ID) + 3;
++  return {left + 8, top, renderer.getScreenWidth() - right - left - 16, rowTop, footer,
++          std::max(1, (footer - rowTop - pageLabel) / ROW_HEIGHT)};
++}
++
++size_t WorkflowyDailyActivity::visibleCount() const {
++  return std::count_if(rows.begin(), rows.end(), [this](const Node& node) { return showDone || !node.done; });
++}
++
++int WorkflowyDailyActivity::rowAt(const int x, const int y) const {
++  const auto bounds = layout();
++  if (x < bounds.x || x >= bounds.x + bounds.width || y < bounds.rowTop ||
++      y >= bounds.rowTop + bounds.rowsPerPage * ROW_HEIGHT)
++    return -1;
++  size_t target = page * bounds.rowsPerPage + (y - bounds.rowTop) / ROW_HEIGHT;
++  for (size_t i = 0; i < rows.size(); ++i) {
++    if (rows[i].done && !showDone) continue;
++    if (target-- == 0) return static_cast<int>(i);
++  }
++  return -1;
++}
++
++void WorkflowyDailyActivity::nextPage(const int delta) {
++  {
++    RenderLock lock(*this);
++    const size_t perPage = layout().rowsPerPage;
++    const size_t count = visibleCount();
++    const int last = count ? (count - 1) / perPage : 0;
++    page = std::clamp(static_cast<int>(page) + delta, 0, last);
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::loop() {
++  using Button = MappedInputManager::Button;
++  using Swipe = MappedInputManager::SwipeDir;
++  if (mappedInput.wasReleased(Button::Back)) return finish();
++  if (step == Step::Start) return connect();
++  if (step == Step::Load) return loadDay();
++  if (step != Step::Ready) return;
++  if (mappedInput.wasReleased(Button::Up)) return nextPage(-1);
++  if (mappedInput.wasReleased(Button::Down)) return nextPage(1);
++  int x = 0, y = 0;
++  if (mappedInput.wasScreenTouchDown(x, y)) {
++    tracking = true;
++    moved = false;
++    touchX = lastX = x;
++    touchY = lastY = y;
++    touchAt = millis();
++  }
++  if (tracking && mappedInput.isScreenTouchHeld(x, y)) {
++    lastX = x;
++    lastY = y;
++    moved |= std::max(std::abs(x - touchX), std::abs(y - touchY)) > 26;
++  }
++  Swipe swipe = Swipe::None;
++  int swipeX = 0, swipeY = 0, endX = 0, endY = 0;
++  const bool sdkSwipe = mappedInput.wasSwipeWithPoints(swipe, swipeX, swipeY, endX, endY);
++  const bool release = mappedInput.wasScreenTouchReleased();
++  if (swipe == Swipe::None && release && tracking) {
++    const int dx = lastX - touchX, dy = lastY - touchY;
++    if (std::max(std::abs(dx), std::abs(dy)) >= 40)
++      swipe = std::abs(dx) > std::abs(dy) ? (dx < 0 ? Swipe::Left : Swipe::Right) : (dy < 0 ? Swipe::Up : Swipe::Down);
++  }
++  if (swipe != Swipe::None) {
++    const int row = sdkSwipe ? rowAt(swipeX, swipeY) : rowAt(touchX, touchY);
++    tracking = false;
++    if (swipe == Swipe::Up || swipe == Swipe::Down) return nextPage(swipe == Swipe::Up ? 1 : -1);
++    if (row >= 0) {
++      if (swipe == Swipe::Right) toggle(row);
++      else actions(row);
++    }
++    return;
++  }
++  if (!release || !tracking) return;
++  tracking = false;
++  if (moved) return;
++  const bool held = millis() - touchAt >= 550;
++  if (!held && !mappedInput.wasScreenTapped(x, y)) return;
++  x = touchX;
++  y = touchY;
++  const auto bounds = layout();
++  if (y < bounds.rowTop && x >= bounds.x + bounds.width - ICON_TARGET) {
++    if (!credential.empty() && !rows.empty()) chooseDate();
++    else if (!credential.empty() && !date.empty() && hasActiveStationWifiConnection()) chooseDate();
++    return;
++  }
++  if (y >= bounds.footer) {
++    const int control = std::clamp((x - bounds.x) * 4 / bounds.width, 0, 3);
++    if (control == 0) finish();
++    if (control == 1) {
++      if (held) editKey();
++      else step = Step::Start;
++    }
++    if (control == 2 && !credential.empty() && !date.empty() && hasActiveStationWifiConnection()) edit(rows.size());
++    if (control == 3) {
++      {
++        RenderLock lock(*this);
++        showDone = !showDone;
++        page = 0;
++      }
++      requestUpdate();
++    }
++    return;
++  }
++  const int row = rowAt(x, y);
++  if (row < 0) return;
++  const int indent = std::min<unsigned>(rows[row].depth, 8) * 16;
++  if (held) actions(row);
++  else if (x >= bounds.x + bounds.width - ROW_ARROW_TARGET && !rows[row].leaf) expand(row);
++  else if (rows[row].todo && x < bounds.x + indent + 30) toggle(row);
++  else edit(row);
++}
++
++void WorkflowyDailyActivity::render(RenderLock&&) {
++  const auto bounds = layout();
++  renderer.clearScreen();
++  GUI.drawDisplayStatusBar(renderer, bounds.top);
++  std::string heading = date.empty() || date == "today" ? tr(STR_WORKFLOWY_TODAY) : date;
++  if (date == isoDate(-1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_YESTERDAY);
++  if (date == isoDate(0) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TODAY);
++  if (date == isoDate(1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TOMORROW);
++  renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, heading.c_str(), true, EpdFontFamily::BOLD);
++  const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
++  renderer.drawRect(cx - 10, cy - 9, 21, 19);
++  renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
++  renderer.drawLine(cx - 5, cy - 12, cx - 5, cy - 6);
++  renderer.drawLine(cx + 5, cy - 12, cx + 5, cy - 6);
++  renderer.drawLine(bounds.x, bounds.rowTop - 4, bounds.x + bounds.width - 1, bounds.rowTop - 4);
++  size_t skip = page * bounds.rowsPerPage;
++  int painted = 0;
++  for (const auto& node : rows) {
++    if (node.done && !showDone) continue;
++    if (skip) { --skip; continue; }
++    if (painted >= bounds.rowsPerPage) break;
++    const int y = bounds.rowTop + painted++ * ROW_HEIGHT + 6;
++    const int indent = std::min<unsigned>(node.depth, 8) * 16;
++    const int start = bounds.x + indent;
++    if (node.depth) renderer.drawLine(start - 7, y - 5, start - 7, y + ROW_HEIGHT - 5);
++    if (node.todo) {
++      renderer.drawRect(start + 1, y + 5, 16, 16);
++      if (node.done) {
++        renderer.drawLine(start + 4, y + 12, start + 8, y + 16, 2, true);
++        renderer.drawLine(start + 8, y + 16, start + 14, y + 8, 2, true);
++      }
++    } else {
++      renderer.fillRect(start + 6, y + 11, 5, 5);
++    }
++    const int textX = start + 25;
++    const int width = bounds.x + bounds.width - textX - (node.leaf ? 0 : ROW_ARROW_TARGET);
++    const auto title = renderer.truncatedText(UI_12_FONT_ID, node.title.c_str(), width);
++    renderer.drawText(UI_12_FONT_ID, textX, y, title.c_str());
++    if (node.done) renderer.drawLine(textX, y + 12, textX + renderer.getTextWidth(UI_12_FONT_ID, title.c_str()), y + 12);
++    if (!node.leaf) {
++      const int tipX = bounds.x + bounds.width - 10;
++      const int xs[3] = {tipX - 5, tipX + 4, node.expanded ? tipX : tipX - 5};
++      const int ys[3] = {y + 8, node.expanded ? y + 8 : y + 13, y + 18};
++      renderer.fillPolygon(xs, ys, 3, true);
++    }
++  }
++  const size_t count = visibleCount();
++  const size_t total = std::max<size_t>(1, (count + bounds.rowsPerPage - 1) / bounds.rowsPerPage);
++  if (message || total > 1 || !count) {
++    char pages[24];
++    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
++    const char* footer = message ? message : (!count ? tr(STR_WORKFLOWY_EMPTY) : pages);
++    renderer.drawCenteredText(SMALL_FONT_ID, bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 2, footer);
++  }
++  renderer.drawLine(bounds.x, bounds.footer, bounds.x + bounds.width - 1, bounds.footer);
++  const int iconY = bounds.footer + 23;
++  const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / 8; };
++  int x = iconX(0);
++  renderer.drawLine(x - 9, iconY, x + 9, iconY, 2, true);
++  renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, 2, true);
++  renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, 2, true);
++  x = iconX(1);
++  renderer.drawText(UI_12_FONT_ID, x - 8, iconY - 13, "↻");
++  x = iconX(2);
++  renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
++  renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
++  x = iconX(3);
++  renderer.drawRect(x - 9, iconY - 9, 18, 18);
++  if (showDone) {
++    renderer.drawLine(x - 5, iconY, x - 1, iconY + 4, 2, true);
++    renderer.drawLine(x - 1, iconY + 4, x + 5, iconY - 4, 2, true);
++  }
++  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++}
+diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..101a16b838724c129cdc6f5b1630e429a1b98d78
+--- /dev/null
++++ b/src/activities/workflowy/WorkflowyDailyActivity.h
+@@ -0,0 +1,66 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "activities/Activity.h"
++
++class WorkflowyDailyActivity final : public Activity {
++ public:
++  WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input);
++  void onEnter() override;
++  void onExit() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++  bool allowGlobalHomeSwipeGesture() const override { return false; }
++
++ private:
++  struct Node {
++    std::string id;
++    std::string title;
++    unsigned depth = 0;
++    int priority = 0;
++    bool todo = false;
++    bool done = false;
++    bool expanded = false;
++    bool leaf = false;
++  };
++
++  enum class Step { Start, Waiting, Load, Ready };
++  Step step = Step::Start;
++  std::vector<Node> rows;
++  std::string credential;
++  std::string date;
++  const char* message = nullptr;
++  bool ownsWifi = false;
++  bool showDone = false;
++  size_t page = 0;
++  int touchX = 0;
++  int touchY = 0;
++  int lastX = 0;
++  int lastY = 0;
++  unsigned long touchAt = 0;
++  bool tracking = false;
++  bool moved = false;
++
++  struct Layout {
++    int x, top, width, rowTop, footer, rowsPerPage;
++  };
++  Layout layout() const;
++  int rowAt(int x, int y) const;
++  size_t visibleCount() const;
++  void nextPage(int delta);
++  void showMessage(const char* text);
++  void connect();
++  void editKey();
++  int request(const char* method, const std::string& path, const std::string& body, uint8_t* response = nullptr,
++              size_t* received = nullptr);
++  bool loadChildren(const std::string& parent, unsigned depth, std::vector<Node>& result);
++  void loadDay();
++  void toggle(size_t row);
++  void expand(size_t row);
++  void actions(size_t row);
++  void edit(size_t row);
++  void chooseDate(std::string moveId = {});
++  void moveToDate(const std::string& id, const std::string& target);
++};
+diff --git a/src/workflowy/WorkflowyIcon.h b/src/workflowy/WorkflowyIcon.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfcf3dc3375
+--- /dev/null
++++ b/src/workflowy/WorkflowyIcon.h
+@@ -0,0 +1,39 @@
++#pragma once
++#include <Icon.h>
++
++// Monochrome mask derived from https://workflowy.com/favicon-32x32.png.
++inline constexpr uint8_t workflowyBits[] = {
++    0xff, 0xff, 0xff, 0xff,
++    0xe0, 0x00, 0x00, 0x07,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x70, 0x00, 0x03,
++    0xc0, 0xff, 0xff, 0x03,
++    0xc0, 0xff, 0xff, 0x03,
++    0xc0, 0xff, 0xff, 0x03,
++    0xc0, 0x70, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x07, 0x00, 0x03,
++    0xc0, 0x0f, 0xff, 0x03,
++    0xc0, 0x0f, 0xff, 0x03,
++    0xc0, 0x0f, 0xbe, 0x03,
++    0xc0, 0x07, 0x00, 0x03,
++    0xc0, 0x20, 0x00, 0x03,
++    0xc0, 0xf0, 0x00, 0x03,
++    0xc0, 0xff, 0xff, 0x03,
++    0xc0, 0xff, 0xff, 0x03,
++    0xc0, 0xf8, 0x02, 0x03,
++    0xc0, 0x60, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xc0, 0x00, 0x00, 0x03,
++    0xe0, 0x00, 0x00, 0x07,
++    0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon workflowyIcon{32, 32, 16, workflowyBits};
 diff --git a/src/workflowy/WorkflowyRoot.h b/src/workflowy/WorkflowyRoot.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..469dcecb0c1bf412819307309e87a6514c411ba8
 --- /dev/null
 +++ b/src/workflowy/WorkflowyRoot.h
 @@ -0,0 +1,36 @@
@@ -571,3 +1432,20 @@ new file mode 100644
 +emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 +-----END CERTIFICATE-----
 +)PEM";
+diff --git a/src/workflowy/WorkflowySettings.h b/src/workflowy/WorkflowySettings.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..eda7d41fe23f9a8506dfef71024a191fb86f26a6
+--- /dev/null
++++ b/src/workflowy/WorkflowySettings.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <cstddef>
++#include <string>
++
++namespace workflowy {
++inline constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
++inline constexpr size_t KEY_MAX = 256;
++std::string readSetting(const char* path, size_t limit);
++bool writeSetting(const char* path, const std::string& value);
++}  // namespace workflowy
