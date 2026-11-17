@@ -1,0 +1,229 @@
+diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+index 2ec6ae5c1e1d17db53b0b6f52282e05f21c6bfef..3beff0bb2357b21a18156c221579c5ce9a3d8eaa 100644
+--- a/src/activities/home/FileBrowserActivity.cpp
++++ b/src/activities/home/FileBrowserActivity.cpp
+@@ -100,10 +100,11 @@ size_t estimateNextVectorCapacity(size_t size, size_t capacity) {
+   return capacity * 2;
+ }
+
+-bool hasHeapForFileEntryAppend(const std::vector<std::string>& files, size_t entryLen) {
++template <typename Entry>
++bool hasHeapForFileEntryAppend(const std::vector<Entry>& files, size_t entryLen) {
+   const size_t nextCapacity = estimateNextVectorCapacity(files.size(), files.capacity());
+   const uint32_t vectorGrowthBytes =
+-      (nextCapacity == files.capacity()) ? 0U : static_cast<uint32_t>(nextCapacity * sizeof(std::string));
++      (nextCapacity == files.capacity()) ? 0U : static_cast<uint32_t>(nextCapacity * sizeof(Entry));
+   const uint32_t stringBytes = static_cast<uint32_t>(entryLen + 1);
+   const uint32_t largestNeeded = std::max(vectorGrowthBytes, stringBytes);
+
+@@ -133,7 +134,7 @@ bool acceptFirmware(const char* name, bool isDir) {
+   if (isMacOSMetadataEntry(name) || isWindowsMetadataEntry(name) || (!SETTINGS.showHiddenFiles && name[0] == '.')) {
+     return false;
+   }
+-  return isDir || FsHelpers::checkFileExtension(std::string_view{name}, ".bin");
++  return !isDir && FsHelpers::checkFileExtension(std::string_view{name}, ".bin");
+ }
+
+ bool acceptDirectory(const char* name, const bool isDir) {
+@@ -224,8 +225,7 @@ bool FileBrowserActivity::loadFilesIntoVector(size_t cap, bool& overflow) {
+     return false;
+   }
+
+-  const auto accept =
+-      mode == Mode::PickFirmware ? acceptFirmware : (mode == Mode::PickDirectory ? acceptDirectory : acceptCommon);
++  const auto accept = mode == Mode::PickDirectory ? acceptDirectory : acceptCommon;
+
+   files.reserve(std::min<size_t>(cap, INDEX_THRESHOLD));
+   for (auto file = root.openNextFile(); file; file = root.openNextFile()) {
+@@ -282,12 +282,58 @@ void FileBrowserActivity::loadFiles() {
+   loadFilesLocked();
+ }
+
++void FileBrowserActivity::loadFirmwareFiles() {
++  files.clear();
++  auto root = Storage.open(basepath.c_str());
++  if (!root || !root.isDirectory() || !fileNameBuffer) return;
++
++  struct FirmwareEntry {
++    std::string name;
++    uint32_t modified;
++  };
++  std::vector<FirmwareEntry> entries;
++  for (auto file = root.openNextFile(); file; file = root.openNextFile()) {
++    file.getName(fileNameBuffer.get(), NAME_BUFFER_SIZE);
++    if (acceptFirmware(fileNameBuffer.get(), file.isDirectory())) {
++      if (entries.size() == static_cast<size_t>(INT16_MAX) ||
++          !hasHeapForFileEntryAppend(entries, std::strlen(fileNameBuffer.get()))) {
++        fileListMemoryLimited = true;
++        return;
++      }
++      const auto modified = file.modificationTime();
++      entries.push_back({fileNameBuffer.get(), modified != 0 ? modified : file.creationTime()});
++    }
++    file.close();
++  }
++  if (FsHelpers::directoryIterationFailed(root)) {
++    fileListReadFailed = true;
++    return;
++  }
++  root.close();
++
++  std::sort(entries.begin(), entries.end(), [](const FirmwareEntry& a, const FirmwareEntry& b) {
++    if (a.modified != b.modified) return a.modified > b.modified;
++    return FsHelpers::naturalLess(a.name, b.name);
++  });
++  const auto bytes = entries.size() * sizeof(std::string);
++  if (ESP.getMaxAllocHeap() < bytes + FILE_BROWSER_APPEND_MIN_MAX_ALLOC_AFTER_ALLOC) {
++    fileListMemoryLimited = true;
++    return;
++  }
++  files.reserve(entries.size());
++  for (auto& entry : entries) files.push_back(std::move(entry.name));
++}
++
+ void FileBrowserActivity::loadFilesLocked() {
+   usingIndex = false;
+   clearIndexNameCache();
+   fileListMemoryLimited = false;
+   fileListReadFailed = false;
+   if (fileIndex) fileIndex->close();
++  if (mode == Mode::PickFirmware) {
++    loadFirmwareFiles();
++    return;
++  }
+
+   bool overflow = false;
+   if (!loadFilesIntoVector(INDEX_THRESHOLD, overflow)) {
+@@ -307,8 +353,7 @@ void FileBrowserActivity::loadFilesLocked() {
+   if (fileIndex && indexEntry) {
+     GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+
+-    const auto accept =
+-        mode == Mode::PickFirmware ? acceptFirmware : (mode == Mode::PickDirectory ? acceptDirectory : acceptCommon);
++    const auto accept = mode == Mode::PickDirectory ? acceptDirectory : acceptCommon;
+     if (fileIndex->open(basepath.c_str(), accept)) {
+       usingIndex = true;
+       return;
+@@ -380,29 +425,31 @@ void FileBrowserActivity::onEnter() {
+   // its release — otherwise we'd immediately auto-open whatever is at index 0.
+   lockNextConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
+
+-  auto root = Storage.open(basepath.c_str());
+-  if (!root) {
+-    basepath = "/";
++  if (mode == Mode::PickFirmware) {
+     loadFiles();
+-    requestUpdate();
+-    return;
+-  }
+-
+-  const bool rootIsDirectory = root.isDirectory();
+-  root.close();
++  } else {
++    auto root = Storage.open(basepath.c_str());
++    if (!root) {
++      basepath = "/";
++      loadFiles();
++      requestUpdate();
++      return;
++    }
+
+-  if (!rootIsDirectory) {
+-    lockLongPressBack = mappedInput.isPressed(MappedInputManager::Button::Back);
++    const bool rootIsDirectory = root.isDirectory();
++    root.close();
+
+-    const std::string oldPath = basepath;
+-    basepath = FsHelpers::extractFolderPath(basepath);
+-    loadFiles();
++    if (!rootIsDirectory) {
++      lockLongPressBack = mappedInput.isPressed(MappedInputManager::Button::Back);
++      const std::string oldPath = basepath;
++      basepath = FsHelpers::extractFolderPath(basepath);
++      loadFiles();
+
+-    const auto pos = oldPath.find_last_of('/');
+-    const std::string fileName = oldPath.substr(pos + 1);
+-    selectorIndex = findEntry(fileName);
+-  } else {
+-    loadFiles();
++      const auto pos = oldPath.find_last_of('/');
++      selectorIndex = findEntry(oldPath.substr(pos + 1));
++    } else {
++      loadFiles();
++    }
+   }
+
+   uiReady = false;
+@@ -1023,8 +1070,7 @@ void FileBrowserActivity::activateSelected() {
+   const std::string entry = entryNameAt(selectorIndex);
+   const bool isDirectory = (entry.back() == '/');
+
+-  // Firmware picker: select file -> return path; navigate into directories normally.
+-  if (mode == Mode::PickFirmware && !isDirectory) {
++  if (mode == Mode::PickFirmware) {
+     std::string cleanBasePath = basepath;
+     if (cleanBasePath.back() != '/') cleanBasePath += "/";
+     ActivityResult res{FilePathResult{cleanBasePath + entry}};
+@@ -1239,7 +1285,7 @@ void FileBrowserActivity::loop() {
+ }
+
+ void FileBrowserActivity::navigateBack() {
+-  if (basepath != "/") {
++  if (basepath != "/" && mode != Mode::PickFirmware) {
+     {
+       RenderLock lock(*this);
+       const std::string oldPath = basepath;
+@@ -1398,7 +1444,7 @@ void FileBrowserActivity::buildListScreen(UiApp::ScreenType& screen) {
+   for (size_t i = 0; i < drawCount; i++) {
+     const size_t entryIndex = static_cast<size_t>(topIndex) + i;
+     const std::string entry = entryNameAt(entryIndex);
+-    names[i] = getFileName(entry);
++    names[i] = mode == Mode::PickFirmware ? entry : getFileName(entry);
+     if (SETTINGS.hideFileExtension == 0) values[i] = getFileExtension(entry);
+     const std::string fullPath = buildFullPath(basepath, entry);
+     if (isPinnedBootFavorite(fullPath)) {
+@@ -1483,11 +1529,7 @@ void FileBrowserActivity::render(RenderLock&&) {
+   const auto backLabel = (basepath == "/") ? (mode == Mode::Books ? mappedInput.withBackArrow(tr(STR_LIBRARY))
+                                                                   : mappedInput.withBackArrow(tr(STR_BACK)))
+                                            : mappedInput.withBackArrow(tr(STR_BACK));
+-  // In PickFirmware mode, Confirm on a .bin returns the path to the caller (not "open"); show
+-  // STR_SELECT instead. Directories in the same picker still descend, so keep STR_OPEN there.
+-  const bool selectingFirmwareFile =
+-      mode == Mode::PickFirmware && visibleEntries > 0 && std::string(entryNameAt(selectorIndex)).back() != '/';
+-  const char* confirmLabel = visibleEntries == 0 ? "" : (selectingFirmwareFile ? tr(STR_SELECT) : tr(STR_OPEN));
++  const char* confirmLabel = visibleEntries == 0 ? "" : (mode == Mode::PickFirmware ? tr(STR_SELECT) : tr(STR_OPEN));
+   const auto labels = mappedInput.mapLabels(
+       backLabel, confirmLabel, visibleEntries == 0 || mode == Mode::PickDirectory ? "" : tr(STR_DIR_UP),
+       mode == Mode::PickDirectory ? tr(STR_SELECT) : (visibleEntries == 0 ? "" : tr(STR_DIR_DOWN)));
+diff --git a/src/activities/home/FileBrowserActivity.h b/src/activities/home/FileBrowserActivity.h
+index b9a88567bb71fc9d728bcb7db667baeb1b8b5a7f..e08d1699d662a94553afb4e93deb04ceacb31d92 100644
+--- a/src/activities/home/FileBrowserActivity.h
++++ b/src/activities/home/FileBrowserActivity.h
+@@ -100,6 +100,7 @@ class FileBrowserActivity final : public Activity {
+   // Caller holds RenderLock while replacing the list backing storage together
+   // with its associated navigation state.
+   void loadFilesLocked();
++  void loadFirmwareFiles();
+   bool loadFilesIntoVector(size_t cap, bool& overflow);
+   size_t entryCount() const;
+   const char* entryNameAt(size_t row);
+diff --git a/src/activities/settings/SdFirmwareUpdateActivity.cpp b/src/activities/settings/SdFirmwareUpdateActivity.cpp
+index 653c4621ad3018ddbe009ef7d8135be65050ee99..c6c27db26366f0fcda00cc42432a5ce34cd9b675 100644
+--- a/src/activities/settings/SdFirmwareUpdateActivity.cpp
++++ b/src/activities/settings/SdFirmwareUpdateActivity.cpp
+@@ -25,8 +25,12 @@ void SdFirmwareUpdateActivity::onEnter() {
+ }
+
+ void SdFirmwareUpdateActivity::launchPicker() {
+-  // Reuse the standard file browser, restricted to .bin files only.
++  constexpr char firmwareDirectory[] = "/firmwares";
++  const bool exists = Storage.exists(firmwareDirectory);
++  if (!exists && !recoveryMode) Storage.mkdir(firmwareDirectory);
++  // Recovery can still find an update placed in the card root.
++  const char* path = recoveryMode && !exists ? "/" : firmwareDirectory;
+   startActivityForResult(
+-      std::make_unique<FileBrowserActivity>(renderer, mappedInput, "/", FileBrowserActivity::Mode::PickFirmware),
++      std::make_unique<FileBrowserActivity>(renderer, mappedInput, path, FileBrowserActivity::Mode::PickFirmware),
+       [this](const ActivityResult& result) { onPickerResult(result); });
+ }
