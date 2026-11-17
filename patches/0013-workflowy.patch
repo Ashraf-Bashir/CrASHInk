@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..94d1260d0ad250fdbb2aa9a0e437de8541895087 100644
+index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..48fe15952a0a58fc74fda1a60fd07b674b66c8d0 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -609,6 +609,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -73,14 +73,14 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..94d1260d0ad250fdbb2aa9a0e437de85
 +STR_WORKFLOWY_ORDER_CHANGED: "Parent restored. Order changed."
 +STR_WORKFLOWY_MARK_DONE: "Mark done"
 +STR_WORKFLOWY_MARK_UNDONE: "Mark undone"
-+STR_WORKFLOWY_COMPLETED_HIDDEN: "Completed items are hidden"
 +STR_WORKFLOWY_ERROR_DETAILS: "Workflowy error details"
 +STR_WORKFLOWY_LOCAL_SAVE_DETAILS: "Check the SD card and the Workflowy key used to queue these items."
 +STR_WORKFLOWY_NO_WIFI_DETAILS: "The device is disconnected from Wi-Fi."
 +STR_WORKFLOWY_CLOCK_DETAILS: "The device needs a valid clock to connect securely."
 +STR_WORKFLOWY_RATE_LIMIT: "Workflowy is limiting requests. Try again shortly."
 +STR_WORKFLOWY_RESPONSE_DETAILS: "The response was invalid or too large to read."
-+STR_WORKFLOWY_CHILDREN_NEXT_PAGE: "Children on next page"
++STR_WORKFLOWY_COMPLETE_FAILED: "Could not mark the item done"
++STR_WORKFLOWY_UNCOMPLETE_FAILED: "Could not mark the item undone"
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -169,19 +169,6 @@ index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882
    bool readClippingPreview(size_t index, std::string& out) const;
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
-diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
-index c8632d51a6c0eea1826a12e30bcdc227c0437854..af1bb210b0bb1ec5a15751a11c6b1eb46e5798f4 100644
---- a/src/activities/ActivityResult.h
-+++ b/src/activities/ActivityResult.h
-@@ -18,6 +18,8 @@ struct WifiResult {
-
- struct KeyboardResult {
-   std::string text;
-+  bool alternate = false;
-+  bool itemMenu = false;
- };
-
- struct MenuResult {
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
 index 3698935155402bc82ba87531c94fda1eb02a3739..14c22290bc6f918f81f31f098929e819c2a1bc8e 100644
 --- a/src/activities/library/LibraryActivity.cpp
@@ -688,7 +675,7 @@ index 0000000000000000000000000000000000000000..8d7e545627fbd94feb289ed0c08eee87
 +  void complete(const char* message);
 +};
 diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
-index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c546135082ea8ac7 100644
+index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..dd0fee4f9df66313025421d6b6ec1d821eb9d8d7 100644
 --- a/src/activities/util/KeyboardEntryActivity.cpp
 +++ b/src/activities/util/KeyboardEntryActivity.cpp
 @@ -137,7 +137,7 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
@@ -705,7 +692,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c5461350
  }
 
 +int KeyboardEntryActivity::firstVisibleInputLine(std::string& display, int width, int capacity) const {
-+  if (!itemMenu) return 0;
++  if (!keepCursorVisible) return 0;
 +  int first = 0, start = 0, before = 0;
 +  while (start < static_cast<int>(display.size())) {
 +    const int end = lineBreakEnd(display, start, width);
@@ -735,33 +722,11 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c5461350
 
 -    if (lineEndIdx == static_cast<int>(displayText.length())) {
 +    if (lineEndIdx == static_cast<int>(displayText.length()) ||
-+        (itemMenu && lineY + lineHeight >= inputStartY + capacity * lineHeight)) {
++        (keepCursorVisible && lineY + lineHeight >= inputStartY + capacity * lineHeight)) {
        break;
      }
 
-@@ -562,6 +576,21 @@ void KeyboardEntryActivity::loop() {
-     return;
-   }
-
-+  if (itemMenu) {
-+    const auto action = itemMenuRect();
-+    if (mappedInput.wasTapInRect(action.x, action.y, action.width, action.height)) {
-+      onComplete(text, false, true);
-+      return;
-+    }
-+  }
-+  if (alternateAction) {
-+    const auto action = alternateActionRect();
-+    if (mappedInput.wasTapInRect(action.x, action.y, action.width, action.height)) {
-+      onComplete(text, true);
-+      return;
-+    }
-+  }
-+
-   int tx = 0;
-   int ty = 0;
-
-@@ -785,6 +814,11 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -785,6 +799,11 @@ void KeyboardEntryActivity::render(RenderLock&&) {
    const auto pageWidth = renderer.getScreenWidth();
    const auto& metrics = UITheme::getInstance().getMetrics();
 
@@ -773,7 +738,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c5461350
    const Rect header{0, metrics.topPadding, pageWidth, TouchHeaderBackButton::height(metrics, mappedInput)};
    if (mappedInput.hasTouchHardware()) {
      TouchHeaderBackButton::draw(renderer, header, title.c_str(), false);
-@@ -792,10 +826,6 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -792,10 +811,6 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      GUI.drawHeader(renderer, header, title.c_str());
    }
 
@@ -784,7 +749,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c5461350
 
    std::string displayText = displayTextForCurrentState();
 
-@@ -832,7 +862,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -832,7 +847,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      if (w > cursorCharWidth) cursorCharWidth = w;
    }
 
@@ -794,73 +759,26 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..72e2c598662ddb5c68ef2113c5461350
    int textWidth = 0;
    int cursorPixelX = effectiveMargin;
    int cursorLineY = inputStartY;
-@@ -892,7 +923,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -892,7 +908,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
        } else {
          renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
        }
 -      if (lineEndIdx == static_cast<int>(displayText.length())) {
 +      if (lineEndIdx == static_cast<int>(displayText.length()) ||
-+          (itemMenu && inputHeight + lineHeight >= capacity * lineHeight)) {
++          (keepCursorVisible && inputHeight + lineHeight >= capacity * lineHeight)) {
          break;
        }
 
-@@ -964,7 +996,25 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -964,7 +981,6 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      }
    }
 
 -  const fui::Rect kbRect = keyboardRect();
-+  if (itemMenu && mappedInput.hasTouchHardware()) {
-+    const auto menu = itemMenuRect();
-+    const int x = menu.x + menu.width / 2, y = menu.y + menu.height / 2;
-+    for (const int dx : {-7, 0, 7}) renderer.fillRect(x + dx - 1, y - 1, 3, 3);
-+  }
-+  if (alternateAction && mappedInput.hasTouchHardware()) {
-+    const auto action = alternateActionRect();
-+    renderer.drawRect(action.x, action.y + 2, action.width, action.height - 4);
-+    const int x = action.x + 8, y = action.y + (action.height - 16) / 2;
-+    renderer.drawRect(x, y, 16, 16);
-+    if (alternateChecked) {
-+      renderer.fillRect(x, y, 16, 16);
-+      renderer.drawLine(x + 3, y + 8, x + 6, y + 11, 2, false);
-+      renderer.drawLine(x + 6, y + 11, x + 12, y + 4, 2, false);
-+    }
-+    const auto label = renderer.truncatedText(SMALL_FONT_ID, alternateAction, action.width - 32);
-+    renderer.drawText(SMALL_FONT_ID, x + 22,
-+                      action.y + (action.height - renderer.getLineHeight(SMALL_FONT_ID)) / 2, label.c_str());
-+  }
    const int keysHeight = std::min(keyboardKeysHeight(metrics, currentLayout().rowCount, mappedInput.hasTouchHardware()),
                                    static_cast<int>(kbRect.height));
    const auto orientation = renderer.getOrientation();
-@@ -1138,8 +1188,25 @@ void KeyboardEntryActivity::render(RenderLock&&) {
-   renderer.displayBuffer();
- }
-
--void KeyboardEntryActivity::onComplete(std::string text) {
--  setResult(KeyboardResult{std::move(text)});
-+fui::Rect KeyboardEntryActivity::alternateActionRect() const {
-+  const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
-+  int top, right, bottom, left;
-+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+  constexpr int width = 120;
-+  return {static_cast<int16_t>(header.width - right - width - (itemMenu ? 50 : 8)), static_cast<int16_t>(header.y),
-+          width, static_cast<int16_t>(header.height)};
-+}
-+
-+fui::Rect KeyboardEntryActivity::itemMenuRect() const {
-+  const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
-+  int top, right, bottom, left;
-+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+  return {static_cast<int16_t>(header.width - right - 50), static_cast<int16_t>(header.y), 46,
-+          static_cast<int16_t>(header.height)};
-+}
-+
-+void KeyboardEntryActivity::onComplete(std::string text, bool alternate, bool openItemMenu) {
-+  setResult(KeyboardResult{std::move(text), alternate, openItemMenu});
-   finish();
- }
-
 diff --git a/src/activities/util/KeyboardEntryActivity.h b/src/activities/util/KeyboardEntryActivity.h
-index 5335aef83dbecd89835ed12f65ce8085a31f071f..476246f9c8d6f6c924eb1d2d1c1dd272da110a84 100644
+index 5335aef83dbecd89835ed12f65ce8085a31f071f..8798bec5d3480ccf616e4ce31502644592cf77ad 100644
 --- a/src/activities/util/KeyboardEntryActivity.h
 +++ b/src/activities/util/KeyboardEntryActivity.h
 @@ -1,4 +1,5 @@
@@ -869,49 +787,41 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..476246f9c8d6f6c924eb1d2d1c1dd272
  #include <FreeInkUIGfxRenderer.h>
  #include <GfxRenderer.h>
 
-@@ -29,6 +30,13 @@ class KeyboardEntryActivity : public Activity {
+@@ -29,6 +30,11 @@ class KeyboardEntryActivity : public Activity {
          inputType(inputType),
          minLength(minLength) {}
 
-+  void showItemMenu() { itemMenu = true; }
-+  void setInitialCursor(size_t cursor) { initialCursor = cursor; }
-+  void setAlternateAction(const char* label, bool checked) {
-+    alternateAction = label;
-+    alternateChecked = checked;
++  void setInitialCursor(size_t cursor) {
++    initialCursor = cursor;
++    keepCursorVisible = true;
 +  }
 +
    void onEnter() override;
    void onExit() override;
    void loop() override;
-@@ -37,6 +45,10 @@ class KeyboardEntryActivity : public Activity {
+@@ -37,6 +43,8 @@ class KeyboardEntryActivity : public Activity {
    uint8_t inputPollDelayMs() const override { return mappedInput.hasTouchHardware() ? 2 : 10; }
 
   private:
-+  const char* alternateAction = nullptr;
-+  bool alternateChecked = false;
-+  bool itemMenu = false;
++  bool keepCursorVisible = false;
 +  size_t initialCursor = std::string::npos;
    std::string title;
    std::string text;
    size_t maxLength;
-@@ -106,7 +118,10 @@ class KeyboardEntryActivity : public Activity {
-
+@@ -107,6 +115,7 @@ class KeyboardEntryActivity : public Activity {
    enum class InputFieldTouchTarget { None, Cursor, PasswordToggle };
 
--  void onComplete(std::string text);
-+  void onComplete(std::string text, bool alternate = false, bool openItemMenu = false);
-+  freeink::ui::Rect alternateActionRect() const;
-+  freeink::ui::Rect itemMenuRect() const;
+   void onComplete(std::string text);
 +  int firstVisibleInputLine(std::string& display, int width, int capacity) const;
    void onCancel();
    InputFieldTouchTarget inputFieldTouchTargetFromPoint(int x, int y, size_t& position) const;
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78414d56fa
+index 0000000000000000000000000000000000000000..4cf43c28d8ffcaabc7d2ba4f22528e71792b5743
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2078 @@
+@@ -0,0 +1,2247 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -935,6 +845,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +#include <ctime>
 +
 +#include "MappedInputManager.h"
++#include "WifiCredentialStore.h"
 +#include "activities/ActivityManager.h"
 +#include "activities/home/SavedItemsHomeActivity.h"
 +#include "activities/settings/ReadestSettingsActivity.h"
@@ -950,7 +861,8 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +
 +namespace {
 +constexpr size_t MAX_ROWS = 1024;
-+constexpr size_t MAX_PREFETCH_ROWS = 220;
++constexpr size_t MAX_CACHED_BRANCH_ROWS = 220;
++constexpr size_t MAX_ERROR_BODY = 768;
 +constexpr unsigned long SYNC_INTERVAL = 120000;
 +constexpr size_t MAX_RESPONSE = 384 * 1024;
 +constexpr int ROW_HEIGHT = 39;
@@ -1118,7 +1030,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +};
 +
 +bool isErrorNotice(const char* text) {
-+  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED) && text != tr(STR_WORKFLOWY_COMPLETED_HIDDEN) && text != tr(STR_WORKFLOWY_CHILDREN_NEXT_PAGE);
++  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED);
 +}
 +
 +class WorkflowyErrorDetails final : public Activity {
@@ -1127,8 +1039,20 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      : Activity("WorkflowyErrorDetails", renderer, input), summary(summary), details(std::move(details)) {}
 +
 +  void loop() override {
-+    if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
-+        TouchHeaderBackButton::wasTapped(mappedInput, renderer)) finish();
++    using Button = MappedInputManager::Button;
++    using Swipe = MappedInputManager::SwipeDir;
++    if (mappedInput.wasReleased(Button::Back) || TouchHeaderBackButton::wasTapped(mappedInput, renderer)) return finish();
++    const auto button = doneButton();
++    if (mappedInput.wasTapInRect(button.x, button.y, button.width, button.height)) return finish();
++    const auto swipe = mappedInput.wasSwipe();
++    const bool forward = swipe == Swipe::Up || mappedInput.wasReleased(Button::Down);
++    const bool backward = swipe == Swipe::Down || mappedInput.wasReleased(Button::Up);
++    if (!forward && !backward) return;
++    {
++      RenderLock lock(*this);
++      offset = std::clamp(offset + (forward ? pageLines : -pageLines), 0, maxOffset);
++    }
++    requestUpdate();
 +  }
 +
 +  void render(RenderLock&&) override {
@@ -1145,22 +1069,48 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      workflowy::wrapOutlineText(text, width, [&](std::string_view line) {
 +        return renderer.getTextWidth(UI_12_FONT_ID, std::string(line).c_str(), style);
 +      }, lines);
-+      for (const auto [begin, end] : lines) {
++      const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID) + 6;
++      int first = 0, count = static_cast<int>(lines.size());
++      if (style != EpdFontFamily::BOLD) {
++        pageLines = std::max(1, (doneButton().y - y - 24) / lineHeight);
++        maxOffset = std::max(0, count - pageLines);
++        offset = std::min(offset, maxOffset);
++        first = offset;
++        count = std::min(count, first + pageLines);
++      }
++      for (int i = first; i < count; ++i) {
++        const auto [begin, end] = lines[i];
 +        renderer.drawText(UI_12_FONT_ID, left + 12, y, std::string(text.substr(begin, end - begin)).c_str(), true, style);
-+        y += renderer.getLineHeight(UI_12_FONT_ID) + 6;
++        y += lineHeight;
 +      }
 +    };
 +    draw(summary, EpdFontFamily::BOLD);
 +    if (!details.empty()) {
 +      y += 12;
 +      draw(details, EpdFontFamily::REGULAR);
++      if (maxOffset) {
++        const char* more = offset == 0 ? "↓" : offset == maxOffset ? "↑" : "↑   ↓";
++        renderer.drawCenteredText(SMALL_FONT_ID, doneButton().y - 22, more);
++      }
 +    }
++    const auto button = doneButton();
++    renderer.drawRoundedRect(button.x, button.y, button.width, button.height, 1, 4, true);
++    renderer.drawCenteredText(UI_12_FONT_ID, button.y + (button.height - renderer.getLineHeight(UI_12_FONT_ID)) / 2,
++                              tr(STR_DONE));
 +    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +  }
 +
 + private:
++  Rect doneButton() const {
++    int top, right, bottom, left;
++    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++    const int width = std::min(160, renderer.getScreenWidth() - left - right - 24);
++    const int x = (renderer.getScreenWidth() + left - right - width) / 2;
++    return Rect{x, renderer.getScreenHeight() - bottom - 54, width, 44};
++  }
 +  const char* summary;
 +  std::string details;
++  int offset = 0, maxOffset = 0, pageLines = 1;
 +};
 +
 +std::string plainTitle(const char* value) {
@@ -1233,7 +1183,10 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +}
 +
 +void WorkflowyDailyActivity::onExit() {
++  while (pendingSave && pendingSave->started && !pendingSave->ready.load(std::memory_order_acquire)) vTaskDelay(1);
++  pendingSave.reset();
 +  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
++  if (scanningWifi) WiFi.scanDelete();
 +  if (ownsWifi) WiFi.disconnect(false, false);
 +  // The fetch owns a TLS session. Wait for its cleanup before the Library can open.
 +  while (prefetch && !prefetch->ready.load(std::memory_order_acquire)) vTaskDelay(1);
@@ -1255,37 +1208,128 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  std::string details;
 +  if (message == tr(STR_WORKFLOWY_OUTBOX_ACCOUNT) || message == tr(STR_WORKFLOWY_SAVE_FAILED)) {
 +    details = tr(STR_WORKFLOWY_LOCAL_SAVE_DETAILS);
-+  } else if (!online || message == tr(STR_WORKFLOWY_CLOCK_FAILED) || lastStatus == -2) {
-+    details = !online ? tr(STR_WORKFLOWY_NO_WIFI_DETAILS) : tr(STR_WORKFLOWY_CLOCK_DETAILS);
++  } else if (!online && lastStatus <= 0) {
++    details = tr(STR_WORKFLOWY_NO_WIFI_DETAILS);
++  } else if (message == tr(STR_WORKFLOWY_CLOCK_FAILED) || lastStatus == -2) {
++    details = tr(STR_WORKFLOWY_CLOCK_DETAILS);
 +  } else if (lastStatus >= 400) {
 +    details = "HTTP " + std::to_string(lastStatus);
 +    if (lastStatus == 401 || lastStatus == 403) details += " · " + std::string(tr(STR_WORKFLOWY_AUTH_FAILED));
 +    if (lastStatus == 429) details += " · " + std::string(tr(STR_WORKFLOWY_RATE_LIMIT));
-+  } else if (lastTransport != ESP_OK) {
-+    details = esp_err_to_name(lastTransport);
++  } else if (lastTransport != ESP_OK || lastStatus == -5) {
++    details = esp_err_to_name(lastStatus == -5 ? ESP_ERR_NO_MEM : lastTransport);
 +  } else if (lastStatus == -3) {
 +    details = tr(STR_WORKFLOWY_RESPONSE_DETAILS);
++  }
++  if (!lastServerError.empty()) {
++    if (!details.empty()) details += " · ";
++    details += lastServerError;
 +  }
 +  startActivityForResult(std::make_unique<WorkflowyErrorDetails>(renderer, mappedInput, message, std::move(details)),
 +                         [](const ActivityResult&) {});
 +}
 +
 +void WorkflowyDailyActivity::connect() {
-+  if (credential.empty()) {
-+    editKey();
-+  } else if (hasActiveStationWifiConnection()) {
-+    ownsWifi = true;
++  if (credential.empty()) return editKey();
++  ownsWifi = true;
++  if (hasActiveStationWifiConnection()) {
++    {
++      RenderLock lock(*this);
++      online = true;
++    }
 +    step = Step::Load;
-+  } else {
-+    ownsWifi = true;
-+    step = Step::Waiting;
-+    startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
-+                           [this](const ActivityResult& result) {
-+      const auto* wifi = std::get_if<WifiResult>(&result.data);
-+      step = !result.isCancelled && wifi && wifi->connected ? Step::Load : Step::Ready;
-+      if (step == Step::Ready) showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
-+    });
++    return;
 +  }
++  if (!WIFI_STORE.getCredentialCount()) return showWifiPicker();
++  WiFi.persistent(false);
++  if (!WiFi.mode(WIFI_STA)) return showWifiPicker();
++  WiFi.setAutoReconnect(true);
++  savedWifiCandidates.clear();
++  scannedSavedWifi = false;
++  const auto last = WIFI_STORE.getLastConnectedSsid();
++  if (!last.empty() && WIFI_STORE.hasSavedCredential(last)) trySavedWifi(last);
++  else scanSavedWifi();
++  {
++    RenderLock lock(*this);
++    connectingWifi = true;
++  }
++  step = Step::Ready;
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::trySavedWifi(const std::string& ssid) {
++  const auto saved = WIFI_STORE.findCredential(ssid);
++  if (saved) WiFi.begin(saved->ssid.c_str(), saved->password.empty() ? nullptr : saved->password.c_str());
++  wifiStartedAt = millis();
++}
++
++void WorkflowyDailyActivity::scanSavedWifi() {
++  WiFi.disconnect(false, false);
++  WiFi.scanDelete();
++  scanningWifi = true;
++  scannedSavedWifi = true;
++  wifiStartedAt = millis();
++  WiFi.scanNetworks(true);
++}
++
++void WorkflowyDailyActivity::pollWifiConnection() {
++  if (!connectingWifi || tracking || pendingSave) return;
++  if (hasActiveStationWifiConnection()) {
++    if (scanningWifi) WiFi.scanDelete();
++    scanningWifi = false;
++    savedWifiCandidates.clear();
++    const std::string connectedSsid = WiFi.SSID().c_str();
++    if (connectedSsid != WIFI_STORE.getLastConnectedSsid()) WIFI_STORE.setLastConnectedSsid(connectedSsid);
++    {
++      RenderLock lock(*this);
++      connectingWifi = false;
++      online = true;
++    }
++    step = Step::Load;
++    return;
++  }
++  if (scanningWifi) {
++    const int count = WiFi.scanComplete();
++    if (count == WIFI_SCAN_RUNNING && millis() - wifiStartedAt < 10000) return;
++    const auto last = WIFI_STORE.getLastConnectedSsid();
++    for (int i = 0; i < count && savedWifiCandidates.size() < WIFI_STORE.getCredentialCount(); ++i) {
++      const std::string ssid = WiFi.SSID(i).c_str();
++      if (ssid != last && WIFI_STORE.hasSavedCredential(ssid) &&
++          std::find(savedWifiCandidates.begin(), savedWifiCandidates.end(), ssid) == savedWifiCandidates.end()) {
++        savedWifiCandidates.push_back(ssid);
++      }
++    }
++    WiFi.scanDelete();
++    scanningWifi = false;
++    if (savedWifiCandidates.empty()) {
++      wifiStartedAt = millis() - 6500;
++    }
++  } else if (millis() - wifiStartedAt < 6500) {
++    return;
++  }
++  if (!scannedSavedWifi) return scanSavedWifi();
++  if (!savedWifiCandidates.empty()) {
++    const auto next = std::move(savedWifiCandidates.front());
++    savedWifiCandidates.erase(savedWifiCandidates.begin());
++    WiFi.disconnect(false, false);
++    return trySavedWifi(next);
++  }
++  if (tracking || pendingSave) return;
++  {
++    RenderLock lock(*this);
++    connectingWifi = false;
++  }
++  showWifiPicker();
++}
++
++void WorkflowyDailyActivity::showWifiPicker() {
++  step = Step::Waiting;
++  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false),
++                         [this](const ActivityResult& result) {
++    const auto* wifi = std::get_if<WifiResult>(&result.data);
++    step = !result.isCancelled && wifi && wifi->connected ? Step::Load : Step::Ready;
++    if (step == Step::Ready) showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  });
 +}
 +
 +void WorkflowyDailyActivity::editKey() {
@@ -1307,6 +1351,24 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +
 +template <typename Work>
 +int WorkflowyDailyActivity::requestWhilePaging(Work work) {
++  if (pendingSave) return -6;
++  using Button = MappedInputManager::Button;
++  using Swipe = MappedInputManager::SwipeDir;
++  const auto pollPaging = [&] {
++    mappedInput.update();
++    Swipe swipe = Swipe::None;
++    int startX = 0, startY = 0, endX = 0, endY = 0;
++    mappedInput.wasSwipeWithPoints(swipe, startX, startY, endX, endY);
++    if (swipe == Swipe::Up || mappedInput.wasReleased(Button::Down)) nextPage(1);
++    if (swipe == Swipe::Down || mappedInput.wasReleased(Button::Up)) nextPage(-1);
++    vTaskDelay(1);
++  };
++  // Cancellation is cooperative. Wait for the read to close TLS before starting a mutation.
++  if (prefetch) {
++    prefetch->cancel.store(true, std::memory_order_relaxed);
++    while (!prefetch->ready.load(std::memory_order_acquire)) pollPaging();
++    prefetch.reset();
++  }
 +  struct Request {
 +    Work work;
 +    int status = 0;
@@ -1320,37 +1382,111 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  };
 +  if (xTaskCreate(task, "wf-request", 8192, &request, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
 +    LOG_ERR("WF", "Could not start Workflowy request");
-+    return 0;
++    return -5;
 +  }
-+  using Button = MappedInputManager::Button;
-+  using Swipe = MappedInputManager::SwipeDir;
-+  while (!request.ready.load(std::memory_order_acquire)) {
-+    mappedInput.update();
-+    Swipe swipe = Swipe::None;
-+    int startX = 0, startY = 0, endX = 0, endY = 0;
-+    mappedInput.wasSwipeWithPoints(swipe, startX, startY, endX, endY);
-+    if (swipe == Swipe::Up || mappedInput.wasReleased(Button::Down)) nextPage(1);
-+    if (swipe == Swipe::Down || mappedInput.wasReleased(Button::Up)) nextPage(-1);
-+    vTaskDelay(1);
-+  }
++  while (!request.ready.load(std::memory_order_acquire)) pollPaging();
 +  return request.status;
 +}
 +
 +int WorkflowyDailyActivity::request(const char* method, const std::string& path, const std::string& body,
 +                                   uint8_t* response, size_t* received, size_t capacity) {
 +  int transport = 0;
++  std::string errorBody;
 +  const int status = requestWhilePaging([&] {
-+    return requestWithKey(credential, method, path, body, response, received, capacity, nullptr, nullptr, &transport);
++    return requestWithKey(credential, method, path, body, response, received, capacity,
++                          nullptr, nullptr, &transport, &errorBody);
 +  });
++  recordServerError(status, transport, errorBody, credential);
++  return status;
++}
++
++void WorkflowyDailyActivity::recordServerError(int status, int transport, const std::string& errorBody,
++                                                 const std::string& key) {
 +  lastStatus = status;
 +  lastTransport = transport;
-+  return status;
++  lastServerError.clear();
++  if (!errorBody.empty()) {
++    JsonDocument error;
++    if (!deserializeJson(error, errorBody)) {
++      const char* reason = error["message"] | "";
++      if (!*reason) reason = error["error"]["message"] | "";
++      if (!*reason) reason = error["error"] | "";
++      if (!*reason) reason = error["code"] | "";
++      lastServerError = plainTitle(reason);
++      if (!key.empty()) {
++        for (size_t at = 0; (at = lastServerError.find(key, at)) != std::string::npos; at += 3) {
++          lastServerError.replace(at, key.size(), "***");
++        }
++      }
++    }
++  }
++}
++
++void WorkflowyDailyActivity::saveTask(void* argument) {
++  auto& save = *static_cast<Save*>(argument);
++  save.status = requestWithKey(save.key, "POST", save.path, save.body,
++                               save.captureResponse ? save.response.data() : nullptr,
++                               &save.received, save.response.size(), nullptr, nullptr, &save.transport, &save.error);
++  save.ready.store(true, std::memory_order_release);
++  vTaskDelete(nullptr);
++}
++
++bool WorkflowyDailyActivity::queueSave(std::string path, std::string body, bool capture,
++                                       std::function<void(const Save&)> finish) {
++  if (pendingSave) return false;
++  auto save = makeUniqueNoThrow<Save>();
++  if (!save) {
++    recordServerError(-5, ESP_ERR_NO_MEM, {}, credential);
++    showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++    return false;
++  }
++  save->key = credential;
++  save->path = std::move(path);
++  save->body = std::move(body);
++  save->captureResponse = capture;
++  save->finish = std::move(finish);
++  pendingSave = std::move(save);
++  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
++  {
++    RenderLock lock(*this);
++    saving = true;
++    message = nullptr;
++  }
++  requestUpdate();
++  return true;
++}
++
++bool WorkflowyDailyActivity::pollSave() {
++  if (!pendingSave) return false;
++  auto& save = *pendingSave;
++  if (!save.started) {
++    if (prefetch && !prefetch->ready.load(std::memory_order_acquire)) return false;
++    prefetch.reset();
++    save.started = true;
++    if (xTaskCreate(saveTask, "wf-save", 8192, &save, tskIDLE_PRIORITY + 1, nullptr) == pdPASS) return false;
++    save.status = -5;
++    save.transport = ESP_ERR_NO_MEM;
++    save.ready.store(true, std::memory_order_release);
++  }
++  if (!save.ready.load(std::memory_order_acquire)) return false;
++  auto completed = std::move(pendingSave);
++  {
++    RenderLock lock(*this);
++    saving = false;
++  }
++  recordServerError(completed->status, completed->transport, completed->error, completed->key);
++  const bool shouldLeave = std::exchange(leaveAfterSave, false);
++  completed->finish(*completed);
++  if (shouldLeave && completed->status >= 200 && completed->status < 300) back();
++  else requestUpdate();
++  return true;
 +}
 +
 +int WorkflowyDailyActivity::requestWithKey(const std::string& key, const char* method, const std::string& path,
 +                                          const std::string& body, uint8_t* response, size_t* received,
 +                                          size_t capacity, HeapByteBuffer* growable,
-+                                          const std::atomic<bool>* cancel, int* transport) {
++                                          const std::atomic<bool>* cancel, int* transport,
++                                          std::string* serverError) {
 +  if (cancel && cancel->load(std::memory_order_relaxed)) return -4;
 +  if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) {
 +    return -2;
@@ -1361,8 +1497,9 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    size_t capacity;
 +    HeapByteBuffer* growable;
 +    const std::atomic<bool>* cancel;
++    std::string* serverError;
 +    bool overflow = false;
-+  } sink{response, received, capacity, growable, cancel};
++  } sink{response, received, capacity, growable, cancel, serverError};
 +
 +  const auto url = std::string(API) + path;
 +  esp_http_client_config_t config{};
@@ -1380,8 +1517,13 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    auto& target = *static_cast<Response*>(event->user_data);
 +    if (target.cancel && target.cancel->load(std::memory_order_relaxed)) return ESP_FAIL;
 +    if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) return ESP_OK;
-+    if (!target.buffer && !target.growable) return ESP_OK;
 +    const auto length = static_cast<size_t>(event->data_len);
++    if (target.serverError && esp_http_client_get_status_code(event->client) >= 400) {
++      const size_t available = MAX_ERROR_BODY - target.serverError->size();
++      target.serverError->append(static_cast<const char*>(event->data), std::min(available, length));
++      return ESP_OK;
++    }
++    if (!target.buffer && !target.growable) return ESP_OK;
 +    const auto needed = *target.used + length;
 +    if (!target.overflow && target.growable && needed > target.capacity && needed <= MAX_RESPONSE) {
 +      const size_t expanded = std::max(needed, std::min(MAX_RESPONSE, std::max<size_t>(4096, target.capacity * 2)));
@@ -1414,6 +1556,9 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    result = esp_http_client_set_header(client, "Content-Type", "application/json");
 +    if (result == ESP_OK) result = esp_http_client_set_post_field(client, body.data(), body.size());
 +  }
++  if (result == ESP_OK && config.method == HTTP_METHOD_POST && body.empty()) {
++    result = esp_http_client_set_header(client, "Content-Length", "0");
++  }
 +  if (result == ESP_OK) result = esp_http_client_perform(client);
 +  const int status = esp_http_client_get_status_code(client);
 +  const bool complete = esp_http_client_is_complete_data_received(client);
@@ -1427,6 +1572,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +                                                                          : result;
 +  }
 +  if (cancel && cancel->load(std::memory_order_relaxed)) return -4;
++  if (status >= 400) return status;
 +  return result == ESP_OK && !sink.overflow && (complete || (!response && !growable)) ? status : 0;
 +}
 +
@@ -1435,6 +1581,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  const int status = requestWhilePaging([&] { return fetchChildren(credential, parent, depth, result, nullptr, &transport); });
 +  lastStatus = status;
 +  lastTransport = transport;
++  lastServerError.clear();
 +  if (status == 200) return true;
 +  showMessage(status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
 +              : status == -3 ? tr(STR_WORKFLOWY_DAILY_READ_FAILED)
@@ -1525,7 +1672,6 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +        while (parent != outline.begin() && (--parent)->depth >= depth) {}
 +        if (parent + 1 == first && (end == outline.end() || end->depth < depth)) {
 +          parent->leaf = true;
-+          parent->expanded = false;
 +          parent->childrenConfirmed = false;
 +        }
 +      }
@@ -1559,10 +1705,8 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    first = end = owner + 1;
 +    while (end != outline.end() && end->depth >= depth) ++end;
 +    changed = owner->leaf != siblings.empty() || owner->childrenConfirmed == siblings.empty();
-+    owner->checkedAt = millis();
 +    owner->leaf = siblings.empty();
 +    owner->childrenConfirmed = !owner->leaf;
-+    if (owner->leaf) owner->expanded = false;
 +  }
 +  const size_t baseCount = outline.size() - (end - first) + siblings.size();
 +  if (baseCount > MAX_ROWS) return changed;
@@ -1590,14 +1734,11 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      continue;
 +    }
 +    node.leaf = old->leaf;
-+    node.expanded = old->expanded;
 +    node.childrenConfirmed = old->childrenConfirmed;
-+    node.checkedAt = old->checkedAt;
 +    auto lastChild = old + 1;
 +    while (lastChild != end && lastChild->depth > depth) ++lastChild;
 +    const size_t count = lastChild - (old + 1);
 +    const bool fits = baseCount + retained + count <= MAX_ROWS;
-+    if (!fits) node.expanded = false;
 +    rebuilt.push_back(std::move(node));
 +    if (fits) {
 +      rebuilt.insert(rebuilt.end(), std::make_move_iterator(old + 1), std::make_move_iterator(lastChild));
@@ -1627,41 +1768,45 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  requestUpdate();
 +}
 +
-+void WorkflowyDailyActivity::toggle(const size_t row) {
-+  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
-+  if (!rows[row].todo) return;
-+  const bool completed = rows[row].done;
-+  setLoading(true);
-+  const int status = request("POST", "/" + rows[row].id + (completed ? "/uncomplete" : "/complete"), {});
-+  setLoading(false);
-+  if (status < 200 || status >= 300) {
-+    showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
-+    return;
++void WorkflowyDailyActivity::updateCompletion(const std::string& id, bool done) {
++  RenderLock lock(*this);
++  for (auto& node : rows) {
++    if (node.id == id) node.done = done;
 +  }
-+  {
-+    RenderLock lock(*this);
-+    rows[row].done = !completed;
-+    syncNode(rows[row]);
-+    layoutDirty = true;
-+    message = nullptr;
++  for (auto& view : viewStack) {
++    for (auto& node : view.rows) {
++      if (node.id == id) node.done = done;
++    }
++  }
++  layoutDirty = true;
++  message = nullptr;
++}
++
++void WorkflowyDailyActivity::toggle(const size_t row) {
++  if (pendingSave || !rows[row].todo) return;
++  const bool completed = rows[row].done;
++  const char* failed = completed ? tr(STR_WORKFLOWY_UNCOMPLETE_FAILED) : tr(STR_WORKFLOWY_COMPLETE_FAILED);
++  if (!online) {
++    recordServerError(0, 0, {}, credential);
++    return showMessage(failed);
 +  }
 +  const auto id = rows[row].id;
-+  offerUndo([this, id, completed] {
-+    setLoading(true);
-+    const bool ok = request("POST", "/" + id + (completed ? "/complete" : "/uncomplete"), {}) == 200;
-+    setLoading(false);
-+    if (!ok) return false;
-+    RenderLock lock(*this);
-+    for (auto& node : rows) {
-+      if (node.id == id) node.done = completed;
++  queueSave("/" + id + (completed ? "/uncomplete" : "/complete"), {}, false,
++            [this, id, completed, failed](const Save& save) {
++    if (save.status < 200 || save.status >= 300) {
++      return showMessage(failed);
 +    }
-+    for (auto& view : viewStack) {
-+      for (auto& node : view.rows) {
-+        if (node.id == id) node.done = completed;
-+      }
-+    }
-+    layoutDirty = true;
-+    return true;
++    updateCompletion(id, !completed);
++    offerUndo([this, id, completed] {
++      return queueSave("/" + id + (completed ? "/complete" : "/uncomplete"), {}, false,
++                       [this, id, completed](const Save& undone) {
++        if (undone.status >= 200 && undone.status < 300) {
++          updateCompletion(id, completed);
++        } else {
++          showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++        }
++      });
++    });
 +  });
 +}
 +
@@ -1679,35 +1824,12 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    if (node == rows.end()) return true;
 +    row = node - rows.begin();
 +  }
-+  expand(row);
++  zoom(row);
 +  return true;
 +}
 +
-+void WorkflowyDailyActivity::expand(const size_t row) {
-+  {
-+    RenderLock lock(*this);
-+    auto& node = rows[row];
-+    if (requestedBranch == node.id) {
-+      requestedBranch.clear();
-+      if (prefetch && prefetch->parent == node.id) prefetch->cancel.store(true, std::memory_order_relaxed);
-+    } else if (row + 1 < rows.size() && rows[row + 1].depth > node.depth) {
-+      node.expanded = !node.expanded;
-+      wrapAnchor = row;
-+      revealParent = node.expanded ? static_cast<int>(row) : -1;
-+      layoutDirty = true;
-+      message = nullptr;
-+    } else if (!node.leaf && online) {
-+      requestedBranch = node.id;
-+      if (prefetch && prefetch->parent != node.id) prefetch->cancel.store(true, std::memory_order_relaxed);
-+      message = nullptr;
-+    } else if (!node.leaf) {
-+      message = tr(STR_WORKFLOWY_NETWORK_FAILED);
-+    }
-+  }
-+  requestUpdate();
-+}
-+
 +void WorkflowyDailyActivity::edit(const size_t row, const int relative, const size_t cursor) {
++  if (pendingSave) return;
 +  const bool adding = relative != 0 || row >= rows.size();
 +  if (!online && (!adding || relative != 0)) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const std::string id = row < rows.size() ? rows[row].id : "";
@@ -1717,15 +1839,9 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  auto keyboard = std::make_unique<KeyboardEntryActivity>(
 +      renderer, mappedInput, adding ? tr(STR_WORKFLOWY_ADD) : tr(STR_EDIT), initial, 512);
 +  keyboard->setInitialCursor(cursor);
-+  if (!adding) keyboard->showItemMenu();
-+  if (!adding && rows[row].todo) {
-+    keyboard->setAlternateAction(rows[row].done ? tr(STR_WORKFLOWY_MARK_UNDONE) : tr(STR_WORKFLOWY_MARK_DONE),
-+                                 rows[row].done);
-+  }
 +  startActivityForResult(std::move(keyboard), [this, id, initial, parent, row, adding, relative](const ActivityResult& result) {
 +    if (result.isCancelled) return;
-+    const auto& entered = std::get<KeyboardResult>(result.data);
-+    auto text = entered.text;
++    auto text = std::get<KeyboardResult>(result.data).text;
 +    workflowy::dropEmoji(text);
 +    const auto first = text.find_first_not_of(" ");
 +    const bool makeTodo = first != std::string::npos && (text.compare(first, 2, "[]") == 0 ||
@@ -1734,11 +1850,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      const auto start = text.find_first_not_of(" ", first + (text[first + 1] == ']' ? 2 : 3));
 +      text = start == std::string::npos ? "" : text.substr(start);
 +    }
-+    if (text == initial && !makeTodo) {
-+      if (entered.alternate) toggle(row);
-+      else if (entered.itemMenu) actions(row);
-+      return;
-+    }
++    if (text == initial && !makeTodo) return;
 +    if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
 +    JsonDocument update;
 +    update["name"] = escapedTitle(text, adding);
@@ -1753,59 +1865,59 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      else showMessage(tr(STR_WORKFLOWY_SAVE_FAILED));
 +      return;
 +    }
-+    setLoading(true);
-+    uint8_t response[256];
-+    size_t received = 0;
-+    const int status = adding ? request("POST", "", encode(update), response, &received, sizeof(response))
-+                              : request("POST", "/" + id, encode(update));
-+    setLoading(false);
-+    if (status < 200 || status >= 300) {
-+      showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
-+      return;
-+    }
-+    if (adding) {
-+      JsonDocument resultBody;
-+      if (deserializeJson(resultBody, response, received)) {
-+        showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
-+        return;
++    queueSave(adding ? "" : "/" + id, encode(update), adding,
++              [this, id, parent, text = std::move(text), adding, makeTodo, relative,
++               capturedDate = date](const Save& save) {
++      if (save.status < 200 || save.status >= 300) {
++        return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +      }
-+      const std::string newId = resultBody["item_id"] | "";
-+      if (newId.empty() || newId.find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos) {
-+        showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
-+        return;
-+      }
-+      size_t newRow = 0;
-+      {
-+        RenderLock lock(*this);
-+        Node added{newId, text, 0, 0, true, false};
-+        added.leaf = true;
-+        if (!zoomId.empty() && parent == zoomId && !rows.empty()) rows.front().expanded = true;
-+        appendChild(rows, parent, added);
-+        for (auto& view : viewStack) {
-+          if (!parent.empty() || view.zoomId.empty()) appendChild(view.rows, parent, added);
++      if (adding) {
++        JsonDocument resultBody;
++        if (deserializeJson(resultBody, save.response.data(), save.received)) {
++          showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++          return;
 +        }
-+        const auto found = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == newId; });
-+        newRow = found - rows.begin();
-+        layoutDirty = true;
-+        message = nullptr;
++        const std::string newId = resultBody["item_id"] | "";
++        if (newId.empty() || newId.find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos) {
++          showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++          return;
++        }
++        size_t newRow = 0;
++        {
++          RenderLock lock(*this);
++          Node added{newId, text, 0, 0, true, false};
++          added.leaf = true;
++          if (!parent.empty() || (capturedDate == date && zoomId.empty())) appendChild(rows, parent, added);
++          for (auto& view : viewStack) {
++            if (!parent.empty() || (capturedDate == date && view.zoomId.empty())) appendChild(view.rows, parent, added);
++          }
++          const auto found = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == newId; });
++          newRow = found - rows.begin();
++          layoutDirty = true;
++          message = nullptr;
++        }
++        if (relative) {
++          const auto anchor = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++          if (anchor != rows.end() && newRow < rows.size()) reorder(newRow, anchor - rows.begin(), relative > 0);
++        }
++      } else {
++        {
++          RenderLock lock(*this);
++          const auto updateTitle = [&](std::vector<Node>& outline) {
++            for (auto& item : outline) {
++              if (item.id != id) continue;
++              item.title = text;
++              if (makeTodo) item.todo = true;
++            }
++          };
++          updateTitle(rows);
++          for (auto& view : viewStack) updateTitle(view.rows);
++          layoutDirty = true;
++          message = nullptr;
++        }
++        requestUpdate();
 +      }
-+      if (relative) {
-+        const auto anchor = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
-+        if (anchor != rows.end() && newRow < rows.size()) reorder(newRow, anchor - rows.begin(), relative > 0);
-+      }
-+    } else {
-+      {
-+        RenderLock lock(*this);
-+        rows[row].title = text;
-+        if (makeTodo) rows[row].todo = true;
-+        syncNode(rows[row]);
-+        layoutDirty = true;
-+        message = nullptr;
-+      }
-+      if (entered.alternate) toggle(row);
-+      else if (entered.itemMenu) actions(row);
-+      else requestUpdate();
-+    }
++    });
 +  });
 +}
 +
@@ -1825,6 +1937,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +}
 +
 +void WorkflowyDailyActivity::actions(const size_t row) {
++  if (pendingSave) return;
 +  std::vector<std::string> options{
 +      tr(STR_EDIT), tr(STR_WORKFLOWY_ZOOM), tr(STR_WORKFLOWY_MOVE_DATE),
 +      rows[row].todo ? tr(STR_WORKFLOWY_TO_BULLET) : tr(STR_WORKFLOWY_TO_TODO), tr(STR_DELETE)};
@@ -1967,17 +2080,12 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  placements.clear();
 +  pageStarts.assign(1, 0);
 +  const int firstLineHeight = std::max(ROW_HEIGHT, bounds.lineHeight + 12);
-+  const int maxLines = std::max(1, 1 + (bounds.rowBottom - bounds.rowTop - firstLineHeight) / bounds.lineHeight);
 +  int y = bounds.rowTop;
-+  unsigned collapsedDepth = UINT_MAX;
++  const unsigned visibleDepth = zoomId.empty() ? 0 : 1;
 +  for (size_t i = 0; i < rows.size(); ++i) {
 +    const auto& node = rows[i];
-+    if (node.depth > collapsedDepth) continue;
-+    collapsedDepth = node.expanded ? UINT_MAX : node.depth;
-+    if (node.id == pendingDelete) {
-+      collapsedDepth = node.depth;
-+      continue;
-+    }
++    if (node.depth > visibleDepth || node.id == pendingDelete ||
++        (!pendingDelete.empty() && pendingDelete == zoomId)) continue;
 +    if (node.done && !showDone && (i != 0 || zoomId.empty())) continue;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int width = std::max(1, bounds.width - indent - 25 - ROW_ARROW_TARGET);
@@ -1990,24 +2098,13 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      outlineLines.push_back({0, node.title.size()});
 +    }
 +    while (first < outlineLines.size()) {
-+      const auto count = std::min(static_cast<size_t>(maxLines), outlineLines.size() - first);
-+      const int height = firstLineHeight + (static_cast<int>(count) - 1) * bounds.lineHeight;
-+      if (y != bounds.rowTop && y + height > bounds.rowBottom) {
-+        auto& previous = placements.back();
-+        const auto previousHeight = previous.bottom - previous.top;
-+        const bool keepParent = previous.row != i && rows[previous.row].expanded &&
-+                                node.depth == rows[previous.row].depth + 1 &&
-+                                previousHeight + height <= bounds.rowBottom - bounds.rowTop &&
-+                                placements.size() - 1 > pageStarts.back() &&
-+                                placements[placements.size() - 2].row != previous.row;
-+        pageStarts.push_back(placements.size() - (keepParent ? 1 : 0));
++      if (y != bounds.rowTop && y + firstLineHeight > bounds.rowBottom) {
++        pageStarts.push_back(placements.size());
 +        y = bounds.rowTop;
-+        if (keepParent) {
-+          previous.top = y;
-+          previous.bottom = y + previousHeight;
-+          y = previous.bottom;
-+        }
 +      }
++      const int capacity = std::max(1, 1 + (bounds.rowBottom - y - firstLineHeight) / bounds.lineHeight);
++      const auto count = std::min(static_cast<size_t>(capacity), outlineLines.size() - first);
++      const int height = firstLineHeight + (static_cast<int>(count) - 1) * bounds.lineHeight;
 +      placements.push_back({i, first, count, y, y + height});
 +      first += count;
 +      y += height;
@@ -2024,23 +2121,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    wrapAnchor = -1;
 +  }
 +  page = std::min(page, pageStarts.size() - 1);
-+  if (revealParent >= 0 && static_cast<size_t>(revealParent) < rows.size()) {
-+    const size_t parent = revealParent;
-+    const auto end = std::find_if(rows.begin() + parent + 1, rows.end(),
-+                                  [&](const Node& node) { return node.depth <= rows[parent].depth; });
-+    const auto limit = static_cast<size_t>(end - rows.begin());
-+    const auto child = std::find_if(placements.begin(), placements.end(),
-+                                    [&](const Placement& entry) { return entry.row > parent && entry.row < limit; });
-+    if (child != placements.end()) {
-+      const auto index = static_cast<size_t>(child - placements.begin());
-+      const auto childPage = static_cast<size_t>(std::upper_bound(pageStarts.begin(), pageStarts.end(), index) -
-+                                                 pageStarts.begin() - 1);
-+      if (childPage > page) message = tr(STR_WORKFLOWY_CHILDREN_NEXT_PAGE);
-+    } else if (limit > parent + 1 && !showDone) {
-+      message = tr(STR_WORKFLOWY_COMPLETED_HIDDEN);
-+    }
-+  }
-+  revealParent = -1;
++
 +}
 +
 +int WorkflowyDailyActivity::rowAt(const int x, const int y) const {
@@ -2082,10 +2163,15 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  std::vector<Node> focused;
 +  const bool cached = row + 1 < rows.size() && rows[row + 1].depth > root.depth;
 +  if (!cached && !root.leaf) {
-+    setLoading(true);
-+    const bool loaded = loadChildren(root.id, 1, focused);
-+    setLoading(false);
-+    if (!loaded) return;
++    if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++    {
++      RenderLock lock(*this);
++      requestedBranch = root.id;
++      message = nullptr;
++      if (prefetch && prefetch->parent != root.id) prefetch->cancel.store(true, std::memory_order_relaxed);
++    }
++    requestUpdate();
++    return;
 +  }
 +  {
 +    RenderLock lock(*this);
@@ -2101,8 +2187,6 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    root.depth = 0;
 +    root.leaf = focused.empty();
 +    root.childrenConfirmed = !root.leaf;
-+    root.checkedAt = millis();
-+    root.expanded = !root.leaf;
 +    focused.insert(focused.begin(), std::move(root));
 +    ++generation;
 +    requestedBranch.clear();
@@ -2120,6 +2204,10 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +
 +void WorkflowyDailyActivity::back() {
 +  if (viewStack.empty()) {
++    if (pendingSave) {
++      leaveAfterSave = true;
++      return;
++    }
 +    commitDelete();
 +    return finish();
 +  }
@@ -2137,13 +2225,10 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      const auto depth = owner->depth;
 +      auto end = owner + 1;
 +      while (end != previous.rows.end() && end->depth > depth) ++end;
-+      const bool expanded = owner->expanded;
 +      *owner = std::move(rows.front());
 +      owner->depth = depth;
-+      owner->expanded = expanded && !owner->leaf;
 +      const bool fits = previous.rows.size() - static_cast<size_t>(end - (owner + 1)) +
-+                        rows.size() - 1 <= MAX_ROWS;
-+      if (!fits) owner->expanded = false;
++                        rows.size() - 1 <= MAX_CACHED_BRANCH_ROWS;
 +      const auto where = previous.rows.erase(owner + 1, end);
 +      if (fits) {
 +        for (auto i = rows.begin() + 1; i != rows.end(); ++i) i->depth += depth;
@@ -2160,6 +2245,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +}
 +
 +bool WorkflowyDailyActivity::reorder(size_t source, size_t target, bool after, bool recordUndo) {
++  if (pendingSave) return false;
 +  const int parent = parentRow(source);
 +  if (source == target || parent != parentRow(target)) return false;
 +  const auto parentNode = parent < 0 ? "" : rows[parent].id;
@@ -2241,6 +2327,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +}
 +
 +void WorkflowyDailyActivity::undo() {
++  if (pendingSave) return;
 +  if (!undoAction) return;
 +  if (!undoIsDelete && !online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  if (!undoAction()) return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
@@ -2307,9 +2394,14 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    return showMessage(tr(STR_WORKFLOWY_SAVE_FAILED));
 +  }
 +  outbox = std::move(marked);
-+  setLoading(true);
-+  const int status = request("POST", "", body);
-+  setLoading(false);
++  if (!queueSave("", std::move(body), false, [this](const Save& save) { finishCapture(save.status); }))
++    finishCapture(-5);
++}
++
++void WorkflowyDailyActivity::finishCapture(int status) {
++  JsonDocument queue;
++  if (deserializeJson(queue, outbox)) return;
++  auto items = queue["items"].as<JsonArray>();
 +  if (status >= 200 && status < 300) items.remove(0);
 +  // An interrupted request may have created the item. Leave it queued for explicit review.
 +  const bool uncertain = status == 0 || status >= 500;
@@ -2323,8 +2415,11 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    if (persisted) pendingCount = items.size();
 +  }
 +  retryOutboxAt = millis() + (status >= 200 && status < 300 ? 350 : 30000);
-+  if (status >= 200 && status < 300) loadDay();
-+  else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  if (status >= 200 && status < 300) {
++    rootCheckedAt = millis() - SYNC_INTERVAL;
++    nextPrefetchAt = millis();
++    requestUpdate();
++  } else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +}
 +
 +void WorkflowyDailyActivity::reviewCapture() {
@@ -2405,6 +2500,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +}
 +
 +void WorkflowyDailyActivity::indent(size_t source, size_t target) {
++  if (pendingSave) return;
 +  const auto id = rows[source].id;
 +  const auto destination = rows[target].id;
 +  const auto original = moveOrigin(source);
@@ -2416,18 +2512,6 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      if (node.id != destination) continue;
 +      node.leaf = false;
 +      node.childrenConfirmed = true;
-+      node.checkedAt = 0;
-+    }
-+  }
-+  const auto owner = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == destination; });
-+  if (owner != rows.end()) {
-+    std::vector<Node> children;
-+    if (loadChildren(destination, owner->depth + 1, children)) {
-+      RenderLock lock(*this);
-+      replaceSiblings(rows, destination, children);
-+      const auto refreshed = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == destination; });
-+      if (refreshed != rows.end()) refreshed->expanded = true;
-+      layoutDirty = true;
 +    }
 +  }
 +  offerUndo([this, id, original] { return restoreMove(id, original); });
@@ -2450,6 +2534,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    auto job = std::move(prefetch);
 +    if (job->generation != generation || job->cancel.load(std::memory_order_relaxed)) return;
 +    bool changed = false;
++    int zoomRow = -1;
 +    {
 +      RenderLock lock(*this);
 +      if (job->root) {
@@ -2458,6 +2543,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +          awaitingOutline = false;
 +          lastStatus = job->status;
 +          lastTransport = job->transport;
++          lastServerError.clear();
 +          changed = true;
 +          message = job->status == 200 ? nullptr
 +                    : job->status == -2 ? tr(STR_WORKFLOWY_CLOCK_FAILED)
@@ -2471,6 +2557,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +        requestedBranch.clear();
 +        lastStatus = job->status;
 +        lastTransport = job->transport;
++        lastServerError.clear();
 +        changed = true;
 +        if (job->status != 200) {
 +          message = tr(STR_WORKFLOWY_DAILY_READ_FAILED);
@@ -2482,33 +2569,17 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +            message = tr(STR_WORKFLOWY_DAILY_READ_FAILED);
 +          } else {
 +            replaceSiblings(rows, job->parent, job->children);
-+            rows[index].expanded = !rows[index].leaf;
-+            wrapAnchor = index;
-+            revealParent = rows[index].expanded ? static_cast<int>(index) : -1;
++            if (!rows[index].leaf) zoomRow = static_cast<int>(index);
 +            message = nullptr;
 +            layoutDirty = true;
 +          }
 +        }
 +      } else if (job->status == 200) {
-+        const auto owner = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == job->parent; });
-+        const bool alreadyCached = owner != rows.end() && std::next(owner) != rows.end() &&
-+                                   std::next(owner)->depth > owner->depth;
-+        const bool fits = rows.size() + job->children.size() <= MAX_PREFETCH_ROWS;
-+        if (job->root || alreadyCached || fits || job->children.empty()) {
-+          changed |= replaceSiblings(rows, job->parent, job->children);
-+        } else if (owner != rows.end()) {
-+          changed |= !owner->childrenConfirmed || owner->leaf;
-+          owner->checkedAt = now;
-+          owner->leaf = false;
-+          owner->childrenConfirmed = true;
-+        }
++        changed |= replaceSiblings(rows, job->parent, job->children);
 +        layoutDirty |= changed;
-+      } else {
-+        for (auto& row : rows) {
-+          if (row.id == job->parent) row.checkedAt = now;
-+        }
 +      }
 +    }
++    if (zoomRow >= 0) return zoom(zoomRow);
 +    if (changed) requestUpdate();
 +    return;
 +  }
@@ -2539,20 +2610,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      parent = zoomId;
 +      depth = zoomId.empty() ? 0 : 1;
 +    } else {
-+      if (layoutDirty || page != paintedPage || page >= pageStarts.size()) return;
-+      const auto end = page + 1 < pageStarts.size() ? pageStarts[page + 1] : placements.size();
-+      for (auto i = pageStarts[page]; i < end; ++i) {
-+        const auto& node = rows[placements[i].row];
-+        if (node.id != zoomId && (!node.checkedAt || now - node.checkedAt >= SYNC_INTERVAL)) {
-+          parent = node.id;
-+          depth = node.depth + 1;
-+          break;
-+        }
-+      }
-+      if (parent.empty()) {
-+        nextPrefetchAt = now + 250;
-+        return;
-+      }
++      return;
 +    }
 +  }
 +  auto job = makeUniqueNoThrow<Prefetch>();
@@ -2564,6 +2622,7 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      requestedBranch.clear();
 +      lastStatus = 0;
 +      lastTransport = ESP_ERR_NO_MEM;
++      lastServerError.clear();
 +    }
 +    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
 +  };
@@ -2597,6 +2656,12 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  if (step == Step::Start) return connect();
 +  if (step == Step::Load) return loadDay();
 +  if (step != Step::Ready || loading) return;
++  pollWifiConnection();
++  if (step != Step::Ready) return;
++  int touchDownX, touchDownY;
++  const bool stillTouching = tracking || mappedInput.wasScreenTouchReleased() ||
++                             mappedInput.wasScreenTouchDown(touchDownX, touchDownY);
++  if (!stillTouching && pollSave()) return;
 +  const auto now = millis();
 +  if (static_cast<long>(now - nextLinkCheck) >= 0) {
 +    nextLinkCheck = now + 500;
@@ -2713,12 +2778,20 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      return;
 +    }
 +  }
++  if (tapped && isErrorNotice(message)) {
++    const auto bounds = layout();
++    if (tapY >= bounds.rowBottom && tapY < bounds.footer &&
++        tapX >= bounds.x + bounds.width / 4 && tapX < bounds.x + bounds.width * 3 / 4) {
++      tracking = false;
++      return showErrorDetails();
++    }
++  }
 +  if (tapped && tapArrow(tapX, tapY)) {
 +    tracking = false;
 +    return;
 +  }
 +  if (!release || !tracking) {
-+    if (!tracking && !release) {
++    if (!tracking && !release && !pendingSave && !connectingWifi) {
 +      if (!requestedBranch.empty()) pollPrefetch();
 +      else if (online && !pendingDelete.empty() && static_cast<long>(millis() - deleteAt) >= 0) commitDelete();
 +      else if (online && pendingCount && !outboxUncertain && !prefetch &&
@@ -2736,27 +2809,26 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
 +      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
 +  if (!zoomId.empty() && y >= bounds.top + 30 && y < bounds.rowTop && x < bounds.x + ICON_TARGET) return back();
-+  if (y >= bounds.top + 28 && y < bounds.rowTop &&
-+      x >= bounds.x + bounds.width - 2 * ICON_TARGET && x < bounds.x + bounds.width - ICON_TARGET) {
-+    {
-+      RenderLock lock(*this);
-+      showDone = !showDone;
-+      message = nullptr;
-+      layoutDirty = true;
-+      if (page < pageStarts.size() && pageStarts[page] < placements.size())
-+        wrapAnchor = static_cast<int>(placements[pageStarts[page]].row);
++  const int headerRight = bounds.x + bounds.width;
++  if (y >= bounds.top + 28 && y < bounds.rowTop && x >= headerRight - 2 * ICON_TARGET && x < headerRight) {
++    if (x >= headerRight - ICON_TARGET) {
++      if (!credential.empty() && !date.empty()) chooseDate();
++    } else if (!pendingSave && !connectingWifi) {
++      if (held) editKey();
++      else if (hasActiveStationWifiConnection() && !credential.empty()) {
++        {
++          RenderLock lock(*this);
++          for (auto& row : rows) {
++            if (row.id != zoomId && row.leaf) row.leaf = false;
++          }
++        }
++        step = Step::Load;
++      } else step = Step::Start;
 +    }
-+    requestUpdate();
-+    return;
-+  }
-+  if (y < bounds.rowTop && x >= bounds.x + bounds.width - ICON_TARGET) {
-+    if (!credential.empty() && !rows.empty()) chooseDate();
-+    else if (!credential.empty() && !date.empty() && hasActiveStationWifiConnection()) chooseDate();
 +    return;
 +  }
 +  if (y >= bounds.rowBottom && y < bounds.footer) {
 +    const int zone = (x - bounds.x) * 8 / bounds.width;
-+    if (!awaitingOutline && requestedBranch.empty() && isErrorNotice(message) && zone >= 2 && zone <= 5) return showErrorDetails();
 +    if (pageStarts.size() <= 1) return;
 +    if (zone >= 0 && zone < 2) return nextPage(-1, zone == 0);
 +    if (zone >= 6 && zone < 8) return nextPage(1, zone == 7);
@@ -2764,23 +2836,24 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  if (y >= bounds.footer) {
 +    const int control = std::clamp((x - bounds.x) * 5 / bounds.width, 0, 4);
 +    if (control == 0) return back();
-+    if (control == 1) {
-+      if (held) editKey();
-+      else if (hasActiveStationWifiConnection() && !credential.empty()) step = Step::Load;
-+      else step = Step::Start;
++    if (control == 2) {
++      if (!credential.empty() && !date.empty()) edit(rows.size());
++      return;
 +    }
-+    if (control == 2 && !credential.empty() && !date.empty()) edit(rows.size());
-+    if (control == 3 && undoReady) return undo();
-+    if (control == 4) {
-+      {
-+        RenderLock lock(*this);
-+        if (page < pageStarts.size() && pageStarts[page] < placements.size())
-+          wrapAnchor = static_cast<int>(placements[pageStarts[page]].row);
-+        wrapItems = !wrapItems;
-+        layoutDirty = true;
-+      }
-+      requestUpdate();
++    if (control == 3) {
++      if (undoReady) undo();
++      return;
 +    }
++    {
++      RenderLock lock(*this);
++      if (control == 1) showDone = !showDone;
++      else wrapItems = !wrapItems;
++      message = nullptr;
++      layoutDirty = true;
++      if (page < pageStarts.size() && pageStarts[page] < placements.size())
++        wrapAnchor = static_cast<int>(placements[pageStarts[page]].row);
++    }
++    requestUpdate();
 +    return;
 +  }
 +  const int row = rowAt(x, y);
@@ -2831,18 +2904,8 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
 +  renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
 +  const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
-+  const int viewX = cx - ICON_TARGET;
-+  const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
-+  const int eyeY[] = {cy, cy - 4, cy - 6, cy - 4, cy, cy + 4, cy + 6, cy + 4};
-+  for (int i = 0; i < 8; ++i) {
-+    const int next = (i + 1) % 8;
-+    renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next]);
-+  }
-+  renderer.fillRect(viewX - 2, cy - 2, 5, 5);
-+  if (!showDone) {
-+    renderer.drawLine(viewX - 10, cy + 8, viewX + 10, cy - 8, 2, false);
-+    renderer.drawLine(viewX - 11, cy + 7, viewX + 9, cy - 9, 2, true);
-+  }
++  const int refreshX = cx - ICON_TARGET;
++  renderer.drawText(UI_12_FONT_ID, refreshX - 8, cy - 13, "↻");
 +  renderer.drawRect(cx - 10, cy - 9, 21, 19);
 +  renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
 +  renderer.drawLine(cx - 5, cy - 12, cx - 5, cy - 6);
@@ -2897,15 +2960,20 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +      if (node.done)
 +        renderer.drawLine(textX, lineY + 12, textX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()), lineY + 12);
 +    }
++    if (i + 1 == end && end < placements.size() && placements[end].row == placement.row) {
++      const int markerX = bounds.x + bounds.width - 15;
++      const int markerY = placement.bottom - 7;
++      for (const int dx : {-5, 0, 5}) renderer.fillRect(markerX + dx, markerY, 2, 2);
++    }
 +    if (static_cast<int>(placement.row) == dropRow) {
 +      const int marker = dropAfter || dropInside ? placement.bottom - 1 : placement.top;
 +      renderer.drawLine(start + (dropInside ? 16 : 0), marker, bounds.x + bounds.width - 1, marker, 2, true);
 +    }
-+    if (!node.leaf) {
++    if (!node.leaf && node.id != zoomId) {
 +      paintedArrows.push_back({node.id, placement.top, placement.bottom});
 +      const int tipX = bounds.x + bounds.width - 10;
-+      const int xs[3] = {tipX - 5, tipX + 4, node.expanded ? tipX : tipX - 5};
-+      const int ys[3] = {y + 8, node.expanded ? y + 8 : y + 13, y + 18};
++      const int xs[3] = {tipX - 5, tipX + 4, tipX - 5};
++      const int ys[3] = {y + 8, y + 13, y + 18};
 +      if (requestedBranch == node.id) {
 +        for (const int dx : {-8, -4, 0}) renderer.fillRect(tipX + dx, y + 12, 2, 2);
 +      } else if (node.childrenConfirmed) {
@@ -2929,15 +2997,17 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +    renderer.drawRoundedRect(x, bounds.top + 5, width, 24, 1, 7, true);
 +    renderer.drawText(SMALL_FONT_ID, x + 8, bounds.top + 8, status);
 +  }
-+  if (awaitingOutline || !requestedBranch.empty() || message || total > 1 || placements.empty()) {
++  if (saving || connectingWifi || awaitingOutline || !requestedBranch.empty() || message || total > 1 || placements.empty()) {
 +    char pages[24];
 +    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
-+    const char* footer = (awaitingOutline || !requestedBranch.empty()) ? tr(STR_LOADING_POPUP)
-+                                         : message ? message : (placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : pages);
++    const bool error = isErrorNotice(message);
++    const char* footer = error ? message : saving ? tr(STR_WORKFLOWY_SENDING)
++                       : (connectingWifi || awaitingOutline || !requestedBranch.empty()) ? tr(STR_LOADING_POPUP)
++                       : message ? message : (placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : pages);
 +    const int textY = bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5;
 +    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
 +    renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
-+    if (!awaitingOutline && requestedBranch.empty() && isErrorNotice(message)) {
++    if (error) {
 +      const int width = renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str());
 +      const int x = bounds.x + (bounds.width - width) / 2;
 +      renderer.drawLine(x, bounds.footer - 3, x + width, bounds.footer - 3);
@@ -2965,40 +3035,50 @@ index 0000000000000000000000000000000000000000..569bba2ddb3d4121e39189bd9e7b2a78
 +  renderer.drawLine(x - 9, iconY, x + 9, iconY, 2, true);
 +  renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, 2, true);
 +  renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, 2, true);
-+  x = iconX(1);
-+  renderer.drawText(UI_12_FONT_ID, x - 8, iconY - 13, "↻");
++  const int viewX = iconX(1);
++  const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
++  const int eyeY[] = {iconY, iconY - 4, iconY - 6, iconY - 4, iconY, iconY + 4, iconY + 6, iconY + 4};
++  for (int i = 0; i < 8; ++i) {
++    const int next = (i + 1) % 8;
++    renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next]);
++  }
++  renderer.fillRect(viewX - 2, iconY - 2, 5, 5);
++  if (!showDone) {
++    renderer.drawLine(viewX - 10, iconY + 8, viewX + 10, iconY - 8, 2, false);
++    renderer.drawLine(viewX - 11, iconY + 7, viewX + 9, iconY - 9, 2, true);
++  }
 +  x = iconX(2);
 +  renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
 +  renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
 +  x = iconX(3);
-+  if (undoReady) {
-+    renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, 2, true);
-+    renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, 2, true);
-+    renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, 2, true);
-+    renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, 2, true);
-+    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, 2, true);
-+    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, 2, true);
-+  }
++  if (undoReady) renderer.fillRoundedRect(x - 15, iconY - 13, 30, 26, 4, Color::Black);
++  const int undoWidth = undoReady ? 2 : 1;
++  renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, !undoReady);
++  renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, !undoReady);
++  renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, undoWidth, !undoReady);
++  renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, undoWidth, !undoReady);
++  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, !undoReady);
++  renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, !undoReady);
 +  x = iconX(4);
 +  if (wrapItems) renderer.fillRoundedRect(x - 15, iconY - 13, 30, 26, 4, Color::LightGray);
-+  renderer.drawLine(x - 10, iconY - 7, x + 7, iconY - 7, 2, true);
-+  renderer.drawLine(x - 10, iconY, x + 1, iconY, 2, true);
-+  renderer.drawLine(x - 10, iconY + 7, x + 7, iconY + 7, 2, true);
-+  renderer.drawLine(x + 10, iconY - 5, x + 10, iconY + 2);
-+  renderer.drawLine(x + 8, iconY, x + 10, iconY + 2);
-+  renderer.drawLine(x + 12, iconY, x + 10, iconY + 2);
++  renderer.drawLine(x - 9, iconY - 6, x + 8, iconY - 6, 2, true);
++  renderer.drawLine(x + 8, iconY - 6, x + 8, iconY + 3, 2, true);
++  renderer.drawLine(x - 7, iconY + 3, x + 8, iconY + 3, 2, true);
++  renderer.drawLine(x - 7, iconY + 3, x - 3, iconY - 1, 2, true);
++  renderer.drawLine(x - 7, iconY + 3, x - 3, iconY + 7, 2, true);
 +  if (loading) GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
 +  else renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae463bdf412
+index 0000000000000000000000000000000000000000..289cc45906eedac38936311cdd9f7a7e6ded4013
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,196 @@
 +#pragma once
 +
 +#include <atomic>
++#include <array>
 +#include <functional>
 +#include <memory>
 +#include <string>
@@ -3026,10 +3106,8 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +    int priority = 0;
 +    bool todo = false;
 +    bool done = false;
-+    bool expanded = false;
 +    bool leaf = false;
 +    bool childrenConfirmed = false;
-+    unsigned long checkedAt = 0;
 +  };
 +
 +  enum class Step { Start, Waiting, Load, Ready };
@@ -3042,7 +3120,6 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +  bool showDone = false;
 +  bool wrapItems = true;
 +  int wrapAnchor = -1;
-+  int revealParent = -1;
 +  size_t page = 0;
 +  int touchX = 0;
 +  int touchY = 0;
@@ -3058,6 +3135,14 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +  bool dropAfter = false;
 +  bool dropInside = false;
 +  bool online = false;
++  bool connectingWifi = false;
++  unsigned long wifiStartedAt = 0;
++  bool scanningWifi = false, scannedSavedWifi = false;
++  std::vector<std::string> savedWifiCandidates;
++  void trySavedWifi(const std::string& ssid);
++  void scanSavedWifi();
++  void showWifiPicker();
++  void pollWifiConnection();
 +  unsigned long nextLinkCheck = 0;
 +  std::string outbox;
 +  size_t pendingCount = 0;
@@ -3072,6 +3157,7 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +  void undo();
 +  bool queueCapture(const std::string& body);
 +  void flushCapture();
++  void finishCapture(int status);
 +  void reviewCapture();
 +  void commitDelete();
 +  struct MoveOrigin {
@@ -3102,6 +3188,23 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +    int status = 0, transport = 0;
 +    std::vector<Node> children;
 +  };
++  struct Save {
++    std::string key, path, body, error;
++    std::array<uint8_t, 256> response{};
++    size_t received = 0;
++    bool captureResponse = false, started = false;
++    std::atomic<bool> ready{false};
++    int status = 0, transport = 0;
++    std::function<void(const Save&)> finish;
++  };
++  std::unique_ptr<Save> pendingSave;
++  bool saving = false;
++  bool leaveAfterSave = false;
++  static void saveTask(void* argument);
++  bool queueSave(std::string path, std::string body, bool capture, std::function<void(const Save&)> finish);
++  bool pollSave();
++  void recordServerError(int status, int transport, const std::string& errorBody, const std::string& key);
++  void updateCompletion(const std::string& id, bool done);
 +  std::shared_ptr<Prefetch> prefetch;
 +  bool awaitingOutline = false;
 +  unsigned generation = 0;
@@ -3143,6 +3246,7 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +  void showMessage(const char* text);
 +  void showErrorDetails();
 +  int lastStatus = 0, lastTransport = 0;
++  std::string lastServerError;
 +  void connect();
 +  void editKey();
 +  int request(const char* method, const std::string& path, const std::string& body, uint8_t* response = nullptr,
@@ -3154,13 +3258,13 @@ index 0000000000000000000000000000000000000000..4efc10e932cc9c901037c97398324ae4
 +  bool replaceSiblings(std::vector<Node>& outline, const std::string& parent, const std::vector<Node>& siblings);
 +  static int requestWithKey(const std::string& key, const char* method, const std::string& path,
 +                            const std::string& body, uint8_t* response, size_t* received, size_t capacity, HeapByteBuffer* growable = nullptr,
-+                            const std::atomic<bool>* cancel = nullptr, int* transport = nullptr);
++                            const std::atomic<bool>* cancel = nullptr, int* transport = nullptr,
++                            std::string* serverError = nullptr);
 +  static int fetchChildren(const std::string& key, const std::string& parent, unsigned depth,
 +                           std::vector<Node>& result, const std::atomic<bool>* cancel = nullptr,
 +                           int* transport = nullptr);
 +  void loadDay();
 +  void toggle(size_t row);
-+  void expand(size_t row);
 +  void actions(size_t row);
 +  void edit(size_t row, int relative = 0, size_t cursor = std::string::npos);
 +  size_t cursorAt(std::string_view text, workflowy::TextSpan line, int width) const;
