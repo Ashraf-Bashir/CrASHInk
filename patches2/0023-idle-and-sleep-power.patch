@@ -1,0 +1,56 @@
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index 8020a3a33eb12e5f56596640d2a00dd93b521338..2a6d3cdc0668c33966074e131785212c17a809ac 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -1566,15 +1566,16 @@ void LibraryActivity::loadGridPageCovers() {
+       requestUpdate();
+     }
+   }
+-  // Continue through all other pages while idle: next pages first, then wrap.
+-  // There is one copied job, never an in-memory queue of books or bitmaps.
++  // Warm two more pages from the current viewport, then let the SD card
++  // and cover worker go idle. Moving the viewport advances the warm window.
++  constexpr int prefetchPages = 2;
+   const uint64_t warmKey = viewCacheKey(sort == Sort::RecentlyRead) ^ (static_cast<uint64_t>(gridCoverWidth) << 32) ^
+-                           static_cast<uint32_t>(gridCoverHeight);
++                           static_cast<uint32_t>(gridCoverHeight) ^ (static_cast<uint64_t>(gridPageStart) << 48);
+   if (warmedCoverView == warmKey) return;
+   if (count == 0 || prefetchFinished) return;
+   if (prefetchCoverRow < 0) {
+     prefetchCoverRow = std::min(gridPageStart + gridPageSize(), count) % count;
+-    prefetchStopRow = gridPageStart;
++    prefetchStopRow = (prefetchCoverRow + std::min(prefetchPages * gridPageSize(), count - visible)) % count;
+   }
+   if (prefetchCoverRow == prefetchStopRow) {
+     prefetchFinished = true;
+diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
+index 33ea535dfb1635e99411d63f94b84df85117d33b..082ae6a11e35061cff7fd081bf818a3e763fc45d 100644
+--- a/src/activities/reader/ReadestSyncActivity.cpp
++++ b/src/activities/reader/ReadestSyncActivity.cpp
+@@ -965,6 +965,12 @@ std::string ReadestSyncActivity::syncPosition(const ReadestBook& book) {
+         action, conflictingTie, remotePos.hasVisibleTextOffset && readableAnchor,
+         readestEpub == epub && !readestCopyMissing, remoteTextUnique, readestCopyMissing);
+     if (uncertain) {
++      // An unattended confirmation would keep the device awake indefinitely.
++      // Preserve both positions so the wake sync can ask while the reader is present.
++      if (sleepMode && (autoSyncWhen & 0xFF) == static_cast<uint32_t>(ReadestAutoSync::Sleep)) {
++        LOG_INF("RDS", "Deferring uncertain position until after sleep");
++        return tr(STR_READEST_POSITION_KEPT);
++      }
+       const int toc = epub->getTocIndexForSpineIndex(remotePos.spineIndex);
+       std::string chapter = toc >= 0 ? epub->getTocItem(toc).title : tr(STR_UNKNOWN_CHAPTER);
+
+diff --git a/src/main.cpp b/src/main.cpp
+index a9f3c44380a803f46f7b161fc4aff4664ae06beb..97bc96ccc331edb4a0e79e30be1238fbfb58b83e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1679,6 +1679,9 @@ void setup() {
+         } else {
+           LOG_ERR("MAIN", "OOM: Readest auto-sync activity after minimal boot (free=%u maxAlloc=%u)",
+                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
++          if ((snapshotPayload & 0xFF) == static_cast<uint32_t>(ReadestAutoSync::Sleep)) {
++            enterDeepSleepAfterReadestSync((snapshotPayload & (1U << 8)) != 0);
++          }
+         }
+         break;
+       }
