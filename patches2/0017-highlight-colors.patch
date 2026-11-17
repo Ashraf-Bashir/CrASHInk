@@ -1,0 +1,248 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6acd7a38787d2307657f4d18b4eea2ab91526cc6..f7fcb5b031655b0338b6e0fbe4447ac7f6163ef2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+
+ ### Added
+
++- Display settings offer light grey, dark grey, and solid saved highlights, with contrasting text and a White option in Dark Mode.
++
+ - Home Dashboard shows reading time and estimated time left beneath the book title and author.
+
+ - Library and Home cover grids show saved reading percentages in high-contrast badges.
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index cf3efdbf6097feeb275091da92c609a12b1ba653..1e90dba8dd3ca09bfd06c9fdd0c9db8aa3ec669b 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -1571,8 +1571,12 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
+   }
+ }
+
+-void GfxRenderer::shadeRect(int x, int y, int width, int height) const {
+-  fillRectImpl<Color::LightGray, true>(x, y, width, height);
++void GfxRenderer::shadeRect(int x, int y, int width, int height, Color shade) const {
++  if (shade == Color::DarkGray) {
++    fillRectImpl<Color::DarkGray, true>(x, y, width, height);
++  } else {
++    fillRectImpl<Color::LightGray, true>(x, y, width, height);
++  }
+ }
+
+ template <Color C, bool PreserveInk>
+@@ -2434,7 +2438,8 @@ void GfxRenderer::invertScreen() const {
+   }
+ }
+
+-void GfxRenderer::invertRect(const int x, const int y, const int width, const int height) const {
++void GfxRenderer::invertRect(const int x, const int y, const int width, const int height,
++                             const uint8_t* source) const {
+   if (frameBuffer == nullptr || width <= 0 || height <= 0) return;
+
+   const int lx0 = std::max(0, x);
+@@ -2465,6 +2470,14 @@ void GfxRenderer::invertRect(const int x, const int y, const int width, const in
+
+   for (int py = phyY0; py <= phyY1; ++py) {
+     uint8_t* row = target + static_cast<int32_t>(py - originY) * panelWidthBytes;
++    if (source) {
++      const uint8_t* original = source + static_cast<int32_t>(py) * panelWidthBytes;
++      for (int byte = byteStart; byte <= byteEnd; ++byte) {
++        const uint8_t mask = (byte == byteStart ? headMask : 0xFFu) & (byte == byteEnd ? tailMask : 0xFFu);
++        row[byte] = (row[byte] & ~mask) | (~original[byte] & mask);
++      }
++      continue;
++    }
+     if (byteStart == byteEnd) {
+       row[byteStart] ^= headMask & tailMask;
+       continue;
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index 82d0244777042ad53cefea8af1058c323eb49e9d..b930a5dc4eedd2a6c92aac834713bd6d1b41acb5 100644
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -233,7 +233,8 @@ class GfxRenderer {
+   // EXPERIMENTAL: Windowed update - display only a rectangular region
+   // void displayWindow(int x, int y, int width, int height) const;
+   void invertScreen() const;
+-  void invertRect(int x, int y, int width, int height) const;
++  // When source is a snapshot of the full framebuffer, overlapping rectangles invert the original pixels once.
++  void invertRect(int x, int y, int width, int height, const uint8_t* source = nullptr) const;
+   void clearScreen(uint8_t color = 0xFF) const;
+   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
+
+@@ -263,7 +264,7 @@ class GfxRenderer {
+   void fillRect(int x, int y, int width, int height, bool state = true) const;
+   void fillRectDither(int x, int y, int width, int height, Color color) const;
+   // Add light gray dithering while preserving existing black pixels.
+-  void shadeRect(int x, int y, int width, int height) const;
++  void shadeRect(int x, int y, int width, int height, Color shade = Color::LightGray) const;
+   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
+   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
+                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 076996896ec7710beee92cdf1a2c59e98368e6fc..c970a568e1055057a982cff082ab2c12c9a7cdb2 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -164,6 +164,11 @@ STR_FORCE_PARAGRAPH_INDENTS: "Force Paragraph Indents"
+ STR_TEXT_AA: "Text Anti-Aliasing"
+ STR_READER_DARK_MODE: "Dark Mode"
+ STR_NIGHT_MODE: "Dark Mode"
++STR_HIGHLIGHT_COLOR: "Highlight Color"
++STR_HIGHLIGHT_LIGHT_GREY: "Light Grey"
++STR_HIGHLIGHT_DARK_GREY: "Dark Grey"
++STR_HIGHLIGHT_BLACK: "Black"
++STR_HIGHLIGHT_WHITE: "White"
+ STR_IMAGES: "Images"
+ STR_IMAGES_DISPLAY: "Display"
+ STR_IMAGES_PLACEHOLDER: "Placeholder"
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index d592cdde3f13642fcd8745530c529f1f23505879..fd14271c747054dbec268d883526d500ca36b9b2 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -440,6 +440,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   // Night mode: inverted output polarity, applied to every activity per render
+   // by ActivityManager. Quick Resume preserves it; other sleep screens remain normal.
+   uint8_t screenInverted = 0;
++  enum HIGHLIGHT_COLOR : uint8_t { HIGHLIGHT_LIGHT_GREY, HIGHLIGHT_DARK_GREY, HIGHLIGHT_SOLID };
++  uint8_t highlightColor = HIGHLIGHT_LIGHT_GREY;
+   uint8_t lightLeakTop = 0;
+   uint8_t lightLeakRight = 0;
+   uint8_t lightLeakBottom = 0;
+diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
+index 250c655b76b5524412def1df07602594c6497ea3..06561bc70eec47a167ea59fb4177072220344cb5 100644
+--- a/src/SettingsList.cpp
++++ b/src/SettingsList.cpp
+@@ -34,6 +34,9 @@ const std::vector<SettingInfo>& getBaseSettingsList() {
+                                 CrossPointSettings::REFRESH_30, CrossPointSettings::REFRESH_NEVER}));
+     add(SettingInfo::Toggle(StrId::STR_NIGHT_MODE, &CrossPointSettings::screenInverted, "screenInverted",
+                             StrId::STR_CAT_DISPLAY));
++    add(SettingInfo::Enum(StrId::STR_HIGHLIGHT_COLOR, &CrossPointSettings::highlightColor,
++                          {StrId::STR_HIGHLIGHT_LIGHT_GREY, StrId::STR_HIGHLIGHT_DARK_GREY, StrId::STR_HIGHLIGHT_BLACK},
++                          "highlightColor", StrId::STR_CAT_DISPLAY));
+ #if CROSSINK_APP_CAP_TOUCH
+     add(SettingInfo::Value(StrId::STR_LIGHT_LEAK_TOP, &CrossPointSettings::lightLeakTop,
+                            {0, 16, 1}, "lightLeakTop", StrId::STR_CAT_DISPLAY));
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 68d39da3d63866642974f8c0f5a8c81bba98a2f3..1d07b192cd49ed5f3f9e932764355874f4459d3f 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -587,7 +587,7 @@ inline SettingInfo buildSideButtonActionSetting(const StrId nameId, uint8_t Cros
+ // can use it directly; mutable device UI lists use getSettingsList(), which
+ // returns an owned copy and can add SD-card font and dictionary options.
+ // Four edge gesture entries are compiled only for touch devices.
+-inline constexpr size_t BASE_SETTINGS_CAPACITY = 109 + (CROSSINK_APP_CAP_TOUCH ? 8 : 0);
++inline constexpr size_t BASE_SETTINGS_CAPACITY = 110 + (CROSSINK_APP_CAP_TOUCH ? 8 : 0);
+
+ const std::vector<SettingInfo>& getBaseSettingsList();
+
+@@ -994,6 +994,7 @@ inline std::vector<SettingInfo> buildGroupedDisplaySettingsList(const std::vecto
+   addDisplaySetting(StrId::STR_HIDE_BATTERY);
+   addDisplaySetting(StrId::STR_REFRESH_FREQ);
+   addDisplaySetting(StrId::STR_NIGHT_MODE);
++  addDisplaySetting(StrId::STR_HIGHLIGHT_COLOR);
+   addDisplaySetting(StrId::STR_UI_THEME);
+   if (SETTINGS.supportsLibraryFileBrowserSwap()) {
+     addDisplaySetting(StrId::STR_SWAP_LIBRARY_FILE_BROWSER);
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index f274958ab3a751c8e1263a045896564056aa6aad..c21c5d295656eff2099c4d270a566ae1cf92289a 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -7606,7 +7606,11 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   const bool pageHasImagesNeedingDecode = !deferImageLoading && pageHasImages && page->hasImagesNeedingDecode();
+
+   const auto finalizeBufferComposition = [&]() {
+-    drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft);
++    if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
++      // The ordinary grayscale text pass contains dark glyphs. Keep the solid
++      // highlight's reversed glyphs in the BW base, while still shading images.
++      needsTextGrayscale = false;
++    }
+     drawPublisherPageMarkers(renderer, *page, orientedMarginTop, contentBottom, foregroundBlack);
+ #if CROSSINK_APP_CAP_TOUCH
+     if (activeFootnotePreview) {
+@@ -8149,14 +8153,9 @@ void EpubReaderActivity::collectClippingPageMatches(const Page& page, ClippingPa
+   }
+ }
+
+-void EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
++bool EpubReaderActivity::drawClippingHighlights(const Page& page, const int fontId, const int orientedMarginTop,
+                                                 const int orientedMarginLeft) {
+-  if (!section || !CLIPPINGS.hasClippings() || renderer.getRenderMode() != GfxRenderer::BW) {
+-    return;
+-  }
+-
+-  // Shade the completed BW page so glyphs that extend into another line
+-  // retain their original ink.
++  if (!section || !CLIPPINGS.hasClippings() || renderer.getRenderMode() != GfxRenderer::BW) return false;
+
+ #if CROSSINK_APP_CAP_TOUCH
+   currentPageClippingTouchTargets.fill({});
+@@ -8175,9 +8174,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+   const auto& matches = prepared->matches;
+   const auto& matchClippingIndices = prepared->clippingIndices;
+   const uint16_t matchCount = prepared->count;
+-  if (matchCount == 0) {
+-    return;
++  if (matchCount == 0) return false;
++
++  HeapByteBuffer original;
++  if (SETTINGS.highlightColor == CrossPointSettings::HIGHLIGHT_SOLID) {
++    const size_t bytes = renderer.getBufferSize();
++    original = makePsramByteBufferNoThrow(bytes);
++    if (!original) original = makeHeapByteBufferNoThrow(bytes);
++    if (original) std::memcpy(original.get(), renderer.getFrameBuffer(), bytes);
+   }
++  const Color shade = SETTINGS.highlightColor == CrossPointSettings::HIGHLIGHT_LIGHT_GREY ? Color::LightGray
++                                                                                         : Color::DarkGray;
+
+   const auto getMatchIndexForWord = [&matches, matchCount](const uint16_t pageWordIndex,
+                                                            const PageTextLine& line) -> int {
+@@ -8270,7 +8277,11 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+   const auto paintMarker = [&](const ClippingHighlightGeometry::GapRect& rect, int owner) {
+     ClippingHighlightGeometry::paintSeparated(
+         rect, contourSeams, owner, [&](const ClippingHighlightGeometry::GapRect& piece) {
+-          renderer.shadeRect(piece.x, piece.y, piece.width, piece.height);
++          if (original) {
++            renderer.invertRect(piece.x, piece.y, piece.width, piece.height, original.get());
++          } else {
++            renderer.shadeRect(piece.x, piece.y, piece.width, piece.height, shade);
++          }
+         });
+   };
+   int bezelTop = 0, bezelRight = 0, bezelBottom = 0, bezelLeft = 0;
+@@ -8427,6 +8438,7 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+   }
+   LOG_DBG("CLIP", "Built %zu touch targets from %u matches", currentPageClippingTouchTargetCount, matchCount);
+ #endif
++  return original != nullptr;
+ }
+
+ void EpubReaderActivity::renderStatusBar() const {
+diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+index af5c55a93384b820ecda3d7e065e0e1cba2b50a6..610395225d7438d775022738d53aa87eebc779f7 100644
+--- a/src/activities/reader/EpubReaderActivity.h
++++ b/src/activities/reader/EpubReaderActivity.h
+@@ -349,7 +349,7 @@ class EpubReaderActivity final : public Activity {
+                       int orientedMarginBottom, int orientedMarginLeft, bool updatePanel);
+   bool ensureGrayscaleStripScratch();
+   void releaseGrayscaleStripScratch(bool force = false);
+-  void drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
++  bool drawClippingHighlights(const Page& page, int fontId, int orientedMarginTop, int orientedMarginLeft);
+   void renderStatusBar() const;
+   void refreshChapterGroupEstimate(uint16_t viewportWidth, uint16_t viewportHeight);
+   bool resolveChapterGroupPageProgress(int& currentPage, int& pageCount, float& chapterProgress,
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index c86ac77c32ff7024111805710ae24e709c804914..0029e4a59b646271e2d54162a9e269dadb86f032 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -222,8 +222,9 @@ inline std::string settingEnumOptionLabel(const SettingInfo& setting, const uint
+   if (!setting.enumStringValues.empty()) {
+     return displayIndex < setting.enumStringValues.size() ? setting.enumStringValues[displayIndex] : std::string();
+   }
+-  return displayIndex < setting.enumValues.size() ? std::string(I18N.get(setting.enumValues[displayIndex]))
+-                                                  : std::string();
++  if (displayIndex >= setting.enumValues.size()) return {};
++  const auto label = setting.enumValues[displayIndex];
++  return I18N.get(label == StrId::STR_HIGHLIGHT_BLACK && SETTINGS.screenInverted ? StrId::STR_HIGHLIGHT_WHITE : label);
+ }
+
+ inline bool settingShowsNavigationCaret(const SettingInfo& setting) {
