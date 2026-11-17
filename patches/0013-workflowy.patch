@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..0e6896ebc8c88b4ddf9925701ee21d3314cbc876 100644
+index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..373ea596c82ca7616426149f2eef1bf628c9fb82 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -609,6 +609,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..0e6896ebc8c88b4ddf9925701ee21d33
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1078,3 +1096,22 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1078,3 +1096,30 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -63,6 +63,14 @@ index bcaff3e863ba9b29056d972a1ee07b79c1b324cc..0e6896ebc8c88b4ddf9925701ee21d33
 +STR_WORKFLOWY_TO_TODO: "Convert to todo"
 +STR_WORKFLOWY_DAILY_READ_FAILED: "Could not load Workflowy items"
 +STR_WORKFLOWY_EMPTY: "No visible items"
++STR_WORKFLOWY_OFFLINE: "Offline"
++STR_WORKFLOWY_PENDING: "Pending"
++STR_WORKFLOWY_CAPTURE_QUEUED: "Saved for sync"
++STR_WORKFLOWY_SYNC_CHECK: "Check pending sync"
++STR_WORKFLOWY_OUTBOX_ACCOUNT: "Pending items use another key"
++STR_WORKFLOWY_OUTBOX_SENT: "Already in Workflowy"
++STR_WORKFLOWY_OUTBOX_RETRY: "Send again"
++STR_WORKFLOWY_ORDER_CHANGED: "Parent restored. Order changed."
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -1063,10 +1071,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8bcb2d9996eac96a60d1c08867c607c3
    size_t maxLength;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a9d5826e9
+index 0000000000000000000000000000000000000000..d691bee5688ed76bb319822ef73e7b1b95426c0c
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,1423 @@
+@@ -0,0 +1,1742 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1105,6 +1113,10 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +constexpr int ROW_HEIGHT = 39;
 +constexpr int ICON_TARGET = 44;
 +constexpr int ROW_ARROW_TARGET = 34;
++constexpr char OUTBOX[] = "/.crashink/.workflowy-outbox.json";
++constexpr size_t OUTBOX_LIMIT = 24 * 1024;
++constexpr size_t OUTBOX_ITEMS = 24;
++constexpr unsigned long DELETE_GRACE = 8000;
 +constexpr char API[] = "https://workflowy.com/api/v1/nodes";
 +
 +// Keep response and parsed fields out of the internal heap used by Wi-Fi/TLS.
@@ -1195,6 +1207,14 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  Activity::onEnter();
 +  credential = workflowy::readSetting(workflowy::KEY_FILE, workflowy::KEY_MAX);
 +  date = isoDate(0);
++  if (date.empty()) date = "today";
++  outbox = workflowy::readSetting(OUTBOX, OUTBOX_LIMIT);
++  JsonDocument saved;
++  if (!outbox.empty() && !deserializeJson(saved, outbox)) {
++    pendingCount = saved["items"].size();
++    outboxUncertain = saved["sending"] | false;
++  }
++  online = hasActiveStationWifiConnection();
 +  requestUpdate();
 +}
 +
@@ -1536,6 +1556,7 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +}
 +
 +void WorkflowyDailyActivity::toggle(const size_t row) {
++  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const bool completed = rows[row].done;
 +  setLoading(true);
 +  const int status = request("POST", "/" + rows[row].id + (completed ? "/uncomplete" : "/complete"), {});
@@ -1551,7 +1572,24 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    layoutDirty = true;
 +    message = nullptr;
 +  }
-+  nextPage(0);
++  const auto id = rows[row].id;
++  offerUndo([this, id, completed] {
++    setLoading(true);
++    const bool ok = request("POST", "/" + id + (completed ? "/complete" : "/uncomplete"), {}) == 200;
++    setLoading(false);
++    if (!ok) return false;
++    RenderLock lock(*this);
++    for (auto& node : rows) {
++      if (node.id == id) node.done = completed;
++    }
++    for (auto& view : viewStack) {
++      for (auto& node : view.rows) {
++        if (node.id == id) node.done = completed;
++      }
++    }
++    layoutDirty = true;
++    return true;
++  });
 +}
 +
 +void WorkflowyDailyActivity::expand(const size_t row) {
@@ -1590,6 +1628,7 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +
 +void WorkflowyDailyActivity::edit(const size_t row, const int relative, const size_t cursor) {
 +  const bool adding = relative != 0 || row >= rows.size();
++  if (!online && (!adding || relative != 0)) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const std::string id = row < rows.size() ? rows[row].id : "";
 +  const std::string initial = adding ? "" : rows[row].title;
 +  const int parentIndex = relative ? parentRow(row) : -1;
@@ -1632,6 +1671,11 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +      update["parent_id"] = parent.empty() ? date : parent;
 +      update["layoutMode"] = "todo";
 +      update["position"] = "bottom";
++    }
++    if (adding && !hasActiveStationWifiConnection()) {
++      if (!relative && queueCapture(encode(update))) showMessage(tr(STR_WORKFLOWY_CAPTURE_QUEUED));
++      else showMessage(tr(STR_WORKFLOWY_SAVE_FAILED));
++      return;
 +    }
 +    setLoading(true);
 +    uint8_t response[256];
@@ -1798,11 +1842,20 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +                                 renderer, mappedInput, tr(STR_DELETE), rows[row].title),
 +                             [this, id](const ActivityResult& confirmation) {
 +        if (confirmation.isCancelled) return;
-+        setLoading(true);
-+        const auto status = request("DELETE", "/" + id, {});
-+        setLoading(false);
-+        if (status == 200) removeNode(id);
-+        else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++        if (!hasActiveStationWifiConnection()) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++        commitDelete();
++        {
++          RenderLock lock(*this);
++          pendingDelete = id;
++          deleteAt = millis() + DELETE_GRACE;
++          layoutDirty = true;
++        }
++        offerUndo([this] {
++          RenderLock lock(*this);
++          pendingDelete.clear();
++          layoutDirty = true;
++          return true;
++        }, true);
 +      });
 +    }
 +  });
@@ -1824,6 +1877,9 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    step = Step::Load;
 +    return;
 +  }
++  const auto old = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++  if (old == rows.end()) return;
++  const auto original = moveOrigin(old - rows.begin());
 +  JsonDocument update;
 +  update["parent_id"] = target;
 +  update["position"] = "bottom";
@@ -1832,8 +1888,9 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  setLoading(false);
 +  const bool currentDay = target == date || (date == "today" && target == isoDate(0)) ||
 +                          (date == "tomorrow" && target == isoDate(1));
-+  if (status == 200) removeNode(id, currentDay);
-+  else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  if (status != 200) return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  removeNode(id, currentDay);
++  offerUndo([this, id, original] { return restoreMove(id, original); });
 +}
 +
 +void WorkflowyDailyActivity::chooseDate(std::string moveId) {
@@ -1915,6 +1972,10 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    const auto& node = rows[i];
 +    if (node.depth > collapsedDepth) continue;
 +    collapsedDepth = node.expanded ? UINT_MAX : node.depth;
++    if (node.id == pendingDelete) {
++      collapsedDepth = node.depth;
++      continue;
++    }
 +    if (node.done && !showDone && (i != 0 || zoomId.empty())) continue;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int width = std::max(1, bounds.width - indent - 25 - ROW_ARROW_TARGET);
@@ -2021,7 +2082,10 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +}
 +
 +void WorkflowyDailyActivity::back() {
-+  if (viewStack.empty()) return finish();
++  if (viewStack.empty()) {
++    commitDelete();
++    return finish();
++  }
 +  {
 +    RenderLock lock(*this);
 +    ++generation;
@@ -2038,18 +2102,22 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  requestUpdate();
 +}
 +
-+void WorkflowyDailyActivity::reorder(size_t source, size_t target, bool after) {
++bool WorkflowyDailyActivity::reorder(size_t source, size_t target, bool after, bool recordUndo) {
 +  const int parent = parentRow(source);
-+  if (source == target || parent != parentRow(target)) return;
-+  const auto parentId = parent < 0 ? date : rows[parent].id;
-+  const auto depth = rows[source].depth;
-+  const auto sourceId = rows[source].id;
-+  const auto targetId = rows[target].id;
++  if (source == target || parent != parentRow(target)) return false;
++  const auto parentNode = parent < 0 ? "" : rows[parent].id;
++  return reorderSiblings(parent < 0 ? date : parentNode, parentNode, rows[source].depth,
++                         rows[source].id, rows[target].id, after, recordUndo);
++}
++
++bool WorkflowyDailyActivity::reorderSiblings(const std::string& parentId, const std::string& parentNode,
++                                             unsigned depth, std::string sourceId, std::string targetId,
++                                             bool after, bool recordUndo) {
 +  setLoading(true);
 +  std::vector<Node> siblings;
 +  if (!loadChildren(parentId, depth, siblings)) {
 +    setLoading(false);
-+    return;
++    return false;
 +  }
 +  std::vector<size_t> order;
 +  size_t sourceIndex = siblings.size(), targetIndex = siblings.size();
@@ -2061,8 +2129,10 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  if (sourceIndex == siblings.size() || targetIndex == siblings.size()) {
 +    setLoading(false);
 +    showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
-+    return;
++    return false;
 +  }
++  const bool wasFirst = sourceIndex == 0;
++  const auto originalNeighbour = siblings[wasFirst ? 1 : sourceIndex - 1].id;
 +  const auto position = std::find(order.begin(), order.end(), targetIndex);
 +  order.insert(position + (after ? 1 : 0), sourceIndex);
 +  const auto stationary = workflowy::stationaryRange(order);
@@ -2086,15 +2156,224 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  setLoading(false);
 +  if (loaded) {
 +    RenderLock lock(*this);
-+    const std::string parentNode = parent < 0 ? "" : parentId;
-+    replaceSiblings(rows, parentNode, refreshed);
++    if (!parentNode.empty() || (zoomId.empty() && parentId == date)) replaceSiblings(rows, parentNode, refreshed);
 +    for (auto& view : viewStack) {
-+      if (!parentNode.empty() || view.zoomId.empty()) replaceSiblings(view.rows, parentNode, refreshed);
++      if (!parentNode.empty() || (view.zoomId.empty() && parentId == date))
++        replaceSiblings(view.rows, parentNode, refreshed);
 +    }
 +    layoutDirty = true;
 +    message = ok ? nullptr : tr(STR_WORKFLOWY_SEND_FAILED);
 +  }
++  if (ok && recordUndo) {
++    offerUndo([this, sourceId, originalNeighbour, wasFirst, parentId, parentNode, depth] {
++      return reorderSiblings(parentId, parentNode, depth, sourceId, originalNeighbour, !wasFirst, false);
++    });
++  }
 +  requestUpdate();
++  return ok;
++}
++
++void WorkflowyDailyActivity::offerUndo(std::function<bool()> action, bool forDelete) {
++  undoIsDelete = forDelete;
++  undoAction = std::move(action);
++  {
++    RenderLock lock(*this);
++    undoReady = true;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::undo() {
++  if (!undoAction) return;
++  if (!undoIsDelete && !online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  if (!undoAction()) return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  undoAction = {};
++  {
++    RenderLock lock(*this);
++    undoReady = false;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::commitDelete() {
++  if (pendingDelete.empty() || !hasActiveStationWifiConnection()) return;
++  const auto id = pendingDelete;
++  setLoading(true);
++  const bool ok = request("DELETE", "/" + id, {}) == 200;
++  setLoading(false);
++  {
++    RenderLock lock(*this);
++    pendingDelete.clear();
++    if (undoIsDelete) undoReady = false;
++    layoutDirty = true;
++  }
++  if (undoIsDelete) undoAction = {};
++  if (ok) removeNode(id);
++  else showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++}
++
++bool WorkflowyDailyActivity::queueCapture(const std::string& body) {
++  JsonDocument queue, item;
++  if ((!outbox.empty() && deserializeJson(queue, outbox)) || deserializeJson(item, body)) return false;
++  const auto account = std::to_string(std::hash<std::string>{}(credential));
++  if (queue["items"].isNull()) queue["items"].to<JsonArray>();
++  auto items = queue["items"].as<JsonArray>();
++  if (items.size() && queue["account"].as<std::string>() != account) return false;
++  queue["account"] = account;
++  if (items.size() >= OUTBOX_ITEMS || !items.add(item.as<JsonVariantConst>())) return false;
++  auto saved = encode(queue);
++  if (saved.size() > OUTBOX_LIMIT || !workflowy::writeSetting(OUTBOX, saved)) return false;
++  outbox = std::move(saved);
++  {
++    RenderLock lock(*this);
++    pendingCount = items.size();
++  }
++  requestUpdate();
++  return true;
++}
++
++void WorkflowyDailyActivity::flushCapture() {
++  JsonDocument queue;
++  if (deserializeJson(queue, outbox)) return;
++  if (queue["account"].as<std::string>() != std::to_string(std::hash<std::string>{}(credential))) {
++    retryOutboxAt = millis() + 30000;
++    return showMessage(tr(STR_WORKFLOWY_OUTBOX_ACCOUNT));
++  }
++  auto items = queue["items"].as<JsonArray>();
++  if (items.size() == 0) return;
++  std::string body;
++  serializeJson(items[0], body);
++  queue["sending"] = true;
++  auto marked = encode(queue);
++  if (!workflowy::writeSetting(OUTBOX, marked)) {
++    retryOutboxAt = millis() + 30000;
++    return showMessage(tr(STR_WORKFLOWY_SAVE_FAILED));
++  }
++  outbox = std::move(marked);
++  setLoading(true);
++  const int status = request("POST", "", body);
++  setLoading(false);
++  if (status >= 200 && status < 300) items.remove(0);
++  // An interrupted request may have created the item. Leave it queued for explicit review.
++  const bool uncertain = status == 0 || status >= 500;
++  queue["sending"] = uncertain;
++  auto saved = encode(queue);
++  const bool persisted = workflowy::writeSetting(OUTBOX, saved);
++  if (persisted) outbox = std::move(saved);
++  {
++    RenderLock lock(*this);
++    outboxUncertain = uncertain || !persisted;
++    if (persisted) pendingCount = items.size();
++  }
++  retryOutboxAt = millis() + (status >= 200 && status < 300 ? 350 : 30000);
++  if (status >= 200 && status < 300) loadDay();
++  else requestUpdate();
++}
++
++void WorkflowyDailyActivity::reviewCapture() {
++  JsonDocument queue;
++  if (deserializeJson(queue, outbox)) return;
++  if (queue["account"].as<std::string>() != std::to_string(std::hash<std::string>{}(credential)))
++    return showMessage(tr(STR_WORKFLOWY_OUTBOX_ACCOUNT));
++  const auto name = plainTitle(queue["items"][0]["name"] | "");
++  std::vector<std::string> options{tr(STR_WORKFLOWY_OUTBOX_SENT), tr(STR_WORKFLOWY_OUTBOX_RETRY)};
++  startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                             renderer, mappedInput, "WorkflowyOutbox", StrId::STR_WORKFLOWY_SYNC_CHECK,
++                             std::move(options), 0, false, true),
++                         [this, name](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    const bool sent = std::get<OptionSelectionResult>(result.data).index == 0;
++    startActivityForResult(std::make_unique<ConfirmationActivity>(
++                               renderer, mappedInput, (sent ? tr(STR_WORKFLOWY_OUTBOX_SENT) : tr(STR_WORKFLOWY_OUTBOX_RETRY)),
++                               name),
++                           [this, sent](const ActivityResult& confirmation) {
++      if (confirmation.isCancelled) return;
++      JsonDocument queue;
++      if (deserializeJson(queue, outbox)) return;
++      auto items = queue["items"].as<JsonArray>();
++      if (sent) items.remove(0);
++      queue["sending"] = false;
++      auto saved = encode(queue);
++      if (!workflowy::writeSetting(OUTBOX, saved)) return showMessage(tr(STR_WORKFLOWY_SAVE_FAILED));
++      outbox = std::move(saved);
++      {
++        RenderLock lock(*this);
++        outboxUncertain = false;
++        pendingCount = items.size();
++      }
++      retryOutboxAt = millis();
++      requestUpdate();
++    });
++  });
++}
++
++bool WorkflowyDailyActivity::moveNode(const std::string& id, const std::string& parent, const char* position) {
++  JsonDocument update;
++  update["parent_id"] = parent;
++  update["position"] = position;
++  setLoading(true);
++  const bool ok = request("POST", "/" + id + "/move", encode(update)) == 200;
++  setLoading(false);
++  if (!ok) showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  return ok;
++}
++
++WorkflowyDailyActivity::MoveOrigin WorkflowyDailyActivity::moveOrigin(size_t source) const {
++  const int parent = parentRow(source);
++  const std::string parentNode = parent < 0 ? "" : rows[parent].id;
++  const unsigned depth = rows[source].depth;
++  MoveOrigin origin{parent < 0 ? date : parentNode, parentNode, {}, depth, false};
++  for (size_t i = parent < 0 ? 0 : parent + 1; i < rows.size() && rows[i].depth >= depth; ++i) {
++    if (i == source || rows[i].depth != depth) continue;
++    if (i > source && !origin.neighbour.empty()) break;
++    origin.neighbour = rows[i].id;
++    origin.after = i < source;
++    if (i > source) break;
++  }
++  return origin;
++}
++
++bool WorkflowyDailyActivity::restoreMove(const std::string& id, const MoveOrigin& origin) {
++  if (!moveNode(id, origin.parent)) return false;
++  removeNode(id);
++  if (!origin.neighbour.empty() &&
++      !reorderSiblings(origin.parent, origin.parentNode, origin.depth, id, origin.neighbour, origin.after, false)) {
++    // The parent was restored. Reconcile if the original neighbour moved or was deleted.
++    loadDay();
++    showMessage(tr(STR_WORKFLOWY_ORDER_CHANGED));
++  } else {
++    loadDay();
++  }
++  return true;
++}
++
++void WorkflowyDailyActivity::indent(size_t source, size_t target) {
++  const auto id = rows[source].id;
++  const auto destination = rows[target].id;
++  const auto original = moveOrigin(source);
++  if (!moveNode(id, destination, "top")) return;
++  removeNode(id);
++  {
++    RenderLock lock(*this);
++    for (auto& node : rows) {
++      if (node.id != destination) continue;
++      node.leaf = false;
++      node.childrenConfirmed = true;
++      node.checkedAt = 0;
++    }
++  }
++  const auto owner = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == destination; });
++  if (owner != rows.end()) {
++    std::vector<Node> children;
++    if (loadChildren(destination, owner->depth + 1, children)) {
++      RenderLock lock(*this);
++      replaceSiblings(rows, destination, children);
++      const auto refreshed = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == destination; });
++      if (refreshed != rows.end()) refreshed->expanded = true;
++      layoutDirty = true;
++    }
++  }
++  offerUndo([this, id, original] { return restoreMove(id, original); });
 +}
 +
 +void WorkflowyDailyActivity::prefetchTask(void* argument) {
@@ -2143,8 +2422,7 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    if (changed) requestUpdate();
 +    return;
 +  }
-+  if (static_cast<long>(now - nextPrefetchAt) < 0 || credential.empty() || date.empty() ||
-+      !hasActiveStationWifiConnection()) return;
++  if (static_cast<long>(now - nextPrefetchAt) < 0 || credential.empty() || date.empty() || !online) return;
 +  std::string parent;
 +  unsigned depth = 0;
 +  const bool root = now - rootCheckedAt >= SYNC_INTERVAL;
@@ -2202,6 +2480,19 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  if (step == Step::Start) return connect();
 +  if (step == Step::Load) return loadDay();
 +  if (step != Step::Ready || loading) return;
++  const auto now = millis();
++  if (static_cast<long>(now - nextLinkCheck) >= 0) {
++    nextLinkCheck = now + 500;
++    const bool connected = hasActiveStationWifiConnection();
++    if (connected != online) {
++      {
++        RenderLock lock(*this);
++        online = connected;
++      }
++      if (connected && !awaitingOutline) loadDay();
++      else requestUpdate();
++    }
++  }
 +  if (mappedInput.wasReleased(Button::Up)) return nextPage(-1);
 +  if (mappedInput.wasReleased(Button::Down)) return nextPage(1);
 +  int x = 0, y = 0;
@@ -2219,14 +2510,16 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    const int dx = std::abs(x - touchX), dy = std::abs(y - touchY);
 +    if (!moved && dragRow < 0 && millis() - touchAt >= 550) dragRow = rowAt(touchX, touchY);
 +    moved |= std::max(dx, dy) > 26;
-+    if (dragRow >= 0 && (dragging || (dy > 26 && dy > dx))) {
++    if (online && dragRow >= 0 && (dragging || dy > 26)) {
 +      dragging = true;
 +      const int over = rowAt(x, y);
 +      const int nextDrop = over >= 0 && over != dragRow && parentRow(over) == parentRow(dragRow) ? over : -1;
++      const bool inside = nextDrop >= 0 && x - touchX >= 32 && rows[nextDrop].depth < 8;
 +      bool changed;
 +      {
 +        RenderLock lock(*this);
-+        changed = dropRow != nextDrop;
++        changed = dropRow != nextDrop || dropInside != inside;
++        dropInside = inside;
 +        dropRow = nextDrop;
 +        dropAfter = nextDrop > dragRow;
 +      }
@@ -2243,15 +2536,19 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    tracking = false;
 +    dragging = false;
 +    int target;
-+    bool after;
++    bool after, inside;
 +    {
 +      RenderLock lock(*this);
 +      target = dropRow;
 +      after = dropAfter;
++      inside = dropInside;
 +      dropRow = -1;
 +    }
 +    requestUpdate();
-+    if (target >= 0) reorder(dragRow, target, after);
++    if (target >= 0) {
++      if (inside) indent(dragRow, target);
++      else reorder(dragRow, target, after);
++    }
 +    return;
 +  }
 +  if (swipe == Swipe::None && release && tracking) {
@@ -2270,7 +2567,12 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    return;
 +  }
 +  if (!release || !tracking) {
-+    if (!tracking && !release) pollPrefetch();
++    if (!tracking && !release) {
++      if (online && !pendingDelete.empty() && static_cast<long>(millis() - deleteAt) >= 0) commitDelete();
++      else if (online && pendingCount && !outboxUncertain && !prefetch &&
++               static_cast<long>(millis() - retryOutboxAt) >= 0) flushCapture();
++      else pollPrefetch();
++    }
 +    return;
 +  }
 +  tracking = false;
@@ -2280,7 +2582,11 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  x = touchX;
 +  y = touchY;
 +  const auto bounds = layout();
++  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
++      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
 +  if (!zoomId.empty() && y >= bounds.top + 30 && y < bounds.rowTop && x < bounds.x + ICON_TARGET) return back();
++  if (undoReady && y >= bounds.top + 28 && y < bounds.rowTop &&
++      x >= bounds.x + bounds.width - 2 * ICON_TARGET && x < bounds.x + bounds.width - ICON_TARGET) return undo();
 +  if (y < bounds.rowTop && x >= bounds.x + bounds.width - ICON_TARGET) {
 +    if (!credential.empty() && !rows.empty()) chooseDate();
 +    else if (!credential.empty() && !date.empty() && hasActiveStationWifiConnection()) chooseDate();
@@ -2299,7 +2605,7 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +      else if (hasActiveStationWifiConnection() && !credential.empty()) step = Step::Load;
 +      else step = Step::Start;
 +    }
-+    if (control == 2 && !credential.empty() && !date.empty() && hasActiveStationWifiConnection()) edit(rows.size());
++    if (control == 2 && !credential.empty() && !date.empty()) edit(rows.size());
 +    if (control == 3) {
 +      {
 +        RenderLock lock(*this);
@@ -2364,12 +2670,21 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +  }
 +  char todoCount[24];
 +  snprintf(todoCount, sizeof(todoCount), "%u/%u", remaining, totalTodos);
-+  const int countX = bounds.x + bounds.width - ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
++  const int countX = bounds.x + bounds.width - (undoReady ? 2 : 1) * ICON_TARGET - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
 +  const auto fittedHeading = renderer.truncatedText(UI_12_FONT_ID, heading.c_str(), countX - bounds.x - 8,
 +                                                     EpdFontFamily::BOLD);
 +  renderer.drawText(UI_12_FONT_ID, bounds.x, bounds.top + 32, fittedHeading.c_str(), true, EpdFontFamily::BOLD);
 +  renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
 +  const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
++  if (undoReady) {
++    const int ux = cx - ICON_TARGET;
++    renderer.drawLine(ux - 10, cy - 3, ux + 4, cy - 3, 2, true);
++    renderer.drawLine(ux + 4, cy - 3, ux + 9, cy + 2, 2, true);
++    renderer.drawLine(ux + 9, cy + 2, ux + 4, cy + 8, 2, true);
++    renderer.drawLine(ux + 4, cy + 8, ux - 3, cy + 8, 2, true);
++    renderer.drawLine(ux - 10, cy - 3, ux - 4, cy - 9, 2, true);
++    renderer.drawLine(ux - 10, cy - 3, ux - 4, cy + 3, 2, true);
++  }
 +  renderer.drawRect(cx - 10, cy - 9, 21, 19);
 +  renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
 +  renderer.drawLine(cx - 5, cy - 12, cx - 5, cy - 6);
@@ -2424,8 +2739,8 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +        renderer.drawLine(textX, lineY + 12, textX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()), lineY + 12);
 +    }
 +    if (static_cast<int>(placement.row) == dropRow) {
-+      const int marker = dropAfter ? placement.bottom - 1 : placement.top;
-+      renderer.drawLine(start, marker, bounds.x + bounds.width - 1, marker, 2, true);
++      const int marker = dropAfter || dropInside ? placement.bottom - 1 : placement.top;
++      renderer.drawLine(start + (dropInside ? 16 : 0), marker, bounds.x + bounds.width - 1, marker, 2, true);
 +    }
 +    if (!node.leaf) {
 +      const int tipX = bounds.x + bounds.width - 10;
@@ -2440,6 +2755,18 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +    }
 +  }
 +  const auto total = pageStarts.size();
++  if (!online || pendingCount) {
++    char status[48];
++    if (outboxUncertain) snprintf(status, sizeof(status), "%s", tr(STR_WORKFLOWY_SYNC_CHECK));
++    else if (pendingCount) snprintf(status, sizeof(status), "%s · %u",
++                                    (online ? tr(STR_WORKFLOWY_PENDING) : tr(STR_WORKFLOWY_OFFLINE)),
++                                    static_cast<unsigned>(pendingCount));
++    else snprintf(status, sizeof(status), "%s", tr(STR_WORKFLOWY_OFFLINE));
++    const int width = renderer.getTextWidth(SMALL_FONT_ID, status) + 16;
++    const int x = bounds.x + (bounds.width - width) / 2;
++    renderer.drawRoundedRect(x, bounds.top + 5, width, 24, 1, 7, true);
++    renderer.drawText(SMALL_FONT_ID, x + 8, bounds.top + 8, status);
++  }
 +  if (awaitingOutline || message || total > 1 || placements.empty()) {
 +    char pages[24];
 +    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
@@ -2492,13 +2819,14 @@ index 0000000000000000000000000000000000000000..43d36843d53b4556846775c5c37e9e4a
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..d4b4122771e798e32c8ea4ef8c561dae729a6549
+index 0000000000000000000000000000000000000000..004d2e91c5bbb6f2d96fe0d87cfe96355755143f
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,162 @@
 +#pragma once
 +
 +#include <atomic>
++#include <functional>
 +#include <memory>
 +#include <string>
 +#include <vector>
@@ -2552,6 +2880,35 @@ index 0000000000000000000000000000000000000000..d4b4122771e798e32c8ea4ef8c561dae
 +  int dragRow = -1;
 +  int dropRow = -1;
 +  bool dropAfter = false;
++  bool dropInside = false;
++  bool online = false;
++  unsigned long nextLinkCheck = 0;
++  std::string outbox;
++  size_t pendingCount = 0;
++  unsigned long retryOutboxAt = 0;
++  bool outboxUncertain = false;
++  std::function<bool()> undoAction;
++  bool undoReady = false;
++  bool undoIsDelete = false;
++  std::string pendingDelete;
++  unsigned long deleteAt = 0;
++  void offerUndo(std::function<bool()> action, bool forDelete = false);
++  void undo();
++  bool queueCapture(const std::string& body);
++  void flushCapture();
++  void reviewCapture();
++  void commitDelete();
++  struct MoveOrigin {
++    std::string parent, parentNode, neighbour;
++    unsigned depth;
++    bool after;
++  };
++  MoveOrigin moveOrigin(size_t source) const;
++  bool restoreMove(const std::string& id, const MoveOrigin& origin);
++  bool reorderSiblings(const std::string& parentId, const std::string& parentNode, unsigned depth,
++                       std::string sourceId, std::string targetId, bool after, bool recordUndo);
++  bool moveNode(const std::string& id, const std::string& parent, const char* position = "bottom");
++  void indent(size_t source, size_t target);
 +  bool dragging = false;
 +  std::string zoomId;
 +  struct View {
@@ -2595,7 +2952,7 @@ index 0000000000000000000000000000000000000000..d4b4122771e798e32c8ea4ef8c561dae
 +  template <typename Work> int requestWhilePaging(Work work);
 +  int rowAt(int x, int y) const;
 +  int parentRow(size_t row) const;
-+  void reorder(size_t source, size_t target, bool after);
++  bool reorder(size_t source, size_t target, bool after, bool recordUndo = true);
 +  void zoom(size_t row);
 +  void back();
 +  void nextPage(int delta, bool edge = false);

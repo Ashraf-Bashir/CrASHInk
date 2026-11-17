@@ -2,6 +2,10 @@
 
 ### Added
 
+- Workflowy can undo completion, reorder, and move actions. An eight-second Undo window precedes permanent deletion.
+- Drag a Workflowy row down and right to nest it under a sibling. The drop line shifts right to show the new level.
+- Offline Workflowy captures are saved to the SD card and sent on reconnect. A header badge shows offline status and the pending count.
+
 - Workflowy wrapped outlines support inline editing at the tapped character and adding items above or below a sibling. An item starting with `[]` becomes a todo.
 - Workflowy has first, previous, next, and last page controls, and vertical swipes can turn pages during requests.
 
