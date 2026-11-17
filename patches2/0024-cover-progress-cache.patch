@@ -1,0 +1,225 @@
+diff --git a/src/activities/home/BookActions.cpp b/src/activities/home/BookActions.cpp
+index 4cf09d8e8e71dae7ec449413ee20dcee1e006269..51ab445b4948e1d3242f88203ebee18382de36ce 100644
+--- a/src/activities/home/BookActions.cpp
++++ b/src/activities/home/BookActions.cpp
+@@ -88,6 +88,7 @@ bool canSendNearby(const std::string& path) {
+ }
+
+ void clearFileMetadata(const std::string& fullPath) {
++  RecentBookProgress::invalidateEpubPercents();
+   if (FsHelpers::hasEpubExtension(fullPath)) {
+     Epub(fullPath, "/.crosspoint").clearCache();
+     BookmarkStore::deleteForFilePath(fullPath, "epub");
+diff --git a/src/activities/home/RecentBookProgress.cpp b/src/activities/home/RecentBookProgress.cpp
+index 1f37810c11ec7976dbfd21b65a92a3e1baebe3f6..5ca02b0b136796dcb357864b30f45466b4ed57b5 100644
+--- a/src/activities/home/RecentBookProgress.cpp
++++ b/src/activities/home/RecentBookProgress.cpp
+@@ -9,9 +9,11 @@
+ #include <Xtc.h>
+
+ #include <algorithm>
++#include <array>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <mutex>
+ #include <string>
+
+ #include "RecentBooksStore.h"
+@@ -25,6 +27,32 @@ constexpr char EPUB_PERCENT_CACHE_FILE[] = "/progress_percent.bin";
+ constexpr uint32_t TXT_CACHE_MAGIC = 0x54585449;  // "TXTI"
+ constexpr uint8_t TXT_CACHE_VERSION = 4;
+
++// Keep recent cover pages warm across Library visits. The SD record remains
++// authoritative across boots; negative entries also avoid reopening unread books.
++struct PercentEntry {
++  std::string path;
++  float percent = -1.0f;
++};
++std::array<PercentEntry, 64> percentCache;
++size_t nextPercentSlot = 0;
++std::mutex percentCacheMutex;
++
++PercentEntry* findPercent(const std::string& cachePath) {
++  const auto entry = std::find_if(percentCache.begin(), percentCache.end(),
++                                  [&](const PercentEntry& candidate) { return candidate.path == cachePath; });
++  return entry != percentCache.end() ? &*entry : nullptr;
++}
++
++void rememberPercent(const std::string& cachePath, const float percent) {
++  auto* entry = findPercent(cachePath);
++  if (!entry) {
++    entry = &percentCache[nextPercentSlot];
++    nextPercentSlot = (nextPercentSlot + 1) % percentCache.size();
++    entry->path = cachePath;
++  }
++  entry->percent = percent;
++}
++
+ float clampProgressPercent(const float progress) { return std::clamp(progress, 0.0f, 100.0f); }
+
+ std::string epubPercentCachePath(const std::string& cachePath) { return cachePath + EPUB_PERCENT_CACHE_FILE; }
+@@ -52,9 +80,9 @@ float loadCachedEpubPercentFromCachePath(const std::string& cachePath) {
+   return static_cast<float>(basisPoints) / 100.0f;
+ }
+
+-void saveCachedEpubPercentToCachePath(const std::string& cachePath, const float progress) {
++bool saveCachedEpubPercentToCachePath(const std::string& cachePath, const float progress) {
+   if (cachePath.empty() || progress < 0.0f) {
+-    return;
++    return false;
+   }
+
+   const float clamped = clampProgressPercent(progress);
+@@ -67,12 +95,12 @@ void saveCachedEpubPercentToCachePath(const std::string& cachePath, const float
+   memcpy(data + sizeof(EPUB_PERCENT_CACHE_MAGIC) + sizeof(EPUB_PERCENT_CACHE_VERSION), &basisPoints,
+          sizeof(basisPoints));
+   const std::string path = epubPercentCachePath(cachePath);
+-  if (fileContentEquals("RBPR", path.c_str(), data, sizeof(data))) return;
++  if (fileContentEquals("RBPR", path.c_str(), data, sizeof(data))) return true;
+
+   FsFile file;
+   if (!Storage.openFileForWrite("RBPR", path, file)) {
+     LOG_ERR("RBPR", "failed to open EPUB percent cache for write: %s", cachePath.c_str());
+-    return;
++    return false;
+   }
+
+   const bool writeOk = file.write(data, sizeof(data)) == sizeof(data) && file.sync();
+@@ -80,6 +108,7 @@ void saveCachedEpubPercentToCachePath(const std::string& cachePath, const float
+   if (!writeOk) {
+     LOG_ERR("RBPR", "failed to write EPUB percent cache: %s", cachePath.c_str());
+   }
++  return writeOk;
+ }
+
+ float loadEpubSizeProgressPercentFromCachePath(const std::string& cachePath) {
+@@ -138,7 +167,7 @@ float loadEpubProgressPercent(const RecentBook& book) {
+   const float chapterProgress = static_cast<float>(progress.pageNumber + 1) / static_cast<float>(progress.pageCount);
+   const float progressPercent =
+       clampProgressPercent(epub.calculateProgress(progress.spineIndex, chapterProgress) * 100.0f);
+-  saveCachedEpubPercentToCachePath(epub.getCachePath(), progressPercent);
++  RecentBookProgress::saveCachedEpubPercent(epub.getCachePath(), progressPercent);
+   return progressPercent;
+ }
+
+@@ -246,16 +275,29 @@ float RecentBookProgress::loadCachedEpubPercent(const RecentBook& book) {
+   if (!FsHelpers::hasEpubExtension(book.path)) {
+     return -1.0f;
+   }
+-  const std::string cachePath = Epub::resolveCachePathForFilePath(book.path, "/.crosspoint");
+-  const float cachedProgress = loadCachedEpubPercentFromCachePath(cachePath);
+-  if (cachedProgress >= 0.0f) {
+-    return cachedProgress;
+-  }
+-  return loadEpubSizeProgressPercentFromCachePath(cachePath);
++  const auto cachePath = Epub::cachePathForFilePath(book.path, "/.crosspoint");
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  if (const auto* entry = findPercent(cachePath)) return entry->percent;
++
++  const auto resolved = Epub::resolveCachePathForFilePath(book.path, "/.crosspoint");
++  float percent = loadCachedEpubPercentFromCachePath(resolved);
++  if (percent < 0.0f) percent = loadEpubSizeProgressPercentFromCachePath(resolved);
++  rememberPercent(cachePath, percent);
++  return percent;
+ }
+
+ void RecentBookProgress::saveCachedEpubPercent(const std::string& cachePath, const float progress) {
+-  saveCachedEpubPercentToCachePath(cachePath, progress);
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  if (saveCachedEpubPercentToCachePath(cachePath, progress)) {
++    const auto basisPoints = static_cast<uint16_t>(clampProgressPercent(progress) * 100.0f + 0.5f);
++    rememberPercent(cachePath, static_cast<float>(basisPoints) / 100.0f);
++  }
++}
++
++void RecentBookProgress::invalidateEpubPercents() {
++  const std::lock_guard<std::mutex> lock(percentCacheMutex);
++  for (auto& entry : percentCache) entry.path.clear();
++  nextPercentSlot = 0;
+ }
+
+ void RecentBookProgress::saveCachedEpubPercent(const Epub& epub, const int spineIndex, const int currentPage,
+@@ -266,7 +308,7 @@ void RecentBookProgress::saveCachedEpubPercent(const Epub& epub, const int spine
+
+   const float chapterProgress = static_cast<float>(currentPage + 1) / static_cast<float>(pageCount);
+   const float progressPercent = clampProgressPercent(epub.calculateProgress(spineIndex, chapterProgress) * 100.0f);
+-  saveCachedEpubPercentToCachePath(epub.getCachePath(), progressPercent);
++  saveCachedEpubPercent(epub.getCachePath(), progressPercent);
+ }
+
+ bool RecentBookProgress::hasPercent(const float progress) { return progress >= 0.0f; }
+diff --git a/src/activities/home/RecentBookProgress.h b/src/activities/home/RecentBookProgress.h
+index d133773bc998a42b6964a28ae27cf642db89f4c3..8f2f011036a7fe2b238bb693a0b8780b95c3b8d5 100644
+--- a/src/activities/home/RecentBookProgress.h
++++ b/src/activities/home/RecentBookProgress.h
+@@ -18,7 +18,9 @@ float loadPercent(const RecentBook& book);
+ // Loads the cached EPUB reading percentage without opening the EPUB.
+ // Returns -1.0f when progress is unavailable or the cache cannot be read.
+ float loadCachedEpubPercent(const RecentBook& book);
+-// Saves a cached EPUB reading percentage for fast Home screen rendering.
++// Drop the in-memory copies after library or cache files change externally.
++void invalidateEpubPercents();
++// Saves a cached EPUB reading percentage for fast cover rendering.
+ void saveCachedEpubPercent(const std::string& cachePath, float progress);
+ // Calculates and saves cached EPUB progress from a reader position.
+ void saveCachedEpubPercent(const Epub& epub, int spineIndex, int currentPage, int pageCount);
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index 2a6d3cdc0668c33966074e131785212c17a809ac..e802d4e102d6893528a555cc7a18fd3d8c5170a7 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -771,6 +771,7 @@ void LibraryActivity::openSearch() {
+ }
+
+ void LibraryActivity::refreshLibrary() {
++  RecentBookProgress::invalidateEpubPercents();
+   rebuildIndex(true, true);
+   requestUpdate();
+ }
+diff --git a/src/activities/settings/ClearCacheActivity.cpp b/src/activities/settings/ClearCacheActivity.cpp
+index b23348c069821176d66076fbe4cae99ec553e8bc..6ab95ee0e7db83e2e60ef29222eb0f7ee6c75f2e 100644
+--- a/src/activities/settings/ClearCacheActivity.cpp
++++ b/src/activities/settings/ClearCacheActivity.cpp
+@@ -7,6 +7,7 @@
+
+ #include <algorithm>
+
++#include "activities/home/RecentBookProgress.h"
+ #include "MappedInputManager.h"
+ #include "components/TouchActionButtons.h"
+ #include "components/TouchHeaderBackButton.h"
+@@ -105,6 +106,7 @@ void ClearCacheActivity::render(RenderLock&&) {
+ }
+
+ void ClearCacheActivity::clearCache() {
++  RecentBookProgress::invalidateEpubPercents();
+   // Open .crosspoint directory
+   auto root = Storage.open("/.crosspoint");
+   if (!root || !root.isDirectory()) {
+diff --git a/src/util/BookMoveUtils.cpp b/src/util/BookMoveUtils.cpp
+index 35fe6bebcb36bc5eb87c05257c4ce88bdb5b47ba..5133db565753ce0e00e5d1a45ccac6f891e987b3 100644
+--- a/src/util/BookMoveUtils.cpp
++++ b/src/util/BookMoveUtils.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cstring>
+
++#include "activities/home/RecentBookProgress.h"
+ #include "BookmarkStore.h"
+ #include "ClippingStore.h"
+ #include "CrossPointState.h"
+@@ -256,6 +257,7 @@ RenameMigrationResult migrateRenamedBookState(const std::string& oldPath, const
+     cacheMoved = true;
+   }
+
++  RecentBookProgress::invalidateEpubPercents();
+   library::invalidateLibraryIndex();
+   if (!Storage.rename(oldPath.c_str(), newPath.c_str())) {
+     LOG_ERR("BookMove", "Failed to rename file: %s -> %s", oldPath.c_str(), newPath.c_str());
+@@ -284,5 +286,6 @@ RenameMigrationResult migrateRenamedBookState(const std::string& oldPath, const
+
+ bool migrateMovedEpubState(const std::string& oldPath, const std::string& newPath, const std::string& oldCachePath,
+                            const std::string& title, const std::string& author, const bool keepInRecents) {
++  RecentBookProgress::invalidateEpubPercents();
+   library::invalidateLibraryIndex();
+   bool ok = true;
