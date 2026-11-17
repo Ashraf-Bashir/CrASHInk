@@ -1,0 +1,372 @@
+diff --git a/libs/display/FreeInkDisplay/include/FreeInkDisplay.h b/libs/display/FreeInkDisplay/include/FreeInkDisplay.h
+index 0acc38a9602802217553306bdeb89ff238b1ab3f..c6638874f06b8c5f1eeffe5a5670bde125719a54 100644
+--- a/libs/display/FreeInkDisplay/include/FreeInkDisplay.h
++++ b/libs/display/FreeInkDisplay/include/FreeInkDisplay.h
+@@ -265,6 +265,7 @@ class FreeInkDisplay {
+
+   // EXPERIMENTAL: Windowed update - display only a rectangular region
+   void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
++  bool displayDirectGrayRegion(freeink::GrayscaleWindow window, bool turnOffScreen = false);
+   void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
+   void displayGrayCalibration(uint16_t customX, uint16_t customY, uint16_t customW, uint16_t customH);
+
+diff --git a/libs/display/FreeInkDisplay/include/GrayscaleCapabilities.h b/libs/display/FreeInkDisplay/include/GrayscaleCapabilities.h
+index ceef58d4d4f4372c2f536e9fe89b9e2e0c7b9f36..e5d5d853895dfc1dc7f1ede0320a15496e5c51e0 100644
+--- a/libs/display/FreeInkDisplay/include/GrayscaleCapabilities.h
++++ b/libs/display/FreeInkDisplay/include/GrayscaleCapabilities.h
+@@ -12,6 +12,11 @@ enum class GrayscaleMode : uint8_t { Overlay, Absolute, Direct };
+ enum class GrayscaleEncoding : uint8_t { Unsupported, OverlayMasks, AbsolutePlanes };
+ enum class GrayscaleBase : uint8_t { Separate, Combined };
+
++// Physical framebuffer coordinates, with exclusive width and height.
++struct GrayscaleWindow {
++  uint16_t x = 0, y = 0, width = 0, height = 0;
++};
++
+ struct GrayscaleCapabilities {
+   // Overlay masks: black/white=00 (distinguished by the B/W base), dark=11,
+   // light=01, in (LSB, MSB) order. Absolute planes: black=00, dark=10,
+@@ -24,6 +29,8 @@ struct GrayscaleCapabilities {
+   // Plane staging touches no SPI and is safe during a pending B/W waveform.
+   bool stagingWhileBusy = false;
+
++  bool regionalDirect = false;
++
+   constexpr bool supported() const { return encoding != GrayscaleEncoding::Unsupported; }
+ };
+
+diff --git a/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp b/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp
+index 2f6fdf135c52854c879301d11ea0f8d4fb007959..3547d5f22cb633475b5fbd8166da9ba2e43b2623 100644
+--- a/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp
++++ b/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp
+@@ -802,6 +802,22 @@ void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t
+ #endif
+ }
+
++bool FreeInkDisplay::displayDirectGrayRegion(freeink::GrayscaleWindow window, bool turnOffScreen) {
++  if (_inverted || _grayscaleMode != GrayscaleMode::Direct || _grayPassFailed ||
++      _grayRows[0] != getDisplayHeight() || _grayRows[1] != getDisplayHeight() ||
++      !window.width || !window.height || window.x + window.width > getDisplayWidth() ||
++      window.y + window.height > getDisplayHeight() || !grayscaleCapabilities(GrayscaleMode::Direct).regionalDirect) {
++    return false;
++  }
++  syncPendingAsync();
++  _shadowValid = false;
++  _redRamSynced = false;
++  const bool rendered = _driver->displayDirectGrayRegion(_bus, frameBuffer, turnOffScreen, window);
++  if (rendered) _inversionDirty = false;
++  cancelGrayscalePass();
++  return rendered;
++}
++
+ void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode) {
+ #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
+   Serial.printf("[EPD] displayGrayBuffer\n");
+diff --git a/libs/display/FreeInkDisplay/src/driver/PanelDriver.h b/libs/display/FreeInkDisplay/src/driver/PanelDriver.h
+index ae67da5dc8298d5fdb5fa6d44be08e04480ba4b9..a08336431fdc0670794c91b9e82a471d1a0600b3 100644
+--- a/libs/display/FreeInkDisplay/src/driver/PanelDriver.h
++++ b/libs/display/FreeInkDisplay/src/driver/PanelDriver.h
+@@ -170,6 +170,7 @@ class PanelDriver {
+     (void)numRows;
+   }
+   virtual void prepareGrayscaleTarget(const uint8_t* bw) { (void)bw; }
++  virtual bool displayDirectGrayRegion(EpdBus&, const uint8_t*, bool, GrayscaleWindow) { return false; }
+   virtual void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) {
+     (void)lut;
+     (void)factoryMode;
+diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.cpp
+index 7694ab9d2bcf557ed298e53bbeb7407b95090f70..bedf66bae7895f54490f8e0dc4cd3b3deeed9d5b 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.cpp
++++ b/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.cpp
+@@ -343,7 +343,7 @@ void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lh
+ }
+
+ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+-  const bool paintDestination = _directGrayOnPanel;
++  const bool followsDirectGray = _directGrayOnPanel;
+   _directGrayOnPanel = false;
+   restoreBwConfiguration(bus);
+   _absoluteInput = false;
+@@ -378,15 +378,9 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
+   // Half is the explicit strong scrub. Post-AA Fast paints are intercepted by
+   // display() and use stock's non-flashing XTF_PRE_BW_MID transition instead.
+   const bool scrub = (mode == RefreshMode::Half);
+-  const bool fast = (mode == RefreshMode::Fast) && !scrub && !_needFullClear && _oldPlaneValid;
+-
+-  if (paintDestination) {
+-    streamPlane(bus, CMD_DTM1, fb, true);
+-    streamPlane(bus, CMD_DTM2, fb);
+-    startBwRefresh(bus, true);
+-    bus.waitRefreshComplete(" 8179_BW_TARGET_DRF");
+-    bus.cmd(CMD_PARTIAL_OUT);
+-  }
++  // Direct grayscale leaves the controller without a valid differential
++  // baseline. Seed the single Fast refresh with the complement of its target.
++  const bool fast = mode == RefreshMode::Fast && (followsDirectGray || (!_needFullClear && _oldPlaneValid));
+
+   // NEW plane (0x13) = new frame.
+   streamPlane(bus, CMD_DTM2, fb);
+@@ -399,6 +393,8 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
+       // Full/forced-first flash retains the known absolute-from-white behavior.
+       bus.fillPlane(CMD_DTM1, 0xFF, _tresH, _wb);
+     }
++  } else if (followsDirectGray) {
++    streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
+   }
+   // (Ordinary Fast: OLD still holds the previous frame from displayFinish.)
+   // A completed ordinary refresh supersedes any pending post-AA transition.
+@@ -657,6 +653,15 @@ void Uc8179Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
+   }
+ }
+
++bool Uc8179Driver::displayDirectGrayRegion(EpdBus& bus, const uint8_t* fb, bool turnOff,
++                                            GrayscaleWindow window) {
++  if (!_directGrayPass || _directGrayPlanes != 3) return false;
++  _grayWindow = window;
++  displayGray(bus, fb, turnOff, nullptr, true);
++  _grayWindow = {};
++  return true;
++}
++
+ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
+                                bool factoryMode) {
+   // fb = the reader's current frame; used to re-seed the B/W baseline below.
+@@ -673,8 +678,21 @@ void Uc8179Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
+       bus.waitBusy(" 8179_direct_PON");
+       _isScreenOn = true;
+     }
++    if (_grayWindow.width) {
++      // This driver reverses the physical framebuffer rows on upload.
++      const uint16_t x = _grayWindow.x;
++      const uint16_t y = _h - _grayWindow.y - _grayWindow.height;
++      const uint16_t x0 = x & ~7u;
++      const uint16_t x1 = (x + _grayWindow.width - 1) | 7u;
++      const uint16_t y1 = y + _grayWindow.height - 1;
++      const uint8_t bounds[] = {uint8_t(x0 >> 8), uint8_t(x0), uint8_t(x1 >> 8), uint8_t(x1),
++                                uint8_t(y >> 8), uint8_t(y), uint8_t(y1 >> 8), uint8_t(y1), 0x01};
++      bus.cmd(CMD_PARTIAL_IN);
++      bus.cmdData(CMD_PARTIAL_WINDOW, bounds, sizeof(bounds));
++    }
+     bus.cmd(CMD_DISPLAY_REFRESH);
+     bus.waitBusy(" 8179_DIRECT_GRAY_DRF");
++    if (_grayWindow.width) bus.cmd(CMD_PARTIAL_OUT);
+     _directGrayOnPanel = true;
+     _directGrayPass = false;
+     _directGrayPlanes = 0;
+diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.h b/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.h
+index f55e9334c249c65122807d42610a2d63a9fcaa66..431249bfb126de2241ba033dc9e59179d423bbb6 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.h
++++ b/libs/display/FreeInkDisplay/src/driver/Uc8179Driver.h
+@@ -89,7 +89,7 @@ class Uc8179Driver : public PanelDriver {
+     if (mode == GrayscaleMode::Absolute || mode == GrayscaleMode::Direct)
+       return {GrayscaleEncoding::AbsolutePlanes,
+               mode == GrayscaleMode::Direct ? GrayscaleBase::Combined : GrayscaleBase::Separate,
+-              false, false, false};
++              false, false, false, mode == GrayscaleMode::Direct};
+     if (mode != GrayscaleMode::Overlay)
+       return {};
+     return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, false,
+@@ -98,6 +98,7 @@ class Uc8179Driver : public PanelDriver {
+   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;
+   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
+   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
++  bool displayDirectGrayRegion(EpdBus& bus, const uint8_t* fb, bool turnOff, GrayscaleWindow window) override;
+   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
+   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
+
+@@ -140,6 +141,7 @@ class Uc8179Driver : public PanelDriver {
+   bool _grayBaseValid = false;
+   bool _absoluteGrayPlanes = false;
+   bool _absoluteInput = false;
++  GrayscaleWindow _grayWindow{};
+   bool _directGrayPass = false;
+   bool _directGrayOnPanel = false;
+   bool _directGrayConfigured = false;
+diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
+index 6ede6e6ab63188101b1d4e0ee8d148a335300ae2..c4fd0148d71a5ad9f04d6075b2b653ac77ebceb8 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
++++ b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
+@@ -392,7 +392,7 @@ void Uc8279X4Driver::powerOnIfNeeded(EpdBus& bus, const char* tag) {
+ }
+
+ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+-  const bool paintDestination = _directGrayOnPanel;
++  const bool followsDirectGray = _directGrayOnPanel;
+   _directGrayOnPanel = false;
+   _grayImagePass = false;
+   _absoluteInput = false;
+@@ -420,15 +420,9 @@ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
+   // Half is CrossPoint's periodic ghost-cleanup (every getRefreshFrequency()
+   // pages) AND the manual force-refresh; it MUST scrub, exactly like UC8179.
+   const bool scrub = (mode == RefreshMode::Half);
+-  const bool fast = (mode == RefreshMode::Fast) && !_needFullClear && _oldPlaneValid;
+-
+-  if (paintDestination) {
+-    streamPlane(bus, CMD_DTM1, fb, true);
+-    streamPlane(bus, CMD_DTM2, fb);
+-    startBwRefresh(bus, true);
+-    bus.waitRefreshComplete(" 8279x4_BW_TARGET_DRF");
+-    bus.cmd(CMD_PARTIAL_OUT);
+-  }
++  // Direct grayscale leaves the controller without a valid differential
++  // baseline. Seed the single Fast refresh with the complement of its target.
++  const bool fast = mode == RefreshMode::Fast && (followsDirectGray || (!_needFullClear && _oldPlaneValid));
+
+   streamPlane(bus, CMD_DTM2, fb);
+   if (!fast) {
+@@ -440,7 +434,7 @@ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
+       // the absolute GC-from-white waveform.
+       bus.fillPlane(CMD_DTM1, 0xFF, _tresH, _wb);
+     }
+-  } else if (_redriveAfterGray) {
++  } else if (followsDirectGray || _redriveAfterGray) {
+     // Re-drive every pixel once after grayscale so the B/W transition scrubs
+     // residual edge charge before restoring the ordinary differential baseline.
+     streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
+@@ -568,7 +562,7 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode)
+   if (BoardConfig::ACTIVE.displayControllerVariant == 0x67) return {};
+   if (mode == GrayscaleMode::Absolute || mode == GrayscaleMode::Direct)
+     return {GrayscaleEncoding::AbsolutePlanes,
+-            mode == GrayscaleMode::Direct ? GrayscaleBase::Combined : GrayscaleBase::Separate, false, false, false};
++            mode == GrayscaleMode::Direct ? GrayscaleBase::Combined : GrayscaleBase::Separate, false, false, false, mode == GrayscaleMode::Direct};
+   if (mode != GrayscaleMode::Overlay) return {};
+   return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, false, false, false};
+ }
+@@ -647,6 +641,15 @@ void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
+   }
+ }
+
++bool Uc8279X4Driver::displayDirectGrayRegion(EpdBus& bus, const uint8_t* fb, bool turnOff,
++                                            GrayscaleWindow window) {
++  if (!_directGrayPass) return false;
++  _grayWindow = window;
++  displayGray(bus, fb, turnOff, nullptr, true);
++  _grayWindow = {};
++  return true;
++}
++
+ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
+                                  bool factoryMode) {
+   (void)lut;
+@@ -682,8 +685,21 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+   bus.data(_cfg.psr0);
+   bus.data(_cfg.psr1);
+
++  if (_grayWindow.width) {
++    const uint16_t x = FREEINK_UC8279X4_XMIRROR ? _w - _grayWindow.x - _grayWindow.width : _grayWindow.x;
++    const uint16_t y = _cfg.gateOffset +
++                       (FREEINK_UC8279X4_ROWREV ? _h - _grayWindow.y - _grayWindow.height : _grayWindow.y);
++    const uint16_t x0 = x & ~7u;
++    const uint16_t x1 = (x + _grayWindow.width - 1) | 7u;
++    const uint16_t y1 = y + _grayWindow.height - 1;
++    const uint8_t bounds[] = {uint8_t(x0 >> 8), uint8_t(x0), uint8_t(x1 >> 8), uint8_t(x1),
++                              uint8_t(y >> 8), uint8_t(y), uint8_t(y1 >> 8), uint8_t(y1), 0x01};
++    bus.cmd(CMD_PARTIAL_IN);
++    bus.cmdData(CMD_PARTIAL_WINDOW, bounds, sizeof(bounds));
++  }
+   bus.cmd(CMD_DISPLAY_REFRESH);
+   bus.waitBusy((_directGrayPass ? " 8279x4_DIRECT_GRAY_DRF" : " 8279x4_gray"));
++  if (_grayWindow.width) bus.cmd(CMD_PARTIAL_OUT);
+   // Vendor production behavior: the UC8279 AA path leaves analog power enabled
+   // between page refreshes (the UC8179 sibling does the same — its gray_aa sends
+   // no POF). Honor only an explicit turnOff.
+diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h
+index 2b05596c628920971599be01c8cc14467de256d7..f57802245940281a0661f1c7a4b595e42028ad21 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h
++++ b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h
+@@ -100,6 +100,7 @@ class Uc8279X4Driver : public PanelDriver {
+   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;
+   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
+   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
++  bool displayDirectGrayRegion(EpdBus& bus, const uint8_t* fb, bool turnOff, GrayscaleWindow window) override;
+   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
+   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
+   // Base frame for a grayscale overlay. The periodic clean the reader asks for
+@@ -151,6 +152,7 @@ class Uc8279X4Driver : public PanelDriver {
+   bool _grayBaseValid = false;
+   bool _absoluteGrayPlanes = false;
+   bool _absoluteInput = false;
++  GrayscaleWindow _grayWindow{};
+   bool _directGrayPass = false;
+   bool _directGrayOnPanel = false;
+   // True once a grayscale (AA) refresh has run. Gates the non-flashing base
+diff --git a/libs/display/FreeInkDisplay/test/host/test_pro.cpp b/libs/display/FreeInkDisplay/test/host/test_pro.cpp
+index f57122df8d0f2e51d675e9e380d3ec374260f7fd..7a7c83b2e9cd3ecedd426d0502e3af08b93fd94c 100644
+--- a/libs/display/FreeInkDisplay/test/host/test_pro.cpp
++++ b/libs/display/FreeInkDisplay/test/host/test_pro.cpp
+@@ -446,17 +446,21 @@ static void testDirectSleep() {
+                          [](const auto& w) { return w.command == 0x12; });
+   };
+   assert(display.grayscaleCapabilities(GrayscaleMode::Direct).base == GrayscaleBase::Combined);
+-  for (auto fallback : {FreeInkDisplay::HALF_REFRESH, FreeInkDisplay::FAST_REFRESH}) {
++  for (auto next : {FreeInkDisplay::HALF_REFRESH, FreeInkDisplay::FAST_REFRESH, FreeInkDisplay::FULL_REFRESH}) {
+     display._bus.clear();
+-    assert(display.displayGrayscaleBase(GrayscaleMode::Direct, fallback));
++    assert(display.displayGrayscaleBase(GrayscaleMode::Direct));
+     assert(activations() == 0);
+     display.copyGrayscaleBuffers(lsb.data(), msb.data());
+     assert(activations() == 0);
+     display.displayGrayBuffer(false);
+     assert(activations() == 1);
+     display.cleanupGrayscaleBuffers(bw.data());
+-    display.displayBuffer(FreeInkDisplay::FAST_REFRESH, false);
+-    assert(activations() > 1);
++    display._bus.clear();
++    display.displayBuffer(next, false);
++    assert(activations() == 1);
++    const bool partial = std::any_of(display._bus.writes.begin(), display._bus.writes.end(),
++                                     [](const auto& w) { return w.command == 0x91; });
++    assert(partial == (next == FreeInkDisplay::FAST_REFRESH));
+   }
+   display._bus.clear();
+   assert(display.displayGrayscaleBase(GrayscaleMode::Direct));
+@@ -467,6 +471,40 @@ static void testDirectSleep() {
+   free(driver._grayBase);
+ }
+
++template<class Driver>
++static void testRegionalDirectGray() {
++  Driver driver;
++  FreeInkDisplay display(1, 2, 3, 4, 5, 6);
++  display._driver = &driver;
++  display.begin();
++  auto bw = frame(7), lsb = frame(17), msb = frame(29);
++  std::memcpy(display.getFrameBuffer(), bw.data(), bw.size());
++  display.displayBuffer(FreeInkDisplay::FAST_REFRESH, false);
++  assert(display.grayscaleCapabilities(GrayscaleMode::Direct).regionalDirect);
++  constexpr bool flippedRows = std::is_same<Driver, Uc8179Driver>::value;
++  for (uint16_t y : {20, 105}) {
++    const uint16_t gate = flippedRows ? 480 - y - 12 : 120 + y;
++    const uint16_t end = gate + 11;
++    const Bytes expected = {0, 8, 0, 39, uint8_t(gate >> 8), uint8_t(gate),
++                            uint8_t(end >> 8), uint8_t(end), 1};
++    display._bus.clear();
++    assert(display.displayGrayscaleBase(GrayscaleMode::Direct));
++    assert(!display.displayDirectGrayRegion({11, y, 24, 12}));
++    display.copyGrayscaleBuffers(lsb.data(), msb.data());
++    assert(!display.displayDirectGrayRegion({790, y, 24, 12}));
++    assert(display.displayDirectGrayRegion({11, y, 24, 12}));
++    std::vector<uint8_t> sequence;
++    for (const auto& write : display._bus.writes) {
++      if (write.command == 0x90) assert(write.bytes == expected);
++      if (write.command == 0x91 || write.command == 0x90 || write.command == 0x12 || write.command == 0x92)
++        sequence.push_back(write.command);
++    }
++    assert((sequence == std::vector<uint8_t>{0x91, 0x90, 0x12, 0x92}));
++  }
++  display.deepSleep();
++  free(driver._grayBase);
++}
++
+ static void testUc8279X4WaveformSelection() {
+   Uc8279X4Driver driver;
+   EpdBus bus;
+@@ -627,6 +665,8 @@ int main(int argc, char** argv) {
+   testUc8279X4WaveformSelection();
+   testDirectSleep<Uc8179Driver>();
+   testDirectSleep<Uc8279X4Driver>();
++  testRegionalDirectGray<Uc8179Driver>();
++  testRegionalDirectGray<Uc8279X4Driver>();
+   testUltraChipAbsolute<Uc8179Driver>(true, 0, false);
+   for (uint8_t variant : {0x02, 0x68, 0x69}) {
+     BoardConfig::ACTIVE.displayControllerVariant = variant;

@@ -1,11 +1,8 @@
 > **This is a personal fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader)** with a focus on improved fonts and minimal reading stats.
 
-### Supported Devices
+### crASHink firmware
 
-- Xteink X3
-- Xteink X4
-- Xteink X4 Pro
-- Seeed Studio Sticky
+The GitHub Actions build targets the Xteink X4 Pro. See the [patch application guide](patch-application-guide.md) for local builds and feature ownership.
 
 ## What's different in this fork
 

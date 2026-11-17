@@ -1,0 +1,839 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,8 @@
+ - Display settings offer light grey, dark grey, and solid saved highlights, with contrasting text and a White option in Dark Mode.
+
+ - Library and Home cover grids show saved reading percentages in high-contrast badges.
++
++- Custom sleep-screen rotation accepts JPEG, PNG, and the first frame of GIF images alongside BMPs.
+
+ - The reader’s swipe-down drawer has a Library shortcut. Display → Frontlight offers independent black border widths from 0 to 16 pixels on each edge to mask light leakage.
+
+diff --git a/docs/user-guide.md b/docs/user-guide.md
+--- a/docs/user-guide.md
++++ b/docs/user-guide.md
+@@ -662,10 +662,10 @@
+
+ To use custom sleep images, set the sleep screen mode to **Custom**, **Cover + Custom**, or **Page Overlay**, then place images on the SD card:
+
+-- **Multiple Images (recommended):** Create a `.sleep` directory in the root of the SD card and place any number of `.bmp` images inside. In **Page Overlay** mode, `.png` images are also supported. One image will be randomly selected each time the device sleeps. (A directory named `sleep` is also accepted as a fallback.)
+-- **Single Image:** Place a file named `sleep.bmp` in the root directory. In **Page Overlay** mode, `sleep.png` is also supported. These files are used as fallbacks if no valid image is found in the `.sleep`/`sleep` directory.
+-
+-In **Page Overlay** mode, white BMP pixels and transparent PNG pixels let the current reader page show through; the remaining wallpaper pixels are drawn over the page. PNG wallpapers are supported only in this mode.
++- **Multiple Images (recommended):** Create a `.sleep` directory in the root of the SD card and place BMP, PNG, JPEG (`.jpg` or `.jpeg`), or GIF images inside for **Custom** and **Cover + Custom** modes. GIFs display their first frame only (up to 480 pixels wide on the device). **Page Overlay** mode supports BMP and PNG. One image will be randomly selected each time the device sleeps. (A directory named `sleep` is also accepted as a fallback.)
++- **Single Image:** In **Custom** mode, place `sleep.bmp`, `sleep.png`, `sleep.jpg`, `sleep.jpeg`, or `sleep.gif` in the root directory. **Page Overlay** supports `sleep.bmp` and `sleep.png`. These files are used as fallbacks if no valid image is found in the `.sleep`/`sleep` directory.
++
++In **Page Overlay** mode, white BMP pixels and transparent PNG pixels let the current reader page show through; the remaining wallpaper pixels are drawn over the page.
+
+ > [!TIP]
+ > For best results:
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -625,7 +625,7 @@
+ STR_DELETE: "Delete"
+ STR_PIN_AS_FAVORITE: "Set Sleep Screen"
+ STR_UNPIN_AS_FAVORITE: "Unset Sleep Screen"
+-STR_PIN_PNG_WARNING: "Pinning a PNG is only compatible with Page Overlay mode"
++STR_PIN_PNG_WARNING: "Pinning this PNG will switch the sleep screen to Page Overlay mode"
+ STR_SET_AS_BOOT_SCREEN: "Set Boot Screen"
+ STR_CLEAR_BOOT_SCREEN: "Clear Boot Screen"
+ STR_SET_AS_SLEEP_FOLDER: "Set as Sleep Folder"
+diff --git a/platformio.ini b/platformio.ini
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -116,6 +116,7 @@
+   greiman/SdFat @ 2.3.1
+   bblanchon/ArduinoJson @ 7.4.2
+   ricmoo/QRCode @ 0.0.1
++  bitbank2/AnimatedGIF @ 2.2.0
+   bitbank2/PNGdec @ 1.1.6
+   https://github.com/bitbank2/JPEGDEC.git#86282979224c8a32fd51e091ed5a35b0c699a52b
+   links2004/WebSockets @ 2.7.3
+@@ -246,6 +247,7 @@
+   NearbyTransfer=symlink://freeink-sdk/libs/network/NearbyTransfer
+   bblanchon/ArduinoJson @ 7.4.2
+   ricmoo/QRCode @ ^0.0.1
++  bitbank2/AnimatedGIF @ 2.2.0
+   bitbank2/PNGdec @ 1.1.6
+   https://github.com/bitbank2/JPEGDEC.git#86282979224c8a32fd51e091ed5a35b0c699a52b
+   links2004/WebSockets @ 2.7.3
+diff --git a/src/activities/boot_sleep/BootActivity.cpp b/src/activities/boot_sleep/BootActivity.cpp
+--- a/src/activities/boot_sleep/BootActivity.cpp
++++ b/src/activities/boot_sleep/BootActivity.cpp
+@@ -95,7 +95,7 @@
+
+   const auto pickAndDraw = [&](const bool validateBmpHeaders) {
+     ImageFolderIndex::Selection selection;
+-    if (!ImageFolderIndex::select(bootDir, false, validateBmpHeaders, APP_STATE.recentBootImages,
++    if (!ImageFolderIndex::select(bootDir, ImageFolderIndex::Formats::Bmp, validateBmpHeaders, APP_STATE.recentBootImages,
+                                   CrossPointState::BOOT_RECENT_COUNT, APP_STATE.recentBootPos, APP_STATE.recentBootFill,
+                                   std::min(APP_STATE.recentBootFill, CrossPointState::BOOT_RECENT_COUNT), selection)) {
+       return false;
+diff --git a/src/activities/boot_sleep/ImageFolderIndex.cpp b/src/activities/boot_sleep/ImageFolderIndex.cpp
+--- a/src/activities/boot_sleep/ImageFolderIndex.cpp
++++ b/src/activities/boot_sleep/ImageFolderIndex.cpp
+@@ -28,6 +28,7 @@
+ constexpr char INDEX_MAGIC[] = {'C', 'S', 'I', 'X'};
+ constexpr uint8_t INDEX_VERSION = 1;
+ constexpr uint8_t FLAG_INCLUDE_PNG = 1 << 0;
++constexpr uint8_t FLAG_CUSTOM_FORMATS = 1 << 2;
+ constexpr uint8_t FLAG_VALIDATED = 1 << 1;
+ constexpr size_t MAX_FILENAME_LENGTH = 255;
+ constexpr size_t NAME_BUFFER_SIZE = MAX_FILENAME_LENGTH + 1;
+@@ -98,10 +99,11 @@
+          pathHasPrefix("/bootscreen", path, true);
+ }
+
+-bool makeCachePath(const std::string& directory, const bool includePng, char* output, const size_t outputSize) {
++bool makeCachePath(const std::string& directory, const Formats formats, char* output, const size_t outputSize) {
+   const uint64_t hash = fnv1a64(directory);
+   const int written = snprintf(output, outputSize, "%s/%016llx-%s.idx", INDEX_DIR,
+-                               static_cast<unsigned long long>(hash), includePng ? "all" : "bmp");
++                               static_cast<unsigned long long>(hash),
++                               formats == Formats::Custom ? "custom" : formats == Formats::Overlay ? "all" : "bmp");
+   return written > 0 && static_cast<size_t>(written) < outputSize;
+ }
+
+@@ -111,22 +113,27 @@
+
+ bool writeExact(HalFile& file, const void* buffer, const size_t size) { return file.write(buffer, size) == size; }
+
+-bool headerMatches(const IndexHeader& header, const std::string& directory, const bool includePng,
++uint8_t formatFlags(Formats formats) {
++  return formats == Formats::Custom ? FLAG_CUSTOM_FORMATS | FLAG_INCLUDE_PNG
++       : formats == Formats::Overlay ? FLAG_INCLUDE_PNG : 0;
++}
++
++bool headerMatches(const IndexHeader& header, const std::string& directory, const Formats formats,
+                    const bool requireValidated) {
+   return memcmp(header.magic, INDEX_MAGIC, sizeof(INDEX_MAGIC)) == 0 && header.version == INDEX_VERSION &&
+-         (header.flags & FLAG_INCLUDE_PNG) == (includePng ? FLAG_INCLUDE_PNG : 0) &&
++         (header.flags & (FLAG_INCLUDE_PNG | FLAG_CUSTOM_FORMATS)) == formatFlags(formats) &&
+          (!requireValidated || (header.flags & FLAG_VALIDATED) != 0) && header.pathLength == directory.size() &&
+          header.recordSize == sizeof(IndexRecord) && header.recordsOffset == sizeof(IndexHeader) + header.pathLength &&
+          header.recordCount <= MAX_RECORDS;
+ }
+
+-bool openValidIndex(const std::string& directory, const bool includePng, const bool requireValidated, HalFile& file,
++bool openValidIndex(const std::string& directory, const Formats formats, const bool requireValidated, HalFile& file,
+                     IndexHeader& header, char* cachePath, const size_t cachePathSize) {
+-  if (!makeCachePath(directory, includePng, cachePath, cachePathSize)) return false;
++  if (!makeCachePath(directory, formats, cachePath, cachePathSize)) return false;
+   file = Storage.open(cachePath);
+   if (!file) return false;
+
+-  if (!readExact(file, &header, sizeof(header)) || !headerMatches(header, directory, includePng, requireValidated)) {
++  if (!readExact(file, &header, sizeof(header)) || !headerMatches(header, directory, formats, requireValidated)) {
+     file.close();
+     return false;
+   }
+@@ -165,7 +172,9 @@
+   if (!readExact(file, name.data(), NAME_BUFFER_SIZE) || name[nameLength] != '\0') return false;
+   name.resize(nameLength);
+   isPng = (flags & 1) != 0;
+-  return (isPng && FsHelpers::hasPngExtension(name)) || (!isPng && FsHelpers::hasBmpExtension(name));
++  return isPng == FsHelpers::hasPngExtension(name) && accepts(name,
++      (header.flags & FLAG_CUSTOM_FORMATS) ? Formats::Custom :
++      (header.flags & FLAG_INCLUDE_PNG) ? Formats::Overlay : Formats::Bmp);
+ }
+
+ bool cacheRecordExists(const std::string& directory, const std::string& name) {
+@@ -208,14 +217,14 @@
+   return rank;
+ }
+
+-bool buildIndex(const std::string& directory, const bool includePng, const bool validateBmpHeaders, char* cachePath,
++bool buildIndex(const std::string& directory, const Formats formats, const bool validateBmpHeaders, char* cachePath,
+                 const size_t cachePathSize) {
+   if (!Storage.ensureDirectoryExists("/.crosspoint") || !Storage.ensureDirectoryExists(INDEX_DIR)) {
+     LOG_ERR("IMGIDX", "Cannot create image index directory");
+     return false;
+   }
+
+-  if (!makeCachePath(directory, includePng, cachePath, cachePathSize)) return false;
++  if (!makeCachePath(directory, formats, cachePath, cachePathSize)) return false;
+   char tempPath[MAX_CACHE_PATH] = {};
+   const int tempWritten = snprintf(tempPath, sizeof(tempPath), "%s.tmp", cachePath);
+   if (tempWritten <= 0 || static_cast<size_t>(tempWritten) >= sizeof(tempPath)) return false;
+@@ -236,7 +245,7 @@
+   IndexHeader header{};
+   memcpy(header.magic, INDEX_MAGIC, sizeof(INDEX_MAGIC));
+   header.version = INDEX_VERSION;
+-  header.flags = includePng ? FLAG_INCLUDE_PNG : 0;
++  header.flags = formatFlags(formats);
+   header.flags |= validateBmpHeaders ? FLAG_VALIDATED : 0;
+   header.pathLength = static_cast<uint16_t>(directory.size());
+   header.recordSize = sizeof(IndexRecord);
+@@ -260,9 +269,9 @@
+     const size_t nameLength = file.getName(nameBuffer.get(), NAME_BUFFER_SIZE);
+     const std::string_view name(nameBuffer.get(), std::min(nameLength, MAX_FILENAME_LENGTH));
+     const bool isBmp = FsHelpers::hasBmpExtension(name);
+-    const bool isPng = includePng && FsHelpers::hasPngExtension(name);
++    const bool isPng = formats != Formats::Bmp && FsHelpers::hasPngExtension(name);
+     bool valid = nameLength > 0 && nameLength <= MAX_FILENAME_LENGTH && !name.empty() && name.front() != '.' &&
+-                 !file.isDirectory() && (isBmp || isPng);
++                 !file.isDirectory() && accepts(name, formats);
+
+     if (valid && validateBmpHeaders && isBmp) {
+       Bitmap bitmap(file);
+@@ -311,17 +320,17 @@
+   return true;
+ }
+
+-bool selectFromCache(const std::string& directory, const bool includePng, const bool validateBmpHeaders,
++bool selectFromCache(const std::string& directory, const Formats formats, const bool validateBmpHeaders,
+                      const uint16_t* recentIndices, const uint8_t recentCapacity, const uint8_t recentPos,
+                      const uint8_t recentFill, const uint8_t recentWindow, Selection& selection,
+                      const bool allowRebuild) {
+   char cachePath[MAX_CACHE_PATH] = {};
+   IndexHeader header{};
+   HalFile cache;
+-  if (!openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
+-    if (!allowRebuild || !buildIndex(directory, includePng, validateBmpHeaders, cachePath, sizeof(cachePath)))
++  if (!openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
++    if (!allowRebuild || !buildIndex(directory, formats, validateBmpHeaders, cachePath, sizeof(cachePath)))
+       return false;
+-    if (!openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath)))
++    if (!openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath)))
+       return false;
+   }
+
+@@ -331,8 +340,8 @@
+   bool isPng = false;
+   if (!readRecordName(cache, header, selectedIndex, filename, isPng)) {
+     cache.close();
+-    if (!allowRebuild || !buildIndex(directory, includePng, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
+-        !openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
++    if (!allowRebuild || !buildIndex(directory, formats, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
++        !openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
+       return false;
+     }
+     const uint16_t rebuiltIndex =
+@@ -356,8 +365,8 @@
+   // The card can be changed outside the firmware, so an otherwise valid index
+   // may point at a deleted or renamed entry. Rebuild once before giving the
+   // caller a chance to use its safe legacy fallback.
+-  if (!allowRebuild || !buildIndex(directory, includePng, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
+-      !openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
++  if (!allowRebuild || !buildIndex(directory, formats, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
++      !openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
+     return false;
+   }
+
+@@ -389,7 +398,7 @@
+   return true;
+ }
+
+-bool select(const std::string& directory, const bool includePng, const bool validateBmpHeaders,
++bool select(const std::string& directory, const Formats formats, const bool validateBmpHeaders,
+             const uint16_t* recentIndices, const uint8_t recentCapacity, const uint8_t recentPos,
+             const uint8_t recentFill, const uint8_t recentWindow, Selection& selection) {
+   selection = Selection{};
+@@ -398,12 +407,18 @@
+   // A normal selection may use an existing index. A missing entry triggers one
+   // rebuild, which catches deletions and renames without a directory walk on
+   // every selection. A second miss falls back to the caller's legacy scan.
+-  if (selectFromCache(directory, includePng, validateBmpHeaders, recentIndices, recentCapacity, recentPos, recentFill,
++  if (selectFromCache(directory, formats, validateBmpHeaders, recentIndices, recentCapacity, recentPos, recentFill,
+                       recentWindow, selection, true))
+     return true;
+
+   invalidate();
+   return false;
++}
++
++bool accepts(std::string_view name, Formats formats) {
++  if (FsHelpers::hasBmpExtension(name)) return true;
++  if (formats != Formats::Bmp && FsHelpers::hasPngExtension(name)) return true;
++  return formats == Formats::Custom && (FsHelpers::hasJpgExtension(name) || FsHelpers::hasGifExtension(name));
+ }
+
+ void invalidate() {
+diff --git a/src/activities/boot_sleep/ImageFolderIndex.h b/src/activities/boot_sleep/ImageFolderIndex.h
+--- a/src/activities/boot_sleep/ImageFolderIndex.h
++++ b/src/activities/boot_sleep/ImageFolderIndex.h
+@@ -2,8 +2,12 @@
+
+ #include <cstdint>
+ #include <string>
++#include <string_view>
+
+ namespace ImageFolderIndex {
++
++enum class Formats : uint8_t { Bmp, Overlay, Custom };
++bool accepts(std::string_view name, Formats formats);
+
+ struct Selection {
+   std::string path;
+@@ -25,7 +29,7 @@
+ // write slot, recentFill is the number of valid entries), so this module has
+ // no dependency on any particular caller's history storage. recentWindow caps
+ // how far back to look when avoiding repeats.
+-bool select(const std::string& directory, bool includePng, bool validateBmpHeaders, const uint16_t* recentIndices,
++bool select(const std::string& directory, Formats formats, bool validateBmpHeaders, const uint16_t* recentIndices,
+             uint8_t recentCapacity, uint8_t recentPos, uint8_t recentFill, uint8_t recentWindow, Selection& selection);
+
+ // Drop all indexes. This only removes files owned by this module.
+diff --git a/src/activities/boot_sleep/SleepActivity.cpp b/src/activities/boot_sleep/SleepActivity.cpp
+--- a/src/activities/boot_sleep/SleepActivity.cpp
++++ b/src/activities/boot_sleep/SleepActivity.cpp
+@@ -10,6 +10,8 @@
+ #include <HalGPIO.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
++#include <JpegToBmpConverter.h>
++#include <PngToBmpConverter.h>
+ #include <Memory.h>
+ #include <PNGdec.h>
+ // PNGdec's bundled zlib internals leak this macro into later FreeInkUI headers.
+@@ -35,6 +37,7 @@
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+ #include "ImageFolderIndex.h"
++#include "SleepGif.h"
+ #include "RecentBooksStore.h"
+ #include "SleepCoverAssets.h"
+ #include "activities/reader/ReaderUtils.h"
+@@ -314,9 +317,9 @@
+   bool isPng = false;
+ };
+
+-bool isBmpSleepImagePath(const std::string& path) { return FsHelpers::hasBmpExtension(path); }
+-
+-bool isPngSleepImagePath(const std::string& path) { return FsHelpers::hasPngExtension(path); }
++ImageFolderIndex::Formats sleepFormats(SleepImageMode mode) {
++  return mode == SleepImageMode::Overlay ? ImageFolderIndex::Formats::Overlay : ImageFolderIndex::Formats::Custom;
++}
+
+ bool tryOpenSleepDirectory(FsFile& dir, std::string& sleepDir, const std::string& candidate) {
+   if (candidate.empty()) {
+@@ -376,21 +379,10 @@
+     return false;
+   }
+
+-  if (isBmpSleepImagePath(favorite)) {
++  if (ImageFolderIndex::accepts(favorite, sleepFormats(mode))) {
+     selection.path = favorite;
+-    selection.isPng = false;
++    selection.isPng = FsHelpers::hasPngExtension(favorite);
+     return true;
+-  }
+-
+-  if (isPngSleepImagePath(favorite)) {
+-    if (mode == SleepImageMode::Overlay) {
+-      selection.path = favorite;
+-      selection.isPng = true;
+-      return true;
+-    }
+-
+-    LOG_INF("SLP", "Pinned PNG sleep image requires Page Overlay mode, falling back: %s", favorite.c_str());
+-    return false;
+   }
+
+   LOG_ERR("SLP", "Pinned sleep image has unsupported extension: %s", favorite.c_str());
+@@ -403,9 +395,9 @@
+   std::string sleepDir;
+   if (!resolvePreferredSleepDirectory(sleepDir)) return false;
+
+-  const bool allowPng = mode == SleepImageMode::Overlay && !bmpOnly;
++  const auto formats = bmpOnly ? ImageFolderIndex::Formats::Bmp : sleepFormats(mode);
+   ImageFolderIndex::Selection indexedSelection;
+-  if (ImageFolderIndex::select(sleepDir, allowPng, validateBmpHeaders, APP_STATE.recentSleepImages,
++  if (ImageFolderIndex::select(sleepDir, formats, validateBmpHeaders, APP_STATE.recentSleepImages,
+                                CrossPointState::SLEEP_RECENT_COUNT, APP_STATE.recentSleepPos, APP_STATE.recentSleepFill,
+                                std::min(APP_STATE.recentSleepFill, CrossPointState::SLEEP_RECENT_COUNT),
+                                indexedSelection)) {
+@@ -449,8 +441,7 @@
+     }
+
+     const bool isBmp = FsHelpers::hasBmpExtension(filename);
+-    const bool isPng = allowPng && FsHelpers::hasPngExtension(filename);
+-    if (!isBmp && !isPng) {
++    if (!ImageFolderIndex::accepts(filename, formats)) {
+       file.close();
+       continue;
+     }
+@@ -623,63 +614,64 @@
+ }
+
+ void SleepActivity::renderCustomSleepScreen() const {
+-  const auto tryRenderSelection = [this](const SleepImageSelection& selection) {
++  const auto tryRender = [this](const std::string& path) {
++    constexpr char convertedPath[] = "/.crashink/.sleep-image.bmp.tmp";
++    const bool converted = !FsHelpers::hasBmpExtension(path);
++    const bool imageLevels = renderer.supportsAbsoluteGrayscale() &&
++        SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
++    if (converted) {
++      FsFile output;
++      if (!Storage.ensureDirectoryExists("/.crashink") ||
++          !Storage.openFileForWrite("SLP", convertedPath, output)) return false;
++      bool decoded = false;
++      if (FsHelpers::hasGifExtension(path)) {
++        decoded = SleepGif::toBitmap(path, output, renderer.getScreenWidth(), renderer.getScreenHeight(), imageLevels);
++      } else {
++        FsFile image;
++        if (Storage.openFileForRead("SLP", path, image)) {
++          const bool crop = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
++          decoded = FsHelpers::hasJpgExtension(path)
++                        ? JpegToBmpConverter::jpegFileToBmpStream(image, output, crop, imageLevels)
++                        : PngToBmpConverter::pngFileToBmpStream(image, output, crop, imageLevels);
++          image.close();
++        }
++      }
++      const bool flushed = output.sync();
++      const bool closed = output.close();
++      if (!decoded || !flushed || !closed) {
++        Storage.remove(convertedPath);
++        LOG_ERR("SLP", "Could not decode custom sleep image: %s", path.c_str());
++        return false;
++      }
++    }
++
+     FsFile file;
+-    if (!Storage.openFileForRead("SLP", selection.path, file)) {
+-      LOG_ERR("SLP", "Failed to open custom sleep image: %s", selection.path.c_str());
+-      return false;
+-    }
+-
+-    LOG_INF("SLP", "Loading custom sleep image: %s", selection.path.c_str());
+-    // Use image-specific gray levels only when the panel accepts complete planes.
+-    Bitmap bitmap(file, true,
+-                  renderer.supportsAbsoluteGrayscale() &&
+-                      SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER);
+-    const BmpReaderError parseResult = bitmap.parseHeaders();
+-    if (parseResult != BmpReaderError::Ok) {
+-      LOG_ERR("SLP", "Failed to parse custom sleep BMP %s: %s", selection.path.c_str(),
+-              Bitmap::errorToString(parseResult));
++    bool success = false;
++    if (Storage.openFileForRead("SLP", converted ? std::string(convertedPath) : path, file)) {
++      Bitmap bitmap(file, true, imageLevels);
++      const auto parsed = bitmap.parseHeaders();
++      if (parsed == BmpReaderError::Ok) success = renderBitmapSleepScreen(bitmap);
+       file.close();
+-      return false;
+-    }
+-
+-    const bool success = renderBitmapSleepScreen(bitmap);
+-    file.close();
++    }
++    if (converted) Storage.remove(convertedPath);
+     return success;
+   };
+
+   SleepImageSelection selection;
+-  if (selectPinnedSleepImage(SleepImageMode::Custom, selection) && tryRenderSelection(selection)) {
+-    return;
+-  }
+-
+-  if (selectRandomSleepImage(SleepImageMode::Custom, selection) && tryRenderSelection(selection)) {
+-    return;
+-  }
+-
+-  // A corrupt BMP should not make an otherwise valid custom folder fall back
+-  // to the dark default screen. Re-scan only on this error path and choose
+-  // from the files whose headers are valid.
+-  if (!selection.path.empty() && selectRandomSleepImage(SleepImageMode::Custom, selection, true) &&
+-      tryRenderSelection(selection)) {
+-    return;
+-  }
+-
+-  // Look for sleep.bmp on the root of the sd card to determine if we should
+-  // render a custom sleep screen instead of the default.
+-  FsFile file;
+-  if (Storage.openFileForRead("SLP", "/sleep.bmp", file)) {
+-    Bitmap bitmap(file, true,
+-                  renderer.supportsAbsoluteGrayscale() &&
+-                      SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER);
+-    if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+-      const bool success = renderBitmapSleepScreen(bitmap);
+-      file.close();
+-      if (success) return;
+-    }
+-  }
+-
+-  file.close();
++  if (selectPinnedSleepImage(SleepImageMode::Custom, selection) && tryRender(selection.path)) return;
++
++  for (int attempt = 0; attempt < 4; ++attempt) {
++    if (!selectRandomSleepImage(SleepImageMode::Custom, selection)) break;
++    if (tryRender(selection.path)) return;
++  }
++
++  // A failed decoder or bad image should not hide valid BMPs in the folder.
++  if (!selection.path.empty() && selectRandomSleepImage(SleepImageMode::Custom, selection, true, true) &&
++      tryRender(selection.path)) return;
++
++  for (const char* fallback : {"/sleep.bmp", "/sleep.png", "/sleep.jpg", "/sleep.jpeg", "/sleep.gif"}) {
++    if (Storage.exists(fallback) && tryRender(fallback)) return;
++  }
+   renderDefaultSleepScreen();
+ }
+
+diff --git a/src/activities/boot_sleep/SleepGif.cpp b/src/activities/boot_sleep/SleepGif.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/activities/boot_sleep/SleepGif.cpp
+@@ -0,0 +1,152 @@
++#include "SleepGif.h"
++
++#include <AnimatedGIF.h>
++#include <Logging.h>
++#include <Memory.h>
++
++#include <algorithm>
++#include <array>
++#include <climits>
++#include <cstring>
++
++namespace {
++
++void* openGif(const char* path, int32_t* size) {
++  auto file = makeUniqueNoThrow<HalFile>();
++  if (!file || !Storage.openFileForRead("SLP", path, *file)) return nullptr;
++  const size_t bytes = file->size();
++  if (bytes == 0 || bytes > INT32_MAX) {
++    file->close();
++    return nullptr;
++  }
++  *size = static_cast<int32_t>(bytes);
++  return file.release();  // AnimatedGIF calls closeGif for this handle.
++}
++
++void closeGif(void* handle) {
++  auto* file = static_cast<HalFile*>(handle);
++  if (!file) return;
++  file->close();
++  delete file;
++}
++
++int32_t readGif(GIFFILE* source, uint8_t* buffer, int32_t length) {
++  auto* file = static_cast<HalFile*>(source->fHandle);
++  const int32_t remaining = source->iSize - source->iPos;
++  if (length <= 0 || remaining <= 0) return 0;
++  const int read = file->read(buffer, std::min(length, remaining));
++  if (read > 0) source->iPos += read;
++  return std::max(0, read);
++}
++
++int32_t seekGif(GIFFILE* source, int32_t position) {
++  auto* file = static_cast<HalFile*>(source->fHandle);
++  if (position < 0 || position > source->iSize || !file->seek(position)) return -1;
++  source->iPos = position;
++  return position;
++}
++
++constexpr size_t headerSize = 70;
++
++// The sleeping cover renderer already accepts top-down 2-bit grayscale BMPs.
++bool writeHeader(HalFile& out, int width, int height, int stride, bool imageLevels) {
++  std::array<uint8_t, headerSize> header{};
++  const auto set = [&](size_t pos, uint32_t value, int bytes = 4) {
++    for (int i = 0; i < bytes; ++i) header[pos + i] = static_cast<uint8_t>(value >> (i * 8));
++  };
++  header[0] = 'B';
++  header[1] = 'M';
++  set(2, headerSize + stride * height);
++  set(10, headerSize);
++  set(14, 40);
++  set(18, width);
++  set(22, static_cast<uint32_t>(-height));
++  set(26, 1, 2);
++  set(28, 2, 2);
++  set(34, stride * height);
++  set(46, 4);
++  set(50, 4);
++  const uint8_t levels[] = {0, uint8_t(imageLevels ? 120 : 85), uint8_t(imageLevels ? 190 : 170), 255};
++  for (int i = 0; i < 4; ++i) memset(header.data() + 54 + 4 * i, levels[i], 3);
++  return out.write(header.data(), header.size()) == header.size();
++}
++
++struct GifRows {
++  HalFile& out;
++  uint8_t* row;
++  int width, height, stride, sourceWidth, sourceHeight;
++  bool failed = false;
++  bool drew = false;
++};
++
++void writeGifRow(GIFDRAW* source) {
++  auto& ctx = *static_cast<GifRows*>(source->pUser);
++  if (ctx.failed) return;
++  const int sourceY = source->iY + source->y;
++  if (sourceY < 0 || sourceY >= ctx.sourceHeight) {
++    ctx.failed = true;
++    return;
++  }
++  ctx.drew = true;
++  const auto scaleY = [&](int y) { return (y * ctx.height + ctx.sourceHeight - 1) / ctx.sourceHeight; };
++  const int first = scaleY(sourceY);
++  const int end = scaleY(sourceY + 1);
++  if (first == end) return;
++  memset(ctx.row, 0xff, ctx.stride);
++  for (int x = 0; x < ctx.width; ++x) {
++    const int pixel = x * ctx.sourceWidth / ctx.width - source->iX;
++    if (pixel < 0 || pixel >= source->iWidth) continue;
++    const uint8_t value = source->pPixels[pixel];
++    if (source->ucHasTransparency && value == source->ucTransparent) continue;
++    const auto* rgb = source->pPalette24 + value * 3;
++    const int gray = (77 * rgb[0] + 150 * rgb[1] + 29 * rgb[2]) >> 8;
++    const int shift = 6 - 2 * (x % 4);
++    ctx.row[x / 4] = (ctx.row[x / 4] & ~(3 << shift)) | (((gray * 3 + 127) / 255) << shift);
++  }
++  ctx.failed = !ctx.out.seek(headerSize + first * ctx.stride);
++  // Interlaced GIFs can deliver rows out of order, so seek to the scaled row.
++  for (int y = first; y < end && !ctx.failed; ++y)
++    ctx.failed = ctx.out.write(ctx.row, ctx.stride) != static_cast<size_t>(ctx.stride);
++}
++}  // namespace
++
++bool SleepGif::toBitmap(const std::string& path, HalFile& output, int maxWidth, int maxHeight, bool imageLevels) {
++  // AnimatedGIF owns its LZW tables. Heap allocation avoids a large stack frame.
++  auto gif = makeUniqueNoThrow<AnimatedGIF>();
++  if (!gif) return false;
++  gif->begin(GIF_PALETTE_RGB888);
++  if (!gif->open(path.c_str(), openGif, closeGif, readGif, seekGif, writeGifRow)) {
++    LOG_ERR("SLP", "Could not open sleep GIF (error %d): %s", gif->getLastError(), path.c_str());
++    gif->close();
++    return false;
++  }
++  const int sourceWidth = gif->getCanvasWidth();
++  const int sourceHeight = gif->getCanvasHeight();
++  // Bound decode time while still allowing tall phone-size backgrounds.
++  if (sourceWidth <= 0 || sourceHeight <= 0 || sourceHeight > 4096 || maxWidth <= 0 || maxHeight <= 0) {
++    gif->close();
++    return false;
++  }
++  const int width = std::max(1, std::min({sourceWidth, maxWidth, sourceWidth * maxHeight / sourceHeight}));
++  const int height = std::max(1, sourceHeight * width / sourceWidth);
++  const int stride = (width + 15) / 16 * 4;
++  auto row = makeUniqueNoThrow<uint8_t[]>(stride);
++  if (!row || !writeHeader(output, width, height, stride, imageLevels)) {
++    gif->close();
++    return false;
++  }
++  // Initialize the canvas for transparent pixels and GIFs whose first frame is
++  // smaller than the canvas. No full image buffer is needed.
++  memset(row.get(), 0xff, stride);
++  for (int y = 0; y < height; ++y) {
++    if (output.write(row.get(), stride) != static_cast<size_t>(stride)) {
++      gif->close();
++      return false;
++    }
++  }
++  GifRows ctx{output, row.get(), width, height, stride, sourceWidth, sourceHeight};
++  const int result = gif->playFrame(false, nullptr, &ctx);
++  const bool success = result >= 0 && ctx.drew && !ctx.failed && gif->getLastError() == GIF_SUCCESS;
++  gif->close();
++  return success;
++}
+diff --git a/src/activities/boot_sleep/SleepGif.h b/src/activities/boot_sleep/SleepGif.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/boot_sleep/SleepGif.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++#include <HalStorage.h>
++
++#include <string>
++
++namespace SleepGif {
++bool toBitmap(const std::string& path, HalFile& output, int maxWidth, int maxHeight, bool imageLevels);
++}
+diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+--- a/src/activities/home/FileBrowserActivity.cpp
++++ b/src/activities/home/FileBrowserActivity.cpp
+@@ -583,9 +583,10 @@
+   }
+   LOG_INF("FileBrowser", "Pinned favorite sleep image: %s", fullPath.c_str());
+
+-  // PNG sleep images only render in Page Overlay mode, so make selecting one
+-  // from the File Browser immediately usable.
+-  if (FsHelpers::hasPngExtension(fullPath) && SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY) {
++  // PNG works directly in Custom and as a fallback in Cover + Custom.
++  if (FsHelpers::hasPngExtension(fullPath) && SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY &&
++      SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM &&
++      SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM) {
+     SETTINGS.sleepScreen = CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY;
+     if (!SETTINGS.saveToFile()) {
+       LOG_ERR("FileBrowser", "Failed to save Page Overlay mode for PNG sleep image");
+@@ -823,7 +824,10 @@
+             return;
+           }
+           case FileBrowserAction::PinFavorite:
+-            if (FsHelpers::hasPngExtension(fullPath)) {
++            if (FsHelpers::hasPngExtension(fullPath) &&
++                SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM &&
++                SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM &&
++                SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY) {
+               startActivityForResult(
+                   std::make_unique<ConfirmationActivity>(renderer, mappedInput, "", tr(STR_PIN_PNG_WARNING)),
+                   [this, fullPath](const ActivityResult& confirmation) {
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -263,12 +263,15 @@
+   input.update();
+   int x = 0;
+   int y = 0;
+-  if (self->scanTouchEnabled() && input.wasScreenTouchDown(x, y)) {
++  const bool touchDown = self->scanTouchEnabled() && input.wasScreenTouchDown(x, y);
++  const bool homeGesture = input.wasHomeGesture();
++  const bool sleepDue = shouldStopLibraryScanForSleep(touchDown || homeGesture);
++  if (touchDown) {
+     // The release must not reach the list as a tap once the scan unwinds.
+     input.suppressCurrentTouchContact();
+     return true;
+   }
+-  if (input.wasHomeGesture()) return true;
++  if (homeGesture || sleepDue) return true;
+   const bool backHeld = input.isPressed(MappedInputManager::Button::Back);
+   if (self->scanBackHeldAtStart) {
+     if (!backHeld) self->scanBackHeldAtStart = false;
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1775,6 +1775,23 @@
+   allowSleepAt = millis() + 2000;
+ }
+
++static unsigned long& inactivityTimestamp() {
++  static unsigned long lastActivityTime = millis();
++  return lastActivityTime;
++}
++
++static bool autoSleepDeadlineReached(const unsigned long now, const unsigned long timeoutMs) {
++  return timeoutMs > 0 && !buttonShortcutController.isQuickLocked() && !gpio.isPressed(HalGPIO::BTN_POWER) &&
++         now - inactivityTimestamp() >= timeoutMs;
++}
++
++bool shouldStopLibraryScanForSleep(const bool touchActivity) {
++  auto& lastActivityTime = inactivityTimestamp();
++  const auto now = millis();
++  if (touchActivity || gpio.wasAnyPressed() || gpio.wasAnyReleased()) lastActivityTime = now;
++  return autoSleepDeadlineReached(now, SETTINGS.getSleepTimeoutMs());
++}
++
+ void loop() {
+   static unsigned long maxLoopDuration = 0;
+   const unsigned long loopStartTime = millis();
+@@ -1841,16 +1858,45 @@
+     logSerial.printf("SCREENSHOT_END\n");
+   }
+
++  int touchX = 0, touchY = 0;
++  const bool touchHeld = mappedInputManager.isScreenTouchHeld(touchX, touchY);
++  static bool hadTouch = false;
++  static bool touchConfirmed = false;
++  static unsigned long touchBeganAt = 0;
++  static int activityTouchX = 0, activityTouchY = 0;
++  const unsigned long now = millis();
++  const bool touchInView = touchHeld && touchX >= 0 && touchY >= 0 && touchX < renderer.getScreenWidth() &&
++                           touchY < renderer.getScreenHeight();
++  if (touchInView && !hadTouch) {
++    touchBeganAt = now;
++    activityTouchX = touchX;
++    activityTouchY = touchY;
++  }
++  // Count sustained contact or deliberate motion. Raw noise at a screen
++  // edge and contacts from a disabled touchscreen should not stop auto-sleep.
++  constexpr unsigned long touchConfirmMs = 25;
++  const bool touchMoved = touchInView && hadTouch &&
++                          (abs(touchX - activityTouchX) + abs(touchY - activityTouchY) >= 4);
++  const bool touchSettled = touchInView && !touchConfirmed && (touchMoved || now - touchBeganAt >= touchConfirmMs);
++  if (touchMoved) {
++    activityTouchX = touchX;
++    activityTouchY = touchY;
++  }
++  const bool touchReleased = hadTouch && !touchHeld && (touchConfirmed || now - touchBeganAt >= touchConfirmMs);
++  touchConfirmed = touchHeld && (touchConfirmed || touchSettled);
++  hadTouch = touchInView || (hadTouch && touchHeld);
++
+   // Notify the active activity before global shortcut and gesture routes consume
+   // the input and skip its loop() for this frame.
+-  const bool userInputReceived = gpio.wasAnyPressed() || gpio.wasAnyReleased()
++  const bool userInputReceived = gpio.wasAnyPressed() || gpio.wasAnyReleased() || touchMoved || touchSettled ||
++                                 touchReleased
+ #if CROSSINK_APP_CAP_TOUCH
+-                                 || gpio.wasTouchActivity()
++                                 || gpio.wasHomeKeyPressed() || gpio.wasHomeKeyTapped() || gpio.wasHomeKeyLongPressed()
+ #endif
+                                  || halTiltSensor.hadActivity();
+
+   // Check for any user activity (button press or release) or active background work
+-  static unsigned long lastActivityTime = millis();
++  auto& lastActivityTime = inactivityTimestamp();
+   if (userInputReceived || activityManager.preventAutoSleep()) {
+     lastActivityTime = millis();         // Reset inactivity timer
+     powerManager.setPowerSaving(false);  // Restore normal CPU frequency on user activity
+@@ -1864,6 +1910,17 @@
+   // a page turn, refresh, or other short power-button action.
+   if (wakePowerReleasePending && !gpio.isPressed(HalGPIO::BTN_POWER)) {
+     wakePowerReleasePending = false;
++    return;
++  }
++
++  // Check the deadline before routing shortcuts. A consumed input frame
++  // can return early, but only a new input edge should extend the deadline.
++  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
++  const bool checkingTouch = touchInView && !touchConfirmed && now - touchBeganAt < touchConfirmMs;
++  if (!checkingTouch && autoSleepDeadlineReached(millis(), sleepTimeoutMs)) {
++    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
++    enterDeepSleep(true);
++    lastActivityTime = millis();  // Deep sleep returns only in the simulator.
+     return;
+   }
+
+@@ -1888,10 +1945,11 @@
+   const auto sideButtonShortcutResult = buttonShortcutController.updateUpDown(
+       millis(), gpio.isPressed(HalGPIO::BTN_UP), gpio.isPressed(HalGPIO::BTN_DOWN), configuredSideButtonChordAction(),
+       touchscreenEscapeHatch, modalOwnsInput);
+-  if (dispatchButtonShortcut(sideButtonShortcutResult) || sideButtonShortcutResult.consumeInput) {
++  if (dispatchButtonShortcut(sideButtonShortcutResult)) {
+     lastActivityTime = millis();
+     return;
+   }
++  if (sideButtonShortcutResult.consumeInput) return;
+
+   const bool powerPressed = gpio.isPressed(HalGPIO::BTN_POWER);
+   const bool chordButtonPressed = gpio.isPressed(HalGPIO::BTN_UP);
+@@ -1936,7 +1994,6 @@
+       lastActivityTime = millis();
+       return;
+     }
+-    const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+     if (sleepTimeoutMs > 0 && buttonShortcutController.shouldQuickLockSleep(millis(), sleepTimeoutMs)) {
+       LOG_DBG("SLP", "Quick Lock timeout triggered after %lu ms", sleepTimeoutMs);
+       APP_STATE.quickLockResumePending = true;
+@@ -1949,6 +2006,12 @@
+       lastActivityTime = millis();
+     }
+     mappedInputManager.clearInjectedReleases();
++    // Quick Lock bypasses the normal idle loop below. Yield between unlock
++    // polls and apply the same clock reduction while the display is static.
++    if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
++      powerManager.setPowerSaving(true);
++    }
++    delay(20);
+     return;
+   }
+
+@@ -1968,16 +2031,5 @@
+   if (handleX4ProHomeKeyShortcuts()) {
+     // Simulator Home-key events bypass HalGPIO's raw touch activity signal.
+     activityManager.notifyUserInput();
+-    return;
+-  }
+-
+-  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+-    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
+-    enterDeepSleep(true);
+-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+-    // In the simulator, deep sleep is a no-op and returns — reset the timer so
+-    // the main loop does not immediately re-trigger auto-sleep.
+-    lastActivityTime = millis();
+     return;
+   }

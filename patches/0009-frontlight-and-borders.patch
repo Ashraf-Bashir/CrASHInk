@@ -1,0 +1,1137 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,11 +12,15 @@
+
+ ### Fixed
+
++- Light-leak border widths can be increased or decreased directly in Display settings.
++
+ - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
+
+ - Image refresh blanks each image separately, keeping text between inline images visible while images are prepared for display. Pending images use an empty background instead of a temporary box border.
+
+ - Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
++
++- SD firmware restarts retain the current frontlight levels and on/off state instead of applying wake scheduling. Highlight controls stay black on white in dark mode. On-page drag editing respects exact highlight endpoints and uses a flat toolbar with thicker icons.
+
+ - Saved highlights stop at the selected text before a joined dash; the floating Edit/Delete toolbar has larger high-contrast icons. Highlights also continue across page breaks inside hyphenated words, without changing saved clipping text.
+
+diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlock.cpp
+--- a/lib/Epub/Epub/blocks/ImageBlock.cpp
++++ b/lib/Epub/Epub/blocks/ImageBlock.cpp
+@@ -57,23 +57,24 @@
+
+   const int s0 = renderer.getWriteOriginY();
+   const int s1 = s0 + renderer.getWriteRows();
+-  const int h = renderer.getDisplayHeight();
++  int panelX, originY;
++  renderer.screenToPanel(0, 0, panelX, originY);
+   switch (renderer.getOrientation()) {
+     case GfxRenderer::LandscapeCounterClockwise:
+-      clip.y0 = std::max(clip.y0, s0 - y);
+-      clip.y1 = std::min(clip.y1, s1 - y);
++      clip.y0 = std::max(clip.y0, s0 - originY - y);
++      clip.y1 = std::min(clip.y1, s1 - originY - y);
+       break;
+     case GfxRenderer::LandscapeClockwise:
+-      clip.y0 = std::max(clip.y0, h - s1 - y);
+-      clip.y1 = std::min(clip.y1, h - s0 - y);
++      clip.y0 = std::max(clip.y0, originY + 1 - s1 - y);
++      clip.y1 = std::min(clip.y1, originY + 1 - s0 - y);
+       break;
+     case GfxRenderer::Portrait:
+-      clip.x0 = std::max(clip.x0, h - s1 - x);
+-      clip.x1 = std::min(clip.x1, h - s0 - x);
++      clip.x0 = std::max(clip.x0, originY + 1 - s1 - x);
++      clip.x1 = std::min(clip.x1, originY + 1 - s0 - x);
+       break;
+     case GfxRenderer::PortraitInverted:
+-      clip.x0 = std::max(clip.x0, s0 - x);
+-      clip.x1 = std::min(clip.x1, s1 - x);
++      clip.x0 = std::max(clip.x0, s0 - originY - x);
++      clip.x1 = std::min(clip.x1, s1 - originY - x);
+       break;
+   }
+   return clip;
+diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/converters/DirectPixelWriter.h
+--- a/lib/Epub/Epub/converters/DirectPixelWriter.h
++++ b/lib/Epub/Epub/converters/DirectPixelWriter.h
+@@ -44,56 +44,14 @@
+     contrast = imageContrast;
+     displayWidthBytes = renderer.getDisplayWidthBytes();
+
+-    const int phyW = renderer.getDisplayWidth();
+-    const int phyH = renderer.getDisplayHeight();
+-
+-    switch (renderer.getOrientation()) {
+-      case GfxRenderer::Portrait:
+-        // phyX = y, phyY = (phyH-1) - x
+-        phyXBase = 0;
+-        phyYBase = phyH - 1;
+-        phyXStepX = 0;
+-        phyYStepX = -1;
+-        phyXStepY = 1;
+-        phyYStepY = 0;
+-        break;
+-      case GfxRenderer::LandscapeClockwise:
+-        // phyX = (phyW-1) - x, phyY = (phyH-1) - y
+-        phyXBase = phyW - 1;
+-        phyYBase = phyH - 1;
+-        phyXStepX = -1;
+-        phyYStepX = 0;
+-        phyXStepY = 0;
+-        phyYStepY = -1;
+-        break;
+-      case GfxRenderer::PortraitInverted:
+-        // phyX = (phyW-1) - y, phyY = x
+-        phyXBase = phyW - 1;
+-        phyYBase = 0;
+-        phyXStepX = 0;
+-        phyYStepX = 1;
+-        phyXStepY = -1;
+-        phyYStepY = 0;
+-        break;
+-      case GfxRenderer::LandscapeCounterClockwise:
+-        // phyX = x, phyY = y
+-        phyXBase = 0;
+-        phyYBase = 0;
+-        phyXStepX = 1;
+-        phyYStepX = 0;
+-        phyXStepY = 0;
+-        phyYStepY = 1;
+-        break;
+-      default:
+-        // Fallback to LandscapeCounterClockwise (identity transform)
+-        phyXBase = 0;
+-        phyYBase = 0;
+-        phyXStepX = 1;
+-        phyYStepX = 0;
+-        phyXStepY = 0;
+-        phyYStepY = 1;
+-        break;
+-    }
++    int nextX, nextY;
++    renderer.screenToPanel(0, 0, phyXBase, phyYBase);
++    renderer.screenToPanel(1, 0, nextX, nextY);
++    phyXStepX = nextX - phyXBase;
++    phyYStepX = nextY - phyYBase;
++    renderer.screenToPanel(0, 1, nextX, nextY);
++    phyXStepY = nextX - phyXBase;
++    phyYStepY = nextY - phyYBase;
+   }
+
+   // Call once per row before the column loop.
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -406,6 +406,11 @@
+       break;
+     }
+   }
++}
++
++void GfxRenderer::screenToPanel(const int x, const int y, int& panelX, int& panelY) const {
++  rotateCoordinates(orientation, x + viewportBorder.left, y + viewportBorder.top, &panelX, &panelY, panelWidth,
++                    panelHeight);
+ }
+
+ struct AlignedMemRect {
+@@ -959,12 +964,12 @@
+   // rotating its neighbours along each logical axis. Together these encode
+   // the text rotation and the panel orientation as one orthogonal transform.
+   glyphBitmap::Frame& physical = target.frame;
+-  rotateCoordinates(orientation, frame.x, frame.y, &physical.x, &physical.y, panelWidth, panelHeight);
++  screenToPanel(frame.x, frame.y, physical.x, physical.y);
+   int nextX, nextY;
+-  rotateCoordinates(orientation, frame.x + frame.dxX, frame.y + frame.dxY, &nextX, &nextY, panelWidth, panelHeight);
++  screenToPanel(frame.x + frame.dxX, frame.y + frame.dxY, nextX, nextY);
+   physical.dxX = nextX - physical.x;
+   physical.dxY = nextY - physical.y;
+-  rotateCoordinates(orientation, frame.x + frame.dyX, frame.y + frame.dyY, &nextX, &nextY, panelWidth, panelHeight);
++  screenToPanel(frame.x + frame.dyX, frame.y + frame.dyY, nextX, nextY);
+   physical.dyX = nextX - physical.x;
+   physical.dyY = nextY - physical.y;
+
+@@ -979,7 +984,7 @@
+ bool GfxRenderer::isPixelBlack(const int x, const int y) const {
+   int phyX = 0;
+   int phyY = 0;
+-  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
++  screenToPanel(x, y, phyX, phyY);
+   if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) {
+     return false;
+   }
+@@ -1008,7 +1013,7 @@
+   int phyY = 0;
+
+   // Note: this call should be inlined for better performance
+-  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
++  screenToPanel(x, y, phyX, phyY);
+
+   // Text glyphs and shapes may cross a clipping edge. This is a per-pixel hot
+   // path, so logging here can turn one off-screen glyph into thousands of slow
+@@ -1604,8 +1609,8 @@
+   // The bounding rect in physical space is the rect we need to fill — rotation
+   // is rigid (no shear/stretch) so the bbox of the two corners IS the rect.
+   int paX, paY, pbX, pbY;
+-  rotateCoordinates(orientation, lx0, ly0, &paX, &paY, panelWidth, panelHeight);
+-  rotateCoordinates(orientation, lx1 - 1, ly1 - 1, &pbX, &pbY, panelWidth, panelHeight);
++  screenToPanel(lx0, ly0, paX, paY);
++  screenToPanel(lx1 - 1, ly1 - 1, pbX, pbY);
+
+   const int phyX0 = std::min(paX, pbX);
+   const int phyX1 = std::max(paX, pbX);  // inclusive
+@@ -1911,7 +1916,7 @@
+ void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+   int rotatedX = 0;
+   int rotatedY = 0;
+-  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY, panelWidth, panelHeight);
++  screenToPanel(x, y, rotatedX, rotatedY);
+   // Rotate origin corner
+   switch (orientation) {
+     case Portrait:
+@@ -1935,7 +1940,7 @@
+                                     const int height) const {
+   int rotatedX = 0;
+   int rotatedY = 0;
+-  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY, panelWidth, panelHeight);
++  screenToPanel(x, y, rotatedX, rotatedY);
+   switch (orientation) {
+     case Portrait:
+       rotatedY = rotatedY - height;
+@@ -1978,8 +1983,20 @@
+   // Portrait-mode coordinate transform (x<->y swap). Draw black source pixels
+   // transparently while preserving sub-byte x offsets; EInkDisplay's transparent
+   // blit is byte-aligned, which can visually shift icons when y is not /8.
+-  const int physX = y;
+-  const int physY = getScreenWidth() - width - x;
++  if (orientation != Portrait && (viewportBorder.top || viewportBorder.right ||
++                                 viewportBorder.bottom || viewportBorder.left)) {
++    const int stride = (height + 7) / 8;
++    for (int row = 0; row < width; ++row) {
++      for (int col = 0; col < height; ++col) {
++        if (!(bitmap[row * stride + col / 8] & (0x80 >> (col & 7))))
++          drawPixel(x + width - 1 - row, y + col, true);
++      }
++    }
++    return;
++  }
++  const int physX = y + viewportBorder.top;
++  const int rawWidth = orientation == Portrait || orientation == PortraitInverted ? panelHeight : panelWidth;
++  const int physY = rawWidth - width - x - viewportBorder.left;
+   const int imgW = height;
+   const int imgH = width;
+   const int srcStride = (imgW + 7) / 8;
+@@ -2038,8 +2055,20 @@
+   // Portrait-mode coordinate transform (x<->y swap), matching drawIcon.
+   // OR with ~srcByte sets framebuffer bits to 1 (white) wherever the icon
+   // bitmap is 0 (black), producing a white icon on a black background.
+-  const int physX = y;
+-  const int physY = getScreenWidth() - width - x;
++  if (orientation != Portrait && (viewportBorder.top || viewportBorder.right ||
++                                 viewportBorder.bottom || viewportBorder.left)) {
++    const int stride = (height + 7) / 8;
++    for (int row = 0; row < width; ++row) {
++      for (int col = 0; col < height; ++col) {
++        if (!(bitmap[row * stride + col / 8] & (0x80 >> (col & 7))))
++          drawPixel(x + width - 1 - row, y + col, false);
++      }
++    }
++    return;
++  }
++  const int physX = y + viewportBorder.top;
++  const int rawWidth = orientation == Portrait || orientation == PortraitInverted ? panelHeight : panelWidth;
++  const int physY = rawWidth - width - x - viewportBorder.left;
+   const int imgW = height;
+   const int imgH = width;
+   const int srcStride = (imgW + 7) / 8;
+@@ -2425,8 +2454,8 @@
+   // orientations the physical bbox stays axis-aligned, so min/max of the two
+   // rotated corners' Y bounds the glyph's physical y-extent.
+   int ax, ay, bx, by;
+-  rotateCoordinates(orientation, x0, y0, &ax, &ay, panelWidth, panelHeight);
+-  rotateCoordinates(orientation, x1, y1, &bx, &by, panelWidth, panelHeight);
++  screenToPanel(x0, y0, ax, ay);
++  screenToPanel(x1, y1, bx, by);
+   const int minY = ay < by ? ay : by;
+   const int maxY = ay > by ? ay : by;
+   return !(maxY < _stripY0 || minY >= _stripY0 + _stripRows);
+@@ -2449,8 +2478,8 @@
+   if (lx0 >= lx1 || ly0 >= ly1) return;
+
+   int paX, paY, pbX, pbY;
+-  rotateCoordinates(orientation, lx0, ly0, &paX, &paY, panelWidth, panelHeight);
+-  rotateCoordinates(orientation, lx1 - 1, ly1 - 1, &pbX, &pbY, panelWidth, panelHeight);
++  screenToPanel(lx0, ly0, paX, paY);
++  screenToPanel(lx1 - 1, ly1 - 1, pbX, pbY);
+
+   const int phyX0 = std::min(paX, pbX);
+   const int phyX1 = std::max(paX, pbX);
+@@ -2499,7 +2528,7 @@
+                                           size_t dstCapacity) const {
+   if (frameBuffer == nullptr || dst == nullptr || w == 0 || h == 0) return 0;
+
+-  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
++  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x + viewportBorder.left, y + viewportBorder.top, w, h, panelWidth, panelHeight);
+   if (!mem.valid) return 0;
+
+   const size_t rowBytes = mem.w / 8;
+@@ -2517,7 +2546,7 @@
+ void GfxRenderer::writeFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t* src) {
+   if (frameBuffer == nullptr || src == nullptr || w == 0 || h == 0) return;
+
+-  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
++  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x + viewportBorder.left, y + viewportBorder.top, w, h, panelWidth, panelHeight);
+   if (!mem.valid) return;
+
+   const size_t rowBytes = mem.w / 8;
+@@ -2655,33 +2684,32 @@
+   return lines;
+ }
+
+-// Note: Internal driver treats screen in command orientation; this library exposes a logical orientation
++void GfxRenderer::setOrientation(const Orientation value) {
++  orientation = value;
++  const auto& b = portraitBorder;
++  switch (orientation) {
++    case Portrait: viewportBorder = b; break;
++    case LandscapeClockwise: viewportBorder = {b.left, b.top, b.right, b.bottom}; break;
++    case PortraitInverted: viewportBorder = {b.bottom, b.left, b.top, b.right}; break;
++    case LandscapeCounterClockwise: viewportBorder = {b.right, b.bottom, b.left, b.top}; break;
++  }
++}
++
++void GfxRenderer::setLightLeakBorder(const uint8_t top, const uint8_t right, const uint8_t bottom, const uint8_t left) {
++  portraitBorder = {std::min<int>(top, 16), std::min<int>(right, 16), std::min<int>(bottom, 16),
++                    std::min<int>(left, 16)};
++  setOrientation(orientation);
++  display.setLightLeakBorder(top, right, bottom, left);
++}
++
+ int GfxRenderer::getScreenWidth() const {
+-  switch (orientation) {
+-    case Portrait:
+-    case PortraitInverted:
+-      // 480px wide in portrait logical coordinates
+-      return panelHeight;
+-    case LandscapeClockwise:
+-    case LandscapeCounterClockwise:
+-      // 800px wide in landscape logical coordinates
+-      return panelWidth;
+-  }
+-  return panelHeight;
++  const int width = orientation == Portrait || orientation == PortraitInverted ? panelHeight : panelWidth;
++  return width - viewportBorder.left - viewportBorder.right;
+ }
+
+ int GfxRenderer::getScreenHeight() const {
+-  switch (orientation) {
+-    case Portrait:
+-    case PortraitInverted:
+-      // 800px tall in portrait logical coordinates
+-      return panelWidth;
+-    case LandscapeClockwise:
+-    case LandscapeCounterClockwise:
+-      // 480px tall in landscape logical coordinates
+-      return panelHeight;
+-  }
+-  return panelWidth;
++  const int height = orientation == Portrait || orientation == PortraitInverted ? panelWidth : panelHeight;
++  return height - viewportBorder.top - viewportBorder.bottom;
+ }
+
+ void GfxRenderer::tapToLogical(float nx, float ny, int& outX, int& outY) const {
+@@ -2711,6 +2739,8 @@
+       outY = phyY;
+       break;
+   }
++  outX -= viewportBorder.left;
++  outY -= viewportBorder.top;
+ }
+
+ // Translate a logical rect through rotateCoordinates and take the bounding
+@@ -2748,7 +2778,8 @@
+
+ size_t GfxRenderer::getRegionByteSize(int lx, int ly, int lw, int lh) const {
+   int x0, y0, x1, y1;
+-  if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
++  if (!logicalRectToPhysicalBounds(orientation, lx + viewportBorder.left, ly + viewportBorder.top, lw, lh,
++                                   panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
+     return 0;
+   }
+   // x bounds are in pixels; widen to byte boundaries on either side so per-row
+@@ -2762,7 +2793,8 @@
+
+ bool GfxRenderer::copyRegionToBuffer(int lx, int ly, int lw, int lh, uint8_t* buf, size_t bufSize) const {
+   int x0, y0, x1, y1;
+-  if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
++  if (!logicalRectToPhysicalBounds(orientation, lx + viewportBorder.left, ly + viewportBorder.top, lw, lh,
++                                   panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
+     return false;
+   }
+   const int byteX0 = x0 / 8;
+@@ -2780,7 +2812,8 @@
+
+ bool GfxRenderer::copyBufferToRegion(int lx, int ly, int lw, int lh, const uint8_t* buf, size_t bufSize) const {
+   int x0, y0, x1, y1;
+-  if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
++  if (!logicalRectToPhysicalBounds(orientation, lx + viewportBorder.left, ly + viewportBorder.top, lw, lh,
++                                   panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
+     return false;
+   }
+   const int byteX0 = x0 / 8;
+@@ -3218,8 +3251,8 @@
+   // Rotate the logical rect's opposite corners to physical panel coords; the
+   // physical bbox stays axis-aligned for all four orientations.
+   int ax, ay, bx, by;
+-  rotateCoordinates(orientation, x, y, &ax, &ay, panelWidth, panelHeight);
+-  rotateCoordinates(orientation, x + w - 1, y + h - 1, &bx, &by, panelWidth, panelHeight);
++  screenToPanel(x, y, ax, ay);
++  screenToPanel(x + w - 1, y + h - 1, bx, by);
+   int x0 = ax < bx ? ax : bx, x1 = ax > bx ? ax : bx;
+   int y0 = ay < by ? ay : by, y1 = ay > by ? ay : by;
+   if (x0 < 0) x0 = 0;
+@@ -3250,9 +3283,10 @@
+   absoluteGrayPlanes = false;
+ }
+
+-void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const {
++void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, uint8_t* scratch, int yStart, int numRows) const {
+   // Guard the uint16_t casts below: a negative would wrap to a huge length.
+   assert(yStart >= 0 && numRows > 0 && yStart <= static_cast<int>(panelHeight) - numRows);
++  display.maskLightLeakBorder(scratch, static_cast<uint16_t>(yStart), static_cast<uint16_t>(numRows), false);
+   display.writeGrayscalePlaneStrip(lsbPlane, scratch, static_cast<uint16_t>(yStart), static_cast<uint16_t>(numRows));
+ }
+
+@@ -3379,6 +3413,10 @@
+       *outLeft = VIEWABLE_MARGIN_TOP;
+       break;
+   }
++  *outTop = std::max(0, *outTop - viewportBorder.top);
++  *outRight = std::max(0, *outRight - viewportBorder.right);
++  *outBottom = std::max(0, *outBottom - viewportBorder.bottom);
++  *outLeft = std::max(0, *outLeft - viewportBorder.left);
+ }
+
+ bool GfxRenderer::supportsAbsoluteGrayscale() const {
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -53,6 +53,11 @@
+   RenderMode renderMode;
+   mutable bool absoluteGrayPlanes = false;
+   Orientation orientation;
++  struct BorderInsets {
++    int top = 0, right = 0, bottom = 0, left = 0;
++  };
++  BorderInsets portraitBorder;
++  BorderInsets viewportBorder;
+   bool fadingFix;
+   uint8_t* frameBuffer = nullptr;
+   uint16_t panelWidth = HalDisplay::DISPLAY_WIDTH;
+@@ -209,7 +214,10 @@
+   bool releaseSdCardFontForLowMemory(int fontId, bool preserveAdvanceTable = false) const;
+
+   // Orientation control (affects logical width/height and coordinate transforms)
+-  void setOrientation(const Orientation o) { orientation = o; }
++  const BorderInsets& getLightLeakInsets() const { return viewportBorder; }
++  void setOrientation(Orientation o);
++  void setLightLeakBorder(uint8_t top, uint8_t right, uint8_t bottom, uint8_t left);
++  void screenToPanel(int x, int y, int& panelX, int& panelY) const;
+   Orientation getOrientation() const { return orientation; }
+
+   // Fading fix control
+@@ -397,7 +405,7 @@
+   void copyGrayscaleLsbBuffers(uint8_t* plane = nullptr) const;
+   void copyGrayscaleMsbBuffers(uint8_t* plane = nullptr) const;
+   void displayGrayBuffer(bool turnOffScreen = false) const;
+-  void writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const;
++  void writeGrayscalePlaneStrip(bool lsbPlane, uint8_t* scratch, int yStart, int numRows) const;
+   bool shouldSkipImageBlanking() const;
+   bool supportsStripGrayscale() const;
+   bool storeBwBuffer();    // Returns true if buffer was stored successfully
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -137,6 +137,10 @@
+ STR_CAT_READER: "Reader"
+ STR_CAT_CONTROLS: "Controls"
+ STR_CAT_SYSTEM: "System"
++STR_LIGHT_LEAK_TOP: "Top black border (px)"
++STR_LIGHT_LEAK_RIGHT: "Right black border (px)"
++STR_LIGHT_LEAK_BOTTOM: "Bottom black border (px)"
++STR_LIGHT_LEAK_LEFT: "Left black border (px)"
+ STR_STATUS_BAR_ICONS: "Status Bar Icons"
+ STR_ICON_FRONTLIGHT: "Frontlight shortcut"
+ STR_ICON_TOUCHSCREEN: "Touchscreen toggle"
+diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
+--- a/lib/hal/HalDisplay.cpp
++++ b/lib/hal/HalDisplay.cpp
+@@ -2,6 +2,9 @@
+ #include <HalGPIO.h>
+
+ #include "HalSpiBus.h"
++
++#include <algorithm>
++#include <cstring>
+
+ namespace {
+ template <typename Display>
+@@ -72,7 +75,51 @@
+   }
+ }
+
++void HalDisplay::setLightLeakBorder(const uint8_t top, const uint8_t right, const uint8_t bottom, const uint8_t left) {
++  lightLeakTop = std::min<uint8_t>(top, 16);
++  lightLeakRight = std::min<uint8_t>(right, 16);
++  lightLeakBottom = std::min<uint8_t>(bottom, 16);
++  lightLeakLeft = std::min<uint8_t>(left, 16);
++}
++
++void HalDisplay::maskLightLeakBorder(uint8_t* buffer, const uint16_t firstRow, const uint16_t rows,
++                                    const bool whiteBits) const {
++  if (!buffer || !(lightLeakTop || lightLeakRight || lightLeakBottom || lightLeakLeft)) return;
++  // Keep the mask on the same physical panel edges when the book rotates.
++  // Portrait top/right/bottom/left become panel left/top/right/bottom.
++  const uint16_t stride = getDisplayWidthBytes();
++  const uint16_t height = getDisplayHeight();
++  const bool landscapeBuffer = getDisplayWidth() > height;
++  const uint8_t top = landscapeBuffer ? lightLeakRight : lightLeakTop;
++  const uint8_t right = landscapeBuffer ? lightLeakBottom : lightLeakRight;
++  const uint8_t bottom = landscapeBuffer ? lightLeakLeft : lightLeakBottom;
++  const uint8_t left = landscapeBuffer ? lightLeakTop : lightLeakLeft;
++  const auto apply = [whiteBits](uint8_t& byte, uint8_t bits) {
++    if (whiteBits) byte |= bits;
++    else byte &= static_cast<uint8_t>(~bits);
++  };
++  for (uint16_t row = 0; row < rows; ++row) {
++    auto* line = buffer + static_cast<size_t>(row) * stride;
++    const int physicalY = firstRow + row;
++    if (physicalY < top || physicalY >= height - bottom) {
++      memset(line, whiteBits ? 0xff : 0, stride);
++      continue;
++    }
++    if (left >= 8) apply(line[0], 0xff);
++    if (left % 8) apply(line[left / 8], static_cast<uint8_t>(0xff << (8 - left % 8)));
++    if (left == 16) apply(line[1], 0xff);
++    if (right >= 8) apply(line[stride - 1], 0xff);
++    if (right % 8) apply(line[stride - 1 - right / 8], static_cast<uint8_t>((1u << (right % 8)) - 1));
++    if (right == 16) apply(line[stride - 2], 0xff);
++  }
++}
++
++void HalDisplay::maskBwLightLeakBorder() {
++  maskLightLeakBorder(getFrameBuffer(), 0, getDisplayHeight(), isInverted());
++}
++
+ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
++  maskBwLightLeakBorder();
+   HalSpiBus::Lock spiLock;
+
+   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+@@ -97,6 +144,7 @@
+ }
+
+ void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
++  maskBwLightLeakBorder();
+   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+     einkDisplay.requestResync(1);
+   }
+@@ -115,12 +163,14 @@
+ bool HalDisplay::supportsAsyncGrayscaleBase() const { return grayscaleCapabilities().asyncBase; }
+
+ bool HalDisplay::displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback, bool turnOffScreen) {
++  maskBwLightLeakBorder();
+   HalSpiBus::Lock spiLock;
+   if (gpio.deviceIsX3() && fallback == HALF_REFRESH) einkDisplay.requestResync(1);
+   return einkDisplay.displayGrayscaleBase(mode, convertRefreshMode(fallback), turnOffScreen);
+ }
+
+ void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
++  maskBwLightLeakBorder();
+   HalSpiBus::Lock spiLock;
+
+   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+@@ -148,6 +198,7 @@
+ }
+
+ void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
++  maskBwLightLeakBorder();
+   // X3: a HALF or FULL fallback means the caller wants a clean base (e.g. the
+   // sleep cover, a full-screen swap from arbitrary prior content). Without
+   // this, the X3 grayscale base takes its gentle differential happy path and
+diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
+--- a/lib/hal/HalDisplay.h
++++ b/lib/hal/HalDisplay.h
+@@ -47,6 +47,8 @@
+   // Persistently invert panel output while leaving framebuffer drawing in its
+   // normal logical colors.
+   void setInverted(bool inverted);
++  void setLightLeakBorder(uint8_t top, uint8_t right, uint8_t bottom, uint8_t left);
++  void maskLightLeakBorder(uint8_t* buffer, uint16_t firstRow, uint16_t rows, bool whiteBits) const;
+   // Restore the controller's old-image plane from the saved Quick Resume frame.
+   // Only supported panels may use a gentle differential first paint.
+   bool restoreVisibleFrame();
+@@ -119,6 +121,11 @@
+   uint32_t getBufferSize() const;
+
+  private:
++  void maskBwLightLeakBorder();
++  uint8_t lightLeakTop = 0;
++  uint8_t lightLeakRight = 0;
++  uint8_t lightLeakBottom = 0;
++  uint8_t lightLeakLeft = 0;
+   EInkDisplay einkDisplay;
+ };
+
+diff --git a/lib/hal/HalFrontlight.cpp b/lib/hal/HalFrontlight.cpp
+--- a/lib/hal/HalFrontlight.cpp
++++ b/lib/hal/HalFrontlight.cpp
+@@ -1,6 +1,12 @@
+ #include "HalFrontlight.h"
+
++#include <BoardConfig.h>
+ #include <Logging.h>
++
++#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
++#include <Arduino.h>
++#include <driver/gpio.h>
++#endif
+
+ HalFrontlight HalFrontlight::instance;
+
+@@ -8,6 +14,14 @@
+   if (!manager.present()) {
+     return;
+   }
++#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
++  if (BoardConfig::isX4Pro()) {
++    const auto& pins = BoardConfig::ACTIVE.frontlight;
++    for (const int8_t pin : {pins.gpio, pins.gpioWarm}) {
++      if (pin >= 0) gpio_hold_dis(static_cast<gpio_num_t>(pin));
++    }
++  }
++#endif
+   manager.begin();
+   lastBrightness = brightness > 100 ? 100 : brightness;
+   manager.setColorTemperature(warmth > 100 ? 100 : warmth);
+@@ -34,3 +48,22 @@
+   lit = on;
+   manager.setBrightness(lit ? lastBrightness : 0);
+ }
++
++void HalFrontlight::prepareForDeepSleep() {
++  if (!manager.present()) return;
++  setOn(false);
++#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
++  if (BoardConfig::isX4Pro()) {
++    // Keep the normal PWM clock for the board's 25 kHz, 10-bit frontlight.
++    // Deep sleep only needs the LED pins detached and held at the off level.
++    const auto& pins = BoardConfig::ACTIVE.frontlight;
++    for (const int8_t pin : {pins.gpio, pins.gpioWarm}) {
++      if (pin < 0) continue;
++      ledcDetach(pin);
++      pinMode(pin, OUTPUT);
++      digitalWrite(pin, pins.activeHigh ? LOW : HIGH);
++      gpio_hold_en(static_cast<gpio_num_t>(pin));
++    }
++  }
++#endif
++}
+diff --git a/lib/hal/HalFrontlight.h b/lib/hal/HalFrontlight.h
+--- a/lib/hal/HalFrontlight.h
++++ b/lib/hal/HalFrontlight.h
+@@ -22,6 +22,7 @@
+   // Warm/cool mix, 0 = cool .. 100 = warm. No-op on single-channel boards.
+   void setWarmth(uint8_t warmPercent);
+   void setOn(bool on);
++  void prepareForDeepSleep();
+
+   uint8_t brightness() const { return lastBrightness; }
+   uint8_t warmth() const { return manager.colorTemperature(); }
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -442,6 +442,10 @@
+   uint8_t screenInverted = 0;
+   enum HIGHLIGHT_COLOR : uint8_t { HIGHLIGHT_LIGHT_GREY, HIGHLIGHT_DARK_GREY, HIGHLIGHT_SOLID };
+   uint8_t highlightColor = HIGHLIGHT_LIGHT_GREY;
++  uint8_t lightLeakTop = 0;
++  uint8_t lightLeakRight = 0;
++  uint8_t lightLeakBottom = 0;
++  uint8_t lightLeakLeft = 0;
+   // Readest Auto-Sync: sync the open book with Readest on open, close, wake and sleep.
+   uint8_t readestAutoSync = 0;
+   // Sleep screen cover mode settings
+diff --git a/src/MappedInputManager.cpp b/src/MappedInputManager.cpp
+--- a/src/MappedInputManager.cpp
++++ b/src/MappedInputManager.cpp
+@@ -621,8 +621,11 @@
+     return progress.finished;
+   }
+
+-  const int width = renderer.getScreenWidth();
+-  const int height = renderer.getScreenHeight();
++  // Side gestures follow the complete touch panel, including masked pixels.
++  // Other gesture and control coordinates remain relative to the content.
++  const auto& border = renderer.getLightLeakInsets();
++  const int width = renderer.getScreenWidth() + border.left + border.right;
++  const int height = renderer.getScreenHeight() + border.top + border.bottom;
+   if (width < 2 || height < 2) {
+     progress.finished = edgeSlideSide != EdgeSlide::None;
+     edgeSlideSide = EdgeSlide::None;
+@@ -632,6 +635,7 @@
+   int x = 0;
+   int y = 0;
+   if (wasScreenTouchDown(x, y)) {
++    x += border.left;
+     edgeSlideSide = x < band ? EdgeSlide::LeftUp : (x >= width - band ? EdgeSlide::RightUp : EdgeSlide::None);
+     edgeSlideStartX = x;
+     edgeSlideStartY = y;
+@@ -647,6 +651,7 @@
+     return true;
+   }
+   if (isScreenTouchHeld(x, y)) {
++    x += border.left;
+     if ((edgeSlideSide == EdgeSlide::LeftUp && x >= band) ||
+         (edgeSlideSide == EdgeSlide::RightUp && x < width - band)) {
+       edgeSlideSide = EdgeSlide::None;
+@@ -670,7 +675,9 @@
+   progress.finished = true;
+   int startX = 0;
+   int startY = 0;
+-  if (!decodeSwipe(startX, startY, x, y)) {
++  if (decodeSwipe(startX, startY, x, y)) {
++    x += border.left;
++  } else {
+     if (!edgeSlideQualified) {
+       edgeSlideSide = EdgeSlide::None;
+       return true;
+diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+--- a/src/activities/home/FileBrowserActivity.cpp
++++ b/src/activities/home/FileBrowserActivity.cpp
+@@ -1447,6 +1447,7 @@
+ }
+
+ void FileBrowserActivity::render(RenderLock&&) {
++  app.setDevice(uiTarget.deviceContext());
+   renderer.clearScreen();
+
+   const auto pageWidth = renderer.getScreenWidth();
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -1411,6 +1411,7 @@
+ }
+
+ void LibraryActivity::render(RenderLock&&) {
++  app.setDevice(uiTarget.deviceContext());
+   uiReady = false;
+   if (initialScanPending) {
+     drawScanScreen(tr(STR_LIBRARY_SCANNING));
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -6356,6 +6356,10 @@
+       renderer, automaticPageTurnActive, activeFootnotePreview || !pendingFootnotePreviewAnchor.empty());
+   const uint16_t viewportWidth = layout.viewportWidth;
+   const uint16_t viewportHeight = layout.viewportHeight;
++  if (section && (viewportWidth != buildViewportWidth || viewportHeight != buildViewportHeight)) {
++    prepareCurrentSectionForRelayout();
++    section.reset();
++  }
+   buildViewportWidth = viewportWidth;
+   buildViewportHeight = viewportHeight;
+
+diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
+--- a/src/activities/reader/TxtReaderActivity.cpp
++++ b/src/activities/reader/TxtReaderActivity.cpp
+@@ -685,6 +685,8 @@
+   cachedBottomStatusBarHeight = UITheme::getInstance().getStatusBarHeight();
+
+   // Calculate viewport dimensions
++  cachedScreenWidth = renderer.getScreenWidth();
++  cachedScreenHeight = renderer.getScreenHeight();
+   renderer.getOrientedViewableTRBL(&cachedOrientedMarginTop, &cachedOrientedMarginRight, &cachedOrientedMarginBottom,
+                                    &cachedOrientedMarginLeft);
+   cachedOrientedMarginLeft += cachedHorizontalMargin;
+@@ -807,13 +809,15 @@
+
+   bool relayout = false;
+   size_t readingOffset = 0;
+-  if (initialized && (cachedTopStatusBarHeight != ReaderUtils::getTopStatusBarReservedHeight(renderer) ||
++  if (initialized && (cachedScreenWidth != renderer.getScreenWidth() ||
++                      cachedScreenHeight != renderer.getScreenHeight() ||
++                      cachedTopStatusBarHeight != ReaderUtils::getTopStatusBarReservedHeight(renderer) ||
+                       cachedBottomStatusBarHeight != UITheme::getInstance().getStatusBarHeight())) {
+     if (currentPage >= 0 && currentPage < static_cast<int>(pageOffsets.size())) {
+       readingOffset = pageOffsets[currentPage];
+       relayout = true;
+     }
+-    if (!flushQueuedProgress()) LOG_ERR("TRS", "Failed to save progress before status bar relayout");
++    if (!flushQueuedProgress()) LOG_ERR("TRS", "Failed to save progress before viewport relayout");
+     initialized = false;
+   }
+
+@@ -823,7 +827,7 @@
+     if (relayout && !pageOffsets.empty()) {
+       const auto nextPage = std::upper_bound(pageOffsets.begin(), pageOffsets.end(), readingOffset);
+       currentPage = std::max(0, static_cast<int>(nextPage - pageOffsets.begin()) - 1);
+-      if (!saveProgress(currentPage)) LOG_ERR("TRS", "Failed to save progress after status bar relayout");
++      if (!saveProgress(currentPage)) LOG_ERR("TRS", "Failed to save progress after viewport relayout");
+     }
+   }
+
+diff --git a/src/activities/reader/TxtReaderActivity.h b/src/activities/reader/TxtReaderActivity.h
+--- a/src/activities/reader/TxtReaderActivity.h
++++ b/src/activities/reader/TxtReaderActivity.h
+@@ -45,6 +45,8 @@
+   uint8_t cachedVerticalMargin = 0;
+   uint8_t cachedHorizontalMargin = 0;
+   uint8_t cachedParagraphAlignment = CrossPointSettings::LEFT_ALIGN;
++  int cachedScreenWidth = 0;
++  int cachedScreenHeight = 0;
+   int cachedTopStatusBarHeight = 0;
+   int cachedBottomStatusBarHeight = 0;
+   int cachedOrientedMarginTop = 0;
+diff --git a/src/activities/settings/SdFirmwareUpdateActivity.cpp b/src/activities/settings/SdFirmwareUpdateActivity.cpp
+--- a/src/activities/settings/SdFirmwareUpdateActivity.cpp
++++ b/src/activities/settings/SdFirmwareUpdateActivity.cpp
+@@ -1,6 +1,7 @@
+ #include "SdFirmwareUpdateActivity.h"
+
+ #include <Arduino.h>
++#include <CrossInkHalFrontlight.h>
+ #include <GfxRenderer.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+@@ -179,6 +180,13 @@
+     return;
+   }
+
++  // Snapshot live levels once before reboot; never write during flash progress.
++  if (Frontlight.present()) {
++    SETTINGS.frontlightBrightness = Frontlight.brightness();
++    SETTINGS.frontlightWarmth = Frontlight.warmth();
++    SETTINGS.frontlightOn = Frontlight.isOn() ? 1 : 0;
++    activityManager.persistGlobalSettings();
++  }
+   LOG_INF("FW", "SD firmware update complete, restarting");
+   {
+     RenderLock lock(*this);
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -257,6 +257,13 @@
+   return {};
+ }
+
++bool isLightLeakBorderSetting(const SettingInfo& setting) {
++  return setting.valuePtr == &CrossPointSettings::lightLeakTop ||
++         setting.valuePtr == &CrossPointSettings::lightLeakRight ||
++         setting.valuePtr == &CrossPointSettings::lightLeakBottom ||
++         setting.valuePtr == &CrossPointSettings::lightLeakLeft;
++}
++
+ bool isTwoFingerSwipeSetting(const uint8_t CrossPointSettings::* const valuePtr) {
+   return valuePtr == &CrossPointSettings::twoFingerSwipeUp || valuePtr == &CrossPointSettings::twoFingerSwipeDown ||
+          valuePtr == &CrossPointSettings::twoFingerSwipeLeft || valuePtr == &CrossPointSettings::twoFingerSwipeRight;
+@@ -1085,6 +1092,10 @@
+     openScreenMarginPicker(setting);
+     return;
+   }
++  if (isLightLeakBorderSetting(setting)) {
++    openLightLeakBorderPicker(setting);
++    return;
++  }
+   if (setting.valuePtr == &CrossPointSettings::readingIdleTimeThresholdUnits) {
+     openIdleTimeThresholdPicker();
+     return;
+@@ -1343,6 +1354,24 @@
+       [this](const ActivityResult& result) {
+         if (!result.isCancelled) {
+           SETTINGS.sleepTimeoutMinutes = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
++          SETTINGS.saveToFile();
++        }
++        requestUpdate();
++      });
++}
++
++void SettingsActivity::openLightLeakBorderPicker(const SettingInfo& setting) {
++  const auto edge = setting.valuePtr;
++  startActivityForResult(
++      std::make_unique<IntervalSelectionActivity>(
++          renderer, mappedInput, "LightLeakBorderInterval", setting.nameId, SETTINGS.*edge, setting.valueRange.min,
++          setting.valueRange.max, setting.valueRange.step, 4, StrId::STR_NONE_OPT,
++          /*readerActivity=*/false, /*allowPowerAsConfirm=*/false, /*ignoreInitialConfirmRelease=*/true,
++          /*showPercentValue=*/false, StrId::STR_NONE_OPT, /*overrideDisabledReaderTouchscreen=*/false,
++          /*showTouchHeaderBackButton=*/true, /*valueFormatter=*/nullptr, /*tapStep=*/1, /*useReaderSlider=*/true),
++      [this, edge](const ActivityResult& result) {
++        if (!result.isCancelled) {
++          SETTINGS.*edge = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
+           SETTINGS.saveToFile();
+         }
+         requestUpdate();
+@@ -1662,6 +1691,7 @@
+   }
+
+   uiReady = false;
++  app.setDevice(uiTarget.deviceContext());
+   app.render();
+   uiReady = true;
+
+@@ -1679,6 +1709,8 @@
+                       (*currentSettings)[selectedSettingIndex - 1].type == SettingType::ACTION ||
+                       (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_FONT_FAMILY ||
+                       (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_TIME_TO_SLEEP ||
++                      isLightLeakBorderSetting((*currentSettings)[selectedSettingIndex - 1]) ||
++                      (*currentSettings)[selectedSettingIndex - 1].valuePtr == &CrossPointSettings::imageContrast ||
+                       (*currentSettings)[selectedSettingIndex - 1].type == SettingType::STRING ||
+                       (*currentSettings)[selectedSettingIndex - 1].valuePtr == &CrossPointSettings::lineHeightPercent ||
+                       (*currentSettings)[selectedSettingIndex - 1].valuePtr ==
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -322,6 +322,7 @@
+   void openIdleTimeThresholdPicker();
+   void toggleCurrentSetting();
+   void openSleepTimeoutPicker();
++  void openLightLeakBorderPicker(const SettingInfo& setting);
+   void openLineHeightPicker();
+   void openFrontlightScheduleTimePicker(uint16_t CrossPointSettings::* valuePtr, StrId titleId);
+   void openStringEditor(const SettingInfo& setting);
+diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
+--- a/src/activities/util/FrontlightPanelActivity.cpp
++++ b/src/activities/util/FrontlightPanelActivity.cpp
+@@ -644,6 +644,7 @@
+ }
+
+ void FrontlightPanelActivity::render(RenderLock&&) {
++  app.setDevice(uiTarget.deviceContext());
+   // Overlay drop-down: keep the framebuffer content (the reader/menu we opened
+   // over) intact below the panel; only the fitted panel is repainted. No full
+   // clearScreen — same as the theme popups draw over the current frame.
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -593,6 +593,25 @@
+   return action;
+ }
+
++// Keep the active viewport and physical mask in sync with emitted light.
++bool updateLightLeakBorders() {
++  static std::array<uint8_t, 4> applied{};
++  std::array<uint8_t, 4> desired{};
++  if (Frontlight.present() && Frontlight.isOn() && Frontlight.brightness() > 0) {
++    desired = {SETTINGS.lightLeakTop, SETTINGS.lightLeakRight, SETTINGS.lightLeakBottom, SETTINGS.lightLeakLeft};
++  }
++  if (desired == applied) return false;
++
++  RenderLock lock;
++  display.waitRefreshComplete();
++  // Overlay redraws keep their backdrop. Clear the old mask before exposing
++  // those pixels so a light toggle also removes the border beneath the panel.
++  display.maskLightLeakBorder(display.getFrameBuffer(), 0, display.getDisplayHeight(), !display.isInverted());
++  renderer.setLightLeakBorder(desired[0], desired[1], desired[2], desired[3]);
++  applied = desired;
++  return true;
++}
++
+ void notifyQuickLockChanged() {
+   const bool locked = buttonShortcutController.isQuickLocked();
+   x4ProHomeKeyTapPending = false;
+@@ -602,6 +621,7 @@
+     APP_STATE.quickLockRestoreFrontlight = Frontlight.isOn();
+     Frontlight.setOn(false);
+     activityManager.notifyInputLockChanged(true);
++    if (updateLightLeakBorders()) (void)activityManager.requestUpdateAndWait();
+     int top = 0;
+     int right = 0;
+     int bottom = 0;
+@@ -628,13 +648,17 @@
+     {
+       RenderLock lock;
+       restoredBadgeBackdrop = quickLockBadgeBackdrop.restore(renderer);
+-      if (restoredBadgeBackdrop) renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+     }
+     if (APP_STATE.quickLockRestoreFrontlight) {
+       Frontlight.setOn(true);
+       APP_STATE.quickLockRestoreFrontlight = false;
+     }
+-    if (!restoredBadgeBackdrop) (void)activityManager.requestUpdateAndWait();
++    if (updateLightLeakBorders() || !restoredBadgeBackdrop) {
++      (void)activityManager.requestUpdateAndWait();
++    } else {
++      RenderLock lock;
++      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++    }
+     activityManager.notifyInputLockChanged(false);
+   }
+ }
+@@ -1142,6 +1166,11 @@
+   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
+   // a WiFi activity would otherwise silentRestart() here and reboot instead.
+   deepSleepInProgress = true;
++  const std::string leavingBook =
++      activityManager.isReaderActivity() ? activityManager.getCurrentBookPath() : std::string();
++  // Apply the light-off viewport before painting or retaining the sleep frame.
++  Frontlight.setOn(false);
++  if (updateLightLeakBorders() && isQuickResumeSleep) (void)activityManager.requestUpdateAndWait();
+   activityManager.goToSleep(fromTimeout);
+   // Reader exit may already have saved this state. Save after the sleep screen
+   // appears, skipping an unchanged snapshot while still retrying failed saves.
+@@ -1248,6 +1277,7 @@
+   // caller selects the reader-sized stack. Lightweight network targets use
+   // 8 KB; reader rendering retains its 16 KB budget.
+   activityManager.begin(useReaderRenderStack ? READER_RENDER_TASK_STACK_BYTES : NETWORK_RENDER_TASK_STACK_BYTES);
++  updateLightLeakBorders();
+
+   // Initialize font decompressor for compressed reader fonts
+   if (!fontDecompressor.init()) {
+@@ -1458,7 +1488,7 @@
+   // current light state rather than applying wake or schedule policy.
+   const bool wasLightOnBeforeSleep =
+       isSilentReboot && isValidSilentTarget && hasRestartFrontlight ? restartFrontlightOn : SETTINGS.frontlightOn != 0;
+-  const bool preserveLightAcrossRestart = FrontlightSchedule::shouldPreserveLightAcrossRestart(isSilentReboot);
++  const bool preserveLightAcrossRestart = FrontlightSchedule::shouldPreserveLightAcrossRestart(isSilentReboot, rawResetReason == ESP_RST_SW);
+   bool restoreLightOn = FrontlightSchedule::shouldRestoreLightOnStart(
+       preserveLightAcrossRestart, SETTINGS.frontlightRestoreOnWake != 0, wasLightOnBeforeSleep);
+   if (FrontlightSchedule::shouldApplyOnWakeSchedule(preserveLightAcrossRestart, SETTINGS.frontlightRestoreOnWake != 0,
+@@ -2002,6 +2032,7 @@
+   }
+
+   const unsigned long activityStartTime = millis();
++  if (updateLightLeakBorders()) activityManager.requestUpdate();
+   activityManager.loop();
+ #if CROSSINK_APP_CAP_TOUCH
+   // A delayed Home event is valid for this activity dispatch only. If an
+diff --git a/src/util/FrontlightSchedule.h b/src/util/FrontlightSchedule.h
+--- a/src/util/FrontlightSchedule.h
++++ b/src/util/FrontlightSchedule.h
+@@ -24,7 +24,9 @@
+
+ // A silent restart is an internal recovery step, so it must preserve the
+ // current frontlight state instead of applying wake or schedule policy.
+-constexpr bool shouldPreserveLightAcrossRestart(const bool isSilentReboot) { return isSilentReboot; }
++constexpr bool shouldPreserveLightAcrossRestart(const bool isSilentReboot, const bool isSoftwareRestart = false) {
++  return isSilentReboot || isSoftwareRestart;
++}
+
+ constexpr bool shouldRestoreLightOnStart(const bool preserveLightAcrossRestart, const bool restoreOnWake,
+                                          const bool wasLightOnBeforeSleep) {
+diff --git a/test/epub_grayscale/EpubTextGrayscaleTest.cpp b/test/epub_grayscale/EpubTextGrayscaleTest.cpp
+--- a/test/epub_grayscale/EpubTextGrayscaleTest.cpp
++++ b/test/epub_grayscale/EpubTextGrayscaleTest.cpp
+@@ -320,3 +320,65 @@
+     }
+   }
+ }
++
++TEST(EpubTextGrayscaleTest, HighlightShadingPreservesInkAcrossLineBoundaries) {
++  fakeheap::reset(true);
++  RasterFont fixture(12);
++  HalDisplay display;
++  GfxRenderer renderer(display);
++  renderer.begin();
++  renderer.insertFont(1, EpdFontFamily(&fixture.font));
++  for (int orientation = 0; orientation < 4; ++orientation) {
++    SCOPED_TRACE(orientation);
++    renderer.setOrientation(GfxRenderer::Orientation(orientation));
++    renderer.clearScreen();
++    renderer.drawText(1, 25, 40, "pjqy");
++    const auto original = display.bw;
++
++    renderer.clearScreen();
++    renderer.fillRectDither(26, 53, 42, 18, Color::LightGray);
++    renderer.fillRectDither(25, 52, 3, 4, Color::LightGray);
++    const auto shade = display.bw;
++    auto expected = original;
++    for (size_t i = 0; i < expected.size(); ++i) expected[i] &= shade[i];
++    ASSERT_NE(expected, shade);
++    ASSERT_NE(expected, original);
++
++    std::copy(original.begin(), original.end(), display.bw.begin());
++    renderer.shadeRect(26, 53, 42, 18);
++    renderer.shadeRect(25, 52, 3, 4);
++    EXPECT_EQ(display.bw, expected);
++  }
++}
++
++TEST(EpubTextGrayscaleTest, AsymmetricBordersMoveDrawingAndTouchTogether) {
++  HalDisplay display(800, 480);
++  GfxRenderer renderer(display);
++  renderer.begin();
++  renderer.setLightLeakBorder(5, 7, 11, 13);
++
++  struct Viewport {
++    GfxRenderer::Orientation orientation;
++    int width, height, panelX, panelY;
++  };
++  const Viewport views[] = {
++      {GfxRenderer::Portrait, 460, 784, 5, 466},
++      {GfxRenderer::LandscapeClockwise, 784, 460, 788, 466},
++      {GfxRenderer::PortraitInverted, 460, 784, 788, 7},
++      {GfxRenderer::LandscapeCounterClockwise, 784, 460, 5, 7},
++  };
++  for (const auto& view : views) {
++    renderer.setOrientation(view.orientation);
++    EXPECT_EQ(renderer.getScreenWidth(), view.width);
++    EXPECT_EQ(renderer.getScreenHeight(), view.height);
++    renderer.clearScreen(0xff);
++    renderer.drawPixel(0, 0);
++    const int offset = view.panelY * display.stride + view.panelX / 8;
++    EXPECT_EQ(display.bw[offset], 0xff & ~(0x80 >> (view.panelX % 8)));
++
++    int x, y;
++    renderer.tapToLogical((view.panelX + 0.5f) / 800, (view.panelY + 0.5f) / 480, x, y);
++    EXPECT_EQ(x, 0);
++    EXPECT_EQ(y, 0);
++  }
++}
+diff --git a/test/epub_grayscale/raster_stubs/HalDisplay.h b/test/epub_grayscale/raster_stubs/HalDisplay.h
+--- a/test/epub_grayscale/raster_stubs/HalDisplay.h
++++ b/test/epub_grayscale/raster_stubs/HalDisplay.h
+@@ -28,6 +28,8 @@
+   uint32_t getBufferSize() const { return bw.size(); }
+   void clearScreen(uint8_t c) const { memset(bw.data(), c, bw.size()); }
+   bool isInverted() const { return false; }
++  void setLightLeakBorder(uint8_t, uint8_t, uint8_t, uint8_t) {}
++  void maskLightLeakBorder(uint8_t*, uint16_t, uint16_t, bool) const {}
+   uint8_t* lendFrameBufferStorage(uint32_t* size) {
+     *size = bw.size();
+     return bw.data();
+diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs/GfxRenderer.h
+--- a/test/epub_grayscale/stubs/GfxRenderer.h
++++ b/test/epub_grayscale/stubs/GfxRenderer.h
+@@ -34,6 +34,14 @@
+   int getScreenWidth() const { return orientation == Portrait || orientation == PortraitInverted ? height : width; }
+   int getScreenHeight() const { return orientation == Portrait || orientation == PortraitInverted ? width : height; }
+   Orientation getOrientation() const { return orientation; }
++  void screenToPanel(int x, int y, int& px, int& py) const {
++    switch (orientation) {
++      case Portrait: px = y; py = height - 1 - x; break;
++      case LandscapeClockwise: px = width - 1 - x; py = height - 1 - y; break;
++      case PortraitInverted: px = width - 1 - y; py = x; break;
++      case LandscapeCounterClockwise: px = x; py = y; break;
++    }
++  }
+   RenderMode getRenderMode() const { return mode; }
+   bool grayPlanesAreAbsolute() const { return absolute; }
+   bool beginCombinedGrayscale() {
+diff --git a/test/frontlight_schedule/FrontlightScheduleTest.cpp b/test/frontlight_schedule/FrontlightScheduleTest.cpp
+--- a/test/frontlight_schedule/FrontlightScheduleTest.cpp
++++ b/test/frontlight_schedule/FrontlightScheduleTest.cpp
+@@ -74,3 +74,12 @@
+   EXPECT_EQ(FrontlightSchedule::minutesFromTimeOfDay(afternoon.hour12, afternoon.minute, afternoon.isPm),
+             timeOfDay(16, 43));
+ }
++
++TEST(FrontlightSchedule, FirmwareRestartPreservesLightWithoutApplyingWakeSchedule) {
++  const bool preserve = FrontlightSchedule::shouldPreserveLightAcrossRestart(false, true);
++  EXPECT_TRUE(preserve);
++  EXPECT_TRUE(FrontlightSchedule::shouldRestoreLightOnStart(preserve, false, true));
++  EXPECT_FALSE(FrontlightSchedule::shouldRestoreLightOnStart(preserve, true, false));
++  EXPECT_FALSE(FrontlightSchedule::shouldApplyOnWakeSchedule(preserve, false, true));
++  EXPECT_FALSE(FrontlightSchedule::shouldPreserveLightAcrossRestart(false, false));
++}

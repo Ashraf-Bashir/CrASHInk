@@ -1,0 +1,573 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -608,6 +608,24 @@
+ STR_SAVE_CLIPPING: "Create Clipping"
+ STR_VIEW_CLIPPINGS: "View Clippings"
+ STR_CLIPPINGS: "Clippings"
++STR_SEND_TO_WORKFLOWY: "Send to Workflowy"
++STR_WORKFLOWY_BOTH: "Quote and note"
++STR_WORKFLOWY_QUOTE: "Quote only"
++STR_WORKFLOWY_NOTE: "Note only"
++STR_WORKFLOWY_EDIT_NOTE: "Edit note"
++STR_WORKFLOWY_API_KEY: "Workflowy API key"
++STR_WORKFLOWY_DESTINATION: "Destination (blank for Reading Gems)"
++STR_WORKFLOWY_NO_NOTES: "Nothing to send"
++STR_WORKFLOWY_SAVE_FAILED: "Could not save"
++STR_WORKFLOWY_NETWORK_FAILED: "Workflowy connection failed"
++STR_WORKFLOWY_READ_FAILED: "Could not read clipping"
++STR_WORKFLOWY_AUTH_FAILED: "Check your Workflowy API key"
++STR_WORKFLOWY_SEND_FAILED: "Workflowy could not save this item"
++STR_WORKFLOWY_SENDING: "Sending to Workflowy"
++STR_WORKFLOWY_SENT: "Sent"
++STR_WORKFLOWY_ALREADY_SENT: "Already sent"
++STR_WORKFLOWY_RECEIPT_FAILED: "Sent, but could not save receipt"
++STR_WORKFLOWY_CLOCK_FAILED: "Could not set time for secure connection"
+ STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
+ STR_NO_CLIPPINGS: "No clippings yet"
+ STR_DELETE_CLIPPINGS: "Clear Clippings"
+diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
+--- a/src/ClippingStore.cpp
++++ b/src/ClippingStore.cpp
+@@ -695,6 +695,14 @@
+         return false;
+       }
+     }
++    if (version >= VERSION &&
++        (!serialization::tryReadPod(f, clipping.noteLength) || clipping.noteLength > CLIPPING_NOTE_MAX ||
++         f.position() > f.size() || clipping.noteLength > f.size() - f.position() ||
++         (clipping.noteLength != 0 && !f.seekCur(clipping.noteLength)))) {
++      f.close();
++      return false;
++    }
++    if (clipping.noteLength) clipping.noteOffset = f.position() - clipping.noteLength;
+     out.push_back(std::move(clipping));
+   }
+
+@@ -703,8 +711,10 @@
+ }
+
+ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
+-                                const std::string* sourcePathOverride) {
+-  Storage.mkdir("/.crosspoint");
++                                const std::string* sourcePathOverride, const char* replacementTitle, const uint8_t* remove,
++                                const std::string* replacementNote) {
++  if (loadFailed_) return false;
++  Storage.mkdir("/.crashink");
+   Storage.mkdir(CLIPPINGS_DIR);
+
+   const std::string tmpPath = storeFilePath + ".tmp";
+@@ -791,7 +801,16 @@
+     } else if (textLen > 0) {
+       wroteText = source && source.seek(clipping.textOffset) && copyBytes(source, f, textLen);
+     }
+-    if (!wroteText) {
++    const bool useNewNote = replacementNote && i == replacementIndex;
++    const uint16_t noteLen = useNewNote ? replacementNote->size() : clipping.noteLength;
++    bool wroteNote = wroteText && serialization::tryWritePod(f, noteLen);
++    if (wroteNote && noteLen > 0) {
++      const auto srcNoteOffset = clipping.noteOffset;
++      wroteNote = useNewNote
++                      ? f.write(reinterpret_cast<const uint8_t*>(replacementNote->data()), noteLen) == noteLen
++                      : source && source.seek(srcNoteOffset) && copyBytes(source, f, noteLen);
++    }
++    if (!wroteNote) {
+       LOG_ERR("CLIP", "Failed to write clipping text %u: %s", i, tmpPath.c_str());
+       f.close();
+       if (source) source.close();
+diff --git a/src/ClippingStore.h b/src/ClippingStore.h
+--- a/src/ClippingStore.h
++++ b/src/ClippingStore.h
+@@ -48,7 +48,9 @@
+   uint32_t timestamp = 0;
+   uint32_t layoutSignature = 0;
+   uint32_t textOffset = 0;
++  uint32_t noteOffset = 0;
+   uint16_t textLength = 0;
++  uint16_t noteLength = 0;
+   uint16_t tableSelection = UINT16_MAX;
+   // Session-only migration state, intentionally omitted from the on-disk
+   // record.
+@@ -117,6 +119,11 @@
+   bool cacheResolvedLayoutRange(size_t index, uint16_t page, uint16_t startWord, uint16_t endWord,
+                                 uint32_t layoutSignature);
+   bool readClippingText(size_t index, std::string& out) const;
++  bool readClippingNote(size_t index, std::string& out) const;
++  bool setClippingNote(size_t index, const std::string& note);
++  const std::string& getBookTitle() const { return bookTitle; }
++  const std::string& getBookAuthor() const { return bookAuthor; }
++  const std::string& getBookFilePath() const { return bookFilePath; }
+   bool readClippingPreview(size_t index, std::string& out) const;
+   bool readClippingText(const Clipping& clipping, std::string& out) const;
+   bool openTextReader(HalFile& reader) const;
+diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
+--- a/src/activities/reader/EpubReaderClippingListActivity.cpp
++++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
+@@ -36,6 +36,15 @@
+
+ Rect clippingHeaderRect(const Rect& safe, const ThemeMetrics& metrics, const MappedInputManager& mappedInput) {
+   return Rect{safe.x, safe.y + metrics.topPadding, safe.width, TouchHeaderBackButton::height(metrics, mappedInput)};
++}
++
++Rect colorFilterButton(const Rect& header) {
++  return Rect{header.x + header.width - 92, header.y + header.height - 42, 88, 40};
++}
++
++Rect shareClippingsButton(const Rect& header) {
++  const auto filter = colorFilterButton(header);
++  return Rect{filter.x - 52, filter.y, 48, filter.height};
+ }
+
+ Rect touchDetailOpenButtonRect(const Rect& safe, const ThemeMetrics& metrics) {
+diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/WorkflowyShareActivity.cpp
+@@ -0,0 +1,349 @@
++#include "WorkflowyShareActivity.h"
++
++#include <ArduinoJson.h>
++#include <GfxRenderer.h>
++#include <HalClock.h>
++#include <HalStorage.h>
++#include <I18n.h>
++#include <SecureHttpClient.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <ctime>
++
++#include "ClippingStore.h"
++#include "MappedInputManager.h"
++#include "activities/network/WifiSelectionActivity.h"
++#include "activities/util/KeyboardEntryActivity.h"
++#include "activities/util/OptionSelectionActivity.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++#include "network/WifiUtils.h"
++#include "workflowy/WorkflowyRoot.h"
++
++namespace {
++constexpr char API_URL[] = "https://workflowy.com/api/v1/nodes";
++constexpr char DEFAULT_DESTINATION[] = "3dbd4508b236";
++constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
++constexpr char DEST_FILE[] = "/.crashink/workflowy.destination";
++constexpr size_t KEY_MAX = 256;
++constexpr size_t DEST_MAX = 128;
++
++std::string readSetting(const char* path, size_t limit) {
++  FsFile file;
++  const auto backup = std::string(path) + ".bak";
++  if (!Storage.exists(path) && Storage.exists(backup.c_str())) Storage.rename(backup.c_str(), path);
++  if (!Storage.openFileForRead("WF", path, file) || file.size() > limit) return {};
++  std::string value(file.size(), '\0');
++  if (file.read(reinterpret_cast<uint8_t*>(value.data()), value.size()) != static_cast<int>(value.size())) return {};
++  if (value.find_first_of("\r\n") != std::string::npos || value.find('\0') != std::string::npos) return {};
++  return value;
++}
++
++bool writeSetting(const char* path, const std::string& value) {
++  if (value.find_first_of("\r\n") != std::string::npos || value.find('\0') != std::string::npos) return false;
++  Storage.mkdir("/.crashink");
++  const auto temp = std::string(path) + ".tmp", backup = std::string(path) + ".bak";
++  if (!Storage.exists(path) && Storage.exists(backup.c_str()) && !Storage.rename(backup.c_str(), path)) return false;
++  FsFile file = Storage.open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
++  if (!file) return false;
++  const bool written = file.write(reinterpret_cast<const uint8_t*>(value.data()), value.size()) == value.size() && file.sync();
++  file.close();
++  if (!written) return false;
++  const bool hadPrevious = Storage.exists(path);
++  if (Storage.exists(backup.c_str()) && !Storage.remove(backup.c_str())) return false;
++  if (hadPrevious && !Storage.rename(path, backup.c_str())) return false;
++  if (!Storage.rename(temp.c_str(), path)) {
++    if (hadPrevious) Storage.rename(backup.c_str(), path);
++    return false;
++  }
++  if (hadPrevious) Storage.remove(backup.c_str());
++  return true;
++}
++
++std::string oneLine(std::string value) {
++  for (char& ch : value)
++    if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
++  // Preserve the full text as one bullet and escape Markdown syntax.
++  std::string escaped;
++  for (const char ch : value) {
++    if (ch == '\\' || ch == '*' || ch == '_' || ch == '[' || ch == ']' ||
++        ch == '-' || ch == '<' || ch == '>' || ch == '#' || ch == '`' || ch == '~') escaped += '\\';
++    escaped += ch;
++  }
++  return escaped;
++}
++// Local receipts identify the exact exported content and destination.
++uint64_t receiptHash(const std::string& value, uint64_t hash = 14695981039346656037ULL) {
++  for (unsigned char ch : value) hash = (hash ^ ch) * 1099511628211ULL;
++  return hash;
++}
++}  // namespace
++
++WorkflowyShareActivity::WorkflowyShareActivity(GfxRenderer& renderer, MappedInputManager& input, size_t index,
++                                               int colorFilter)
++    : Activity("WorkflowyShare", renderer, input), index(index), colorFilter(colorFilter) {}
++
++WorkflowyShareActivity::~WorkflowyShareActivity() = default;
++
++void WorkflowyShareActivity::onExit() {
++  client.reset();
++  if (ownsWifi) {
++    WiFi.disconnect(false, false);
++    WiFi.mode(WIFI_OFF);
++  }
++  Activity::onExit();
++}
++
++void WorkflowyShareActivity::menu() {
++  std::vector<std::string> options{tr(STR_WORKFLOWY_BOTH), tr(STR_WORKFLOWY_QUOTE), tr(STR_WORKFLOWY_NOTE)};
++  if (index != SIZE_MAX) options.emplace_back(tr(STR_WORKFLOWY_EDIT_NOTE));
++  options.emplace_back(tr(STR_WORKFLOWY_API_KEY));
++  options.emplace_back(tr(STR_WORKFLOWY_DESTINATION));
++  step = Step::Waiting;
++  startActivityForResult(
++      std::make_unique<OptionSelectionActivity>(renderer, mappedInput, "WorkflowyActions", StrId::STR_SEND_TO_WORKFLOWY,
++                                                std::move(options), 0, false, true),
++      [this](const ActivityResult& result) {
++        if (result.isCancelled) {
++          finish();
++          return;
++        }
++        const auto selected = std::get<OptionSelectionResult>(result.data).index;
++        if (selected < 3) {
++          content = static_cast<Content>(selected);
++          if (content == Content::Note && index != SIZE_MAX &&
++              (!CLIPPINGS.clippingAt(index) || !CLIPPINGS.clippingAt(index)->noteLength)) {
++            complete(tr(STR_WORKFLOWY_NO_NOTES));
++            return;
++          }
++          credential = readSetting(KEY_FILE, KEY_MAX);
++          destination = readSetting(DEST_FILE, DEST_MAX);
++          sendAfterKey = credential.empty();
++          step = sendAfterKey ? Step::Key : Step::Connect;
++        } else if (index != SIZE_MAX && selected == 3) {
++          step = Step::Note;
++        } else {
++          step = selected == (index == SIZE_MAX ? 3 : 4) ? Step::Key : Step::Destination;
++        }
++      });
++}
++
++void WorkflowyShareActivity::editSetting(bool apiKey) {
++  step = Step::Waiting;
++  const auto title = apiKey ? StrId::STR_WORKFLOWY_API_KEY : StrId::STR_WORKFLOWY_DESTINATION;
++  startActivityForResult(
++      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, I18n::getInstance().get(title),
++                                             apiKey ? "" : readSetting(DEST_FILE, DEST_MAX),
++                                             apiKey ? KEY_MAX : DEST_MAX, apiKey ? InputType::Password : InputType::Text),
++      [this, apiKey](const ActivityResult& result) {
++        if (result.isCancelled) {
++          sendAfterKey = false;
++          step = Step::Menu;
++          return;
++        }
++        const auto& value = std::get<KeyboardResult>(result.data).text;
++        if (!writeSetting(apiKey ? KEY_FILE : DEST_FILE, value)) {
++          complete(tr(STR_WORKFLOWY_SAVE_FAILED));
++          return;
++        }
++        if (apiKey) credential = value;
++        step = sendAfterKey && !credential.empty() ? Step::Connect : Step::Menu;
++        sendAfterKey = false;
++      });
++}
++
++void WorkflowyShareActivity::editNote() {
++  std::string note;
++  if (!CLIPPINGS.readClippingNote(index, note)) {
++    complete(tr(STR_WORKFLOWY_SAVE_FAILED));
++    return;
++  }
++  step = Step::Waiting;
++  startActivityForResult(
++      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_WORKFLOWY_EDIT_NOTE), std::move(note),
++                                             CLIPPING_NOTE_MAX, InputType::Text),
++      [this](const ActivityResult& result) {
++        if (!result.isCancelled && !CLIPPINGS.setClippingNote(index, std::get<KeyboardResult>(result.data).text)) {
++          complete(tr(STR_WORKFLOWY_SAVE_FAILED));
++          return;
++        }
++        step = Step::Menu;
++      });
++}
++
++void WorkflowyShareActivity::connect() {
++  next = index == SIZE_MAX ? 0 : index;
++  if (!loadReceipts()) {
++    complete(tr(STR_WORKFLOWY_SAVE_FAILED));
++    return;
++  }
++  if (hasActiveStationWifiConnection()) {
++    step = Step::Send;
++    return;
++  }
++  ownsWifi = true;
++  step = Step::Waiting;
++  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
++                         [this](const ActivityResult& result) {
++                           const auto* wifi = std::get_if<WifiResult>(&result.data);
++                           if (result.isCancelled || !wifi || !wifi->connected)
++                             complete(tr(STR_WORKFLOWY_NETWORK_FAILED));
++                           else
++                             step = Step::Send;
++                         });
++}
++
++bool WorkflowyShareActivity::loadReceipts() {
++  char path[64];
++  snprintf(path, sizeof(path), "/.crashink/.workflowy/%016llx.sent",
++           static_cast<unsigned long long>(receiptHash(CLIPPINGS.getBookFilePath())));
++  sentFile = path;
++  Storage.mkdir("/.crashink");
++  Storage.mkdir("/.crashink/.workflowy");
++  if (!Storage.exists(sentFile.c_str())) return true;
++  FsFile file;
++  if (!Storage.openFileForRead("WF", sentFile, file)) return false;
++  uint64_t receipt;
++  while (file.read(&receipt, sizeof(receipt)) == sizeof(receipt)) receipts.push_back(receipt);
++  std::sort(receipts.begin(), receipts.end());
++  return true;
++}
++
++bool WorkflowyShareActivity::recordReceipt(uint64_t receipt) {
++  FsFile file = Storage.open(sentFile.c_str(), O_WRONLY | O_CREAT);
++  if (!file || !file.seek(file.size() / sizeof(receipt) * sizeof(receipt))) return false;
++  return file.write(&receipt, sizeof(receipt)) == sizeof(receipt) && file.sync();
++}
++
++void WorkflowyShareActivity::sendNext() {
++  const size_t end = index == SIZE_MAX ? CLIPPINGS.clippingCount() : index + 1;
++  if (next >= end) {
++    complete(sent.load() ? tr(STR_WORKFLOWY_SENT) :
++             alreadySent ? tr(STR_WORKFLOWY_ALREADY_SENT) : tr(STR_WORKFLOWY_NO_NOTES));
++    return;
++  }
++  const size_t current = next++;
++  const auto* clipping = CLIPPINGS.clippingAt(current);
++  if (!clipping || (colorFilter && static_cast<int>(clipping->color) + 1 != colorFilter)) return;
++
++  std::string note, quote, chapter;
++  if ((content != Content::Quote && !CLIPPINGS.readClippingNote(current, note)) ||
++      (content != Content::Note && !CLIPPINGS.readClippingText(current, quote))) {
++    complete(tr(STR_WORKFLOWY_READ_FAILED));
++    return;
++  }
++  if (note.empty() && (content == Content::Note || (content == Content::Both && index == SIZE_MAX))) {
++    return;
++  }
++  CLIPPINGS.readChapterTitle(current, chapter);
++  std::string name = oneLine(content == Content::Note ? note : quote);
++  std::string citation;
++  const std::string* parts[] = {&CLIPPINGS.getBookTitle(), &CLIPPINGS.getBookAuthor(), &chapter};
++  for (const auto* part : parts) {
++    if (part->empty()) continue;
++    if (!citation.empty()) citation += " — ";
++    citation += oneLine(*part);
++  }
++  // Workflowy parses double newlines as child bullets in a single create call.
++  if (!citation.empty()) name += "\n\n📖 " + citation;
++  if (content == Content::Both && !note.empty()) name += "\n\n📝 " + oneLine(note);
++
++  JsonDocument request;
++  request["parent_id"] = destination.empty() ? DEFAULT_DESTINATION : destination;
++  request["name"] = name;
++  request["position"] = "bottom";
++  std::string encoded;
++  if (!serializeJson(request, encoded) || request.overflowed()) {
++    complete(tr(STR_WORKFLOWY_SEND_FAILED));
++    return;
++  }
++  auto receipt = receiptHash(encoded, receiptHash(credential));
++  receipt = (receipt ^ clipping->spineIndex) * 1099511628211ULL;
++  receipt = (receipt ^ clipping->startPage) * 1099511628211ULL;
++  receipt = (receipt ^ clipping->startWordIndex) * 1099511628211ULL;
++  if (std::binary_search(receipts.begin(), receipts.end(), receipt)) {
++    alreadySent = true;
++    return;
++  }
++  if (!client) {
++    // Certificate validation needs an initialized system clock, even on an RTC board.
++    if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) {
++      complete(tr(STR_WORKFLOWY_CLOCK_FAILED));
++      return;
++    }
++    client = std::make_unique<freeink::SecureHttpClient>();
++    client->setCACert(WorkflowyRoot);
++    client->setTimeout(12000);
++    client->setReuse(false);  // Do not retry a POST whose response was lost.
++    client->setUserAgent("CrASHInk/Workflowy");
++  }
++  if (!client->begin(API_URL)) {
++    complete(tr(STR_WORKFLOWY_NETWORK_FAILED));
++    return;
++  }
++  client->addHeader("Authorization", "Bearer " + credential);
++  client->addHeader("Content-Type", "application/json");
++  const int status = client->sendRequest("POST", reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size(),
++                                         [](const uint8_t*, size_t) { return true; });
++  if (status < 200 || status >= 300) {
++    complete(status == 401 || status == 403 ? tr(STR_WORKFLOWY_AUTH_FAILED)
++             : status <= 0 ? tr(STR_WORKFLOWY_NETWORK_FAILED) : tr(STR_WORKFLOWY_SEND_FAILED));
++    return;
++  }
++  ++sent;
++  if (!recordReceipt(receipt)) {
++    complete(tr(STR_WORKFLOWY_RECEIPT_FAILED));
++    return;
++  }
++  receipts.insert(std::lower_bound(receipts.begin(), receipts.end(), receipt), receipt);
++  requestUpdate();
++}
++
++void WorkflowyShareActivity::complete(const char* message) {
++  client.reset();
++  if (ownsWifi) {
++    WiFi.disconnect(false, false);
++    WiFi.mode(WIFI_OFF);
++    ownsWifi = false;
++  }
++  {
++    RenderLock lock(*this);
++    summary = message;
++    step = Step::Done;
++  }
++  requestUpdate();
++}
++
++void WorkflowyShareActivity::loop() {
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back) || TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
++    finish();
++    return;
++  }
++  switch (step) {
++    case Step::Menu: menu(); break;
++    case Step::Key: editSetting(true); break;
++    case Step::Destination: editSetting(false); break;
++    case Step::Note: editNote(); break;
++    case Step::Connect: connect(); break;
++    case Step::Send: sendNext(); break;
++    case Step::Done:
++      if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) finish();
++      break;
++    case Step::Waiting: break;
++  }
++}
++
++void WorkflowyShareActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  TouchHeaderBackButton::drawCompact(renderer, tr(STR_SEND_TO_WORKFLOWY), false, true);
++  const int middle = renderer.getScreenHeight() / 2;
++  const auto message = renderer.truncatedText(UI_12_FONT_ID, summary.empty() ? tr(STR_WORKFLOWY_SENDING) : summary.c_str(),
++                                              renderer.getScreenWidth() - 24);
++  renderer.drawCenteredText(UI_12_FONT_ID, middle - 16, message.c_str());
++  char counts[48];
++  snprintf(counts, sizeof(counts), "%s %u", tr(STR_WORKFLOWY_SENT), sent.load());
++  renderer.drawCenteredText(UI_10_FONT_ID, middle + 18, counts);
++  renderer.displayBuffer();
++}
+diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
+new file mode 100644
+--- /dev/null
++++ b/src/activities/reader/WorkflowyShareActivity.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "activities/Activity.h"
++
++namespace freeink {
++class SecureHttpClient;
++}
++
++class WorkflowyShareActivity final : public Activity {
++ public:
++  // SIZE_MAX sends the current book's clippings. Color follows its list filter.
++  WorkflowyShareActivity(GfxRenderer& renderer, MappedInputManager& input, size_t index, int colorFilter = 0);
++  ~WorkflowyShareActivity() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++  void onExit() override;
++  bool preventAutoSleep() override { return true; }
++
++ private:
++  enum class Step { Menu, Waiting, Key, Destination, Note, Connect, Send, Done };
++  enum class Content { Both, Quote, Note };
++  Step step = Step::Menu;
++  Content content = Content::Both;
++  size_t index;
++  size_t next = 0;
++  std::atomic<unsigned> sent{0};
++  int colorFilter;
++  bool ownsWifi = false;
++  bool sendAfterKey = false;
++  std::string credential;
++  std::string destination;
++  std::string summary;
++  std::string sentFile;
++  std::vector<uint64_t> receipts;
++  bool alreadySent = false;
++  std::unique_ptr<freeink::SecureHttpClient> client;
++
++  void menu();
++  void editSetting(bool apiKey);
++  void editNote();
++  void connect();
++  bool loadReceipts();
++  bool recordReceipt(uint64_t receipt);
++  void sendNext();
++  void complete(const char* message);
++};
+diff --git a/src/workflowy/WorkflowyRoot.h b/src/workflowy/WorkflowyRoot.h
+new file mode 100644
+--- /dev/null
++++ b/src/workflowy/WorkflowyRoot.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++// ISRG Root X1, the root of the Workflowy HTTPS certificate chain.
++inline constexpr char WorkflowyRoot[] = R"PEM(
++-----BEGIN CERTIFICATE-----
++MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
++TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
++cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
++WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
++ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
++MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
++h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
++0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
++A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
++T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
++B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
++B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
++KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
++OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
++jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
++qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
++rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
++HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
++hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
++ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
++3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
++NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
++ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
++TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
++jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
++oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
++4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
++mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
++emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
++-----END CERTIFICATE-----
++)PEM";
