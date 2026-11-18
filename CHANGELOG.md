@@ -20,6 +20,9 @@
 
 ### Changed
 
+- Workflowy puts Refresh in the bottom toolbar and uses the top row for the full date, day arrows, task count, and calendar. The pending badge keeps pagination visible and includes requested item expansion.
+- New Workflowy tasks start with an editable checkbox marker. Tag completion includes `@OUTSIDE` and `@INSIDE` and capitalizes the next letter after insertion.
+
 - More Workflowy actions update locally and roll back on failure. Network changes run in the background without a loading popup.
 - Workflowy typing reuses the unchanged keyboard and refreshes the edited screen region.
 
@@ -32,6 +35,8 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- Workflowy retries saved Wi-Fi without automatically opening password entry after a failed reconnect. It shows Loading while retrieving the first outline.
 
 - Workflowy preserves the `#` in tags when a new title begins with `[]`.
 

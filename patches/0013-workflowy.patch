@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a6af292478e11d385b42e6c43786a5b840ea21d..5f6aeecb95f2912759194bd830f7ba8e68685ed2 100644
+index 3a6af292478e11d385b42e6c43786a5b840ea21d..c75ae1bd5c19b38f7e33c984755e4521925ad80f 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -611,6 +611,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..5f6aeecb95f2912759194bd830f7ba8e
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1080,3 +1098,55 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1080,3 +1098,57 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -96,6 +96,8 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..5f6aeecb95f2912759194bd830f7ba8e
 +STR_WORKFLOWY_TURN_INTO: "Turn into"
 +STR_WORKFLOWY_TODO_TYPE: "Todo"
 +STR_WORKFLOWY_BULLET_TYPE: "Bullet"
++STR_WORKFLOWY_ACTION_PENDING: "%u action pending"
++STR_WORKFLOWY_ACTIONS_PENDING: "%u actions pending"
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -581,7 +583,7 @@ index 0000000000000000000000000000000000000000..ffc991db741a2782c4fccf0a1a381611
 +std::optional<StrId> takeShareError();
 +}
 diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
-index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a989dab4307 100644
+index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..b43c4fb2abbea3837a2b076511c668bfca57e123 100644
 --- a/src/activities/util/KeyboardEntryActivity.cpp
 +++ b/src/activities/util/KeyboardEntryActivity.cpp
 @@ -7,6 +7,7 @@
@@ -592,7 +594,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
 
  #include "DeviceCapabilities.h"
  #include "KeyboardLayoutSet.h"
-@@ -137,7 +138,7 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
+@@ -137,11 +138,12 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
  void KeyboardEntryActivity::onEnter() {
    Activity::onEnter();
    inputLineHeight = renderer.getLineHeight(UI_12_FONT_ID);
@@ -601,7 +603,12 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    layoutId = inputType == InputType::Url ? fui::KeyboardLayoutId::QwertyEn : keyboard_layouts::startingLayout();
    const uint16_t enabledLayouts = keyboard_layouts::enabled();
    showLangKey = (enabledLayouts & (enabledLayouts - 1)) != 0;
-@@ -161,6 +162,7 @@ void KeyboardEntryActivity::onEnter() {
+   shifted = false;
++  capitalizeAfterTag = false;
+   symbols = false;
+   urlPanel = false;
+   cursorMode = false;
+@@ -161,6 +163,7 @@ void KeyboardEntryActivity::onEnter() {
    touchRouter.holdMs = TOUCH_LONG_PRESS_MS;
    touchRouter.overrideHoldMs = TOUCH_DEL_LONG_PRESS_MS;
    interactionsReady = false;
@@ -609,7 +616,29 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    requestUpdate();
  }
 
-@@ -410,10 +412,14 @@ bool KeyboardEntryActivity::rangeIsRtl(std::string& s, const int start, const in
+@@ -280,6 +283,7 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+     case fui::QWERTY_KEY_SHIFT:
+       delPressCount = 0;
+       hintVisible = false;
++      capitalizeAfterTag = false;
+       // Letters: case toggle. Symbols: pages between "?123" and "#+=".
+       shifted = !shifted;
+       clampSelection();
+@@ -342,8 +346,11 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+       const auto oldLength = text.size();
+       insertUtf8(out);
+       if (text.size() == oldLength) return false;
+-      if (shifted && !symbols) {
+-        shifted = false;  // shift auto-releases after one character
++      const bool letter = (*out >= 'A' && *out <= 'Z') || (*out >= 'a' && *out <= 'z') ||
++                          static_cast<uint8_t>(*out) >= 0xc0;
++      if (shifted && !symbols && (!capitalizeAfterTag || letter)) {
++        shifted = false;
++        capitalizeAfterTag = false;
+         clampSelection();
+       }
+       return true;
+@@ -410,10 +417,14 @@ bool KeyboardEntryActivity::rangeIsRtl(std::string& s, const int start, const in
 
  int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const int maxWidth) const {
    const int len = static_cast<int>(s.length());
@@ -627,7 +656,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    while (lo <= hi) {
      const int mid = lo + (hi - lo) / 2;
      if (measureRange(s, start, mid) <= maxWidth) {
-@@ -435,6 +441,18 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
+@@ -435,6 +446,18 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
    return best < firstCharEnd ? firstCharEnd : best;
  }
 
@@ -646,7 +675,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
  KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTouchTargetFromPoint(
      const int x, const int y, size_t& position) const {
    // Key taps are the overwhelmingly common case; they land on the keyboard,
-@@ -464,7 +482,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+@@ -464,7 +487,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
    const bool centerText = metrics.keyboardCenteredText;
    std::string displayText = displayTextForCurrentState();
 
@@ -657,7 +686,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    int lineY = inputStartY;
    int lastLineStartIdx = 0;
    int lastLineEndIdx = static_cast<int>(displayText.length());
-@@ -516,7 +536,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+@@ -516,7 +541,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
        return InputFieldTouchTarget::Cursor;
      }
 
@@ -667,7 +696,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
        break;
      }
 
-@@ -555,19 +576,95 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
+@@ -555,19 +581,97 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
                     static_cast<int16_t>(hasTouch ? pageHeight - y : height)};
  }
 
@@ -678,7 +707,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
 -    return;
 +namespace {
 +constexpr const char* TAGS[] = {"#health", "#career", "#family", "#finance", "#operational", "#CRITICAL",
-+                                 "#P0", "#P1", "#P2", "#P3", "#P4"};
++                                 "#P0", "#P1", "#P2", "#P3", "#P4", "@OUTSIDE", "@INSIDE"};
 +constexpr int TAG_COLUMNS = 3;
 +constexpr int TAG_ROW_HEIGHT = 30;
 +constexpr int TAG_ROWS = (std::size(TAGS) + TAG_COLUMNS - 1) / TAG_COLUMNS;
@@ -694,7 +723,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
 +  if (!workflowyTags || cursorPos == 0 || cursorPos > text.size()) return std::string::npos;
 +  const auto space = text.find_last_of(" \t\r\n", cursorPos - 1);
 +  const auto start = space == std::string::npos ? 0 : space + 1;
-+  if (start >= cursorPos || text[start] != '#' || (cursorPos != text.size() && text[cursorPos] != ' ')) {
++  if (start >= cursorPos || (text[start] != '#' && text[start] != '@') || (cursorPos != text.size() && text[cursorPos] != ' ')) {
 +    return std::string::npos;
    }
 +  const auto prefix = std::string_view(text).substr(start, cursorPos - start);
@@ -723,7 +752,9 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
 +    text.replace(start, previous, replacement);
 +    cursorPos = start + replacement.size();
 +    if (cursorPos < text.size() && text[cursorPos] == ' ') text.erase(cursorPos, 1);
-+    shifted = symbols = false;
++    symbols = false;
++    shifted = true;
++    capitalizeAfterTag = true;
 +    clampSelection();
 +    touchRouter.reset();
 +    requestUpdate();
@@ -772,7 +803,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
      if (inputTarget == InputFieldTouchTarget::PasswordToggle) {
        buttonSelectionVisible = false;
        passwordVisible = !passwordVisible;
-@@ -594,11 +691,10 @@ void KeyboardEntryActivity::loop() {
+@@ -594,11 +698,10 @@ void KeyboardEntryActivity::loop() {
    }
 
    if (!cursorMode && interactionsReady.load(std::memory_order_acquire)) {
@@ -786,7 +817,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
      int hx = 0;
      int hy = 0;
      const bool inContact = mappedInput.isScreenTouchHeld(hx, hy);
-@@ -607,9 +703,11 @@ void KeyboardEntryActivity::loop() {
+@@ -607,9 +710,11 @@ void KeyboardEntryActivity::loop() {
          touchRouter.update(interactions, tapCandidate, static_cast<int16_t>(tx), static_cast<int16_t>(ty), tapped,
                             static_cast<int16_t>(tapX), static_cast<int16_t>(tapY), inContact, millis());
      if (result.event) {
@@ -799,7 +830,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
          requestUpdate();
        }
        return;
-@@ -780,22 +878,36 @@ void KeyboardEntryActivity::loop() {
+@@ -780,22 +885,36 @@ void KeyboardEntryActivity::loop() {
  }
 
  void KeyboardEntryActivity::render(RenderLock&&) {
@@ -845,7 +876,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
 
    std::string displayText = displayTextForCurrentState();
 
-@@ -832,7 +944,9 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -832,7 +951,9 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      if (w > cursorCharWidth) cursorCharWidth = w;
    }
 
@@ -856,7 +887,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    int textWidth = 0;
    int cursorPixelX = effectiveMargin;
    int cursorLineY = inputStartY;
-@@ -892,7 +1006,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -892,7 +1013,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
        } else {
          renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
        }
@@ -866,7 +897,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
          break;
        }
 
-@@ -964,7 +1079,13 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -964,7 +1086,13 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      }
    }
 
@@ -881,7 +912,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    const int keysHeight = std::min(keyboardKeysHeight(metrics, currentLayout().rowCount, mappedInput.hasTouchHardware()),
                                    static_cast<int>(kbRect.height));
    const auto orientation = renderer.getOrientation();
-@@ -1122,8 +1243,20 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -1122,8 +1250,20 @@ void KeyboardEntryActivity::render(RenderLock&&) {
  #if CROSSINK_APP_CAP_TOUCH
    interactions.beginPublishCycle();
    interactions.clear();
@@ -903,7 +934,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
    }
  #endif
    interactions.publish();
-@@ -1135,7 +1268,17 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -1135,7 +1275,17 @@ void KeyboardEntryActivity::render(RenderLock&&) {
 
    GUI.drawSideButtonHints(renderer, ">", "<");
 
@@ -923,7 +954,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..61519c12c8069375ff2b0e9f098f9a98
 
  void KeyboardEntryActivity::onComplete(std::string text) {
 diff --git a/src/activities/util/KeyboardEntryActivity.h b/src/activities/util/KeyboardEntryActivity.h
-index 5335aef83dbecd89835ed12f65ce8085a31f071f..3fbfae79048d7d3fa31bfdcecdd6071ff44189c4 100644
+index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af3b7e2938 100644
 --- a/src/activities/util/KeyboardEntryActivity.h
 +++ b/src/activities/util/KeyboardEntryActivity.h
 @@ -1,9 +1,11 @@
@@ -938,7 +969,7 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..3fbfae79048d7d3fa31bfdcecdd6071f
  #include <string>
  #include <utility>
 
-@@ -29,14 +31,32 @@ class KeyboardEntryActivity : public Activity {
+@@ -29,14 +31,33 @@ class KeyboardEntryActivity : public Activity {
          inputType(inputType),
          minLength(minLength) {}
 
@@ -959,6 +990,7 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..3fbfae79048d7d3fa31bfdcecdd6071f
 
   private:
 +  bool workflowyTags = false;
++  bool capitalizeAfterTag = false;
 +  std::atomic<bool> textOnlyPaint{false};
 +  int lastPaintWidth = 0, lastPaintHeight = 0, lastPaintKeyboardY = -1;
 +  freeink::ui::Rect tagPanel() const;
@@ -971,7 +1003,7 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..3fbfae79048d7d3fa31bfdcecdd6071f
    std::string title;
    std::string text;
    size_t maxLength;
-@@ -107,6 +127,7 @@ class KeyboardEntryActivity : public Activity {
+@@ -107,6 +128,7 @@ class KeyboardEntryActivity : public Activity {
    enum class InputFieldTouchTarget { None, Cursor, PasswordToggle };
 
    void onComplete(std::string text);
@@ -981,10 +1013,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..3fbfae79048d7d3fa31bfdcecdd6071f
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d4c68a8ef
+index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfbcfaa1fdd
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2853 @@
+@@ -0,0 +1,2951 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1032,8 +1064,10 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +constexpr size_t MAX_RESPONSE = 384 * 1024;
 +constexpr int ROW_HEIGHT = 39;
 +constexpr int ICON_TARGET = 44;
-+constexpr int DAY_TARGET = 28;
-+constexpr int DAY_WIDTH = 174;
++constexpr int DAY_TARGET = 36;
++constexpr int COUNT_TARGET = 76;
++constexpr int FOOTER_CONTROLS = 6;
++constexpr unsigned long SAVED_WIFI_TIMEOUT = 10000;
 +constexpr int ROW_ARROW_TARGET = 34;
 +constexpr char CONTINUATION[] = "...";
 +constexpr int CONTINUATION_GAP = 3;
@@ -1410,19 +1444,28 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +void WorkflowyDailyActivity::connect() {
 +  if (workflowy::shareInProgress()) return;
 +  if (credential.empty()) return editKey();
-+  ownsWifi = true;
 +  if (hasActiveStationWifiConnection()) {
 +    {
 +      RenderLock lock(*this);
 +      online = true;
++      awaitingOutline = true;
++      message = nullptr;
 +    }
 +    step = Step::Load;
++    requestUpdate();
 +    return;
 +  }
 +  if (!WIFI_STORE.getCredentialCount()) return showWifiPicker();
 +  WiFi.persistent(false);
-+  if (!WiFi.mode(WIFI_STA)) return showWifiPicker();
-+  WiFi.setAutoReconnect(true);
++  const auto previousMode = WiFi.getMode();
++  if (!WiFi.mode(WIFI_STA)) {
++    step = Step::Ready;
++    return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  }
++  ownsWifi = ownsWifi || previousMode == WIFI_OFF;
++  WiFi.setAutoReconnect(false);
++  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
++  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 +  savedWifiCandidates.clear();
 +  scannedSavedWifi = false;
 +  const auto last = WIFI_STORE.getLastConnectedSsid();
@@ -1431,6 +1474,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  {
 +    RenderLock lock(*this);
 +    connectingWifi = true;
++    message = nullptr;
 +  }
 +  step = Step::Ready;
 +  requestUpdate();
@@ -1438,7 +1482,10 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +
 +void WorkflowyDailyActivity::trySavedWifi(const std::string& ssid) {
 +  const auto saved = WIFI_STORE.findCredential(ssid);
-+  if (saved) WiFi.begin(saved->ssid.c_str(), saved->password.empty() ? nullptr : saved->password.c_str());
++  if (saved) {
++    const auto* password = saved->password.empty() ? nullptr : saved->password.c_str();
++    WiFi.begin(saved->ssid.c_str(), password);
++  }
 +  wifiStartedAt = millis();
 +}
 +
@@ -1463,8 +1510,11 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +      RenderLock lock(*this);
 +      connectingWifi = false;
 +      online = true;
++      awaitingOutline = true;
++      message = nullptr;
 +    }
 +    step = Step::Load;
++    requestUpdate();
 +    return;
 +  }
 +  if (scanningWifi) {
@@ -1481,9 +1531,9 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    WiFi.scanDelete();
 +    scanningWifi = false;
 +    if (savedWifiCandidates.empty()) {
-+      wifiStartedAt = millis() - 6500;
++      wifiStartedAt = millis() - SAVED_WIFI_TIMEOUT;
 +    }
-+  } else if (millis() - wifiStartedAt < 6500) {
++  } else if (millis() - wifiStartedAt < SAVED_WIFI_TIMEOUT) {
 +    return;
 +  }
 +  if (!scannedSavedWifi) return scanSavedWifi();
@@ -1498,17 +1548,59 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    RenderLock lock(*this);
 +    connectingWifi = false;
 +  }
-+  showWifiPicker();
++  if (ownsWifi) {
++    WiFi.disconnect(false, false);
++    WiFi.mode(WIFI_OFF);
++    ownsWifi = false;
++  }
++  showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +}
 +
 +void WorkflowyDailyActivity::showWifiPicker() {
++  const bool hadConnection = hasActiveStationWifiConnection();
 +  step = Step::Waiting;
-+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false),
-+                         [this](const ActivityResult& result) {
++  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, true),
++                         [this, hadConnection](const ActivityResult& result) {
 +    const auto* wifi = std::get_if<WifiResult>(&result.data);
-+    step = !result.isCancelled && wifi && wifi->connected ? Step::Load : Step::Ready;
-+    if (step == Step::Ready) showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++    if (result.isCancelled || !wifi || !wifi->connected) {
++      step = Step::Ready;
++      return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++    }
++    ownsWifi = ownsWifi || !hadConnection;
++    {
++      RenderLock lock(*this);
++      online = true;
++      awaitingOutline = true;
++      message = nullptr;
++    }
++    step = Step::Load;
++    requestUpdate();
 +  });
++}
++
++void WorkflowyDailyActivity::refresh(bool configure) {
++  if (connectingWifi) return;
++  if (configure) {
++    if (!saves.empty()) return;
++    startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                               renderer, mappedInput, "WorkflowyConnection", StrId::STR_SYSTEM_NETWORK_SYNC,
++                               std::vector<std::string>{tr(STR_WIFI_NETWORKS), tr(STR_WORKFLOWY_API_KEY)}, 0, false, true),
++                           [this](const ActivityResult& result) {
++      if (result.isCancelled) return;
++      if (std::get<OptionSelectionResult>(result.data).index == 0) showWifiPicker();
++      else editKey();
++    });
++    return;
++  }
++  if (hasActiveStationWifiConnection() && !credential.empty()) {
++    {
++      RenderLock lock(*this);
++      for (auto& row : rows) if (row.id != zoomId && row.leaf) row.leaf = false;
++    }
++    step = Step::Load;
++  } else {
++    step = Step::Start;
++  }
 +}
 +
 +void WorkflowyDailyActivity::editKey() {
@@ -1578,6 +1670,13 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  }
 +  RenderLock lock(*this);
 +  offlineQueuePreview = std::move(preview);
++}
++
++size_t WorkflowyDailyActivity::pendingOperationsCount() const {
++  const bool sendingCapture = pendingCount && std::any_of(saves.begin(), saves.end(), [](const auto& save) {
++    return save->fromOutbox;
++  });
++  return saves.size() + pendingCount - sendingCapture + !requestedBranch.empty();
 +}
 +
 +void WorkflowyDailyActivity::showPendingOperations() {
@@ -1942,6 +2041,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    RenderLock lock(*this);
 +    requestedBranch.clear();
 +    awaitingOutline = true;
++    message = nullptr;
 +  }
 +  step = Step::Ready;
 +  requestUpdate();
@@ -2017,13 +2117,13 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  const bool adding = relative != 0 || row >= rows.size();
 +  if (!online && (!adding || relative != 0)) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const std::string id = row < rows.size() ? rows[row].id : "";
-+  const std::string initial = adding ? "" : rows[row].title;
++  const std::string initial = adding ? "[] " : rows[row].title;
 +  const bool originalTodo = !adding && rows[row].todo;
 +  const int parentIndex = relative ? parentRow(row) : -1;
 +  const std::string parent = relative ? (parentIndex < 0 ? "" : rows[parentIndex].id) : zoomId;
 +  auto keyboard = std::make_unique<KeyboardEntryActivity>(
 +      renderer, mappedInput, adding ? tr(STR_WORKFLOWY_ADD) : tr(STR_EDIT), initial, 512);
-+  keyboard->setInitialCursor(cursor);
++  keyboard->setInitialCursor(adding ? initial.size() : cursor);
 +  keyboard->enableWorkflowyTags();
 +  startActivityForResult(std::move(keyboard), [this, id, initial, originalTodo, parent, adding, relative](const ActivityResult& result) {
 +    if (result.isCancelled) return;
@@ -2043,7 +2143,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    if (makeTodo) update["layoutMode"] = "todo";
 +    if (adding) {
 +      update["parent_id"] = parent.empty() ? date : parent;
-+      update["layoutMode"] = "todo";
++      update["layoutMode"] = makeTodo ? "todo" : "bullets";
 +      update["position"] = "bottom";
 +    }
 +    if (adding && !hasActiveStationWifiConnection()) {
@@ -2089,7 +2189,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    if (!adding) return applyTitle(id, text, makeTodo || originalTodo);
 +    {
 +      RenderLock lock(*this);
-+      Node added{localId, text, 0, 0, true, false};
++      Node added{localId, text, 0, 0, makeTodo, false};
 +      added.leaf = true;
 +      if (!parent.empty() || zoomId.empty()) appendChild(rows, parent, added);
 +      for (auto& view : viewStack) {
@@ -2493,7 +2593,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +WorkflowyDailyActivity::Layout WorkflowyDailyActivity::layout() const {
 +  int top, right, bottom, left;
 +  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+  const int rowTop = top + 74;
++  const int rowTop = top + 74 + (!zoomId.empty() && !selecting ? 30 : 0);
 +  const int footer = renderer.getScreenHeight() - bottom - 52;
 +  const int pageLabel = std::max(32, renderer.getLineHeight(SMALL_FONT_ID) + 3);
 +  return {left + 8, top, renderer.getScreenWidth() - right - left - 16, rowTop, footer,
@@ -2744,7 +2844,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  const int parentWidth = depth > 1 ? (total - dayWidth - moreWidth) / 2 : 0;
 +  breadcrumbHits = {depth, bounds.x + dayWidth, bounds.x + dayWidth + moreWidth,
 +                     bounds.x + dayWidth + moreWidth + parentWidth};
-+  const int y = bounds.top + 36;
++  const int y = bounds.top + 70;
 +  const auto draw = [&](int left, int end, const char* label, bool ancestor) {
 +    const int labelWidth = end - left - (ancestor ? 15 : 0);
 +    if (labelWidth <= 0) return;
@@ -2766,7 +2866,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +bool WorkflowyDailyActivity::tapBreadcrumb(int x, int y) {
 +  if (selecting || viewStack.empty()) return false;
 +  const auto bounds = layout();
-+  if (y < bounds.top + 28 || y >= bounds.rowTop || x < bounds.x) return false;
++  if (y < bounds.top + 63 || y >= bounds.rowTop || x < bounds.x) return false;
 +  BreadcrumbHits hit;
 +  {
 +    RenderLock lock(*this);
@@ -3008,6 +3108,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +        pendingCount = items.size();
 +      }
 +      retryOutboxAt = millis();
++      if (queueVisible) refreshOfflineQueuePreview();
 +      requestUpdate();
 +    });
 +  });
@@ -3264,17 +3365,25 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  const auto now = millis();
 +  if (queueVisible) {
 +    const auto bounds = layout();
++    const int uncertainY = bounds.rowTop + (!requestedBranch.empty() ? ROW_HEIGHT : 0);
++    if (sdkTap && outboxUncertain && queuePage == 0 && tapY >= uncertainY && tapY < uncertainY + ROW_HEIGHT &&
++        saves.empty()) {
++      return reviewCapture();
++    }
 +    if (sdkTap && (tapY < bounds.rowTop || tapY >= bounds.footer)) return showPendingOperations();
 +    const auto swipe = mappedInput.wasSwipe();
 +    if (swipe == Swipe::Up || swipe == Swipe::Down) {
 +      RenderLock lock(*this);
 +      const size_t visible = std::max(1, (bounds.rowBottom - bounds.rowTop) / ROW_HEIGHT);
 +      if (swipe == Swipe::Down && queuePage) --queuePage;
-+      else if (swipe == Swipe::Up && (queuePage + 1) * visible < saves.size() + offlineQueuePreview.size()) ++queuePage;
++      else if (swipe == Swipe::Up && (queuePage + 1) * visible < pendingOperationsCount()) ++queuePage;
 +    }
++    if (step == Step::Ready) pollWifiConnection();
++    if (step == Step::Load) loadDay();
 +    if (!pollSave() && swipe != Swipe::None) requestUpdate();
-+    if (saves.empty() && pendingCount && !outboxUncertain && hasActiveStationWifiConnection() &&
-+        static_cast<long>(now - retryOutboxAt) >= 0) flushCapture();
++    if (saves.empty() && (!requestedBranch.empty() || awaitingOutline)) pollPrefetch();
++    else if (saves.empty() && pendingCount && !outboxUncertain && hasActiveStationWifiConnection() &&
++             static_cast<long>(now - retryOutboxAt) >= 0) flushCapture();
 +    return;
 +  }
 +  const bool tapped = sdkTap && (tracking || gestureEndedAt == 0 || now - gestureEndedAt >= 120);
@@ -3282,16 +3391,15 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  if (tapped && !selecting && step != Step::Waiting && !dragging && !(tracking && moved)) {
 +    const auto bounds = layout();
 +    const int right = bounds.x + bounds.width;
-+    if (tapY >= bounds.top + 28 && tapY < bounds.rowTop && tapX < right) {
++    if (tapY >= bounds.top + 28 && tapY < bounds.top + 63 && tapX >= bounds.x && tapX < right) {
 +      if (tapX >= right - ICON_TARGET) {
 +        tracking = false;
 +        return chooseDate();
 +      }
-+      const int dayRight = right - 2 * ICON_TARGET;
-+      const int dayLeft = dayRight - DAY_WIDTH;
-+      if (tapX >= dayLeft && tapX < dayRight) {
++      const int dayRight = right - ICON_TARGET - COUNT_TARGET;
++      if (tapX < dayRight) {
 +        tracking = false;
-+        if (tapX < dayLeft + DAY_TARGET) return shiftDay(-1);
++        if (tapX < bounds.x + DAY_TARGET) return shiftDay(-1);
 +        if (tapX >= dayRight - DAY_TARGET) return shiftDay(1);
 +        return chooseDate();
 +      }
@@ -3430,11 +3538,10 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +      return;
 +    }
 +  }
-+  if (tapped && (!saves.empty() || (pendingCount && !outboxUncertain))) {
++  if (tapped && pendingOperationsCount()) {
 +    const auto bounds = layout();
-+    const bool badge = tapY >= bounds.top + 5 && tapY < bounds.top + 29;
-+    const bool actionLabel = !saves.empty() && !isErrorNotice(message) && tapY >= bounds.rowBottom && tapY < bounds.footer;
-+    if ((badge || actionLabel) && tapX >= bounds.x + bounds.width / 4 && tapX < bounds.x + bounds.width * 3 / 4) {
++    if (tapY >= bounds.top + 5 && tapY < bounds.top + 29 &&
++        tapX >= bounds.x + bounds.width / 4 && tapX < bounds.x + bounds.width * 3 / 4) {
 +      return showPendingOperations();
 +    }
 +  }
@@ -3480,24 +3587,6 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  }
 +  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
 +      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
-+  const int headerRight = bounds.x + bounds.width;
-+  if (y >= bounds.top + 28 && y < bounds.rowTop &&
-+      x >= headerRight - 2 * ICON_TARGET && x < headerRight - ICON_TARGET) {
-+    if (!connectingWifi) {
-+      if (held) {
-+        if (saves.empty()) editKey();
-+      } else if (hasActiveStationWifiConnection() && !credential.empty()) {
-+        {
-+          RenderLock lock(*this);
-+          for (auto& row : rows) {
-+            if (row.id != zoomId && row.leaf) row.leaf = false;
-+          }
-+        }
-+        step = Step::Load;
-+      } else step = Step::Start;
-+    }
-+    return;
-+  }
 +  if (y >= bounds.rowBottom && y < bounds.footer) {
 +    const int zone = (x - bounds.x) * 8 / bounds.width;
 +    if (pageStarts.size() <= 1) return;
@@ -3509,8 +3598,9 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +      if (x < bounds.x + bounds.width / 5) cancelSelection();
 +      return;
 +    }
-+    const int control = std::clamp((x - bounds.x) * 5 / bounds.width, 0, 4);
++    const int control = std::clamp((x - bounds.x) * FOOTER_CONTROLS / bounds.width, 0, FOOTER_CONTROLS - 1);
 +    if (control == 0) return back();
++    if (control == 5) return refresh(held);
 +    if (control == 2) {
 +      if (!credential.empty() && !date.empty()) edit(rows.size());
 +      return;
@@ -3580,14 +3670,29 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    const size_t inFlightCapture = std::any_of(saves.begin(), saves.end(), [](const auto& save) {
 +      return save->fromOutbox;
 +    }) && !offlineQueuePreview.empty() ? 1 : 0;
-+    const auto total = saves.size() + offlineQueuePreview.size() - inFlightCapture;
++    const size_t branchEntries = !requestedBranch.empty();
++    const auto offlineStart = saves.size() + branchEntries;
++    const auto total = offlineStart + offlineQueuePreview.size() - inFlightCapture;
 +    queuePage = std::min(queuePage, total == 0 ? 0 : (total - 1) / visible);
++    const auto opening = branchEntries ? std::find_if(rows.begin(), rows.end(), [&](const Node& node) {
++      return node.id == requestedBranch;
++    }) : rows.end();
 +    for (size_t i = queuePage * visible; i < total && i < (queuePage + 1) * visible; ++i) {
 +      const auto* save = i < saves.size() ? saves[i].get() : nullptr;
-+      const auto type = save ? save->label : StrId::STR_WORKFLOWY_ADD;
-+      const auto& name = save ? save->title : offlineQueuePreview[i - saves.size() + inFlightCapture];
++      const bool openingItem = !save && i < offlineStart;
++      const auto type = save ? save->label : openingItem ? StrId::STR_WORKFLOWY_ZOOM : StrId::STR_WORKFLOWY_ADD;
++      const auto name = save ? std::string_view(save->title)
++                        : openingItem ? (opening == rows.end() ? std::string_view{} : std::string_view(opening->title))
++                        : std::string_view(offlineQueuePreview[i - offlineStart + inFlightCapture]);
 +      auto text = std::to_string(i + 1) + ". " + I18n::getInstance().get(type);
-+      if (!name.empty()) text += " · " + name;
++      if (!name.empty()) {
++        text += " · ";
++        text += name;
++      }
++      if (!save && !openingItem && outboxUncertain && i == offlineStart) {
++        text += " · ";
++        text += tr(STR_WORKFLOWY_SYNC_CHECK);
++      }
 +      const auto fitted = renderer.truncatedText(UI_12_FONT_ID, text.c_str(), bounds.width - 14);
 +      renderer.drawText(UI_12_FONT_ID, bounds.x + 4, bounds.rowTop + (i % visible) * ROW_HEIGHT + 6, fitted.c_str());
 +    }
@@ -3608,10 +3713,12 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    renderer.drawText(SMALL_FONT_ID, right - ICON_TARGET - 96, cy - 9, tr(STR_WORKFLOWY_SELECT_ALL));
 +    for (const int dx : {-7, 0, 7}) renderer.fillRect(right - 22 + dx, cy - 1, 3, 3);
 +  } else {
-+    std::string heading = date.empty() || date == "today" ? tr(STR_WORKFLOWY_TODAY) : date;
-+    if (date == isoDate(-1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_YESTERDAY);
-+    if (date == isoDate(0) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TODAY);
-+    if (date == isoDate(1) && !date.empty()) heading += std::string("  ") + tr(STR_WORKFLOWY_TOMORROW);
++    std::string heading = date.empty() || date == "today" ? isoDate(0) : date == "tomorrow" ? isoDate(1) : date;
++    const char* relative = nullptr;
++    if (date == "today" || date.empty() || date == isoDate(0)) relative = tr(STR_WORKFLOWY_TODAY);
++    else if (date == "tomorrow" || date == isoDate(1)) relative = tr(STR_WORKFLOWY_TOMORROW);
++    else if (date == isoDate(-1)) relative = tr(STR_WORKFLOWY_YESTERDAY);
++    if (relative) heading += heading.empty() ? relative : std::string(", ") + relative;
 +    unsigned completed = 0, totalTodos = 0;
 +    const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
 +    for (const auto& row : rows) {
@@ -3622,23 +3729,34 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    }
 +    char todoCount[24];
 +    snprintf(todoCount, sizeof(todoCount), "%u/%u", completed, totalTodos);
-+    const int countX = bounds.x + bounds.width - 2 * ICON_TARGET - DAY_WIDTH - 8 - renderer.getTextWidth(SMALL_FONT_ID, todoCount);
-+    if (!zoomId.empty()) drawBreadcrumbs(bounds, countX - 8);
++    const int right = bounds.x + bounds.width;
++    const int cx = right - ICON_TARGET / 2, cy = bounds.top + 46;
++    const int dayRight = right - ICON_TARGET - COUNT_TARGET;
++    const int dateLeft = bounds.x + DAY_TARGET;
++    const int dateRight = dayRight - DAY_TARGET;
++    const int countX = dayRight + (COUNT_TARGET - renderer.getTextWidth(SMALL_FONT_ID, todoCount)) / 2;
 +    renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
-+    const int cx = bounds.x + bounds.width - 23, cy = bounds.top + 46;
-+    const int refreshX = cx - ICON_TARGET;
-+    const int dayRight = bounds.x + bounds.width - 2 * ICON_TARGET;
-+    const int dayLeft = dayRight - DAY_WIDTH;
-+    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, heading.c_str(), DAY_WIDTH - 2 * DAY_TARGET + 10,
-+                                               EpdFontFamily::BOLD);
-+    renderer.drawText(SMALL_FONT_ID, (dayLeft + dayRight - renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str())) / 2,
-+                      bounds.top + 36, fitted.c_str(), true, EpdFontFamily::BOLD);
++    if (!zoomId.empty()) drawBreadcrumbs(bounds, right);
++    const auto dateWidth = dateRight - dateLeft;
++    const auto drawDate = [&](const std::string& text, int font, int y) {
++      const int width = renderer.getTextWidth(font, text.c_str(), EpdFontFamily::BOLD);
++      renderer.drawText(font, (dateLeft + dateRight - width) / 2, y, text.c_str(), true, EpdFontFamily::BOLD);
++    };
++    if (renderer.getTextWidth(UI_12_FONT_ID, heading.c_str(), EpdFontFamily::BOLD) <= dateWidth) {
++      drawDate(heading, UI_12_FONT_ID, bounds.top + 32);
++    } else if (renderer.getTextWidth(SMALL_FONT_ID, heading.c_str(), EpdFontFamily::BOLD) <= dateWidth) {
++      drawDate(heading, SMALL_FONT_ID, bounds.top + 36);
++    } else if (const auto split = heading.find(", "); split != std::string::npos) {
++      drawDate(heading.substr(0, split + 1), SMALL_FONT_ID, bounds.top + 28);
++      drawDate(heading.substr(split + 2), SMALL_FONT_ID, bounds.top + 46);
++    } else {
++      drawDate(heading, SMALL_FONT_ID, bounds.top + 36);
++    }
 +    for (const int direction : {-1, 1}) {
-+      const int arrowX = direction < 0 ? dayLeft + DAY_TARGET / 2 : dayRight - DAY_TARGET / 2;
++      const int arrowX = direction < 0 ? bounds.x + DAY_TARGET / 2 : dayRight - DAY_TARGET / 2;
 +      renderer.drawLine(arrowX - direction * 4, cy - 6, arrowX + direction * 4, cy, 2);
 +      renderer.drawLine(arrowX + direction * 4, cy, arrowX - direction * 4, cy + 6, 2);
 +    }
-+    renderer.drawText(UI_12_FONT_ID, refreshX - 8, cy - 13, "↻");
 +    renderer.drawRect(cx - 10, cy - 9, 21, 19);
 +    renderer.drawLine(cx - 10, cy - 3, cx + 10, cy - 3);
 +    renderer.drawLine(cx - 5, cy - 12, cx - 5, cy - 6);
@@ -3744,15 +3862,19 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    }
 +  }
 +  const auto total = pageStarts.size();
-+  if (!online || pendingCount || !saves.empty()) {
-+    char status[48];
-+    if (!saves.empty()) snprintf(status, sizeof(status), "%s · %u", tr(STR_WORKFLOWY_PENDING),
-+                                 static_cast<unsigned>(saves.size()));
-+    else if (outboxUncertain) snprintf(status, sizeof(status), "%s", tr(STR_WORKFLOWY_SYNC_CHECK));
-+    else if (pendingCount) snprintf(status, sizeof(status), "%s · %u",
-+                                    (online ? tr(STR_WORKFLOWY_PENDING) : tr(STR_WORKFLOWY_OFFLINE)),
-+                                    static_cast<unsigned>(pendingCount));
-+    else snprintf(status, sizeof(status), "%s", tr(STR_WORKFLOWY_OFFLINE));
++  const auto pending = pendingOperationsCount();
++  if (!online || pending || connectingWifi) {
++    char status[52];
++    if (pending == 1) {
++      const auto action = !saves.empty() ? saves.front()->label
++                        : !requestedBranch.empty() ? StrId::STR_WORKFLOWY_ZOOM
++                        : outboxUncertain ? StrId::STR_WORKFLOWY_SYNC_CHECK : StrId::STR_WORKFLOWY_ADD;
++      snprintf(status, sizeof(status), "%s", I18n::getInstance().get(action));
++    } else if (pending > 1) {
++      snprintf(status, sizeof(status), tr(STR_WORKFLOWY_ACTIONS_PENDING), static_cast<unsigned>(pending));
++    } else {
++      snprintf(status, sizeof(status), "%s", connectingWifi ? tr(STR_CONNECTING) : tr(STR_WORKFLOWY_OFFLINE));
++    }
 +    const int width = renderer.getTextWidth(SMALL_FONT_ID, status) + 16;
 +    const int x = bounds.x + (bounds.width - width) / 2;
 +    renderer.drawRoundedRect(x, bounds.top + 5, width, 24, 1, 7, true);
@@ -3772,14 +3894,20 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    const int tip = buttonX + buttonWidth - 9, mid = buttonY + buttonHeight / 2;
 +    renderer.drawLine(tip - 5, mid - 4, tip, mid);
 +    renderer.drawLine(tip, mid, tip - 5, mid + 4);
-+  } else if (!saves.empty() || message || total > 1 || (placements.empty() && !connectingWifi && !awaitingOutline)) {
++  } else if (message || total > 1 || awaitingOutline || connectingWifi || placements.empty()) {
 +    char pages[24];
 +    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
-+    const char* footer = !saves.empty() ? I18n::getInstance().get(saves.front()->label)
-+                                        : message ? message : (placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : pages);
++    const char* footer = total > 1 ? pages : message ? message : connectingWifi ? tr(STR_CONNECTING)
++                        : awaitingOutline ? tr(STR_LOADING_POPUP) : placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : nullptr;
 +    const int textY = bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5;
-+    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
-+    renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
++    if (footer) {
++      const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
++      renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
++    }
++    if (awaitingOutline && total > 1) {
++      renderer.drawCenteredText(SMALL_FONT_ID, bounds.rowTop - renderer.getLineHeight(SMALL_FONT_ID) - 5,
++                                tr(STR_LOADING_POPUP));
++    }
 +  }
 +  if (!error && total > 1) {
 +    const int y = (bounds.rowBottom + bounds.footer) / 2;
@@ -3799,7 +3927,7 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +  renderer.drawLine(bounds.x, bounds.footer, bounds.x + bounds.width - 1, bounds.footer);
 +  if (!selecting) {
 +    const int iconY = bounds.footer + 23;
-+    const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / 10; };
++    const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / (2 * FOOTER_CONTROLS); };
 +    int x = iconX(0);
 +    renderer.drawLine(x - 9, iconY, x + 9, iconY, 2, true);
 +    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, 2, true);
@@ -3835,15 +3963,17 @@ index 0000000000000000000000000000000000000000..12cc5464a38b6faf3a9c7a0f4778e61d
 +    renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
++    const int refreshX = iconX(5);
++    renderer.drawText(UI_12_FONT_ID, refreshX - renderer.getTextWidth(UI_12_FONT_ID, "↻") / 2, iconY - 13, "↻");
 +  }
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..80e4dcccf6ef972f47144c8811cc2a77296586d1
+index 0000000000000000000000000000000000000000..446a47da43d85a01d830de492fe071c702486bc7
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,234 @@
 +#pragma once
 +
 +#include <atomic>
@@ -3927,6 +4057,8 @@ index 0000000000000000000000000000000000000000..80e4dcccf6ef972f47144c8811cc2a77
 +  void trySavedWifi(const std::string& ssid);
 +  void scanSavedWifi();
 +  void showWifiPicker();
++  void refresh(bool configure);
++  size_t pendingOperationsCount() const;
 +  void pollWifiConnection();
 +  unsigned long nextLinkCheck = 0;
 +  std::string outbox;
