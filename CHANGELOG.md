@@ -2,6 +2,10 @@
 
 ### Added
 
+- Workflowy has a Move menu with parent and relative-day shortcuts, a Turn into menu, and day arrows beside the date.
+- The Workflowy keyboard suggests common tags when typing `#`, including `#CRITICAL` and `#P0` through `#P4`.
+- A tappable Workflowy queue lists pending operations in order and marks the affected rows while requests run.
+
 - In-book image controls are grouped under Layout → Images and saved per EPUB, with a new monochrome mode.
 
 - Zoomed Workflowy items show a tappable breadcrumb with shortened ancestor names and an overflow menu.
@@ -16,6 +20,9 @@
 
 ### Changed
 
+- More Workflowy actions update locally and roll back on failure. Network changes run in the background without a loading popup.
+- Workflowy typing reuses the unchanged keyboard and refreshes the edited screen region.
+
 - Book preparation and Library index builds run in the background. Workflowy keeps the outline visible during requests.
 
 - Clipping shares send the quote and any saved note directly to Workflowy over saved Wi-Fi. Sharing also dismisses the highlight toolbar or editor. Sending runs in the background and switches off Wi-Fi if sharing enabled it.
@@ -25,6 +32,8 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- Workflowy preserves the `#` in tags when a new title begins with `[]`.
 
 - The X4 Pro keyboard accepts taps through the edge of each row and uses smaller display updates on SSD1677 panels when possible.
 
