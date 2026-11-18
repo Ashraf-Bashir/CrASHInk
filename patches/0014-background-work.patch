@@ -866,7 +866,7 @@ index e649fbfa8d60861902da13b964e540dc7a6ba917..3fe26349afc16b6311ad805558d7ca3e
 +  void completeOpen(bool hasSource);
  };
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-index 14958703311c90179b684e2d418327bc4602ef59..9349560dddc4758c93eb9e0c3ff409764937878f 100644
+index 14958703311c90179b684e2d418327bc4602ef59..b44d21d655c718178357cd9551effe7006ff78c5 100644
 --- a/src/activities/workflowy/WorkflowyDailyActivity.cpp
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 @@ -636,7 +636,6 @@ bool WorkflowyDailyActivity::queueSave(std::string path, std::string body, bool
@@ -898,7 +898,59 @@ index 14958703311c90179b684e2d418327bc4602ef59..9349560dddc4758c93eb9e0c3ff40976
  }
 
  void WorkflowyDailyActivity::layoutRows(const Layout& bounds) {
-@@ -2532,9 +2526,7 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
+@@ -1489,12 +1483,20 @@ void WorkflowyDailyActivity::layoutRows(const Layout& bounds) {
+
+ }
+
+-int WorkflowyDailyActivity::rowAt(const int x, const int y) const {
++int WorkflowyDailyActivity::rowAt(const int x, int y, const bool dropping) const {
+   RenderLock lock;
+-  if (layoutDirty || paintedPage != page || page >= pageStarts.size() || x < laidOut.x || x >= laidOut.x + laidOut.width)
+-    return -1;
++  if (layoutDirty || paintedPage != page || page >= pageStarts.size()) return -1;
++  if (!dropping && (x < laidOut.x || x >= laidOut.x + laidOut.width)) return -1;
++  const auto first = pageStarts[page];
+   const auto end = page + 1 < pageStarts.size() ? pageStarts[page + 1] : placements.size();
+-  for (auto i = pageStarts[page]; i < end; ++i) {
++  if (first == end) return -1;
++  if (dropping) {
++    if (y < laidOut.rowTop - 4 || y >= laidOut.rowBottom) return -1;
++    // Treat the outline gutter and the unused space below the final row as
++    // part of the drop area. The header and toolbar still cancel the drop.
++    y = std::clamp(y, placements[first].top, placements[end - 1].bottom - 1);
++  }
++  for (auto i = first; i < end; ++i) {
+     const auto& hit = placements[i];
+     if (y >= hit.top && y < hit.bottom) return static_cast<int>(hit.row);
+   }
+@@ -2190,7 +2192,7 @@ void WorkflowyDailyActivity::loop() {
+     moved |= std::max(dx, dy) > 26;
+     if (online && dragRow >= 0 && (dragging || dy > 26)) {
+       dragging = true;
+-      const int over = rowAt(x, y);
++      const int over = rowAt(x, y, true);
+       const int nextDrop = over >= 0 && over != dragRow && parentRow(over) == parentRow(dragRow) ? over : -1;
+       const bool inside = nextDrop >= 0 && x - touchX >= 32 && rows[nextDrop].depth < 8;
+       bool changed;
+@@ -2201,7 +2203,7 @@ void WorkflowyDailyActivity::loop() {
+         dropRow = nextDrop;
+         dropAfter = nextDrop > dragRow;
+       }
+-      if (changed) requestUpdate();
++      if (changed) requestUpdate(true);
+       return;
+     }
+   }
+@@ -2523,18 +2525,12 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
+           renderer.drawText(UI_12_FONT_ID, tail + CONTINUATION_GAP, lineY, CONTINUATION);
+       }
+     }
+-    if (static_cast<int>(placement.row) == dropRow) {
+-      const int marker = dropAfter || dropInside ? placement.bottom - 1 : placement.top;
+-      renderer.drawLine(start + (dropInside ? 16 : 0), marker, bounds.x + bounds.width - 1, marker, 2, true);
+-    }
+     if (!selecting && firstFragment && !node.leaf && node.id != zoomId) {
+       paintedArrows.push_back({node.id, placement.top, placement.bottom});
        const int tipX = bounds.x + bounds.width - 10;
        const int xs[3] = {tipX - 5, tipX + 4, tipX - 5};
        const int ys[3] = {y + 8, y + 13, y + 18};
@@ -909,7 +961,27 @@ index 14958703311c90179b684e2d418327bc4602ef59..9349560dddc4758c93eb9e0c3ff40976
          renderer.fillPolygon(xs, ys, 3, true);
        } else {
          renderer.drawLine(tipX - 5, y + 8, tipX + 1, y + 13);
-@@ -2569,13 +2561,10 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
+@@ -2542,6 +2538,19 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
+       }
+     }
+   }
++  // Paint the marker over row artwork and keep its full thickness inside
++  // the target row, including at the last row on the page.
++  if (dropRow >= 0) {
++    for (auto i = pageStarts[page]; i < end; ++i) {
++      const auto& placement = placements[i];
++      if (placement.row != static_cast<size_t>(dropRow)) continue;
++      constexpr int thickness = 4;
++      const int left = bounds.x + 16 * (std::min<unsigned>(rows[placement.row].depth, 8) + dropInside);
++      const int marker = dropAfter || dropInside ? placement.bottom - thickness : placement.top;
++      renderer.fillRect(left, marker, bounds.x + bounds.width - left, thickness, true);
++      break;
++    }
++  }
+   const auto total = pageStarts.size();
+   if (!online || pendingCount) {
+     char status[48];
+@@ -2569,13 +2578,10 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
      const int tip = buttonX + buttonWidth - 9, mid = buttonY + buttonHeight / 2;
      renderer.drawLine(tip - 5, mid - 4, tip, mid);
      renderer.drawLine(tip, mid, tip - 5, mid + 4);
@@ -925,7 +997,7 @@ index 14958703311c90179b684e2d418327bc4602ef59..9349560dddc4758c93eb9e0c3ff40976
      const int textY = bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5;
      const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
      renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
-@@ -2635,6 +2624,5 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
+@@ -2635,6 +2641,5 @@ void WorkflowyDailyActivity::render(RenderLock&&) {
      renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
      renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
    }
@@ -934,7 +1006,7 @@ index 14958703311c90179b684e2d418327bc4602ef59..9349560dddc4758c93eb9e0c3ff40976
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
  }
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
-index 85dff59244193f9c261a6e1b53bb7fb8fd4dd51a..1091a4091c5bc040b940855bb1919f4acf056073 100644
+index 85dff59244193f9c261a6e1b53bb7fb8fd4dd51a..3463eb8268052247ad5f302660f2f022a47be7ce 100644
 --- a/src/activities/workflowy/WorkflowyDailyActivity.h
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
 @@ -138,7 +138,6 @@ class WorkflowyDailyActivity final : public Activity {
@@ -945,6 +1017,15 @@ index 85dff59244193f9c261a6e1b53bb7fb8fd4dd51a..1091a4091c5bc040b940855bb1919f4a
    bool leaveAfterSave = false;
    static void saveTask(void* argument);
    bool queueSave(std::string path, std::string body, bool capture, std::function<void(const Save&)> finish,
+@@ -184,7 +183,7 @@ class WorkflowyDailyActivity final : public Activity {
+   void layoutRows(const Layout& bounds);
+   void setLoading(bool active);
+   template <typename Work> int requestWhilePaging(Work work);
+-  int rowAt(int x, int y) const;
++  int rowAt(int x, int y, bool dropping = false) const;
+   int parentRow(size_t row) const;
+   bool reorder(size_t source, size_t target, bool after, bool recordUndo = true);
+   void zoom(size_t row);
 diff --git a/src/main.cpp b/src/main.cpp
 index 7bf9b806ed674c1c1824c9d1ce6cb217c9a0504d..1ba09cc33236f8a06ea216de628b33678deddcc7 100644
 --- a/src/main.cpp
