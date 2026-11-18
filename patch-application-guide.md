@@ -35,5 +35,6 @@ Make changes in the owning patch. Shared source files can appear in several patc
 | `0011-power-and-sleep.patch` | Power management, auto-sleep, and sleep images |
 | `0012-sd-firmware-updates.patch` | Firmware picker and SD installs |
 | `0013-workflowy.patch` | Workflowy export and integration |
+| `0014-background-work.patch` | Background book preparation, Library indexing, and Workflowy display |
 
 The SDK series owns the display driver changes for grayscale and the SecureNet HTTPS hostname handling.

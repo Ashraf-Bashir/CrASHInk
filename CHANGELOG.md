@@ -16,6 +16,8 @@
 
 ### Changed
 
+- Book preparation and Library index builds run in the background. Workflowy keeps the outline visible during requests.
+
 - Clipping shares send the quote and any saved note directly to Workflowy over saved Wi-Fi. Sharing also dismisses the highlight toolbar or editor. Sending runs in the background and switches off Wi-Fi if sharing enabled it.
 
 - The date, completed count, Calendar, and Refresh are at the top. Back, Show completed, Add, Undo, and Wrap are at the bottom. Wrapped items use the remaining page space and show inline ellipses on both sides of a page break. Completed items appear below open ones. Wrap and Back use distinct icons without a fill.
@@ -23,6 +25,8 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- The X4 Pro keyboard accepts taps through the edge of each row and uses smaller display updates on SSD1677 panels when possible.
 
 - The Workflowy calendar draws immediately when opened, including while the outline is loading in the background.
 
