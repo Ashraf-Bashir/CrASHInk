@@ -20,6 +20,8 @@
 
 ### Changed
 
+- Workflowy displays loading, connection, pending actions, and errors above the outline, with pagination below. Relative day labels use a consistent font size. Navigation icons use stronger strokes on the light background.
+
 - Workflowy puts Refresh in the bottom toolbar and uses the top row for the full date, day arrows, task count, and calendar. The pending badge keeps pagination visible and includes requested item expansion.
 - New Workflowy tasks start with an editable checkbox marker. Tag completion includes `@OUTSIDE` and `@INSIDE` and capitalizes the next letter after insertion.
 
@@ -35,6 +37,8 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- Workflowy cancels a superseded day fetch when refreshing or switching dates.
 
 - Workflowy retries saved Wi-Fi without automatically opening password entry after a failed reconnect. It shows Loading while retrieving the first outline.
 

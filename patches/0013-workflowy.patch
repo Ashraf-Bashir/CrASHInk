@@ -1013,13 +1013,15 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfbcfaa1fdd
+index 0000000000000000000000000000000000000000..d75961fad74bad82e26cd38ae6af7f96b480ac8e
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2951 @@
+@@ -0,0 +1,2975 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
++#include <FreeInkUIGfxRenderer.h>
++#include <FreeInkUIIcon.h>
 +#include <GfxRenderer.h>
 +#include <HalClock.h>
 +#include <HalFrontlight.h>
@@ -1051,6 +1053,7 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +#include "activities/util/OptionSelectionActivity.h"
 +#include "components/TouchHeaderBackButton.h"
 +#include "components/UITheme.h"
++#include "components/icons/libraryIcons.h"
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
 +#include "workflowy/WorkflowySettings.h"
@@ -1066,6 +1069,9 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +constexpr int ICON_TARGET = 44;
 +constexpr int DAY_TARGET = 36;
 +constexpr int COUNT_TARGET = 76;
++constexpr int STATUS_TOP = 64;
++constexpr int STATUS_HEIGHT = 25;
++constexpr int CONTENT_TOP = STATUS_TOP + STATUS_HEIGHT + 8;
 +constexpr int FOOTER_CONTROLS = 6;
 +constexpr unsigned long SAVED_WIFI_TIMEOUT = 10000;
 +constexpr int ROW_ARROW_TARGET = 34;
@@ -1597,7 +1603,7 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +      RenderLock lock(*this);
 +      for (auto& row : rows) if (row.id != zoomId && row.leaf) row.leaf = false;
 +    }
-+    step = Step::Load;
++    loadDay();
 +  } else {
 +    step = Step::Start;
 +  }
@@ -2034,6 +2040,9 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +    RenderLock lock(*this);
 +    date = today.empty() ? "today" : std::move(today);
 +  }
++  // Keep one network reader. Its existing cancellation flag lets the
++  // worker release its TLS resources before the replacement starts.
++  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
 +  ++generation;
 +  rootCheckedAt = millis() - SYNC_INTERVAL;
 +  nextPrefetchAt = millis();
@@ -2539,8 +2548,6 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +    if (date == target) return;
 +    {
 +      RenderLock lock(*this);
-+      ++generation;
-+      requestedBranch.clear();
 +      date = target;
 +      zoomId.clear();
 +      viewStack.clear();
@@ -2549,7 +2556,7 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +      rows.clear();
 +      layoutDirty = true;
 +    }
-+    if (step != Step::Start) step = Step::Load;
++    if (step != Step::Start) loadDay();
 +    return;
 +  }
 +  const auto old = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
@@ -2593,7 +2600,7 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +WorkflowyDailyActivity::Layout WorkflowyDailyActivity::layout() const {
 +  int top, right, bottom, left;
 +  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+  const int rowTop = top + 74 + (!zoomId.empty() && !selecting ? 30 : 0);
++  const int rowTop = top + CONTENT_TOP + (!zoomId.empty() && !selecting ? 30 : 0);
 +  const int footer = renderer.getScreenHeight() - bottom - 52;
 +  const int pageLabel = std::max(32, renderer.getLineHeight(SMALL_FONT_ID) + 3);
 +  return {left + 8, top, renderer.getScreenWidth() - right - left - 16, rowTop, footer,
@@ -2844,7 +2851,7 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +  const int parentWidth = depth > 1 ? (total - dayWidth - moreWidth) / 2 : 0;
 +  breadcrumbHits = {depth, bounds.x + dayWidth, bounds.x + dayWidth + moreWidth,
 +                     bounds.x + dayWidth + moreWidth + parentWidth};
-+  const int y = bounds.top + 70;
++  const int y = bounds.top + CONTENT_TOP + 5;
 +  const auto draw = [&](int left, int end, const char* label, bool ancestor) {
 +    const int labelWidth = end - left - (ancestor ? 15 : 0);
 +    if (labelWidth <= 0) return;
@@ -2866,7 +2873,7 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +bool WorkflowyDailyActivity::tapBreadcrumb(int x, int y) {
 +  if (selecting || viewStack.empty()) return false;
 +  const auto bounds = layout();
-+  if (y < bounds.top + 63 || y >= bounds.rowTop || x < bounds.x) return false;
++  if (y < bounds.top + CONTENT_TOP || y >= bounds.rowTop || x < bounds.x) return false;
 +  BreadcrumbHits hit;
 +  {
 +    RenderLock lock(*this);
@@ -3538,19 +3545,19 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +      return;
 +    }
 +  }
-+  if (tapped && pendingOperationsCount()) {
++  if (tapped) {
 +    const auto bounds = layout();
-+    if (tapY >= bounds.top + 5 && tapY < bounds.top + 29 &&
-+        tapX >= bounds.x + bounds.width / 4 && tapX < bounds.x + bounds.width * 3 / 4) {
-+      return showPendingOperations();
-+    }
-+  }
-+  if (tapped && isErrorNotice(message)) {
-+    const auto bounds = layout();
-+    if (tapY >= bounds.rowBottom && tapY < bounds.footer && tapX >= bounds.x && tapX < bounds.x + bounds.width) {
-+      tracking = false;
-+      mappedInput.suppressCurrentTouchContact();
-+      return showErrorDetails();
++    if (tapY >= bounds.top + STATUS_TOP && tapY < bounds.top + STATUS_TOP + STATUS_HEIGHT &&
++        tapX >= bounds.x && tapX < bounds.x + bounds.width) {
++      const auto pending = pendingOperationsCount();
++      const auto* notice = statusNotice();
++      const int divider = bounds.x + bounds.width / 2;
++      if (pending && (!notice || tapX >= divider)) return showPendingOperations();
++      if (isErrorNotice(message)) {
++        tracking = false;
++        mappedInput.suppressCurrentTouchContact();
++        return showErrorDetails();
++      }
 +    }
 +  }
 +  if (tapped && tapBreadcrumb(tapX, tapY)) {
@@ -3578,15 +3585,13 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +  x = held ? touchX : tapX;
 +  y = held ? touchY : tapY;
 +  const auto bounds = layout();
-+  if (selecting && y >= bounds.top + 28 && y < bounds.rowTop && !held) {
++  if (selecting && y >= bounds.top + 28 && y < bounds.top + STATUS_TOP && !held) {
 +    const int right = bounds.x + bounds.width;
 +    if (x < bounds.x + ICON_TARGET) return cancelSelection();
 +    if (x >= right - ICON_TARGET) return showBulkMenu();
 +    if (x >= right - ICON_TARGET - 104) return selectAll();
 +    return;
 +  }
-+  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
-+      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
 +  if (y >= bounds.rowBottom && y < bounds.footer) {
 +    const int zone = (x - bounds.x) * 8 / bounds.width;
 +    if (pageStarts.size() <= 1) return;
@@ -3652,6 +3657,50 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +  }
 +  if (checkboxHit) return toggle(row);
 +  edit(row, 0, cursor);
++}
++
++const char* WorkflowyDailyActivity::statusNotice() const {
++  if (isErrorNotice(message)) return message;
++  if (connectingWifi) return tr(STR_CONNECTING);
++  if (awaitingOutline && online) return tr(STR_LOADING_POPUP);
++  if (message) return message;
++  if (!online) return tr(STR_WORKFLOWY_OFFLINE);
++  return nullptr;
++}
++
++void WorkflowyDailyActivity::drawStatus(const Layout& bounds, const size_t pending, const char* notice) {
++  const auto badge = [&](const char* label, const int left, const int span, const bool tappable) {
++    const int caretWidth = tappable ? 15 : 0;
++    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, label, span - 20 - caretWidth);
++    const int width = renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str()) + 16 + caretWidth;
++    const int x = left + (span - width) / 2;
++    const int top = bounds.top + STATUS_TOP;
++    const int textY = top + (STATUS_HEIGHT - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
++    renderer.drawRoundedRect(x, top, width, STATUS_HEIGHT, 1, 7, true);
++    renderer.drawText(SMALL_FONT_ID, x + 8, textY, fitted.c_str());
++    if (tappable) {
++      const int tip = x + width - 8;
++      const int mid = top + STATUS_HEIGHT / 2;
++      renderer.drawLine(tip - 4, mid - 4, tip, mid);
++      renderer.drawLine(tip, mid, tip - 4, mid + 4);
++    }
++  };
++  const int noticeWidth = pending && notice ? bounds.width / 2 : bounds.width;
++  if (notice) badge(notice, bounds.x, noticeWidth, isErrorNotice(message));
++  if (!pending) return;
++  char count[52];
++  const char* label;
++  if (pending == 1) {
++    const auto action = !saves.empty() ? saves.front()->label
++                      : !requestedBranch.empty() ? StrId::STR_WORKFLOWY_ZOOM
++                      : outboxUncertain ? StrId::STR_WORKFLOWY_SYNC_CHECK : StrId::STR_WORKFLOWY_ADD;
++    label = I18n::getInstance().get(action);
++  } else {
++    snprintf(count, sizeof(count), tr(STR_WORKFLOWY_ACTIONS_PENDING), static_cast<unsigned>(pending));
++    label = count;
++  }
++  const int inset = notice ? noticeWidth : 0;
++  badge(label, bounds.x + inset, bounds.width - inset, true);
 +}
 +
 +void WorkflowyDailyActivity::render(RenderLock&&) {
@@ -3737,20 +3786,30 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +    const int countX = dayRight + (COUNT_TARGET - renderer.getTextWidth(SMALL_FONT_ID, todoCount)) / 2;
 +    renderer.drawText(SMALL_FONT_ID, countX, bounds.top + 36, todoCount);
 +    if (!zoomId.empty()) drawBreadcrumbs(bounds, right);
-+    const auto dateWidth = dateRight - dateLeft;
-+    const auto drawDate = [&](const std::string& text, int font, int y) {
-+      const int width = renderer.getTextWidth(font, text.c_str(), EpdFontFamily::BOLD);
-+      renderer.drawText(font, (dateLeft + dateRight - width) / 2, y, text.c_str(), true, EpdFontFamily::BOLD);
++    const int dateWidth = dateRight - dateLeft;
++    // Choose one font for all three relative dates. Switching days should
++    // never shrink only the longer Yesterday or Tomorrow label.
++    int dateFont = UI_12_FONT_ID;
++    for (const auto label : {StrId::STR_WORKFLOWY_TODAY, StrId::STR_WORKFLOWY_YESTERDAY, StrId::STR_WORKFLOWY_TOMORROW}) {
++      const auto sample = std::string("2000-00-00, ") + I18n::getInstance().get(label);
++      if (renderer.getTextWidth(UI_12_FONT_ID, sample.c_str(), EpdFontFamily::BOLD) > dateWidth) {
++        dateFont = SMALL_FONT_ID;
++        break;
++      }
++    }
++    const auto drawDate = [&](const std::string& text, int y) {
++      const int width = renderer.getTextWidth(dateFont, text.c_str(), EpdFontFamily::BOLD);
++      renderer.drawText(dateFont, (dateLeft + dateRight - width) / 2, y, text.c_str(), true, EpdFontFamily::BOLD);
 +    };
-+    if (renderer.getTextWidth(UI_12_FONT_ID, heading.c_str(), EpdFontFamily::BOLD) <= dateWidth) {
-+      drawDate(heading, UI_12_FONT_ID, bounds.top + 32);
-+    } else if (renderer.getTextWidth(SMALL_FONT_ID, heading.c_str(), EpdFontFamily::BOLD) <= dateWidth) {
-+      drawDate(heading, SMALL_FONT_ID, bounds.top + 36);
-+    } else if (const auto split = heading.find(", "); split != std::string::npos) {
-+      drawDate(heading.substr(0, split + 1), SMALL_FONT_ID, bounds.top + 28);
-+      drawDate(heading.substr(split + 2), SMALL_FONT_ID, bounds.top + 46);
++    if (renderer.getTextWidth(dateFont, heading.c_str(), EpdFontFamily::BOLD) > dateWidth) {
++      if (const auto split = heading.find(", "); split != std::string::npos) {
++        drawDate(heading.substr(0, split + 1), bounds.top + 28);
++        drawDate(heading.substr(split + 2), bounds.top + 46);
++      } else {
++        drawDate(heading, bounds.top + 36);
++      }
 +    } else {
-+      drawDate(heading, SMALL_FONT_ID, bounds.top + 36);
++      drawDate(heading, bounds.top + (dateFont == UI_12_FONT_ID ? 32 : 36));
 +    }
 +    for (const int direction : {-1, 1}) {
 +      const int arrowX = direction < 0 ? bounds.x + DAY_TARGET / 2 : dayRight - DAY_TARGET / 2;
@@ -3863,53 +3922,14 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +  }
 +  const auto total = pageStarts.size();
 +  const auto pending = pendingOperationsCount();
-+  if (!online || pending || connectingWifi) {
-+    char status[52];
-+    if (pending == 1) {
-+      const auto action = !saves.empty() ? saves.front()->label
-+                        : !requestedBranch.empty() ? StrId::STR_WORKFLOWY_ZOOM
-+                        : outboxUncertain ? StrId::STR_WORKFLOWY_SYNC_CHECK : StrId::STR_WORKFLOWY_ADD;
-+      snprintf(status, sizeof(status), "%s", I18n::getInstance().get(action));
-+    } else if (pending > 1) {
-+      snprintf(status, sizeof(status), tr(STR_WORKFLOWY_ACTIONS_PENDING), static_cast<unsigned>(pending));
-+    } else {
-+      snprintf(status, sizeof(status), "%s", connectingWifi ? tr(STR_CONNECTING) : tr(STR_WORKFLOWY_OFFLINE));
-+    }
-+    const int width = renderer.getTextWidth(SMALL_FONT_ID, status) + 16;
-+    const int x = bounds.x + (bounds.width - width) / 2;
-+    renderer.drawRoundedRect(x, bounds.top + 5, width, 24, 1, 7, true);
-+    renderer.drawText(SMALL_FONT_ID, x + 8, bounds.top + 8, status);
-+  }
-+  const bool error = isErrorNotice(message);
-+  if (error) {
-+    const int buttonWidth = std::max(84, renderer.getTextWidth(SMALL_FONT_ID, tr(STR_MORE)) + 30);
-+    const int buttonX = bounds.x + bounds.width - buttonWidth;
-+    const int buttonY = bounds.rowBottom + 2;
-+    const int buttonHeight = bounds.footer - buttonY - 3;
-+    const int textY = buttonY + (buttonHeight - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
-+    const auto summary = renderer.truncatedText(SMALL_FONT_ID, message, bounds.width - buttonWidth - 16);
-+    renderer.drawText(SMALL_FONT_ID, bounds.x + 6, textY, summary.c_str());
-+    renderer.drawRoundedRect(buttonX, buttonY, buttonWidth, buttonHeight, 1, 4, true);
-+    renderer.drawText(SMALL_FONT_ID, buttonX + 9, textY, tr(STR_MORE));
-+    const int tip = buttonX + buttonWidth - 9, mid = buttonY + buttonHeight / 2;
-+    renderer.drawLine(tip - 5, mid - 4, tip, mid);
-+    renderer.drawLine(tip, mid, tip - 5, mid + 4);
-+  } else if (message || total > 1 || awaitingOutline || connectingWifi || placements.empty()) {
++  const auto* notice = statusNotice();
++  if (!pending && !notice && placements.empty()) notice = tr(STR_WORKFLOWY_EMPTY);
++  drawStatus(bounds, pending, notice);
++  constexpr int ICON_STROKE = 3;
++  if (total > 1) {
 +    char pages[24];
 +    snprintf(pages, sizeof(pages), "%u/%u", static_cast<unsigned>(page + 1), static_cast<unsigned>(total));
-+    const char* footer = total > 1 ? pages : message ? message : connectingWifi ? tr(STR_CONNECTING)
-+                        : awaitingOutline ? tr(STR_LOADING_POPUP) : placements.empty() ? tr(STR_WORKFLOWY_EMPTY) : nullptr;
-+    const int textY = bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5;
-+    if (footer) {
-+      const auto fitted = renderer.truncatedText(SMALL_FONT_ID, footer, bounds.width / 2 - 4);
-+      renderer.drawCenteredText(SMALL_FONT_ID, textY, fitted.c_str());
-+    }
-+    if (awaitingOutline && total > 1) {
-+      renderer.drawCenteredText(SMALL_FONT_ID, bounds.rowTop - renderer.getLineHeight(SMALL_FONT_ID) - 5,
-+                                tr(STR_LOADING_POPUP));
-+    }
-+  }
-+  if (!error && total > 1) {
++    renderer.drawCenteredText(SMALL_FONT_ID, bounds.footer - renderer.getLineHeight(SMALL_FONT_ID) - 5, pages);
 +    const int y = (bounds.rowBottom + bounds.footer) / 2;
 +    for (const int direction : {-1, 1}) {
 +      const bool enabled = direction < 0 ? page > 0 : page + 1 < total;
@@ -3918,9 +3938,9 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +        const int slot = direction < 0 ? (edge ? 0 : 1) : (edge ? 7 : 6);
 +        const int x = bounds.x + (2 * slot + 1) * bounds.width / 16;
 +        const int tip = x + direction * 4;
-+        renderer.drawLine(x - direction * 4, y - 6, tip, y, 2, true);
-+        renderer.drawLine(tip, y, x - direction * 4, y + 6, 2, true);
-+        if (edge) renderer.drawLine(tip + direction * 4, y - 6, tip + direction * 4, y + 6, 2, true);
++        renderer.drawLine(x - direction * 4, y - 6, tip, y, ICON_STROKE, true);
++        renderer.drawLine(tip, y, x - direction * 4, y + 6, ICON_STROKE, true);
++        if (edge) renderer.drawLine(tip + direction * 4, y - 6, tip + direction * 4, y + 6, ICON_STROKE, true);
 +      }
 +    }
 +  }
@@ -3929,26 +3949,26 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +    const int iconY = bounds.footer + 23;
 +    const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / (2 * FOOTER_CONTROLS); };
 +    int x = iconX(0);
-+    renderer.drawLine(x - 9, iconY, x + 9, iconY, 2, true);
-+    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, 2, true);
-+    renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, 2, true);
++    renderer.drawLine(x - 9, iconY, x + 9, iconY, ICON_STROKE, true);
++    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, ICON_STROKE, true);
++    renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, ICON_STROKE, true);
 +    const int viewX = iconX(1);
 +    const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
 +    const int eyeY[] = {iconY, iconY - 4, iconY - 6, iconY - 4, iconY, iconY + 4, iconY + 6, iconY + 4};
 +    for (int i = 0; i < 8; ++i) {
 +      const int next = (i + 1) % 8;
-+      renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next]);
++      renderer.drawLine(eyeX[i], eyeY[i], eyeX[next], eyeY[next], ICON_STROKE, true);
 +    }
 +    renderer.fillRect(viewX - 2, iconY - 2, 5, 5);
 +    if (!showDone) {
-+      renderer.drawLine(viewX - 10, iconY + 8, viewX + 10, iconY - 8, 2, false);
-+      renderer.drawLine(viewX - 11, iconY + 7, viewX + 9, iconY - 9, 2, true);
++      renderer.drawLine(viewX - 10, iconY + 8, viewX + 10, iconY - 8, ICON_STROKE + 2, false);
++      renderer.drawLine(viewX - 11, iconY + 7, viewX + 9, iconY - 9, ICON_STROKE, true);
 +    }
 +    x = iconX(2);
-+    renderer.drawLine(x - 8, iconY, x + 8, iconY, 2, true);
-+    renderer.drawLine(x, iconY - 8, x, iconY + 8, 2, true);
++    renderer.drawLine(x - 8, iconY, x + 8, iconY, ICON_STROKE, true);
++    renderer.drawLine(x, iconY - 8, x, iconY + 8, ICON_STROKE, true);
 +    x = iconX(3);
-+    const int undoWidth = undoReady ? 2 : 1;
++    const int undoWidth = undoReady ? ICON_STROKE : ICON_STROKE - 1;
 +    renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, true);
 +    renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, true);
 +    renderer.drawLine(x + 9, iconY + 2, x + 4, iconY + 8, undoWidth, true);
@@ -3956,24 +3976,28 @@ index 0000000000000000000000000000000000000000..893b397844a14108cbedc2d508d74cfb
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, true);
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
 +    x = iconX(4);
-+    const int wrapWidth = wrapItems ? 2 : 1;
++    const int wrapWidth = wrapItems ? ICON_STROKE : ICON_STROKE - 1;
 +    renderer.drawLine(x - 11, iconY - 7, x + 4, iconY - 7, wrapWidth, true);
 +    renderer.drawLine(x - 11, iconY, x + 2, iconY, wrapWidth, true);
 +    renderer.drawLine(x - 11, iconY + 7, x - 3, iconY + 7, wrapWidth, true);
 +    renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
-+    const int refreshX = iconX(5);
-+    renderer.drawText(UI_12_FONT_ID, refreshX - renderer.getTextWidth(UI_12_FONT_ID, "↻") / 2, iconY - 13, "↻");
++    const auto refresh = freeink::ui::bitmapFromIcon(icon_refresh_cw_32);
++    freeink::ui::GfxRendererTarget target(renderer);
++    target.bitmap({static_cast<int16_t>(iconX(5) - refresh.width / 2),
++                   static_cast<int16_t>(iconY - icon_refresh_cw_32.opticalCenterY),
++                   static_cast<int16_t>(refresh.width), static_cast<int16_t>(refresh.height)},
++                  refresh, freeink::ui::BitmapMode::Center);
 +  }
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..446a47da43d85a01d830de492fe071c702486bc7
+index 0000000000000000000000000000000000000000..c30661c01b024f97165c60a52752afe865023959
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,236 @@
 +#pragma once
 +
 +#include <atomic>
@@ -4059,6 +4083,7 @@ index 0000000000000000000000000000000000000000..446a47da43d85a01d830de492fe071c7
 +  void showWifiPicker();
 +  void refresh(bool configure);
 +  size_t pendingOperationsCount() const;
++  const char* statusNotice() const;
 +  void pollWifiConnection();
 +  unsigned long nextLinkCheck = 0;
 +  std::string outbox;
@@ -4171,6 +4196,7 @@ index 0000000000000000000000000000000000000000..446a47da43d85a01d830de492fe071c7
 +  void drawBreadcrumbs(const Layout& bounds, int right);
 +  bool tapBreadcrumb(int x, int y);
 +  Layout layout() const;
++  void drawStatus(const Layout& bounds, size_t pending, const char* notice);
 +  void layoutRows(const Layout& bounds);
 +  int rowAt(int x, int y, bool dropping = false) const;
 +  int parentRow(size_t row) const;
