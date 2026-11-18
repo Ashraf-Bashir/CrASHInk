@@ -16,7 +16,7 @@
 
 ### Changed
 
-- Clipping shares send the quote and any saved note directly to Workflowy over saved Wi-Fi. Sending runs in the background and switches off Wi-Fi if sharing enabled it.
+- Clipping shares send the quote and any saved note directly to Workflowy over saved Wi-Fi. Sharing also dismisses the highlight toolbar or editor. Sending runs in the background and switches off Wi-Fi if sharing enabled it.
 
 - The date, completed count, Calendar, and Refresh are at the top. Back, Show completed, Add, Undo, and Wrap are at the bottom. Wrapped items use the remaining page space and show inline ellipses on both sides of a page break. Completed items appear below open ones. Wrap and Back use distinct icons without a fill.
 - Workflowy tries saved Wi-Fi networks in the background. Text edits, new items, checkboxes, and queued captures save without blocking the outline.
