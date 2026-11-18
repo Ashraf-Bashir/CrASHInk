@@ -714,10 +714,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8798bec5d3480ccf616e4ce315026445
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb1ec5a9dd
+index 0000000000000000000000000000000000000000..14958703311c90179b684e2d418327bc4602ef59
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2628 @@
+@@ -0,0 +1,2640 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -814,6 +814,11 @@ index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb
 +                     const std::string& date, const std::string& today)
 +      : Activity("WorkflowyDatePicker", renderer, input), title(title), date(date), today(today) {
 +    sscanf(date.c_str(), "%4d-%2d", &year, &month);
++  }
++
++  void onEnter() override {
++    Activity::onEnter();
++    requestUpdate();
 +  }
 +
 +  bool allowGlobalHomeSwipeGesture() const override { return false; }
@@ -2068,7 +2073,7 @@ index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb
 +      rows.clear();
 +      layoutDirty = true;
 +    }
-+    step = Step::Load;
++    if (step != Step::Start) step = Step::Load;
 +    return;
 +  }
 +  const auto old = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
@@ -2091,7 +2096,6 @@ index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb
 +  const auto title = moveId.empty() ? StrId::STR_WORKFLOWY_SHOW_DATE : StrId::STR_WORKFLOWY_MOVE_DATE;
 +  const auto today = isoDate(0);
 +  const auto selected = validDate(date) ? date : date == "tomorrow" ? isoDate(1) : today;
-+  if (selected.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
 +  startActivityForResult(std::make_unique<WorkflowyDatePicker>(renderer, mappedInput, title, selected, today),
 +                         [this, moveId = std::move(moveId)](const ActivityResult& result) {
 +    if (!result.isCancelled) moveToDate(moveId, std::get<KeyboardResult>(result.data).text);
@@ -2850,18 +2854,28 @@ index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb
 +    if (selecting) return cancelSelection();
 +    return back();
 +  }
++  int tapX = 0, tapY = 0;
++  const bool sdkTap = mappedInput.wasScreenTapped(tapX, tapY);
++  const auto now = millis();
++  const bool tapped = sdkTap && (tracking || gestureEndedAt == 0 || now - gestureEndedAt >= 120);
++  // The calendar is local. Open it before processing Wi-Fi or outline work.
++  if (tapped && !selecting && !loading && step != Step::Waiting && !dragging && !(tracking && moved)) {
++    const auto bounds = layout();
++    const int right = bounds.x + bounds.width;
++    if (tapY >= bounds.top + 28 && tapY < bounds.rowTop && tapX >= right - ICON_TARGET && tapX < right) {
++      tracking = false;
++      return chooseDate();
++    }
++  }
 +  if (step == Step::Start) return connect();
 +  if (step == Step::Load) return loadDay();
 +  if (step != Step::Ready || loading) return;
 +  pollWifiConnection();
 +  if (step != Step::Ready) return;
-+  int tapX = 0, tapY = 0;
-+  const bool sdkTap = mappedInput.wasScreenTapped(tapX, tapY);
 +  int touchDownX, touchDownY;
 +  const bool stillTouching = sdkTap || tracking || mappedInput.wasScreenTouchReleased() ||
 +                             mappedInput.wasScreenTouchDown(touchDownX, touchDownY);
 +  if (!stillTouching && pollSave()) return;
-+  const auto now = millis();
 +  if (static_cast<long>(now - nextLinkCheck) >= 0) {
 +    nextLinkCheck = now + 500;
 +    const bool connected = hasActiveStationWifiConnection();
@@ -2954,7 +2968,6 @@ index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb
 +    }
 +    return;
 +  }
-+  const bool tapped = sdkTap && (tracking || gestureEndedAt == 0 || now - gestureEndedAt >= 120);
 +  if (tapped) {
 +    const int statusTop = layout().top + UITheme::getTopStatusBarInset(renderer);
 +    const bool lamp = GUI.isFrontlightIndicatorTap(renderer, statusTop, tapX, tapY);
@@ -3026,10 +3039,9 @@ index 0000000000000000000000000000000000000000..279746fbe3158a01df85fa4282a4e4fb
 +  if (outboxUncertain && y >= bounds.top + 5 && y < bounds.top + 29 &&
 +      x >= bounds.x + bounds.width / 4 && x < bounds.x + bounds.width * 3 / 4) return reviewCapture();
 +  const int headerRight = bounds.x + bounds.width;
-+  if (y >= bounds.top + 28 && y < bounds.rowTop && x >= headerRight - 2 * ICON_TARGET && x < headerRight) {
-+    if (x >= headerRight - ICON_TARGET) {
-+      if (!credential.empty() && !date.empty()) chooseDate();
-+    } else if (!connectingWifi) {
++  if (y >= bounds.top + 28 && y < bounds.rowTop &&
++      x >= headerRight - 2 * ICON_TARGET && x < headerRight - ICON_TARGET) {
++    if (!connectingWifi) {
 +      if (held) {
 +        if (!pendingSave) editKey();
 +      } else if (pendingSave || (hasActiveStationWifiConnection() && !credential.empty())) {

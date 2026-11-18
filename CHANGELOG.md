@@ -24,6 +24,8 @@
 
 ### Fixed
 
+- The Workflowy calendar draws immediately when opened, including while the outline is loading in the background.
+
 - Workflowy Calendar, Refresh, and selection accept recognized taps without requiring a separate touch edge. Selected rows are shaded light gray.
 
 - Workflowy vertical swipes take precedence over tap-to-edit.
