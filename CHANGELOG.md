@@ -2,7 +2,7 @@
 
 ### Added
 
-- Wi-Fi file transfer closes to the originating reader/library after two minutes without a transfer, shutting down Wi-Fi. Active uploads (including fonts, WebSocket and WebDAV) are protected; downloads reset the idle period when they return. Browser polling does not keep Wi-Fi awake.
+- Wi-Fi file transfer closes to the originating reader/library after five minutes without a transfer, shutting down Wi-Fi. Active uploads (including fonts, WebSocket and WebDAV) are protected; downloads reset the idle period when they return. Browser polling does not keep Wi-Fi awake.
 
 - Wrapped Workflowy tasks render tags and time ranges below the task body in a much smaller font. Compact tasks use a smaller inline font. This is display-only; stored text and edit-cursor positions are preserved, with metadata included in paging.
 
@@ -78,6 +78,9 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- Workflowy keeps Wi-Fi while its task/calendar view or editor is open, but always disconnects when leaving for the reader/library or sleep, including inherited connections.
+- Pending Workflowy saves share a three-minute budget across queue wait and every request in a multi-step job. Expired work reports an error and releases the auto-sleep block; cancellation safely waits for the network worker to unwind.
 
 - Timed-task sorting marks only the affected timed tasks as pending. It accepts only leading time ranges (ignoring decorative emoji), and leaves completed tasks and tasks with words/tags before their time outside the scheduled section.
 - Scheduled separators disappear when no unfinished timed tasks remain above them, and are deleted/recreated in the background after completion or undo. Recent sorted parent lists are remembered on the device, including while their separator is absent.
