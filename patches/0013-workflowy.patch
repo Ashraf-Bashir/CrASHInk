@@ -1043,10 +1043,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb632ac4e9
+index 0000000000000000000000000000000000000000..43d350baaafd4f26d7a6c8f1185153242e49b8ac
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4609 @@
+@@ -0,0 +1,4689 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1109,6 +1109,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +namespace {
 +constexpr size_t MAX_ROWS = 1024;
 +constexpr size_t MAX_SAVE_QUEUE = 24;
++constexpr char SORTED_PARENTS[] = "/.crashink/.workflowy-timed-parents";
 +constexpr size_t MAX_CACHED_BRANCH_ROWS = 220;
 +constexpr size_t MAX_ERROR_BODY = 768;
 +constexpr unsigned long SYNC_INTERVAL = 120000;
@@ -1605,6 +1606,19 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +  credential = workflowy::readSetting(workflowy::KEY_FILE, workflowy::KEY_MAX);
 +  date = isoDate(0);
 +  if (date.empty()) date = "today";
++  // Remember sorted sections even while all their timed tasks are completed and
++  // the separator is absent. Keep a bounded, credential-free on-device list.
++  const auto sorted = workflowy::readSetting(SORTED_PARENTS, 32 * 37);
++  timedSectionParents.reserve(32);
++  for (size_t begin = 0; begin < sorted.size() && timedSectionParents.size() < 32;) {
++    const auto end = sorted.find(',', begin);
++    const auto id = sorted.substr(begin, end == std::string::npos ? end : end - begin);
++    if (!id.empty() && id.size() <= 36 &&
++        id.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-") == std::string::npos)
++      timedSectionParents.push_back(id);
++    if (end == std::string::npos) break;
++    begin = end + 1;
++  }
 +  outbox = workflowy::readSetting(OUTBOX, OUTBOX_LIMIT);
 +  JsonDocument saved;
 +  if (!outbox.empty() && !deserializeJson(saved, outbox)) {
@@ -1890,7 +1904,9 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +bool WorkflowyDailyActivity::itemPending(const std::string& id) const {
 +  return !id.empty() &&
 +         (id == pendingDelete || std::any_of(saves.begin(), saves.end(), [&](const auto& save) {
-+           return save->item == id || (!save->scope.empty() && save->scope == (zoomId.empty() ? date : zoomId));
++           return save->item == id || (save->timedItems &&
++                  std::any_of(save->timedItems->begin(), save->timedItems->end(),
++                              [&](const auto& item) { return item.second == id; }));
 +         }));
 +}
 +
@@ -2002,6 +2018,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +    layoutDirty = true;
 +  }
 +  recordServerError(completed->status, completed->transport, completed->error, completed->key);
++  timedSectionDirty = true;
 +  completed->finish(*completed);
 +  if (leaveAfterSave && saves.empty()) {
 +    leaveAfterSave = false;
@@ -2314,6 +2331,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +    }
 +  }
 +  layoutDirty = true;
++  timedSectionDirty = true;
 +  message = nullptr;
 +}
 +
@@ -2933,28 +2951,74 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +  requestUpdate();
 +}
 +
-+void WorkflowyDailyActivity::sortTimedItems() {
-+  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++void WorkflowyDailyActivity::sortTimedItems(bool automatic) {
++  if (!online) { if (!automatic) showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED)); return; }
 +  if (!saves.empty() || awaitingOutline || !requestedBranch.empty()) return;
 +  const auto parent = zoomId.empty() ? date : zoomId;
 +  const unsigned depth = zoomId.empty() ? 0 : 1;
-+  // At most MAX_ROWS IDs, retained by one queued worker until its moves finish.
 +  std::vector<std::pair<int, std::string>> timed;
 +  timed.reserve(rows.size());
++  std::vector<std::string_view> current;
++  current.reserve(rows.size());
 +  std::string divider;
 +  for (const auto& node : rows) {
 +    if (node.depth != depth || node.id == zoomId) continue;
++    current.push_back(node.id);
 +    if (node.scheduledDivider) divider = node.id;
-+    if (node.divider || itemPending(node.id)) continue;
-+    if (const auto range = workflowy::parseTimeRange(node.title)) timed.emplace_back(range->start, node.id);
++    if (node.divider || node.done || itemPending(node.id)) continue;
++    if (const auto range = workflowy::leadingTaskTimeRange(node.title)) timed.emplace_back(range->start, node.id);
 +  }
-+  if (timed.empty()) return showMessage(tr(STR_WORKFLOWY_EMPTY));
++  timedSectionDirty = false;
++  const auto known = std::find(timedSectionParents.begin(), timedSectionParents.end(), parent);
++  if (automatic && known == timedSectionParents.end() && divider.empty()) return;
++  if (known == timedSectionParents.end()) {
++    // Retain mode while its divider is temporarily absent, bounded by recent views.
++    if (timedSectionParents.size() >= 32) timedSectionParents.erase(timedSectionParents.begin());
++    timedSectionParents.push_back(parent);
++    std::string remembered;
++    remembered.reserve(32 * 37);
++    for (const auto& id : timedSectionParents) {
++      if (!remembered.empty()) remembered += ',';
++      remembered += id;
++    }
++    workflowy::writeSetting(SORTED_PARENTS, remembered);
++  }
++  if (timed.empty() && divider.empty()) {
++    if (!automatic) showMessage(tr(STR_WORKFLOWY_EMPTY));
++    return;
++  }
 +  std::stable_sort(timed.begin(), timed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++  std::vector<std::string_view> desired;
++  desired.reserve(current.size() + 1);
++  for (const auto& item : timed) desired.push_back(item.second);
++  if (!timed.empty()) desired.push_back(divider);
++  for (const auto& id : current) {
++    if (id != divider && std::none_of(timed.begin(), timed.end(), [&](const auto& item) { return item.second == id; }))
++      desired.push_back(id);
++  }
++  if (desired == current) return;
++  auto allocation = makeUniqueNoThrow<std::vector<std::pair<int, std::string>>>();
++  if (!allocation) {
++    LOG_ERR("WF", "Cannot allocate timed sorting job");
++    return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  }
++  allocation->swap(timed);
++  // One immutable list is shared by the worker and pending-row rendering.
++  // Avoid retaining a second full set of task IDs for large day lists.
++  std::shared_ptr<const std::vector<std::pair<int, std::string>>> sorting(std::move(allocation));
 +  if (!queueSave({}, {}, false, [this, parent](const Save& save) {
++        if (save.status < 200 || save.status >= 300) {
++          timedSectionDirty = false;
++          return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++        }
 +        if ((zoomId.empty() ? date : zoomId) == parent) loadDay();
-+        if (save.status < 200 || save.status >= 300) showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +      }, "POST", StrId::STR_SORT, {},
-+      [parent, divider = std::move(divider), timed = std::move(timed)](Save& save) mutable {
++      [parent, divider = std::move(divider), sorting](Save& save) mutable {
++        if (sorting->empty()) {
++          save.status = requestWithKey(save.key, "DELETE", "/" + divider, {}, nullptr, nullptr, 0,
++                                       nullptr, nullptr, &save.transport, &save.error);
++          return;
++        }
 +        if (divider.empty()) {
 +          JsonDocument create;
 +          create["parent_id"] = parent;
@@ -2980,13 +3044,12 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +          return save.status >= 200 && save.status < 300;
 +        };
 +        if (!moveTop(divider)) return;
-+        // Top insertion in reverse time order leaves untimed siblings untouched.
-+        for (auto item = timed.rbegin(); item != timed.rend(); ++item)
++        for (auto item = sorting->rbegin(); item != sorting->rend(); ++item)
 +          if (!moveTop(item->second)) return;
 +      })) return;
 +  {
 +    RenderLock lock(*this);
-+    saves.back()->scope = parent;
++    saves.back()->timedItems = std::move(sorting);
 +  }
 +  requestUpdate();
 +}
@@ -3104,6 +3167,18 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +  const auto placeRow = [&](size_t i) {
 +    const auto& node = rows[i];
 +    if (node.depth > visibleDepth) return;
++    if (node.scheduledDivider) {
++      bool unfinishedAbove = false;
++      for (size_t before = 0; before < i; ++before) {
++        const auto& candidate = rows[before];
++        if (candidate.depth == visibleDepth && !candidate.done && !candidate.divider &&
++            candidate.id != zoomId && workflowy::leadingTaskTimeRange(candidate.title)) {
++          unfinishedAbove = true;
++          break;
++        }
++      }
++      if (!unfinishedAbove) return;
++    }
 +    if (node.divider && !replyOnly) {
 +      if (y + 20 > bounds.rowBottom) { pageStarts.push_back(placements.size()); y = bounds.rowTop; }
 +      const auto first = outlineLines.size();
@@ -3265,6 +3340,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +    requestedBranch.clear();
 +    rootCheckedAt = millis();
 +    awaitingOutline = false;
++    timedSectionDirty = true;
 +    viewStack.push_back({std::move(rows), std::move(zoomId), page});
 +    zoomId = focused.front().id;
 +    rows = std::move(focused);
@@ -3321,6 +3397,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +    }
 +    wrapAnchor = -1;
 +    layoutDirty = true;
++    timedSectionDirty = true;
 +    message = nullptr;
 +  }
 +  requestUpdate();
@@ -3813,7 +3890,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +      calendarFocusZoom = true;
 +    }
 +    if (zoomRow >= 0) return zoom(zoomRow);
-+    if (changed) requestUpdate();
++    if (changed) { timedSectionDirty = true; requestUpdate(); }
 +    return;
 +  }
 +  const bool interactive = !requestedBranch.empty();
@@ -3961,6 +4038,7 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +  const bool stillTouching = sdkTap || tracking || mappedInput.wasScreenTouchReleased() ||
 +                             mappedInput.wasScreenTouchDown(touchDownX, touchDownY);
 +  if (!stillTouching && pollSave()) return;
++  if (!stillTouching && timedSectionDirty) sortTimedItems(true);
 +  if (static_cast<long>(now - nextLinkCheck) >= 0) {
 +    nextLinkCheck = now + 500;
 +    const bool connected = hasActiveStationWifiConnection();
@@ -4589,13 +4667,15 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, true);
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
 +    x = iconX(TodoControl::Wrap);
-+    const int wrapWidth = wrapItems ? ICON_STROKE : ICON_STROKE - 1;
-+    renderer.drawLine(x - 11, iconY - 7, x + 4, iconY - 7, wrapWidth, true);
-+    renderer.drawLine(x - 11, iconY, x + 2, iconY, wrapWidth, true);
-+    renderer.drawLine(x - 11, iconY + 7, x - 3, iconY + 7, wrapWidth, true);
-+    renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
-+    renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
-+    renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
++    // Use the calendar's inward/outward vertical arrows for the target size.
++    const int direction = wrapItems ? -1 : 1;
++    for (int sign : {-1, 1}) {
++      const int tipY = iconY + sign * (direction > 0 ? 10 : 2);
++      const int tailY = iconY + sign * (direction > 0 ? 2 : 11);
++      renderer.drawLine(x, tailY, x, tipY, ICON_STROKE, true);
++      renderer.drawLine(x - 4, tipY - sign * direction * 4, x, tipY, ICON_STROKE, true);
++      renderer.drawLine(x, tipY, x + 4, tipY - sign * direction * 4, ICON_STROKE, true);
++    }
 +    const int calendarX = iconX(TodoControl::Calendar);
 +    renderer.drawRect(calendarX - 11, iconY - 10, 23, 22);
 +    renderer.drawLine(calendarX - 10, iconY - 3, calendarX + 10, iconY - 3, ICON_STROKE, true);
@@ -5658,10 +5738,10 @@ index 0000000000000000000000000000000000000000..ff1516592d0229f5c888b48a1a2a28bb
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0392e5b233c79d0bbfd999ffb56c9bb25e9f8005
+index 0000000000000000000000000000000000000000..d518b3ce36af551dfcd8ea841804aff2c6490618
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,325 @@
 +#pragma once
 +
 +#include <atomic>
@@ -5672,6 +5752,7 @@ index 0000000000000000000000000000000000000000..0392e5b233c79d0bbfd999ffb56c9bb2
 +#include <optional>
 +#include <string>
 +#include <vector>
++#include <utility>
 +
 +#include <I18n.h>
 +#include <Memory.h>
@@ -5786,9 +5867,11 @@ index 0000000000000000000000000000000000000000..0392e5b233c79d0bbfd999ffb56c9bb2
 +  bool ownsWifi = false;
 +  bool showDone = false;
 +  bool replyOnly = false;
++  bool timedSectionDirty = false;
++  std::vector<std::string> timedSectionParents;
 +  void toggleReplyFilter();
 +  void moveUnfinishedForward();
-+  void sortTimedItems();
++  void sortTimedItems(bool automatic = false);
 +  bool wrapItems = true;
 +  int wrapAnchor = -1;
 +  size_t page = 0;
@@ -5881,7 +5964,8 @@ index 0000000000000000000000000000000000000000..0392e5b233c79d0bbfd999ffb56c9bb2
 +    std::vector<Node> children;
 +  };
 +  struct Save {
-+    std::string key, path, body, error, item, title, scope;
++    std::string key, path, body, error, item, title;
++    std::shared_ptr<const std::vector<std::pair<int, std::string>>> timedItems;
 +    StrId label = StrId::STR_EDIT;
 +    std::function<void(Save&)> work;
 +    std::array<uint8_t, 256> response{};
@@ -6050,10 +6134,10 @@ index 0000000000000000000000000000000000000000..857b43e7a8480a99133db2c6ce432463
 +inline constexpr freeink::Icon workflowyCalendarIcon{32, 32, 16, workflowyCalendarBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..315489ebf8bcff6f4470d7ff1557fc6881d3b7a4
+index 0000000000000000000000000000000000000000..3090d267b35792358f0f5f29c7f0f7d223d7179e
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,216 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -6131,6 +6215,17 @@ index 0000000000000000000000000000000000000000..315489ebf8bcff6f4470d7ff1557fc68
 +    at = end;
 +  }
 +  text.resize(write);
++}
++
++// Only a leading time range schedules a task for sorting. Decorative emoji
++// before it are ignored; tags, words and other content before it are not.
++inline std::optional<TimeRange> leadingTaskTimeRange(std::string_view text) {
++  const auto range = parseTimeRange(text);
++  if (!range) return {};
++  auto prefix = std::string(text.substr(0, range->begin));
++  dropEmoji(prefix);
++  if (prefix.find_first_not_of(" \t\r\n") != std::string::npos) return {};
++  return range;
 +}
 +
 +// Return byte spans so a tag split across lines keeps its original identity.
@@ -6562,16 +6657,23 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..063c31e859c371ee1230a975af99863207e9e800
+index 0000000000000000000000000000000000000000..f091805f9daa0814dfa9213706356360c8de0224
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,100 @@
 +#include "WorkflowySchedule.h"
 +#include "WorkflowyOutlineLayout.h"
 +#include <cassert>
 +#include <random>
 +int main() {
 +  using namespace workflowy;
++  assert(leadingTaskTimeRange("8:30am - 12pm Task"));
++  assert(leadingTaskTimeRange("  📅 8:30am - 12pm Task #career"));
++  assert(leadingTaskTimeRange("⏰ 9:00 – 10:00 Task"));
++  assert(!leadingTaskTimeRange("Task 8:30am - 12pm"));
++  assert(!leadingTaskTimeRange("#career 8:30am - 12pm Task"));
++  assert(!leadingTaskTimeRange("@INSIDE 8:30am - 12pm Task"));
++  assert(!leadingTaskTimeRange("Tomorrow 📅 8:30am - 12pm Task"));
 +  const std::string original = "#career 8:30am - 12pm Plan project @INSIDE with team #P0";
 +  TaskTextProjection projected(original);
 +  assert(projected.text(false) == "Plan project with team");

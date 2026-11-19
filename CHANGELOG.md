@@ -79,6 +79,10 @@
 
 ### Fixed
 
+- Timed-task sorting marks only the affected timed tasks as pending. It accepts only leading time ranges (ignoring decorative emoji), and leaves completed tasks and tasks with words/tags before their time outside the scheduled section.
+- Scheduled separators disappear when no unfinished timed tasks remain above them, and are deleted/recreated in the background after completion or undo. Recent sorted parent lists are remembered on the device, including while their separator is absent.
+- Workflowy’s expanded/compact toggle uses distinct inward/outward arrows matching calendar sizing controls instead of resembling Sort.
+
 - Workflowy’s email filter also filters the zoomed parent note, instead of leaving non-matching parent text above reply/respond tasks. Breadcrumb navigation remains available.
 
 - Workflowy loading and operation messages center on the screen across task and calendar views, shifting only to avoid status icons or the clock.
