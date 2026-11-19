@@ -2,6 +2,9 @@
 
 ### Added
 
+- Workflowy item actions include Schedule: choose a spot in today’s calendar, adjust the time, and save to return to the task in its list. The time-block picker can also schedule an existing task from today.
+- The Workflowy calendar adds Schedule agenda view, vertical hour zoom, completed events with faded backgrounds and strikethrough, and background refresh every minute.
+
 - Workflowy has a time calendar with scrollable day and Monday–Sunday week views. Tasks formatted as `8:30 to 12:00 Title` appear as blocks; `am` and `pm` times are supported.
 - Tap an empty time slot to create a task, or a block to open its task and children. Hold a block to move it across times and days, or drag its edges to change its time range in 15-minute steps.
 
@@ -23,6 +26,8 @@
 
 ### Changed
 
+- Workflowy calendar blocks show event titles without repeating their time ranges. New ranges use a dash. Add stays at the far right of each toolbar, and one pending-action indicator sits beside the clock.
+
 - Workflowy removes the calendar icon, gives its tappable date more width, and puts the task counter on the far right. Relative dates keep the regular header font.
 
 - Workflowy displays loading, connection, pending actions, and errors above the outline, with pagination below. Relative day labels use a consistent font size. Navigation icons use stronger strokes on the light background.
@@ -42,6 +47,8 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- Calendar swipes take priority over taps, preventing scrolling gestures from opening a task or a time-block picker.
 
 - Workflowy cancels a superseded day fetch when refreshing or switching dates.
 
