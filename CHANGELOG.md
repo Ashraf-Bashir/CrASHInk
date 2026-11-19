@@ -62,6 +62,8 @@
 
 ### Fixed
 
+- The Library icon keeps a single base line, with the extra active-tab underline removed.
+
 - Calendar swipes take priority over taps, preventing scrolling gestures from opening a task or a time-block picker.
 
 - Workflowy cancels a superseded day fetch when refreshing or switching dates.
