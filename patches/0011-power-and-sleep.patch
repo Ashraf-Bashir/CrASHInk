@@ -1081,3 +1081,200 @@ diff --git a/test/sleep_wake_policy/SleepWakePolicyTest.cpp b/test/sleep_wake_po
 -  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes - 1, kExpectedFrameBytes));
 -  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes + 1, kExpectedFrameBytes));
 -}
+diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
+index 21c82a09db0aece69e36623e91958534d1fd42b9..cca4e9e9f66e239f90ff9df1e80b8774a11f5774 100644
+--- a/src/activities/network/CrossPointWebServerActivity.cpp
++++ b/src/activities/network/CrossPointWebServerActivity.cpp
+@@ -470,6 +470,13 @@ void CrossPointWebServerActivity::loop() {
+         }
+       }
+       lastHandleClientTime = millis();
++      if (webServer->transferIdleExpired(static_cast<uint32_t>(millis()))) {
++        LOG_DBG("WEBACT", "No file transfer for two minutes; closing WiFi transfer");
++        // Use the same exit path as Back: it stops services/WiFi and restores
++        // the originating reader or library, including boot-isolated sessions.
++        exitToOrigin();
++        return;
++      }
+     }
+   }
+ }
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index 01a4c57ff032274643adabc75ea402eeaae391ef..7a20926215c1b03e65273d36ac7c2e50c6e12ff7 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -325,6 +325,7 @@ CrossPointWebServer::CrossPointWebServer() {}
+ CrossPointWebServer::~CrossPointWebServer() { stop(); }
+
+ void CrossPointWebServer::begin() {
++  noteTransfer();
+   if (running) {
+     LOG_DBG("WEB", "Web server already running");
+     return;
+@@ -423,7 +424,15 @@ void CrossPointWebServer::begin() {
+   // Collect WebDAV headers and register handler
+   const char* davHeaders[] = {"Depth", "Destination", "Overwrite", "If", "Lock-Token", "Timeout", "If-None-Match"};
+   server->collectHeaders(davHeaders, 7);
+-  server->addHandler(new WebDAVHandler());  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
++  auto dav = makeUniqueNoThrow<WebDAVHandler>(
++      [](void* context) { static_cast<CrossPointWebServer*>(context)->noteTransfer(); }, this);
++  if (!dav) {
++    LOG_ERR("WEB", "Cannot allocate WebDAV handler for transfer session");
++    server.reset();
++    return;
++  }
++  webDavHandler = dav.get();
++  server->addHandler(dav.release());  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
+
+   server->begin();
+
+@@ -527,6 +536,7 @@ void CrossPointWebServer::stop() {
+   // Brief delay before deletion
+   delay(10);
+
++  webDavHandler = nullptr;
+   server.reset();
+
+   // Note: Static upload variables (uploadFileName, uploadPath, uploadError) are declared
+@@ -555,6 +565,12 @@ void CrossPointWebServer::handleClient() {
+   }
+
+   server->handleClient();
++  if (transferTouched) {
++    // Blocking HTTP uploads/downloads must start their idle period on return,
++    // not at the beginning of a potentially long transfer.
++    lastTransferAt = millis();
++    transferTouched = false;
++  }
+
+   // Handle WebSocket events
+   if (wsServer) {
+@@ -584,6 +600,19 @@ void CrossPointWebServer::handleClient() {
+   }
+ }
+
++void CrossPointWebServer::noteTransfer() const {
++  lastTransferAt = millis();
++  transferTouched = true;
++}
++
++bool CrossPointWebServer::transferIdleExpired(uint32_t now) const {
++  // A connected browser (including its status polling) isn't a transfer.
++  // Never terminate an active multipart, font, or WebSocket upload.
++  if (wsUploadInProgress || upload.file.isOpen() || fontUpload.file.isOpen() ||
++      (webDavHandler && webDavHandler->transferInProgress())) return false;
++  return static_cast<uint32_t>(now - lastTransferAt) >= 120000u;
++}
++
+ CrossPointWebServer::WsUploadStatus CrossPointWebServer::getWsUploadStatus() const {
+   WsUploadStatus status;
+   status.inProgress = wsUploadInProgress;
+@@ -860,6 +889,7 @@ void CrossPointWebServer::handleFileListData() const {
+ }
+
+ void CrossPointWebServer::handleDownload() const {
++  noteTransfer();
+   if (!server->hasArg("path")) {
+     server->send(400, "text/plain", "Missing path");
+     return;
+@@ -957,6 +987,7 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
+   }
+
+   const HTTPUpload& upload = server->upload();
++  noteTransfer();
+
+   if (upload.status == UPLOAD_FILE_START) {
+     state.fileName = StringUtils::sanitizeFilename(upload.filename.c_str()).c_str();
+@@ -2188,6 +2219,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t*
+     }
+
+     case WStype_BIN: {
++      noteTransfer();
+       if (!wsUploadInProgress || !wsUploadFile || num != wsUploadClientNum) {
+         wsServer->sendTXT(num, "ERROR:No upload in progress");
+         return;
+diff --git a/src/network/CrossPointWebServer.h b/src/network/CrossPointWebServer.h
+index 7f6851924c045ef79be722c998d630df5ed9c1e2..89876b2bae33964abc8035ac2ee379eacfd7e35e 100644
+--- a/src/network/CrossPointWebServer.h
++++ b/src/network/CrossPointWebServer.h
+@@ -5,10 +5,13 @@
+ #include <WebServer.h>
+ #include <WebSocketsServer.h>
+
++#include <cstdint>
+ #include <memory>
+ #include <string>
+ #include <vector>
+
++class WebDAVHandler;
++
+ // Structure to hold file information
+ struct FileInfo {
+   String name;
+@@ -64,6 +67,8 @@ class CrossPointWebServer {
+   bool isRunning() const { return running; }
+
+   WsUploadStatus getWsUploadStatus() const;
++  bool transferIdleExpired(uint32_t now) const;
++
+
+   // Borrowed callback/context, owned by the activity that owns this server.
+   using UploadCancelCheck = bool (*)(void*);
+@@ -79,6 +84,11 @@ class CrossPointWebServer {
+   std::unique_ptr<WebServer> server = nullptr;
+   std::unique_ptr<WebSocketsServer> wsServer = nullptr;
+   bool running = false;
++  WebDAVHandler* webDavHandler = nullptr;  // Borrowed; owned by server request handlers.
++  mutable uint32_t lastTransferAt = 0;
++  mutable bool transferTouched = false;
++  void noteTransfer() const;
++
+   bool apMode = false;  // true when running in AP mode, false for STA mode
+   uint16_t port = 80;
+   uint16_t wsPort = 81;  // WebSocket port
+diff --git a/src/network/WebDAVHandler.cpp b/src/network/WebDAVHandler.cpp
+index abfd1b652f54a756c8962647dda10178b8523ef9..2350ecd15a3e7e11462573ecedf2d9c485dea899 100644
+--- a/src/network/WebDAVHandler.cpp
++++ b/src/network/WebDAVHandler.cpp
+@@ -61,6 +61,7 @@ bool WebDAVHandler::canRaw(WebServer& server, const String& uri) {
+ }
+
+ void WebDAVHandler::raw(WebServer& server, const String& uri, HTTPRaw& raw) {
++  noteTransfer();
+   (void)uri;
+   if (raw.status == RAW_START) {
+     _putPath = getRequestPath(server);
+@@ -132,6 +133,7 @@ void WebDAVHandler::raw(WebServer& server, const String& uri, HTTPRaw& raw) {
+ }
+
+ bool WebDAVHandler::handle(WebServer& server, HTTPMethod method, const String& uri) {
++  if (method == HTTP_GET || method == HTTP_PUT) noteTransfer();
+   (void)uri;
+   switch (method) {
+     case HTTP_OPTIONS:
+diff --git a/src/network/WebDAVHandler.h b/src/network/WebDAVHandler.h
+index 7b21bd9ceb27d6634655f7f3cc6738356fdcbac5..b00f9b953df6e54ff8a826aee341d9a2fa09675d 100644
+--- a/src/network/WebDAVHandler.h
++++ b/src/network/WebDAVHandler.h
+@@ -5,6 +5,11 @@
+
+ class WebDAVHandler : public RequestHandler {
+  public:
++  using TransferActivity = void (*)(void*);
++  explicit WebDAVHandler(TransferActivity activity = nullptr, void* context = nullptr)
++      : transferActivity(activity), transferContext(context) {}
++  bool transferInProgress() const { return _putFile.isOpen(); }
++
+   // RequestHandler interface
+   bool canHandle(WebServer& server, HTTPMethod method, const String& uri) override;
+   bool canRaw(WebServer& server, const String& uri) override;
+@@ -12,6 +17,9 @@ class WebDAVHandler : public RequestHandler {
+   bool handle(WebServer& server, HTTPMethod method, const String& uri) override;
+
+  private:
++  TransferActivity transferActivity = nullptr;
++  void* transferContext = nullptr;
++  void noteTransfer() const { if (transferActivity) transferActivity(transferContext); }
+   // PUT streaming state (raw() is called in chunks)
+   HalFile _putFile;
+   String _putPath;

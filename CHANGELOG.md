@@ -2,6 +2,8 @@
 
 ### Added
 
+- Wi-Fi file transfer closes to the originating reader/library after two minutes without a transfer, shutting down Wi-Fi. Active uploads (including fonts, WebSocket and WebDAV) are protected; downloads reset the idle period when they return. Browser polling does not keep Wi-Fi awake.
+
 - Wrapped Workflowy tasks render tags and time ranges below the task body in a much smaller font. Compact tasks use a smaller inline font. This is display-only; stored text and edit-cursor positions are preserved, with metadata included in paging.
 
 - Workflowy task time ranges share the light-grey highlighting used for tags, including wrapped ranges.
