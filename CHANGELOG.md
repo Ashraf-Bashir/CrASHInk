@@ -2,6 +2,9 @@
 
 ### Added
 
+- Workflowy has a time calendar with scrollable day and Monday–Sunday week views. Tasks formatted as `8:30 to 12:00 Title` appear as blocks; `am` and `pm` times are supported.
+- Tap an empty time slot to create a task, or a block to open its task and children. Hold a block to move it across times and days, or drag its edges to change its time range in 15-minute steps.
+
 - Workflowy has a Move menu with parent and relative-day shortcuts, a Turn into menu, and day arrows beside the date.
 - The Workflowy keyboard suggests common tags when typing `#`, including `#CRITICAL` and `#P0` through `#P4`.
 - A tappable Workflowy queue lists pending operations in order and marks the affected rows while requests run.

@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a6af292478e11d385b42e6c43786a5b840ea21d..c75ae1bd5c19b38f7e33c984755e4521925ad80f 100644
+index 3a6af292478e11d385b42e6c43786a5b840ea21d..29288d7ba5fa07a30443f0e6c0f7154554e190c3 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -611,6 +611,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..c75ae1bd5c19b38f7e33c984755e4521
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1080,3 +1098,57 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1080,3 +1098,62 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -98,6 +98,11 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..c75ae1bd5c19b38f7e33c984755e4521
 +STR_WORKFLOWY_BULLET_TYPE: "Bullet"
 +STR_WORKFLOWY_ACTION_PENDING: "%u action pending"
 +STR_WORKFLOWY_ACTIONS_PENDING: "%u actions pending"
++STR_WORKFLOWY_ADD_BLOCK: "Add time block"
++STR_WORKFLOWY_START: "From"
++STR_WORKFLOWY_END: "To"
++STR_WORKFLOWY_DAY: "Day"
++STR_WORKFLOWY_WEEK: "Week"
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -1013,10 +1018,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37c512d15f
+index 0000000000000000000000000000000000000000..4d7a6d832e2978475051223253d0235679695000
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,2958 @@
+@@ -0,0 +1,3733 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1072,7 +1077,8 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +constexpr int STATUS_TOP = 64;
 +constexpr int STATUS_HEIGHT = 25;
 +constexpr int CONTENT_TOP = STATUS_TOP + STATUS_HEIGHT + 8;
-+constexpr int FOOTER_CONTROLS = 6;
++constexpr int FOOTER_CONTROLS = 7;
++constexpr size_t MAX_CALENDAR_ITEMS = MAX_ROWS;
 +constexpr unsigned long SAVED_WIFI_TIMEOUT = 10000;
 +constexpr int ROW_ARROW_TARGET = 34;
 +constexpr char CONTINUATION[] = "...";
@@ -1243,6 +1249,88 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  }
 +};
 +
++class WorkflowyTimeRangePicker final : public Activity {
++ public:
++  WorkflowyTimeRangePicker(GfxRenderer& renderer, MappedInputManager& input, int start)
++      : Activity("WorkflowyTimeRange", renderer, input), start(std::clamp(start, 0, 1425)),
++        end(std::min(1440, this->start + 60)) {}
++  void onEnter() override {
++    Activity::onEnter();
++    requestUpdate();
++  }
++  bool allowGlobalHomeSwipeGesture() const override { return false; }
++  void loop() override {
++    if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
++        TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
++      ActivityResult result;
++      result.isCancelled = true;
++      setResult(std::move(result));
++      return finish();
++    }
++    const auto bounds = geometry();
++    int x, y;
++    if (!mappedInput.wasScreenTapped(x, y)) return;
++    const int row = (y - bounds.y) / 72;
++    if (y >= bounds.y && row < 2) {
++      const int delta = x < bounds.x + bounds.width / 3 ? -15 : x >= bounds.x + 2 * bounds.width / 3 ? 15 : 0;
++      if (!delta) {
++        const auto initial = workflowy::scheduleRange(start, end);
++        startActivityForResult(std::make_unique<KeyboardEntryActivity>(
++                                   renderer, mappedInput, tr(STR_WORKFLOWY_ADD_BLOCK), initial, 48),
++                               [this](const ActivityResult& result) {
++          if (result.isCancelled) return;
++          const auto& value = std::get<KeyboardResult>(result.data).text;
++          const auto range = workflowy::parseTimeRange(value);
++          if (range && range->begin == 0 && range->finish == value.size()) {
++            RenderLock lock(*this);
++            start = range->start;
++            end = range->end;
++          }
++          requestUpdate();
++        });
++        return;
++      }
++      {
++        RenderLock lock(*this);
++        if (row == 0) start = std::clamp(start + delta, 0, end - 15);
++        else end = std::clamp(end + delta, start + 15, 1440);
++      }
++      return requestUpdate();
++    }
++    if (y >= bounds.y + 164 && y < bounds.y + 216 && x >= bounds.x && x < bounds.x + bounds.width) {
++      setResult(KeyboardResult{workflowy::scheduleRange(start, end)});
++      finish();
++    }
++  }
++  void render(RenderLock&&) override {
++    renderer.clearScreen();
++    TouchHeaderBackButton::drawCompact(renderer, tr(STR_WORKFLOWY_ADD_BLOCK), false, true);
++    const auto bounds = geometry();
++    for (int row = 0; row < 2; ++row) {
++      const int top = bounds.y + row * 72;
++      renderer.drawText(SMALL_FONT_ID, bounds.x + 12, top, row ? tr(STR_WORKFLOWY_END) : tr(STR_WORKFLOWY_START));
++      const auto value = workflowy::scheduleClock(row ? end : start);
++      renderer.drawCenteredText(UI_12_FONT_ID, top + 25, value.c_str(), true, EpdFontFamily::BOLD);
++      for (const int direction : {-1, 1}) {
++        const int cx = bounds.x + (direction < 0 ? 28 : bounds.width - 28);
++        renderer.drawLine(cx - 8, top + 35, cx + 8, top + 35, 3, true);
++        if (direction > 0) renderer.drawLine(cx, top + 27, cx, top + 43, 3, true);
++      }
++    }
++    renderer.drawRoundedRect(bounds.x, bounds.y + 164, bounds.width, 48, 1, 6, true);
++    renderer.drawCenteredText(UI_12_FONT_ID, bounds.y + 177, tr(STR_WORKFLOWY_ADD), true, EpdFontFamily::BOLD);
++    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++  }
++ private:
++  int start, end;
++  Rect geometry() const {
++    int top, right, bottom, left;
++    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++    const int width = std::min(360, renderer.getScreenWidth() - left - right - 24);
++    return Rect{(renderer.getScreenWidth() + left - right - width) / 2, top + 100, width, 216};
++  }
++};
++
 +bool isErrorNotice(const char* text) {
 +  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED);
 +}
@@ -1398,6 +1486,11 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +}
 +
 +void WorkflowyDailyActivity::onExit() {
++  if (calendarFetch) {
++    calendarFetch->cancel.store(true, std::memory_order_relaxed);
++    while (!calendarFetch->ready.load(std::memory_order_acquire)) vTaskDelay(1);
++    calendarFetch.reset();
++  }
 +  for (const auto& save : saves) {
 +    if (!save->started) break;
 +    while (!save->ready.load(std::memory_order_acquire)) vTaskDelay(1);
@@ -1682,7 +1775,8 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  const bool sendingCapture = pendingCount && std::any_of(saves.begin(), saves.end(), [](const auto& save) {
 +    return save->fromOutbox;
 +  });
-+  return saves.size() + pendingCount - sendingCapture + !requestedBranch.empty();
++  return saves.size() + pendingCount - sendingCapture + !requestedBranch.empty() +
++         (calendarVisible && calendarFetch && !calendarFetch->cancel.load(std::memory_order_relaxed));
 +}
 +
 +void WorkflowyDailyActivity::showPendingOperations() {
@@ -1722,6 +1816,7 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  const auto node = std::find_if(rows.begin(), rows.end(), [&](const Node& row) { return row.id == save->item; });
 +  if (node != rows.end()) save->title = node->title.substr(0, 120);
 +  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
++  if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
 +  {
 +    RenderLock lock(*this);
 +    saves.push_back(std::move(save));
@@ -1736,8 +1831,10 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  for (auto& item : saves) {
 +    auto& save = *item;
 +    if (save.ready.load(std::memory_order_acquire)) continue;
-+    if (save.started || (prefetch && !prefetch->ready.load(std::memory_order_acquire))) return;
++    if (save.started || (prefetch && !prefetch->ready.load(std::memory_order_acquire)) ||
++        (calendarFetch && !calendarFetch->ready.load(std::memory_order_acquire))) return;
 +    prefetch.reset();
++    calendarFetch.reset();
 +    save.started = true;
 +    if (xTaskCreate(saveTask, "wf-save", 8192, &save, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
 +      save.status = -5;
@@ -2121,20 +2218,23 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  return true;
 +}
 +
-+void WorkflowyDailyActivity::edit(const size_t row, const int relative, const size_t cursor) {
++void WorkflowyDailyActivity::edit(const size_t row, const int relative, const size_t cursor,
++                                   std::string initialText, std::string targetDate) {
 +  if (row < rows.size() && itemPending(rows[row].id)) return;
 +  const bool adding = relative != 0 || row >= rows.size();
 +  if (!online && (!adding || relative != 0)) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const std::string id = row < rows.size() ? rows[row].id : "";
-+  const std::string initial = adding ? "[] " : rows[row].title;
++  const std::string initial = adding ? (initialText.empty() ? "[] " : std::move(initialText)) : rows[row].title;
 +  const bool originalTodo = !adding && rows[row].todo;
 +  const int parentIndex = relative ? parentRow(row) : -1;
-+  const std::string parent = relative ? (parentIndex < 0 ? "" : rows[parentIndex].id) : zoomId;
++  const bool scheduled = !targetDate.empty();
++  const std::string createDate = scheduled ? std::move(targetDate) : date;
++  const std::string parent = scheduled ? "" : relative ? (parentIndex < 0 ? "" : rows[parentIndex].id) : zoomId;
 +  auto keyboard = std::make_unique<KeyboardEntryActivity>(
 +      renderer, mappedInput, adding ? tr(STR_WORKFLOWY_ADD) : tr(STR_EDIT), initial, 512);
 +  keyboard->setInitialCursor(adding ? initial.size() : cursor);
 +  keyboard->enableWorkflowyTags();
-+  startActivityForResult(std::move(keyboard), [this, id, initial, originalTodo, parent, adding, relative](const ActivityResult& result) {
++  startActivityForResult(std::move(keyboard), [this, id, initial, originalTodo, parent, adding, relative, createDate, scheduled](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    auto text = std::get<KeyboardResult>(result.data).text;
 +    workflowy::dropEmoji(text);
@@ -2151,7 +2251,7 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +    update["name"] = escapedTitle(text, adding);
 +    if (makeTodo) update["layoutMode"] = "todo";
 +    if (adding) {
-+      update["parent_id"] = parent.empty() ? date : parent;
++      update["parent_id"] = parent.empty() ? createDate : parent;
 +      update["layoutMode"] = makeTodo ? "todo" : "bullets";
 +      update["position"] = "bottom";
 +    }
@@ -2161,13 +2261,20 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +      return;
 +    }
 +    const auto localId = adding ? "pending:" + std::to_string(++temporaryId) : id;
-+    const auto capturedDate = date;
++    const auto capturedDate = createDate;
 +    const auto label = adding ? StrId::STR_WORKFLOWY_ADD : StrId::STR_EDIT;
 +    if (!queueSave(adding ? "" : "/" + id, encode(update), adding,
 +              [this, id, localId, parent, initial, originalTodo, adding, relative, capturedDate](const Save& save) {
 +      if (save.status < 200 || save.status >= 300) {
-+        if (adding) removeNode(localId);
-+        else applyTitle(id, initial, originalTodo);
++        if (adding) {
++          {
++            RenderLock lock(*this);
++            for (auto& day : calendarDays) {
++              std::erase_if(day.items, [&](const Node& item) { return item.id == localId; });
++            }
++          }
++          removeNode(localId);
++        } else applyTitle(id, initial, originalTodo);
 +        return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +      }
 +      if (!adding) return;
@@ -2182,6 +2289,9 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +      }
 +      {
 +        RenderLock lock(*this);
++        for (auto& day : calendarDays) {
++          for (auto& item : day.items) if (item.id == localId) item.id = newId;
++        }
 +        const auto replaceId = [&](std::vector<Node>& outline) {
 +          for (auto& node : outline) if (node.id == localId) node.id = newId;
 +        };
@@ -2200,9 +2310,12 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +      RenderLock lock(*this);
 +      Node added{localId, text, 0, 0, makeTodo, false};
 +      added.leaf = true;
-+      if (!parent.empty() || zoomId.empty()) appendChild(rows, parent, added);
++      if (scheduled) {
++        for (auto& day : calendarDays) if (day.date == createDate) day.items.push_back(added);
++      }
++      if (!parent.empty() || (createDate == date && zoomId.empty())) appendChild(rows, parent, added);
 +      for (auto& view : viewStack) {
-+        if (!parent.empty() || view.zoomId.empty()) appendChild(view.rows, parent, added);
++        if (!parent.empty() || (createDate == date && view.zoomId.empty())) appendChild(view.rows, parent, added);
 +      }
 +      saves.back()->title = text.substr(0, 120);
 +      layoutDirty = true;
@@ -3238,6 +3351,11 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +}
 +
 +void WorkflowyDailyActivity::pollPrefetch() {
++  if (calendarFetch) {
++    calendarFetch->cancel.store(true, std::memory_order_relaxed);
++    if (!calendarFetch->ready.load(std::memory_order_acquire)) return;
++    calendarFetch.reset();
++  }
 +  const auto now = millis();
 +  if (prefetch) {
 +    if (!prefetch->ready.load(std::memory_order_acquire)) return;
@@ -3279,7 +3397,7 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +            message = tr(STR_WORKFLOWY_DAILY_READ_FAILED);
 +          } else {
 +            replaceSiblings(rows, job->parent, job->children);
-+            if (!rows[index].leaf) zoomRow = static_cast<int>(index);
++            zoomRow = static_cast<int>(index);
 +            message = nullptr;
 +            layoutDirty = true;
 +          }
@@ -3288,6 +3406,11 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +        changed |= replaceSiblings(rows, job->parent, job->children);
 +        layoutDirty |= changed;
 +      }
++    }
++    if (!calendarFocus.empty() && job->root && job->status == 200) {
++      const auto item = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == calendarFocus; });
++      calendarFocus.clear();
++      if (item != rows.end()) zoomRow = item - rows.begin();
 +    }
 +    if (zoomRow >= 0) return zoom(zoomRow);
 +    if (changed) requestUpdate();
@@ -3364,6 +3487,15 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  using Swipe = MappedInputManager::SwipeDir;
 +  if (mappedInput.wasReleased(Button::Back)) {
 +    if (queueVisible) return showPendingOperations();
++    if (calendarVisible) {
++      {
++        RenderLock lock(*this);
++        calendarVisible = false;
++        calendarDrag = {};
++      }
++      if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
++      return requestUpdate();
++    }
 +    if (selecting) return cancelSelection();
 +    return back();
 +  }
@@ -3388,9 +3520,21 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +    if (step == Step::Ready) pollWifiConnection();
 +    if (step == Step::Load) loadDay();
 +    if (!pollSave() && swipe != Swipe::None) requestUpdate();
-+    if (saves.empty() && (!requestedBranch.empty() || awaitingOutline)) pollPrefetch();
++    if (calendarVisible) pollCalendar();
++    else if (saves.empty() && (!requestedBranch.empty() || awaitingOutline)) pollPrefetch();
 +    else if (saves.empty() && pendingCount && !outboxUncertain && hasActiveStationWifiConnection() &&
 +             static_cast<long>(now - retryOutboxAt) >= 0) flushCapture();
++    return;
++  }
++  if (calendarVisible) {
++    if (step == Step::Start) connect();
++    else if (step == Step::Ready) pollWifiConnection();
++    if (step == Step::Load) {
++      step = Step::Ready;
++      awaitingOutline = false;
++      reloadCalendar();
++    }
++    calendarLoop(sdkTap, tapX, tapY);
 +    return;
 +  }
 +  const bool tapped = sdkTap && (tracking || gestureEndedAt == 0 || now - gestureEndedAt >= 120);
@@ -3601,7 +3745,8 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +    }
 +    const int control = std::clamp((x - bounds.x) * FOOTER_CONTROLS / bounds.width, 0, FOOTER_CONTROLS - 1);
 +    if (control == 0) return back();
-+    if (control == 5) return refresh(held);
++    if (control == 5) return openCalendar(false);
++    if (control == 6) return refresh(held);
 +    if (control == 2) {
 +      if (!credential.empty() && !date.empty()) edit(rows.size());
 +      return;
@@ -3658,7 +3803,7 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +const char* WorkflowyDailyActivity::statusNotice() const {
 +  if (isErrorNotice(message)) return message;
 +  if (connectingWifi) return tr(STR_CONNECTING);
-+  if (awaitingOutline && online) return tr(STR_LOADING_POPUP);
++  if ((awaitingOutline || (calendarVisible && calendarFetch)) && online) return tr(STR_LOADING_POPUP);
 +  if (message) return message;
 +  if (!online) return tr(STR_WORKFLOWY_OFFLINE);
 +  return nullptr;
@@ -3689,6 +3834,7 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +  if (pending == 1) {
 +    const auto action = !saves.empty() ? saves.front()->label
 +                      : !requestedBranch.empty() ? StrId::STR_WORKFLOWY_ZOOM
++                      : calendarVisible && calendarFetch ? StrId::STR_LOADING_POPUP
 +                      : outboxUncertain ? StrId::STR_WORKFLOWY_SYNC_CHECK : StrId::STR_WORKFLOWY_ADD;
 +    label = I18n::getInstance().get(action);
 +  } else {
@@ -3716,7 +3862,9 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +      return save->fromOutbox;
 +    }) && !offlineQueuePreview.empty() ? 1 : 0;
 +    const size_t branchEntries = !requestedBranch.empty();
-+    const auto offlineStart = saves.size() + branchEntries;
++    const size_t calendarEntries = calendarVisible && calendarFetch &&
++                                   !calendarFetch->cancel.load(std::memory_order_relaxed);
++    const auto offlineStart = saves.size() + branchEntries + calendarEntries;
 +    const auto total = offlineStart + offlineQueuePreview.size() - inFlightCapture;
 +    queuePage = std::min(queuePage, total == 0 ? 0 : (total - 1) / visible);
 +    const auto opening = branchEntries ? std::find_if(rows.begin(), rows.end(), [&](const Node& node) {
@@ -3724,17 +3872,20 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +    }) : rows.end();
 +    for (size_t i = queuePage * visible; i < total && i < (queuePage + 1) * visible; ++i) {
 +      const auto* save = i < saves.size() ? saves[i].get() : nullptr;
-+      const bool openingItem = !save && i < offlineStart;
-+      const auto type = save ? save->label : openingItem ? StrId::STR_WORKFLOWY_ZOOM : StrId::STR_WORKFLOWY_ADD;
++      const bool openingItem = !save && i < saves.size() + branchEntries;
++      const bool calendarItem = !save && !openingItem && i < offlineStart;
++      const auto type = save ? save->label : openingItem ? StrId::STR_WORKFLOWY_ZOOM
++                        : calendarItem ? StrId::STR_LOADING_POPUP : StrId::STR_WORKFLOWY_ADD;
 +      const auto name = save ? std::string_view(save->title)
 +                        : openingItem ? (opening == rows.end() ? std::string_view{} : std::string_view(opening->title))
++                        : calendarItem ? std::string_view(calendarFetch->date)
 +                        : std::string_view(offlineQueuePreview[i - offlineStart + inFlightCapture]);
 +      auto text = std::to_string(i + 1) + ". " + I18n::getInstance().get(type);
 +      if (!name.empty()) {
 +        text += " · ";
 +        text += name;
 +      }
-+      if (!save && !openingItem && outboxUncertain && i == offlineStart) {
++      if (!save && !openingItem && !calendarItem && outboxUncertain && i == offlineStart) {
 +        text += " · ";
 +        text += tr(STR_WORKFLOWY_SYNC_CHECK);
 +      }
@@ -3744,6 +3895,10 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +    if (!total) renderer.drawCenteredText(UI_12_FONT_ID, bounds.rowTop + 12, tr(STR_WORKFLOWY_QUEUE_EMPTY));
 +    renderer.drawCenteredText(SMALL_FONT_ID, bounds.footer + 13, tr(STR_BACK));
 +    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++    return;
++  }
++  if (calendarVisible) {
++    renderCalendar(bounds);
 +    return;
 +  }
 +  if (selecting) {
@@ -3966,21 +4121,646 @@ index 0000000000000000000000000000000000000000..23c60d40fea11615fdeaaec377052c37
 +    renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
++    const int calendarX = iconX(5);
++    renderer.drawRect(calendarX - 11, iconY - 10, 23, 22);
++    renderer.drawLine(calendarX - 10, iconY - 3, calendarX + 10, iconY - 3, ICON_STROKE, true);
++    renderer.drawLine(calendarX - 5, iconY - 13, calendarX - 5, iconY - 7, ICON_STROKE, true);
++    renderer.drawLine(calendarX + 5, iconY - 13, calendarX + 5, iconY - 7, ICON_STROKE, true);
 +    const auto refresh = freeink::ui::bitmapFromIcon(icon_refresh_cw_32);
 +    freeink::ui::GfxRendererTarget target(renderer);
-+    target.bitmap({static_cast<int16_t>(iconX(5) - refresh.width / 2),
++    target.bitmap({static_cast<int16_t>(iconX(6) - refresh.width / 2),
 +                   static_cast<int16_t>(iconY - icon_refresh_cw_32.opticalCenterY),
 +                   static_cast<int16_t>(refresh.width), static_cast<int16_t>(refresh.height)},
 +                  refresh, freeink::ui::BitmapMode::Center);
 +  }
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
++
++int WorkflowyDailyActivity::CalendarGrid::minuteAt(int pixel) const {
++  return (pixel - y) * 60 / hourHeight;
++}
++
++WorkflowyDailyActivity::CalendarGrid WorkflowyDailyActivity::calendarGrid() const {
++  const auto bounds = layout();
++  const int y = bounds.top + CONTENT_TOP + (calendarWeek ? 44 : 8);
++  const int height = std::max(120, bounds.footer - y - 6);
++  return {bounds.x + 43, y, bounds.width - 43, height, std::max(64, height / 6)};
++}
++
++void WorkflowyDailyActivity::openCalendar(bool week) {
++  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
++  const auto current = validDate(date) ? date : isoDate(date == "tomorrow" ? 1 : 0);
++  if (current.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++  {
++    RenderLock lock(*this);
++    calendarVisible = true;
++    calendarWeek = week;
++    calendarAnchor = current;
++    requestedBranch.clear();
++    awaitingOutline = false;
++    calendarDrag = {};
++    calendarHits.clear();
++  }
++  reloadCalendar();
++}
++
++void WorkflowyDailyActivity::reloadCalendar() {
++  if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
++  const auto first = calendarWeek
++                         ? workflowy::shiftScheduleDate(calendarAnchor, -workflowy::scheduleWeekday(calendarAnchor))
++                         : calendarAnchor;
++  {
++    RenderLock lock(*this);
++    const auto previous = std::move(calendarDays);
++    calendarDays = {};
++    for (size_t i = 0; i < (calendarWeek ? 7u : 1u); ++i) {
++      auto& day = calendarDays[i];
++      day.date = workflowy::shiftScheduleDate(first, static_cast<int>(i));
++      const auto cached = std::find_if(previous.begin(), previous.end(), [&](const CalendarDay& item) {
++        return item.date == day.date && item.loaded;
++      });
++      if (cached != previous.end()) {
++        day.items = cached->items;
++      } else if (day.date == date) {
++        const auto& outline = viewStack.empty() ? rows : viewStack.front().rows;
++        for (const auto& node : outline) {
++          if (node.depth == 0 && workflowy::parseTimeRange(node.title)) day.items.push_back(node);
++        }
++      }
++    }
++    calendarHits.clear();
++    message = nullptr;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::calendarFetchTask(void* argument) {
++  {
++    std::unique_ptr<std::shared_ptr<CalendarFetch>> holder(static_cast<std::shared_ptr<CalendarFetch>*>(argument));
++    auto& job = **holder;
++    job.status = fetchChildren(job.key, job.date, 0, job.items, &job.cancel, &job.transport);
++    // The timeline owns only timed nodes. Full child lists remain lazy in the outline.
++    std::erase_if(job.items, [](const Node& node) { return !workflowy::parseTimeRange(node.title); });
++    job.ready.store(true, std::memory_order_release);
++  }
++  vTaskDelete(nullptr);
++}
++
++void WorkflowyDailyActivity::pollCalendar() {
++  if (calendarFetch) {
++    if (!calendarFetch->ready.load(std::memory_order_acquire)) return;
++    auto completed = std::move(calendarFetch);
++    if (!completed->cancel.load(std::memory_order_relaxed)) {
++      const auto day = std::find_if(calendarDays.begin(), calendarDays.end(), [&](const CalendarDay& entry) {
++        return entry.date == completed->date;
++      });
++      if (day != calendarDays.end()) {
++        {
++          RenderLock lock(*this);
++          day->loaded = true;
++          if (completed->status == 200) {
++            // Preserve optimistic items until their own save response settles.
++            for (const auto& old : day->items) {
++              if (!itemPending(old.id)) continue;
++              const auto found = std::find_if(completed->items.begin(), completed->items.end(),
++                                               [&](const Node& node) { return node.id == old.id; });
++              if (found != completed->items.end()) *found = old;
++              else if (old.id.starts_with("pending:")) completed->items.push_back(old);
++            }
++            day->items = std::move(completed->items);
++          }
++        }
++        if (completed->status != 200) {
++          recordServerError(completed->status, completed->transport, {}, credential);
++          showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++        } else requestUpdate();
++      }
++    }
++  }
++  if (!calendarVisible || !saves.empty() || !online || calendarDrag.active) return;
++  if (prefetch) {
++    prefetch->cancel.store(true, std::memory_order_relaxed);
++    if (!prefetch->ready.load(std::memory_order_acquire)) return;
++    prefetch.reset();
++  }
++  const auto next = std::find_if(calendarDays.begin(), calendarDays.end(), [](const CalendarDay& day) {
++    return !day.date.empty() && !day.loaded;
++  });
++  if (next == calendarDays.end()) return;
++  // Shared ownership keeps a cancelled request alive until its worker closes TLS.
++  auto allocation = makeUniqueNoThrow<CalendarFetch>();
++  if (!allocation) return showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++  std::shared_ptr<CalendarFetch> job(std::move(allocation));
++  job->key = credential;
++  job->date = next->date;
++  auto holder = makeUniqueNoThrow<std::shared_ptr<CalendarFetch>>(job);
++  if (!holder) return showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++  calendarFetch = job;
++  // calendarFetchTask takes ownership of the argument.
++  auto* argument = holder.release();
++  if (xTaskCreate(calendarFetchTask, "wf-calendar", 8192, argument, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
++    delete argument;
++    calendarFetch.reset();
++    return showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::openCalendarTask(unsigned day, const std::string& id) {
++  if (day >= calendarDays.size() || itemPending(id)) return;
++  const auto item = std::find_if(calendarDays[day].items.begin(), calendarDays[day].items.end(),
++                                  [&](const Node& node) { return node.id == id; });
++  if (item == calendarDays[day].items.end()) return;
++  const auto target = calendarDays[day].date;
++  if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
++  {
++    RenderLock lock(*this);
++    calendarVisible = false;
++    calendarDrag = {};
++  }
++  if (!viewStack.empty()) returnToDepth(0);
++  if (target == date && std::any_of(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; })) {
++    const auto existing = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++    return zoom(existing - rows.begin());
++  }
++  calendarFocus = id;
++  if (target == date) loadDay();
++  else moveToDate({}, target);
++}
++
++void WorkflowyDailyActivity::createCalendarTask(unsigned day, int start) {
++  if (day >= calendarDays.size() || calendarDays[day].date.empty()) return;
++  const auto target = calendarDays[day].date;
++  startActivityForResult(std::make_unique<WorkflowyTimeRangePicker>(renderer, mappedInput, start),
++                         [this, target](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    edit(rows.size(), 0, std::string::npos, "[] " + std::get<KeyboardResult>(result.data).text + " ", target);
++  });
++}
++
++void WorkflowyDailyActivity::updateCalendarTask(const std::string& id, const std::string& source,
++                                                const std::string& destination, const std::string& title) {
++  RenderLock lock(*this);
++  std::optional<Node> moved;
++  for (auto& day : calendarDays) {
++    const auto node = std::find_if(day.items.begin(), day.items.end(), [&](const Node& row) { return row.id == id; });
++    if (node == day.items.end()) continue;
++    if (source != destination) {
++      moved = *node;
++      day.items.erase(node);
++    } else {
++      node->title = title;
++    }
++  }
++  if (moved) {
++    moved->title = title;
++    for (auto& day : calendarDays) {
++      if (day.date == destination && std::none_of(day.items.begin(), day.items.end(),
++                                                 [&](const Node& item) { return item.id == id; })) {
++        day.items.push_back(*moved);
++      }
++    }
++  }
++  const auto update = [&](std::vector<Node>& outline) {
++    for (auto& item : outline) if (item.id == id) item.title = title;
++  };
++  update(rows);
++  for (auto& view : viewStack) update(view.rows);
++  layoutDirty = true;
++}
++
++void WorkflowyDailyActivity::saveCalendarDrag() {
++  const auto drag = calendarDrag;
++  {
++    RenderLock lock(*this);
++    calendarDrag = {};
++  }
++  if (!drag.active || drag.day >= calendarDays.size() || itemPending(drag.id)) return requestUpdate();
++  const auto destination = calendarDays[drag.day].date;
++  if (drag.start == drag.originalStart && drag.end == drag.originalEnd && destination == drag.originDate)
++    return requestUpdate();
++  const auto updated = workflowy::replaceTimeRange(drag.title, drag.start, drag.end);
++  JsonDocument change;
++  change["name"] = escapedTitle(updated, false);
++  const auto body = encode(change);
++  if (!queueSave("/" + drag.id, body, false,
++                 [this, drag, destination, updated](const Save& save) {
++    if (save.status < 200 || save.status >= 300) {
++      updateCalendarTask(drag.id, destination, drag.originDate, drag.title);
++      showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++      // A move response can be lost after the server accepts it. Refresh the
++      // visible dates to reconcile the task after restoring the local preview.
++      if (calendarVisible) {
++        reloadCalendar();
++        showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++      }
++      return;
++    }
++    if (destination != drag.originDate) {
++      const bool current = destination == date || (date == "today" && destination == isoDate(0));
++      removeNode(drag.id, current);
++    }
++  }, "POST", StrId::STR_WORKFLOWY_MOVE, drag.id,
++     [id = drag.id, original = drag.title, destination, source = drag.originDate, body](Save& save) {
++    save.status = requestWithKey(save.key, "POST", "/" + id, body, nullptr, nullptr, 0,
++                                 nullptr, nullptr, &save.transport, &save.error);
++    if (save.status < 200 || save.status >= 300 || source == destination) return;
++    JsonDocument move;
++    move["parent_id"] = destination;
++    move["position"] = "bottom";
++    save.status = requestWithKey(save.key, "POST", "/" + id + "/move", encode(move), nullptr, nullptr, 0,
++                                 nullptr, nullptr, &save.transport, &save.error);
++    if (save.status < 200 || save.status >= 300) {
++      JsonDocument restore;
++      restore["name"] = escapedTitle(original, false);
++      requestWithKey(save.key, "POST", "/" + id, encode(restore), nullptr, nullptr, 0);
++    }
++  })) return requestUpdate();
++  {
++    RenderLock lock(*this);
++    saves.back()->title = drag.title.substr(0, 120);
++  }
++  updateCalendarTask(drag.id, drag.originDate, destination, updated);
++  {
++    RenderLock lock(*this);
++    for (auto& day : calendarDays) {
++      if (day.date == destination && std::none_of(day.items.begin(), day.items.end(),
++                                                 [&](const Node& item) { return item.id == drag.id; })) {
++        day.items.push_back(Node{drag.id, updated, 0, 0, drag.todo, drag.done});
++      }
++    }
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::calendarLoop(bool tapped, int tapX, int tapY) {
++  using Swipe = MappedInputManager::SwipeDir;
++  using Button = MappedInputManager::Button;
++  const auto bounds = layout();
++  const auto grid = calendarGrid();
++  const auto changePeriod = [&](int delta) {
++    const auto shifted = workflowy::shiftScheduleDate(calendarAnchor, delta * (calendarWeek ? 7 : 1));
++    if (shifted.empty()) return;
++    {
++      RenderLock lock(*this);
++      calendarAnchor = shifted;
++      calendarDrag = {};
++    }
++    reloadCalendar();
++  };
++  if (tapped && gestureEndedAt && millis() - gestureEndedAt < 160) tapped = false;
++  if (tapped && calendarWeek && tapY >= grid.y - 44 && tapY < grid.y &&
++      tapX >= grid.x && tapX < grid.x + grid.width) {
++    const auto column = std::clamp((tapX - grid.x) * 7 / grid.width, 0, 6);
++    {
++      RenderLock lock(*this);
++      calendarAnchor = calendarDays[column].date;
++      calendarWeek = false;
++    }
++    return reloadCalendar();
++  }
++  if (tapped && tapY >= bounds.top + 28 && tapY < bounds.top + 63) {
++    if (tapX < bounds.x + ICON_TARGET) return changePeriod(-1);
++    if (tapX >= bounds.x + bounds.width - ICON_TARGET) return changePeriod(1);
++    startActivityForResult(std::make_unique<WorkflowyDatePicker>(renderer, mappedInput,
++                               StrId::STR_WORKFLOWY_SHOW_DATE, calendarAnchor, isoDate(0)),
++                           [this](const ActivityResult& result) {
++      if (!result.isCancelled) {
++        {
++          RenderLock lock(*this);
++          calendarAnchor = std::get<KeyboardResult>(result.data).text;
++        }
++        reloadCalendar();
++      }
++    });
++    return;
++  }
++  if (tapped && tapY >= bounds.top + STATUS_TOP && tapY < bounds.top + STATUS_TOP + STATUS_HEIGHT) {
++    const auto pending = pendingOperationsCount();
++    if (pending && (!statusNotice() || tapX >= bounds.x + bounds.width / 2)) return showPendingOperations();
++    if (isErrorNotice(message)) return showErrorDetails();
++  }
++  if (tapped && tapY >= bounds.footer) {
++    const int slot = std::clamp((tapX - bounds.x) * 6 / bounds.width, 0, 5);
++    if (slot == 0) {
++      {
++        RenderLock lock(*this);
++        calendarVisible = false;
++      }
++      if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
++      return requestUpdate();
++    }
++    if (slot == 1 || slot == 2) {
++      {
++        RenderLock lock(*this);
++        calendarWeek = slot == 2;
++      }
++      return reloadCalendar();
++    }
++    if (slot == 3) {
++      unsigned day = 0;
++      if (calendarWeek) {
++        for (unsigned i = 0; i < calendarDays.size(); ++i)
++          if (calendarDays[i].date == calendarAnchor) day = i;
++      }
++      return createCalendarTask(day, calendarScroll);
++    }
++    if (slot == 4) {
++      const auto today = isoDate(0);
++      if (today.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++      {
++        RenderLock lock(*this);
++        calendarAnchor = today;
++      }
++    }
++    return reloadCalendar();
++  }
++  int x, y;
++  if (mappedInput.wasScreenTouchDown(x, y) && y >= grid.y && y < grid.y + grid.height) {
++    RenderLock lock(*this);
++    calendarDrag = {};
++    calendarDrag.tracking = true;
++    calendarDrag.x = x;
++    calendarDrag.y = y;
++    calendarDrag.started = millis();
++    const auto hit = std::find_if(calendarHits.rbegin(), calendarHits.rend(), [&](const CalendarHit& item) {
++      return x >= item.x && x < item.x + item.width && y >= item.y && y < item.y + item.height;
++    });
++    if (hit != calendarHits.rend() && !itemPending(hit->id)) {
++      const auto node = std::find_if(calendarDays[hit->day].items.begin(), calendarDays[hit->day].items.end(),
++                                     [&](const Node& row) { return row.id == hit->id; });
++      if (node != calendarDays[hit->day].items.end()) {
++        calendarDrag.id = hit->id;
++        calendarDrag.title = node->title;
++        calendarDrag.todo = node->todo;
++        calendarDrag.done = node->done;
++        calendarDrag.originDate = calendarDays[hit->day].date;
++        calendarDrag.day = hit->day;
++        calendarDrag.originalScroll = calendarScroll;
++        calendarDrag.start = calendarDrag.originalStart = hit->start;
++        calendarDrag.end = calendarDrag.originalEnd = hit->end;
++        const int handle = std::min(12, hit->height / 3);
++        const int visibleEnd = calendarScroll + grid.height * 60 / grid.hourHeight;
++        calendarDrag.edge = y < hit->y + handle && hit->start >= calendarScroll ? -1
++                          : y >= hit->y + hit->height - handle && hit->end <= visibleEnd ? 1 : 0;
++      }
++    }
++  }
++  if (calendarDrag.tracking && mappedInput.isScreenTouchHeld(x, y)) {
++    const int distance = std::max(std::abs(x - calendarDrag.x), std::abs(y - calendarDrag.y));
++    if (!calendarDrag.active && distance > 22 && millis() - calendarDrag.started < 350) calendarDrag.moved = true;
++    if (!calendarDrag.id.empty() && !calendarDrag.moved && millis() - calendarDrag.started >= 350) {
++      bool changed;
++      bool shiftPeriod = false;
++      {
++        RenderLock lock(*this);
++        const auto now = millis();
++        if (now - calendarDrag.scrollAt >= 650) {
++          const int scrollDelta = y < grid.y + 20 ? -30 : y >= grid.y + grid.height - 20 ? 30 : 0;
++          calendarScroll = std::clamp(calendarScroll + scrollDelta, 0,
++                                      std::max(0, 1440 - grid.height * 60 / grid.hourHeight));
++          if (!calendarDrag.edge && (x < grid.x || x >= grid.x + grid.width)) {
++            const int direction = x < grid.x ? -1 : 1;
++            const auto target = workflowy::shiftScheduleDate(calendarAnchor, direction * (calendarWeek ? 7 : 1));
++            if (!target.empty()) {
++              calendarAnchor = target;
++              shiftPeriod = true;
++            }
++          }
++          calendarDrag.scrollAt = now;
++        }
++        const bool wasActive = calendarDrag.active;
++        const int delta = (((y - calendarDrag.y) * 60 / grid.hourHeight) +
++                           calendarScroll - calendarDrag.originalScroll) / 15 * 15;
++        const int oldStart = calendarDrag.start, oldEnd = calendarDrag.end;
++        const unsigned oldDay = calendarDrag.day;
++        calendarDrag.active = true;
++        if (calendarDrag.edge < 0) {
++          calendarDrag.start = std::clamp(calendarDrag.originalStart + delta, 0, calendarDrag.originalEnd - 15);
++        } else if (calendarDrag.edge > 0) {
++          calendarDrag.end = std::clamp(calendarDrag.originalEnd + delta, calendarDrag.originalStart + 15, 1440);
++        } else {
++          const int duration = calendarDrag.originalEnd - calendarDrag.originalStart;
++          calendarDrag.start = std::clamp(calendarDrag.originalStart + delta, 0, 1440 - duration);
++          calendarDrag.end = calendarDrag.start + duration;
++          if (calendarWeek)
++            calendarDrag.day = std::clamp((x - grid.x) * 7 / grid.width, 0, 6);
++        }
++        changed = !wasActive || oldStart != calendarDrag.start || oldEnd != calendarDrag.end ||
++                  oldDay != calendarDrag.day || shiftPeriod;
++      }
++      if (shiftPeriod) reloadCalendar();
++      else if (changed) requestUpdate();
++      return;
++    }
++  }
++  if (calendarDrag.active && mappedInput.wasScreenTouchReleased()) return saveCalendarDrag();
++  const auto swipe = mappedInput.wasSwipe();
++  if (swipe != Swipe::None && !calendarDrag.active) {
++    gestureEndedAt = millis();
++    {
++      RenderLock lock(*this);
++      calendarDrag = {};
++    }
++    if (swipe == Swipe::Left || swipe == Swipe::Right) return changePeriod(swipe == Swipe::Left ? 1 : -1);
++    {
++      RenderLock lock(*this);
++      const int minutes = grid.height * 60 / grid.hourHeight;
++      const int end = std::max(0, 1440 - minutes);
++      calendarScroll = std::clamp(calendarScroll + (swipe == Swipe::Up ? 120 : -120), 0, end);
++    }
++    requestUpdate();
++    return;
++  }
++  if (mappedInput.wasReleased(Button::Down) || mappedInput.wasReleased(Button::Up)) {
++    const int delta = mappedInput.wasReleased(Button::Down) ? 120 : -120;
++    {
++      RenderLock lock(*this);
++      calendarScroll = std::clamp(calendarScroll + delta, 0, std::max(0, 1440 - grid.height * 60 / grid.hourHeight));
++    }
++    requestUpdate();
++  }
++  if (tapped && tapX >= bounds.x && tapX < grid.x + grid.width && tapY >= grid.y && tapY < grid.y + grid.height) {
++    std::optional<CalendarHit> selected;
++    {
++      RenderLock lock(*this);
++      if (calendarDrag.active) return;
++      if (calendarDrag.moved) {
++        calendarDrag = {};
++        return;
++      }
++      const auto hit = std::find_if(calendarHits.rbegin(), calendarHits.rend(), [&](const CalendarHit& item) {
++        return tapX >= item.x && tapX < item.x + item.width && tapY >= item.y && tapY < item.y + item.height;
++      });
++      if (hit != calendarHits.rend()) selected = *hit;
++      calendarDrag = {};
++    }
++    if (selected) return openCalendarTask(selected->day, selected->id);
++    const unsigned day = calendarWeek ? std::clamp((tapX - grid.x) * 7 / grid.width, 0, 6) : 0;
++    const int start = std::clamp((calendarScroll + grid.minuteAt(tapY)) / 15 * 15, 0, 1425);
++    return createCalendarTask(day, start);
++  }
++  if (mappedInput.wasScreenTouchReleased() && !calendarDrag.active) {
++    RenderLock lock(*this);
++    calendarDrag = {};
++  }
++  // Transport progresses even if the calendar was panned while a request ran.
++  if (!pollSave()) pollCalendar();
++}
++
++void WorkflowyDailyActivity::renderCalendar(const Layout& bounds) {
++  const auto grid = calendarGrid();
++  const int right = bounds.x + bounds.width;
++  const int cy = bounds.top + 46;
++  const auto first = calendarDays.front().date.empty() ? calendarAnchor : calendarDays.front().date;
++  const auto last = calendarWeek ? workflowy::shiftScheduleDate(first, 6) : first;
++  const auto label = calendarWeek ? first.substr(5) + " — " + last.substr(5) : calendarAnchor;
++  renderer.drawCenteredText(UI_12_FONT_ID, bounds.top + 32, label.c_str(), true, EpdFontFamily::BOLD);
++  for (const int direction : {-1, 1}) {
++    const int x = direction < 0 ? bounds.x + 20 : right - 20;
++    renderer.drawLine(x - direction * 5, cy - 6, x + direction * 5, cy, 3, true);
++    renderer.drawLine(x + direction * 5, cy, x - direction * 5, cy + 6, 3, true);
++  }
++  drawStatus(bounds, pendingOperationsCount(), statusNotice());
++  const unsigned columns = calendarWeek ? 7 : 1;
++  const int minutes = grid.height * 60 / grid.hourHeight;
++  calendarScroll = std::clamp(calendarScroll, 0, std::max(0, 1440 - minutes));
++  const auto columnLeft = [&](unsigned column) { return grid.x + static_cast<int>(column) * grid.width / columns; };
++  if (calendarWeek) {
++    constexpr StrId days[] = {StrId::STR_STATS_MON, StrId::STR_STATS_TUE, StrId::STR_STATS_WED, StrId::STR_STATS_THU,
++                               StrId::STR_STATS_FRI, StrId::STR_STATS_SAT, StrId::STR_STATS_SUN};
++    for (unsigned column = 0; column < 7; ++column) {
++      const auto& day = calendarDays[column].date;
++      const int left = columnLeft(column), width = columnLeft(column + 1) - left;
++      const auto weekday = renderer.truncatedText(SMALL_FONT_ID, I18n::getInstance().get(days[column]), width - 4);
++      const bool today = day == isoDate(0);
++      renderer.drawText(SMALL_FONT_ID, left + (width - renderer.getTextWidth(SMALL_FONT_ID, weekday.c_str())) / 2,
++                        grid.y - 42, weekday.c_str());
++      const auto number = day.size() == 10 ? day.substr(8) : "";
++      if (today) renderer.drawRoundedRect(left + width / 2 - 14, grid.y - 24, 28, 23, 1, 8, true);
++      renderer.drawText(SMALL_FONT_ID, left + (width - renderer.getTextWidth(SMALL_FONT_ID, number.c_str())) / 2,
++                        grid.y - 21, number.c_str(), true, EpdFontFamily::BOLD);
++    }
++  }
++  for (int minute = (calendarScroll / 60) * 60; minute <= calendarScroll + minutes; minute += 30) {
++    const int y = grid.y + (minute - calendarScroll) * grid.hourHeight / 60;
++    if (y < grid.y || y >= grid.y + grid.height) continue;
++    if (minute % 60 == 0) {
++      const auto hour = workflowy::scheduleClock(minute);
++      renderer.drawText(SMALL_FONT_ID, bounds.x, y, hour.c_str());
++      renderer.drawLine(grid.x, y, right - 1, y);
++    } else {
++      for (int x = grid.x; x < right; x += 6) renderer.drawPixel(x, y, true);
++    }
++  }
++  for (unsigned column = 0; column <= columns; ++column) {
++    renderer.drawLine(columnLeft(column), grid.y, columnLeft(column), grid.y + grid.height);
++  }
++  calendarHits.clear();
++  size_t totalBlocks = 0;
++  for (const auto& day : calendarDays) totalBlocks += day.items.size();
++  calendarHits.reserve(totalBlocks);
++  const auto drawBlock = [&](const Node& node, unsigned column, int start, int end, unsigned lane, unsigned lanes, bool preview) {
++    if (end <= calendarScroll || start >= calendarScroll + minutes) return;
++    const int left = columnLeft(column), columnWidth = columnLeft(column + 1) - left;
++    const int x = left + static_cast<int>(lane) * columnWidth / lanes + 2;
++    const int width = std::max(4, columnWidth / static_cast<int>(lanes) - 4);
++    const int y = std::max(grid.y + 1, grid.y + (start - calendarScroll) * grid.hourHeight / 60);
++    const int bottom = std::min(grid.y + grid.height - 1,
++                                grid.y + (end - calendarScroll) * grid.hourHeight / 60);
++    const int height = std::max(5, bottom - y - 1);
++    renderer.fillRoundedRect(x, y, width, height, 4, Color::White);
++    renderer.fillRectDither(x, y, width, height, preview || itemPending(node.id) ? Color::DarkGray : Color::LightGray);
++    renderer.drawRoundedRect(x, y, width, height, preview ? 2 : 1, 4, true);
++    renderer.fillRect(x, y + 3, std::min(3, width), std::max(1, height - 6), true);
++    if (width > 22 && height >= renderer.getLineHeight(SMALL_FONT_ID)) {
++      const auto time = calendarWeek ? workflowy::scheduleClock(start) : workflowy::scheduleRange(start, end);
++      const auto fitted = renderer.truncatedText(SMALL_FONT_ID, time.c_str(), width - 10);
++      renderer.drawText(SMALL_FONT_ID, x + 6, y + 3, fitted.c_str(), true, EpdFontFamily::BOLD);
++      auto title = node.title;
++      if (const auto range = workflowy::parseTimeRange(title)) title.erase(range->begin, range->finish - range->begin);
++      while (!title.empty() && title.front() == ' ') title.erase(0, 1);
++      const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
++      const int capacity = std::max(0, (height - lineHeight - 6) / lineHeight);
++      calendarTextLines.clear();
++      workflowy::wrapOutlineText(std::string_view(title), width - 10,
++                                [&](std::string_view value) {
++        return renderer.getTextWidth(SMALL_FONT_ID, std::string(value).c_str());
++      }, calendarTextLines);
++      for (int line = 0; line < capacity && static_cast<size_t>(line) < calendarTextLines.size(); ++line) {
++        const auto span = calendarTextLines[line];
++        const auto text = title.substr(span.begin, span.end - span.begin);
++        renderer.drawText(SMALL_FONT_ID, x + 6, y + lineHeight + 3 + line * lineHeight, text.c_str());
++      }
++    }
++    if (height > 18 && width > 20) {
++      const int cx = x + width / 2;
++      renderer.drawLine(cx - 5, y + 3, cx + 5, y + 3, 2, true);
++      renderer.drawLine(cx - 5, y + height - 4, cx + 5, y + height - 4, 2, true);
++    }
++    if (!preview) calendarHits.push_back({node.id, column, x, y, width, height, start, end});
++  };
++  for (unsigned column = 0; column < columns; ++column) {
++    calendarBlocks.clear();
++    const auto& day = calendarDays[column];
++    calendarBlocks.reserve(day.items.size());
++    for (size_t i = 0; i < day.items.size(); ++i) {
++      const auto& node = day.items[i];
++      if (node.done && !showDone) continue;
++      if (calendarDrag.active && node.id == calendarDrag.id) continue;
++      if (const auto range = workflowy::parseTimeRange(node.title)) {
++        calendarBlocks.push_back({range->start, range->end, i});
++      }
++    }
++    workflowy::assignScheduleLanes(calendarBlocks, calendarLaneEnds);
++    for (const auto& block : calendarBlocks)
++      drawBlock(day.items[block.item], column, block.start, block.end, block.lane, block.lanes, false);
++  }
++  if (calendarDrag.active) {
++    const Node preview{calendarDrag.id, calendarDrag.title};
++    drawBlock(preview, calendarDrag.day, calendarDrag.start, calendarDrag.end, 0, 1, true);
++  }
++  if (calendarAnchor == isoDate(0) || calendarWeek) {
++    const auto utc = halClock.utcNowMs();
++    const auto local = utc / 60000 + (static_cast<int>(SETTINGS.clockUtcOffsetQ) - 48) * 15;
++    const int minute = (local % 1440 + 1440) % 1440;
++    const int y = grid.y + (minute - calendarScroll) * grid.hourHeight / 60;
++    if (utc && y >= grid.y && y < grid.y + grid.height) {
++      for (unsigned column = 0; column < columns; ++column) {
++        if (calendarDays[column].date != isoDate(0)) continue;
++        renderer.drawLine(columnLeft(column), y, columnLeft(column + 1) - 1, y, 2, true);
++        renderer.fillRoundedRect(columnLeft(column) - 3, y - 3, 7, 7, 3, Color::Black);
++      }
++    }
++  }
++  renderer.drawLine(bounds.x, bounds.footer, right, bounds.footer);
++  const auto slot = [&](int value) { return bounds.x + (2 * value + 1) * bounds.width / 12; };
++  const int y = bounds.footer + 23;
++  renderer.drawLine(slot(0) - 8, y, slot(0) + 8, y, 3, true);
++  renderer.drawLine(slot(0) - 8, y, slot(0) - 2, y - 6, 3, true);
++  renderer.drawLine(slot(0) - 8, y, slot(0) - 2, y + 6, 3, true);
++  for (int mode = 1; mode <= 2; ++mode) {
++    const auto text = mode == 1 ? tr(STR_WORKFLOWY_DAY) : tr(STR_WORKFLOWY_WEEK);
++    renderer.drawText(SMALL_FONT_ID, slot(mode) - renderer.getTextWidth(SMALL_FONT_ID, text) / 2, y - 8,
++                      text, true, EpdFontFamily::BOLD);
++    if (calendarWeek == (mode == 2)) renderer.fillRect(slot(mode) - 13, bounds.footer + 44, 26, 3, true);
++  }
++  renderer.drawLine(slot(3) - 9, y, slot(3) + 9, y, 3, true);
++  renderer.drawLine(slot(3), y - 9, slot(3), y + 9, 3, true);
++  const auto today = tr(STR_WORKFLOWY_TODAY);
++  renderer.drawText(SMALL_FONT_ID, slot(4) - renderer.getTextWidth(SMALL_FONT_ID, today) / 2, y - 8, today);
++  const auto refresh = freeink::ui::bitmapFromIcon(icon_refresh_cw_32);
++  freeink::ui::GfxRendererTarget target(renderer);
++  target.bitmap({static_cast<int16_t>(slot(5) - 16), static_cast<int16_t>(y - icon_refresh_cw_32.opticalCenterY),
++                 32, 32}, refresh, freeink::ui::BitmapMode::Center);
++  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c30661c01b024f97165c60a52752afe865023959
+index 0000000000000000000000000000000000000000..ac15aaa72479b6367b608a8b4bd3371ab371fdae
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,287 @@
 +#pragma once
 +
 +#include <atomic>
@@ -3996,6 +4776,7 @@ index 0000000000000000000000000000000000000000..c30661c01b024f97165c60a52752afe8
 +
 +#include "activities/Activity.h"
 +#include "workflowy/WorkflowyOutlineLayout.h"
++#include "workflowy/WorkflowySchedule.h"
 +
 +class WorkflowyDailyActivity final : public Activity {
 + public:
@@ -4021,6 +4802,55 @@ index 0000000000000000000000000000000000000000..c30661c01b024f97165c60a52752afe8
 +    bool selected = false;
 +  };
 +
++  struct Layout;
++  struct CalendarDay {
++    std::string date;
++    std::vector<Node> items;
++    bool loaded = false;
++  };
++  struct CalendarFetch {
++    std::string key, date;
++    std::vector<Node> items;
++    int status = 0, transport = 0;
++    std::atomic<bool> cancel{false}, ready{false};
++  };
++  bool calendarVisible = false, calendarWeek = false;
++  int calendarScroll = 8 * 60;
++  std::array<CalendarDay, 7> calendarDays;
++  std::shared_ptr<CalendarFetch> calendarFetch;
++  std::string calendarAnchor, calendarFocus;
++  struct CalendarHit {
++    std::string id;
++    unsigned day = 0;
++    int x, y, width, height, start, end;
++  };
++  std::vector<CalendarHit> calendarHits;
++  std::vector<workflowy::ScheduleLane> calendarBlocks;
++  std::vector<int> calendarLaneEnds;
++  std::vector<workflowy::TextSpan> calendarTextLines;
++  struct CalendarDrag {
++    bool tracking = false, active = false, moved = false, todo = false, done = false;
++    unsigned day = 0;
++    int edge = 0, x = 0, y = 0, start = 0, end = 0, originalStart = 0, originalEnd = 0, originalScroll = 0;
++    unsigned long started = 0, scrollAt = 0;
++    std::string id, title, originDate;
++  } calendarDrag;
++  struct CalendarGrid {
++    int x, y, width, height, hourHeight;
++    int minuteAt(int pixel) const;
++  };
++  CalendarGrid calendarGrid() const;
++  void openCalendar(bool week);
++  void reloadCalendar();
++  void pollCalendar();
++  void calendarLoop(bool tapped, int x, int y);
++  void renderCalendar(const Layout& bounds);
++  void openCalendarTask(unsigned day, const std::string& id);
++  void createCalendarTask(unsigned day, int start);
++  void saveCalendarDrag();
++  void updateCalendarTask(const std::string& id, const std::string& source, const std::string& destination,
++                          const std::string& title);
++  static void calendarFetchTask(void* argument);
 +  enum class Step { Start, Waiting, Load, Ready };
 +  Step step = Step::Start;
 +  std::vector<Node> rows;
@@ -4209,7 +5039,8 @@ index 0000000000000000000000000000000000000000..c30661c01b024f97165c60a52752afe8
 +  void loadDay();
 +  void toggle(size_t row);
 +  void actions(size_t row);
-+  void edit(size_t row, int relative = 0, size_t cursor = std::string::npos);
++  void edit(size_t row, int relative = 0, size_t cursor = std::string::npos,
++            std::string initialText = {}, std::string targetDate = {});
 +  size_t cursorAt(std::string_view text, workflowy::TextSpan line, int width) const;
 +  void chooseDate(std::string moveId = {});
 +  void showMoveMenu(size_t row);
@@ -4486,3 +5317,253 @@ index 0705cc3ee57e80ac6f51b365577c8e03235c0925..98c15702407ab756e3a4adeab8d97ca2
            break;
          case HighlightToolbar::Action::Edit:
            returnAction(true);
+diff --git a/src/workflowy/WorkflowySchedule.h b/src/workflowy/WorkflowySchedule.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bece7702ac92022cf2112faeed545a9f588e352f
+--- /dev/null
++++ b/src/workflowy/WorkflowySchedule.h
+@@ -0,0 +1,171 @@
++#pragma once
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace workflowy {
++struct TimeRange {
++  int start = 0, end = 0;
++  size_t begin = 0, finish = 0;
++};
++
++inline void skipTimeSpaces(std::string_view text, size_t& at) {
++  while (at < text.size() && std::isspace(static_cast<unsigned char>(text[at]))) ++at;
++}
++
++struct ClockToken {
++  int minutes;
++  bool meridiem;
++};
++
++inline std::optional<ClockToken> parseClock(std::string_view text, size_t& at) {
++  const auto begin = at;
++  int hour = 0, digits = 0, minute = 0;
++  while (at < text.size() && std::isdigit(static_cast<unsigned char>(text[at])) && digits < 2) {
++    hour = hour * 10 + text[at++] - '0';
++    ++digits;
++  }
++  if (!digits) return {};
++  bool colon = at < text.size() && text[at] == ':';
++  if (colon) {
++    ++at;
++    if (at + 2 > text.size() || !std::isdigit(static_cast<unsigned char>(text[at])) ||
++        !std::isdigit(static_cast<unsigned char>(text[at + 1]))) return {};
++    minute = (text[at] - '0') * 10 + text[at + 1] - '0';
++    at += 2;
++  }
++  auto suffix = at;
++  skipTimeSpaces(text, suffix);
++  const bool am = suffix + 2 <= text.size() && (text[suffix] == 'a' || text[suffix] == 'A') &&
++                  (text[suffix + 1] == 'm' || text[suffix + 1] == 'M');
++  const bool pm = suffix + 2 <= text.size() && (text[suffix] == 'p' || text[suffix] == 'P') &&
++                  (text[suffix + 1] == 'm' || text[suffix + 1] == 'M');
++  if (minute > 59 || hour > 24 || (hour == 24 && minute) ||
++      ((am || pm) && (hour < 1 || hour > 12)) || (!colon && !am && !pm)) return {};
++  if (am || pm) {
++    hour = hour % 12 + (pm ? 12 : 0);
++    at = suffix + 2;
++  }
++  if (at == begin || (at < text.size() && std::isalnum(static_cast<unsigned char>(text[at])))) return {};
++  return ClockToken{hour * 60 + minute, am || pm};
++}
++
++inline std::optional<TimeRange> parseTimeRange(std::string_view text) {
++  for (size_t begin = 0; begin < text.size(); ++begin) {
++    if (!std::isdigit(static_cast<unsigned char>(text[begin])) ||
++        (begin && (std::isalnum(static_cast<unsigned char>(text[begin - 1])) || text[begin - 1] == ':'))) continue;
++    auto at = begin;
++    const auto start = parseClock(text, at);
++    if (!start || start->minutes >= 1440) continue;
++    skipTimeSpaces(text, at);
++    if (text.substr(at, 2) == "to" || text.substr(at, 2) == "TO") at += 2;
++    else if (text.substr(at, 3) == "–" || text.substr(at, 3) == "—") at += 3;
++    else if (at < text.size() && text[at] == '-') ++at;
++    else continue;
++    skipTimeSpaces(text, at);
++    const auto end = parseClock(text, at);
++    if (!end) continue;
++    int finish = end->minutes;
++    if (finish == 0 && end->meridiem) finish = 1440;
++    if (finish <= start->minutes) continue;
++    return TimeRange{start->minutes, finish, begin, at};
++  }
++  return {};
++}
++
++inline std::string scheduleClock(int minutes) {
++  char value[12];
++  if (minutes == 1440) return "12am";
++  snprintf(value, sizeof(value), "%d:%02d", minutes / 60, minutes % 60);
++  return value;
++}
++
++inline std::string scheduleRange(int start, int end) {
++  return scheduleClock(start) + " to " + scheduleClock(end);
++}
++
++inline std::string replaceTimeRange(std::string text, int start, int end) {
++  const auto range = parseTimeRange(text);
++  if (range) text.replace(range->begin, range->finish - range->begin, scheduleRange(start, end));
++  return text;
++}
++
++inline std::string shiftScheduleDate(std::string_view value, int delta) {
++  int year, month, day;
++  if (sscanf(std::string(value).c_str(), "%d-%d-%d", &year, &month, &day) != 3 ||
++      year < 1900 || year > 9999 || month < 1 || month > 12) return {};
++  const auto length = [](int y, int m) {
++    constexpr int days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
++    return days[m - 1] + (m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
++  };
++  if (day < 1 || day > length(year, month)) return {};
++  while (delta > 0) {
++    if (++day > length(year, month)) {
++      day = 1;
++      if (++month > 12) { month = 1; ++year; }
++    }
++    --delta;
++  }
++  while (delta < 0) {
++    if (--day < 1) {
++      if (--month < 1) { month = 12; --year; }
++      day = length(year, month);
++    }
++    ++delta;
++  }
++  if (year < 1900 || year > 9999) return {};
++  char text[16];
++  snprintf(text, sizeof(text), "%04d-%02d-%02d", year, month, day);
++  return text;
++}
++
++inline int scheduleWeekday(std::string_view value) {
++  int year, month, day;
++  if (sscanf(std::string(value).c_str(), "%d-%d-%d", &year, &month, &day) != 3 ||
++      month < 1 || month > 12) return 0;
++  constexpr int offsets[] = {0,3,2,5,0,3,5,1,4,6,2,4};
++  year -= month < 3;
++  return (year + year / 4 - year / 100 + year / 400 + offsets[month - 1] + day + 6) % 7;
++}
++
++// Connected overlaps share the same number of side-by-side lanes.
++struct ScheduleLane {
++  int start, end;
++  size_t item;
++  unsigned lane = 0, lanes = 1;
++};
++inline void assignScheduleLanes(std::vector<ScheduleLane>& blocks, std::vector<int>& laneEnds) {
++  laneEnds.reserve(blocks.size());
++  std::stable_sort(blocks.begin(), blocks.end(), [](const auto& a, const auto& b) {
++    return a.start < b.start || (a.start == b.start && a.end > b.end);
++  });
++  size_t group = 0;
++  while (group < blocks.size()) {
++    int until = blocks[group].end;
++    size_t end = group + 1;
++    while (end < blocks.size() && blocks[end].start < until) {
++      until = std::max(until, blocks[end++].end);
++    }
++    laneEnds.clear();
++    for (size_t i = group; i < end; ++i) {
++      const auto lane = std::find_if(laneEnds.begin(), laneEnds.end(), [&](int until) {
++        return until <= blocks[i].start;
++      });
++      blocks[i].lane = lane - laneEnds.begin();
++      if (lane == laneEnds.end()) laneEnds.push_back(blocks[i].end);
++      else *lane = blocks[i].end;
++    }
++    for (size_t i = group; i < end; ++i) blocks[i].lanes = laneEnds.size();
++    group = end;
++  }
++}
++inline void assignScheduleLanes(std::vector<ScheduleLane>& blocks) {
++  std::vector<int> laneEnds;
++  assignScheduleLanes(blocks, laneEnds);
++}
++}  // namespace workflowy
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..9875394defd0b9d68970a44e9136420a185ded71 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -130,3 +130,5 @@ add_subdirectory(image_refresh_regions)
+ add_subdirectory(library_thumbnails)
+
+ add_subdirectory(end_of_book_dismiss)
++
++add_subdirectory(workflowy_schedule)
+diff --git a/test/workflowy_schedule/CMakeLists.txt b/test/workflowy_schedule/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14a785a641
+--- /dev/null
++++ b/test/workflowy_schedule/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_executable(workflowy_schedule_test WorkflowyScheduleTest.cpp)
++target_include_directories(workflowy_schedule_test PRIVATE ${REPO_ROOT}/src/workflowy)
++target_compile_features(workflowy_schedule_test PRIVATE cxx_std_20)
++add_test(NAME workflowy_schedule COMMAND workflowy_schedule_test)
++target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c43128a22ce70a98831cbdcbe6a53d6b46bdf995
+--- /dev/null
++++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
+@@ -0,0 +1,46 @@
++#include "WorkflowySchedule.h"
++#include <cassert>
++#include <random>
++int main() {
++  using namespace workflowy;
++  auto range = parseTimeRange("8:30 to 12:00 Focus");
++  assert(range && range->start == 510 && range->end == 720);
++  assert(range->begin == 0 && range->finish == 13);
++  range = parseTimeRange("#career 8:30am to 12pm Review");
++  assert(range && range->start == 510 && range->end == 720);
++  range = parseTimeRange("12am to 8:30am Sleep");
++  assert(range && range->start == 0 && range->end == 510);
++  range = parseTimeRange("8:30pm to 12am Read");
++  assert(range && range->start == 1230 && range->end == 1440);
++  range = parseTimeRange("  [ ] 9:00 – 10:15 Work #P0");
++  assert(range && range->start == 540 && range->end == 615);
++  assert(!parseTimeRange("9:60 to 12:00"));
++  assert(!parseTimeRange("25:00 to 26:00"));
++  assert(!parseTimeRange("12:00 to 12:00"));
++  assert(!parseTimeRange("Contact 123:00 to 14:00"));
++  assert(!parseTimeRange("8:30 to 12amp"));
++  assert(replaceTimeRange("#P0 8:30 to 12:00 Task", 540, 780) == "#P0 9:00 to 13:00 Task");
++  assert(scheduleRange(0, 1440) == "0:00 to 12am");
++  assert(shiftScheduleDate("2024-03-01", -1) == "2024-02-29");
++  assert(shiftScheduleDate("2026-12-31", 1) == "2027-01-01");
++  assert(scheduleWeekday("2026-11-16") == 0);
++  assert(scheduleWeekday("2026-11-22") == 6);
++  assert(shiftScheduleDate("2026-11-19", -scheduleWeekday("2026-11-19")) == "2026-11-16");
++  std::mt19937 random(19);
++  for (int iteration = 0; iteration < 100; ++iteration) {
++    std::vector<ScheduleLane> blocks;
++    for (size_t i = 0; i < 40; ++i) {
++      int start = random() % 1400;
++      blocks.push_back({start, std::min(start + 15 + int(random()%180), 1440), i});
++    }
++    assignScheduleLanes(blocks);
++    for (size_t i = 0; i < blocks.size(); ++i) {
++      assert(blocks[i].lane < blocks[i].lanes);
++      for (size_t j = i+1; j < blocks.size(); ++j) {
++        if (blocks[j].start >= blocks[i].end || blocks[i].start >= blocks[j].end) continue;
++        assert(blocks[i].lane != blocks[j].lane);
++        assert(blocks[i].lanes == blocks[j].lanes);
++      }
++    }
++  }
++}
