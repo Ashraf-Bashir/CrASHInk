@@ -1025,10 +1025,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041ebc7c863
+index 0000000000000000000000000000000000000000..82f94c5d81b395c06f732c7bb939fb244cc1fa8c
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4580 @@
+@@ -0,0 +1,4562 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2287,7 +2287,7 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +}
 +
 +void WorkflowyDailyActivity::toggle(const size_t row) {
-+  if (itemPending(rows[row].id) || !rows[row].todo) return;
++  if (itemPending(rows[row].id) || (!rows[row].todo && !rows[row].done)) return;
 +  const bool completed = rows[row].done;
 +  const char* failed = completed ? tr(STR_WORKFLOWY_UNCOMPLETE_FAILED) : tr(STR_WORKFLOWY_COMPLETE_FAILED);
 +  if (!online) {
@@ -2515,6 +2515,9 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +  if (!count) return;
 +  const bool hasTodo = std::any_of(rows.begin(), rows.end(), [](const Node& node) { return node.selected && node.todo; });
 +  const bool hasBullet = std::any_of(rows.begin(), rows.end(), [](const Node& node) { return node.selected && !node.todo; });
++  const bool hasCompletable = std::any_of(rows.begin(), rows.end(), [](const Node& node) {
++    return node.selected && (node.todo || node.done);
++  });
 +  enum class Command { Edit, Done, Undone, Schedule, Move, Convert, Zoom, Above, Below, Delete };
 +  std::vector<std::string> labels;
 +  std::vector<Command> commands;
@@ -2525,7 +2528,7 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +    labels.emplace_back(I18n::getInstance().get(label));
 +  };
 +  if (count == 1) add(Command::Edit, StrId::STR_EDIT);
-+  if (hasTodo) {
++  if (hasCompletable) {
 +    add(Command::Done, StrId::STR_WORKFLOWY_MARK_DONE);
 +    add(Command::Undone, StrId::STR_WORKFLOWY_MARK_UNDONE);
 +  }
@@ -2655,7 +2658,7 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +  items.reserve(selectionCount());
 +  for (const auto& node : rows) {
 +    if (!node.selected || itemPending(node.id) || node.divider) continue;
-+    if (completion && (!node.todo || node.done == done)) continue;
++    if (completion && ((!node.todo && !node.done) || node.done == done)) continue;
 +    if (conversion && node.todo == todo) continue;
 +    items.push_back(node.id);
 +  }
@@ -2736,7 +2739,7 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +  };
 +  if (!rows[row].divider) {
 +  add(Action::Edit, StrId::STR_EDIT);
-+  if (rows[row].todo)
++  if (rows[row].todo || rows[row].done)
 +    add(Action::Complete, rows[row].done ? StrId::STR_WORKFLOWY_MARK_UNDONE : StrId::STR_WORKFLOWY_MARK_DONE);
 +  add(Action::Schedule, StrId::STR_WORKFLOWY_SCHEDULE_VIEW);
 +  add(Action::Move, StrId::STR_WORKFLOWY_MOVE);
@@ -4132,7 +4135,7 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +      const auto& placement = placements[i];
 +      if (placement.row != static_cast<size_t>(row) || y < placement.top || y >= placement.bottom) continue;
 +      const bool firstFragment = i == 0 || placements[i - 1].row != placement.row;
-+      checkboxHit = firstFragment && rows[row].todo && x < bounds.x + indent + 30;
++      checkboxHit = firstFragment && (rows[row].todo || rows[row].done) && x < bounds.x + indent + 30;
 +      if (!checkboxHit) {
 +        const auto line = std::min(placement.lineCount - 1,
 +                                  static_cast<size_t>(std::max(0, y - placement.top - 6) / bounds.lineHeight));
@@ -4396,11 +4399,9 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +        renderer.drawLine(start + 8, y + 15, start + 14, y + 8, 2, false);
 +      }
 +    } else if (firstFragment && !selecting) {
-+      if (node.todo) {
++      if (node.todo || node.done) {
 +        if (node.done) {
-+          renderer.fillRect(start + 1, y + 4, 18, 18);
-+          renderer.drawLine(start + 5, y + 12, start + 8, y + 15, 2, false);
-+          renderer.drawLine(start + 8, y + 15, start + 14, y + 8, 2, false);
++          drawCheckedBox(renderer, start + 1, y + 4, 18);
 +        } else {
 +          renderer.drawRect(start + 1, y + 4, 18, 18);
 +        }
@@ -5376,22 +5377,14 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +      renderer.fillRectDither(x, y, width, height, preview || itemPending(node.id) ? Color::DarkGray : Color::LightGray);
 +    renderer.drawRoundedRect(x, y, width, height, preview ? 2 : 1, 4, true);
 +    renderer.fillRect(x, y + 3, std::min(3, width), std::max(1, height - 6), true);
-+    const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
-+    const int boxSize = node.done ? std::min({14, width - 6, height - 6}) : 0;
-+    const int checkInset = boxSize >= 7 ? boxSize + 5 : 0;
-+    if (checkInset) {
-+      const int boxY = y + std::clamp(3 + (lineHeight - boxSize) / 2, 3, height - boxSize - 3);
-+      drawCheckedBox(renderer, x + 4, boxY, boxSize);
-+    }
-+    if (width > 22 && height >= lineHeight) {
++    if (width > 22 && height >= renderer.getLineHeight(SMALL_FONT_ID)) {
 +      auto title = node.title;
 +      if (const auto range = workflowy::parseTimeRange(title)) title.erase(range->begin, range->finish - range->begin);
 +      while (!title.empty() && title.front() == ' ') title.erase(0, 1);
++      const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
 +      const int capacity = std::max(0, (height - 6) / lineHeight);
 +      calendarTextLines.clear();
-+      workflowy::wrapOutlineTextByLine(std::string_view(title), [&](size_t line) {
-+        return std::max(1, width - 10 - (line == 0 ? checkInset : 0));
-+      },
++      workflowy::wrapOutlineText(std::string_view(title), width - 10,
 +                                [&](std::string_view value) {
 +        return renderer.getTextWidth(SMALL_FONT_ID, std::string(value).c_str());
 +      }, calendarTextLines);
@@ -5399,14 +5392,10 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +        const auto span = calendarTextLines[line];
 +        const auto text = title.substr(span.begin, span.end - span.begin);
 +        const int textY = y + 3 + line * lineHeight;
-+        const int textX = x + 6 + (line == 0 ? checkInset : 0);
-+        if (textX >= x + width - 5) continue;
-+        renderer.beginTextClip(x + 5, textY, width - 10, std::min(lineHeight, y + height - textY));
-+        renderer.drawText(SMALL_FONT_ID, textX, textY, text.c_str());
-+        if (node.done) renderer.drawLine(textX, textY + lineHeight / 2,
-+                                         std::min(x + width - 5, textX + renderer.getTextWidth(SMALL_FONT_ID, text.c_str())),
++        renderer.drawText(SMALL_FONT_ID, x + 6, textY, text.c_str());
++        if (node.done) renderer.drawLine(x + 6, textY + lineHeight / 2,
++                                         x + 6 + renderer.getTextWidth(SMALL_FONT_ID, text.c_str()),
 +                                         textY + lineHeight / 2);
-+        renderer.endTextClip();
 +      }
 +    }
 +    if (height > 18 && width > 20) {
@@ -5583,12 +5572,8 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +    auto title = node.title;
 +    const auto range = workflowy::parseTimeRange(title);
 +    title.erase(range->begin, range->finish - range->begin);
-+    const int checkInset = node.done ? 23 : 0;
-+    if (node.done) drawCheckedBox(renderer, x + 8, y + 10, 17);
 +    calendarTextLines.clear();
-+    workflowy::wrapOutlineTextByLine(std::string_view(title), [&](size_t line) {
-+      return std::max(1, width - 16 - (line == 0 ? checkInset : 0));
-+    }, [&](std::string_view value) {
++    workflowy::wrapOutlineText(std::string_view(title), width - 16, [&](std::string_view value) {
 +      return renderer.getTextWidth(UI_12_FONT_ID, std::string(value).c_str());
 +    }, calendarTextLines);
 +    const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
@@ -5597,13 +5582,10 @@ index 0000000000000000000000000000000000000000..b4a5291a0cad9cabad0f1e629a167041
 +      const auto span = calendarTextLines[line];
 +      const auto text = title.substr(span.begin, span.end - span.begin);
 +      const int textY = y + 7 + static_cast<int>(line) * lineHeight;
-+      const int textX = x + 8 + (line == 0 ? checkInset : 0);
-+      renderer.beginTextClip(x + 8, textY, width - 16, std::min(lineHeight, y + rowHeight - 5 - textY));
-+      renderer.drawText(UI_12_FONT_ID, textX, textY, text.c_str());
-+      if (node.done) renderer.drawLine(textX, textY + lineHeight / 2,
-+                                      std::min(x + width - 8, textX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str())),
++      renderer.drawText(UI_12_FONT_ID, x + 8, textY, text.c_str());
++      if (node.done) renderer.drawLine(x + 8, textY + lineHeight / 2,
++                                      x + 8 + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()),
 +                                      textY + lineHeight / 2);
-+      renderer.endTextClip();
 +    }
 +    calendarHits.push_back({node.id, 0, bounds.x, y, bounds.width, rowHeight,
 +                           block.start, block.end});
@@ -6601,10 +6583,10 @@ index 0000000000000000000000000000000000000000..3738f8cd7b3951c2b8cbbf707ed271a3
 +Path(sys.argv[2]).write_text("\n".join(parts))
 diff --git a/test/workflowy_bulk/WorkflowyBulkTest.cpp b/test/workflowy_bulk/WorkflowyBulkTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2c8d43cbbf036ac240afe9f67f60fe6e565f08ff
+index 0000000000000000000000000000000000000000..aa5caf0395dfd88c5733455a6cf88c3c52061eee
 --- /dev/null
 +++ b/test/workflowy_bulk/WorkflowyBulkTest.cpp
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,142 @@
 +
 +#include <ArduinoJson.h>
 +#include <algorithm>
@@ -6735,5 +6717,15 @@ index 0000000000000000000000000000000000000000..2c8d43cbbf036ac240afe9f67f60fe6e
 +  for(auto& job:app.saves){job->status=200;job->finish(*job);}
 +  assert(app.removed==2 && app.layoutDirty && app.viewStack[0].rows.size()==3);
 +  assert(app.viewStack[0].rows[1].id=="a" && app.viewStack[0].rows[2].id=="b");
++ }
++ {
++  App app;app.rows={{"a","Completed bullet",true,false,true},
++                    {"b","Plain bullet",true,false,false},
++                    {"c","Completed todo",true,true,true}};
++  app.startBulk(Action::Undone);
++  assert(app.saves.size()==2 && app.saves[0]->path=="/a/uncomplete" && app.saves[1]->path=="/c/uncomplete");
++  assert(!app.rows[0].done && !app.rows[0].todo && !app.rows[2].done);
++  app.saves[0]->status=503;app.saves[0]->finish(*app.saves[0]);
++  assert(app.rows[0].done && !app.rows[0].todo && !app.rows[1].done);
 + }
 +}

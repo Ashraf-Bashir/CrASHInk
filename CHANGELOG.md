@@ -67,7 +67,7 @@
 
 ### Fixed
 
-- Completed calendar items show a checked checkbox alongside strikethrough in Day, Week, and Schedule views, including during dragging.
+- Completed items in the Workflowy task list show a checked checkbox alongside strikethrough, including completed bullet-type items. Their checkbox and Mark incomplete actions can restore them; calendar events retain strikethrough without a checkbox.
 
 - The Library icon keeps a single base line, with the extra active-tab underline removed.
 
