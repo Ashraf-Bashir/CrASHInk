@@ -2,6 +2,8 @@
 
 ### Added
 
+- New Workflowy tasks show all tag choices immediately. Selected tags are grouped before the task body, preserve the todo marker and cursor, and avoid duplicate prefix tags.
+
 - Workflowy bulk actions include scheduling consecutive time blocks, turning items into todos or bullets, moving to the top/bottom or a parent/date, and adding an item above/below the selection. Edit and Zoom are available for a single selected item.
 - Bulk moves preserve selection order, conversions restore the previous type on failure, and selections stay available when only part of a batch can be queued.
 
@@ -66,6 +68,8 @@
 - Arrow taps zoom into the item. Child lists are loaded on demand, cached within a memory limit, and omitted from the outline until zoomed. Known leaves have no arrow.
 
 ### Fixed
+
+- Workflowy status text is horizontally centered independently of its log arrow. Time-picker loading/errors share the same header lane, with clipping that protects the clock and left icons.
 
 - Completed items in the Workflowy task list show a checked checkbox alongside strikethrough, including completed bullet-type items. Their checkbox and Mark incomplete actions can restore them; calendar events retain strikethrough without a checkbox.
 
