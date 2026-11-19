@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a6af292478e11d385b42e6c43786a5b840ea21d..6b84d808e49f3f3222efe7cc5af8c230bb70116c 100644
+index 3a6af292478e11d385b42e6c43786a5b840ea21d..925fda481f32911fb00db7287f22d6e101b46f5c 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -611,6 +611,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -40,7 +40,7 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..6b84d808e49f3f3222efe7cc5af8c230
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1080,3 +1098,65 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1080,3 +1098,67 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -106,6 +106,8 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..6b84d808e49f3f3222efe7cc5af8c230
 +STR_WORKFLOWY_CALENDAR_VIEW: "Calendar view"
 +STR_WORKFLOWY_SCHEDULE_VIEW: "Schedule"
 +STR_WORKFLOWY_NEW_TASK: "New task"
++
++STR_WORKFLOWY_SCHEDULE_OVERFLOW: "Choose an earlier time; selected items must fit in one day."
 diff --git a/platformio.ini b/platformio.ini
 index 717848d4b5a2bccd929066ee495570d089ac1f90..78242ca264fa3e22ed9df66866a76eea9173c67f 100644
 --- a/platformio.ini
@@ -1023,10 +1025,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9352160ec
+index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed998265e74d7c6
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4376 @@
+@@ -0,0 +1,4554 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2502,62 +2504,113 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +}
 +
 +void WorkflowyDailyActivity::showBulkMenu() {
-+  if (selectionCount() == 0) return;
-+  const bool hasTodo = std::any_of(rows.begin(), rows.end(),
-+                                   [&](const Node& row) { return row.todo && row.selected; });
-+  std::vector<std::string> choices;
++  const auto count = selectionCount();
++  if (!count) return;
++  const bool hasTodo = std::any_of(rows.begin(), rows.end(), [](const Node& node) { return node.selected && node.todo; });
++  const bool hasBullet = std::any_of(rows.begin(), rows.end(), [](const Node& node) { return node.selected && !node.todo; });
++  enum class Command { Edit, Done, Undone, Schedule, Move, Convert, Zoom, Above, Below, Delete };
++  std::vector<std::string> labels;
++  std::vector<Command> commands;
++  labels.reserve(10);
++  commands.reserve(10);
++  const auto add = [&](Command command, StrId label) {
++    commands.push_back(command);
++    labels.emplace_back(I18n::getInstance().get(label));
++  };
++  if (count == 1) add(Command::Edit, StrId::STR_EDIT);
 +  if (hasTodo) {
-+    choices.emplace_back(tr(STR_WORKFLOWY_MARK_DONE));
-+    choices.emplace_back(tr(STR_WORKFLOWY_MARK_UNDONE));
++    add(Command::Done, StrId::STR_WORKFLOWY_MARK_DONE);
++    add(Command::Undone, StrId::STR_WORKFLOWY_MARK_UNDONE);
 +  }
-+  choices.emplace_back(tr(STR_WORKFLOWY_MOVE));
-+  choices.emplace_back(tr(STR_DELETE));
++  add(Command::Schedule, StrId::STR_WORKFLOWY_SCHEDULE_VIEW);
++  add(Command::Move, StrId::STR_WORKFLOWY_MOVE);
++  add(Command::Convert, StrId::STR_WORKFLOWY_TURN_INTO);
++  if (count == 1) add(Command::Zoom, StrId::STR_WORKFLOWY_ZOOM);
++  add(Command::Above, StrId::STR_WORKFLOWY_ADD_ABOVE);
++  add(Command::Below, StrId::STR_WORKFLOWY_ADD_BELOW);
++  add(Command::Delete, StrId::STR_DELETE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
-+                            renderer, mappedInput, "WorkflowyBulk", StrId::STR_WORKFLOWY_BULK_ACTIONS,
-+                            std::move(choices), 0, false, true),
-+                         [this, hasTodo](const ActivityResult& result) {
++                             renderer, mappedInput, "WorkflowyBulk", StrId::STR_WORKFLOWY_BULK_ACTIONS,
++                             std::move(labels), 0, false, true),
++                         [this, commands = std::move(commands), hasTodo, hasBullet](const ActivityResult& result) {
 +    if (result.isCancelled) return;
-+    int selected = std::get<OptionSelectionResult>(result.data).index;
-+    if (hasTodo) {
-+      if (selected == 0) return startBulk(BulkAction::Done);
-+      if (selected == 1) return startBulk(BulkAction::Undone);
-+      selected -= 2;
++    const size_t index = std::get<OptionSelectionResult>(result.data).index;
++    if (index >= commands.size()) return;
++    const auto command = commands[index];
++    if (command == Command::Done) return startBulk(BulkAction::Done);
++    if (command == Command::Undone) return startBulk(BulkAction::Undone);
++    if (command == Command::Schedule) return scheduleSelection();
++    if (command == Command::Move) return showBulkMoveMenu();
++    if (command == Command::Convert) {
++      std::vector<std::string> types;
++      types.reserve(2);
++      if (hasBullet) types.emplace_back(tr(STR_WORKFLOWY_TODO_TYPE));
++      if (hasTodo) types.emplace_back(tr(STR_WORKFLOWY_BULLET_TYPE));
++      startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                                 renderer, mappedInput, "WorkflowyBulkType", StrId::STR_WORKFLOWY_TURN_INTO,
++                                 std::move(types), 0, false, true),
++                             [this, hasBullet](const ActivityResult& choice) {
++        if (choice.isCancelled) return;
++        startBulk(hasBullet && std::get<OptionSelectionResult>(choice.data).index == 0
++                      ? BulkAction::ToTodo : BulkAction::ToBullet);
++      });
++      return;
 +    }
-+    if (selected == 0) return showBulkMoveMenu();
-+    if (selected == 1) {
++    if (command == Command::Delete) {
 +      char prompt[64];
 +      snprintf(prompt, sizeof(prompt), tr(STR_WORKFLOWY_BULK_DELETE), static_cast<unsigned>(selectionCount()));
 +      startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_DELETE), prompt),
 +                             [this](const ActivityResult& confirmed) {
 +        if (!confirmed.isCancelled) startBulk(BulkAction::Delete);
 +      });
++      return;
 +    }
++    auto node = std::find_if(rows.begin(), rows.end(), [](const Node& node) { return node.selected; });
++    if (command == Command::Below) {
++      const auto last = std::find_if(rows.rbegin(), rows.rend(), [](const Node& node) { return node.selected; });
++      if (last != rows.rend()) node = std::prev(last.base());
++    }
++    if (node == rows.end() || itemPending(node->id)) return;
++    const size_t row = node - rows.begin();
++    cancelSelection();
++    if (command == Command::Edit) return edit(row);
++    if (command == Command::Zoom) return zoom(row);
++    edit(row, command == Command::Above ? -1 : 1);
 +  });
 +}
 +
 +void WorkflowyDailyActivity::showBulkMoveMenu() {
-+  std::vector<std::string> targets, labels;
-+  if (!zoomId.empty() && rows.size() > 1 && rows[1].depth > 0) {
-+    targets.push_back(parentDestination(rows[1].id));
-+    labels.emplace_back(tr(STR_WORKFLOWY_MOVE_PARENT));
-+  }
++  struct Choice { BulkAction action; std::string target; };
++  std::vector<Choice> choices;
++  std::vector<std::string> labels;
++  choices.reserve(7);
++  labels.reserve(7);
++  const auto add = [&](BulkAction action, StrId label, std::string target = {}) {
++    choices.push_back({action, std::move(target)});
++    labels.emplace_back(I18n::getInstance().get(label));
++  };
++  add(BulkAction::MoveTop, StrId::STR_WORKFLOWY_MOVE_TOP);
++  add(BulkAction::MoveBottom, StrId::STR_WORKFLOWY_MOVE_BOTTOM);
++  const auto first = std::find_if(rows.begin(), rows.end(), [](const Node& node) { return node.selected; });
++  if (first != rows.end() && !parentOf(first->id).empty())
++    add(BulkAction::MoveDate, StrId::STR_WORKFLOWY_MOVE_PARENT, parentDestination(first->id));
 +  constexpr StrId days[] = {StrId::STR_WORKFLOWY_MOVE_YESTERDAY, StrId::STR_WORKFLOWY_MOVE_TODAY,
 +                             StrId::STR_WORKFLOWY_MOVE_TOMORROW};
 +  for (int delta = -1; delta <= 1; ++delta) {
 +    auto day = isoDate(delta);
 +    if (day.empty() && delta >= 0) day = delta == 0 ? "today" : "tomorrow";
 +    if (day.empty() || day == date || (delta == 0 && date == "today") || (delta == 1 && date == "tomorrow")) continue;
-+    targets.push_back(std::move(day));
-+    labels.emplace_back(I18n::getInstance().get(days[delta + 1]));
++    add(BulkAction::MoveDate, days[delta + 1], std::move(day));
 +  }
-+  labels.emplace_back(tr(STR_WORKFLOWY_MOVE_DATE));
++  add(BulkAction::None, StrId::STR_WORKFLOWY_MOVE_DATE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyBulkMove", StrId::STR_WORKFLOWY_MOVE,
 +                             std::move(labels), 0, false, true),
-+                         [this, targets = std::move(targets)](const ActivityResult& result) {
++                         [this, choices = std::move(choices)](const ActivityResult& result) {
 +    if (result.isCancelled) return;
-+    const size_t choice = std::get<OptionSelectionResult>(result.data).index;
-+    if (choice < targets.size()) return startBulk(BulkAction::MoveDate, targets[choice]);
++    const size_t index = std::get<OptionSelectionResult>(result.data).index;
++    if (index >= choices.size()) return;
++    if (choices[index].action != BulkAction::None) return startBulk(choices[index].action, choices[index].target);
 +    const auto today = isoDate(0);
 +    startActivityForResult(std::make_unique<WorkflowyDatePicker>(renderer, mappedInput, StrId::STR_WORKFLOWY_MOVE_DATE,
 +                              validDate(date) ? date : today, today), [this](const ActivityResult& picked) {
@@ -2566,43 +2619,101 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +  });
 +}
 +
++void WorkflowyDailyActivity::updateType(const std::string& id, bool todo) {
++  RenderLock lock(*this);
++  const auto update = [&](std::vector<Node>& nodes) {
++    for (auto& node : nodes) if (node.id == id) node.todo = todo;
++  };
++  update(rows);
++  for (auto& view : viewStack) update(view.rows);
++  for (auto& day : calendarDays) update(day.items);
++  layoutDirty = true;
++  requestUpdate();
++}
++
 +void WorkflowyDailyActivity::startBulk(BulkAction action, std::string target) {
 +  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
 +  const bool completion = action == BulkAction::Done || action == BulkAction::Undone;
 +  const bool done = action == BulkAction::Done;
++  const bool conversion = action == BulkAction::ToTodo || action == BulkAction::ToBullet;
++  const bool todo = action == BulkAction::ToTodo;
++  const bool boundary = action == BulkAction::MoveTop || action == BulkAction::MoveBottom;
++  const auto parent = zoomId.empty() ? date : zoomId;
 +  const auto label = completion ? (done ? StrId::STR_WORKFLOWY_MARK_DONE : StrId::STR_WORKFLOWY_MARK_UNDONE)
-+                                : (action == BulkAction::Delete ? StrId::STR_DELETE : StrId::STR_WORKFLOWY_MOVE);
++                   : conversion ? (todo ? StrId::STR_WORKFLOWY_TO_TODO : StrId::STR_WORKFLOWY_TO_BULLET)
++                   : action == BulkAction::MoveTop ? StrId::STR_WORKFLOWY_MOVE_TOP
++                   : action == BulkAction::MoveBottom ? StrId::STR_WORKFLOWY_MOVE_BOTTOM
++                   : action == BulkAction::Delete ? StrId::STR_DELETE : StrId::STR_WORKFLOWY_MOVE;
 +  std::vector<std::string> items;
 +  items.reserve(selectionCount());
-+  for (const auto& row : rows) {
-+    if (row.selected && !itemPending(row.id) && (!completion || (row.todo && row.done != done))) items.push_back(row.id);
++  for (const auto& node : rows) {
++    if (!node.selected || itemPending(node.id) || node.divider) continue;
++    if (completion && (!node.todo || node.done == done)) continue;
++    if (conversion && node.todo == todo) continue;
++    items.push_back(node.id);
 +  }
 +  if (items.size() > MAX_SAVE_QUEUE - saves.size()) return showMessage(tr(STR_WORKFLOWY_QUEUE_FULL));
++  // Repeated top insertion reverses order, so submit top moves in reverse.
++  if (action == BulkAction::MoveTop) std::reverse(items.begin(), items.end());
++  bool queuedAll = true;
 +  for (const auto& id : items) {
++    const auto node = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++    if (node == rows.end()) continue;
++    const bool oldTodo = node->todo;
++    const auto title = node->title.substr(0, 120);
 +    auto path = "/" + id;
 +    std::string body;
 +    if (completion) path += done ? "/complete" : "/uncomplete";
-+    else if (action == BulkAction::MoveDate) {
++    else if (conversion) {
 +      JsonDocument update;
-+      update["parent_id"] = target;
-+      update["position"] = "bottom";
++      update["layoutMode"] = todo ? "todo" : "bullets";
++      body = encode(update);
++    } else if (action == BulkAction::MoveDate || boundary) {
++      JsonDocument update;
++      update["parent_id"] = boundary ? parent : target;
++      update["position"] = action == BulkAction::MoveTop ? "top" : "bottom";
 +      path += "/move";
 +      body = encode(update);
 +    }
-+    if (!queueSave(std::move(path), std::move(body), false, [this, id, done, completion, action, target](const Save& save) {
++    if (!queueSave(std::move(path), std::move(body), false,
++                   [this, id, done, oldTodo, completion, conversion, boundary, parent, action, target](const Save& save) {
 +          if (save.status < 200 || save.status >= 300) {
 +            if (completion) updateCompletion(id, !done);
++            if (conversion) updateType(id, oldTodo);
 +            return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +          }
-+          if (!completion) {
++          if (boundary) {
++            if ((zoomId.empty() ? date : zoomId) == parent) loadDay();
++          } else if (!completion && !conversion) {
 +            const bool sameDay = action == BulkAction::MoveDate && (target == date ||
 +                (date == "today" && target == isoDate(0)) || (date == "tomorrow" && target == isoDate(1)));
++            std::optional<Node> moved;
++            const bool cachedParent = action == BulkAction::MoveDate && !sameDay && !validDate(target) &&
++                                      target != "today" && target != "tomorrow";
++            if (cachedParent) {
++              const auto node = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++              if (node != rows.end()) moved = *node;
++            }
 +            removeNode(id, sameDay);
++            if (moved) {
++              RenderLock lock(*this);
++              appendChild(rows, target, *moved);
++              for (auto& view : viewStack) appendChild(view.rows, target, *moved);
++              layoutDirty = true;
++            }
++            requestUpdate();
 +          }
-+        }, action == BulkAction::Delete ? "DELETE" : "POST", label, id)) break;
++        }, action == BulkAction::Delete ? "DELETE" : "POST", label, id)) { queuedAll = false; break; }
++    {
++      RenderLock lock(*this);
++      saves.back()->title = title;
++      node->selected = false;
++    }
 +    if (completion) updateCompletion(id, done);
++    if (conversion) updateType(id, todo);
 +  }
-+  cancelSelection();
++  if (queuedAll) cancelSelection();
++  else requestUpdate();
 +}
 +
 +void WorkflowyDailyActivity::actions(const size_t row) {
@@ -4470,6 +4581,7 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +    calendarWeek = week;
 +    calendarSchedule = false;
 +    schedulingItem.reset();
++    schedulingItems.reset();
 +    schedulingDate.clear();
 +    scheduleOffset = 0;
 +    calendarAnchor = current;
@@ -4622,8 +4734,9 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +  const auto target = calendarDays[day].date;
 +  std::shared_ptr<WorkflowyTimeChoices> choices;
 +  const auto fixed = schedulingItem;
++  const auto bulk = schedulingItems;
 +  const auto source = schedulingDate;
-+  if (!fixed) {
++  if (!fixed && !bulk) {
 +    const auto today = isoDate(0);
 +    if (!timeChoices) {
 +      auto allocation = makeUniqueNoThrow<WorkflowyTimeChoices>();
@@ -4649,18 +4762,21 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +    if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
 +    if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
 +  }
++  char bulkTitle[48]{};
++  if (bulk) snprintf(bulkTitle, sizeof(bulkTitle), tr(STR_WORKFLOWY_SELECTION_COUNT), static_cast<unsigned>(bulk->size()));
 +  auto picker = makeUniqueNoThrow<WorkflowyTimeRangePicker>(
 +      renderer, mappedInput, start, choices, [this] { pollTimeChoices(); },
-+      fixed ? fixed->id : "", fixed ? fixed->title : "",
++      fixed ? fixed->id : "", bulk ? std::string(bulkTitle) : fixed ? fixed->title : "",
 +      [this] { drawStatus(layout(), 1, tr(STR_LOADING_POPUP)); });
 +  if (!picker) {
 +    LOG_ERR("WF", "Could not allocate time-block picker");
 +    return showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
 +  }
 +  startActivityForResult(std::move(picker),
-+                         [this, target, source, fixed, choices](const ActivityResult& result) {
++                         [this, target, source, fixed, bulk, choices](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const auto& picked = std::get<WorkflowyBlockResult>(result.data);
++    if (bulk) return applyScheduledSelection(*bulk, source, target, picked.start, picked.end);
 +    if (fixed) return saveTaskSchedule(*fixed, source, target, picked.start, picked.end, true);
 +    if (!picked.itemId.empty() && choices && choices->ready.load(std::memory_order_acquire)) {
 +      const auto selected = std::find_if(choices->items.begin(), choices->items.end(),
@@ -4671,6 +4787,70 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +    }
 +    edit(rows.size(), 0, std::string::npos, "[] " + workflowy::scheduleRange(picked.start, picked.end) + " ", target);
 +  });
++}
++
++void WorkflowyDailyActivity::scheduleSelection() {
++  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  const auto count = selectionCount();
++  if (!count) return;
++  if (count > MAX_SAVE_QUEUE - saves.size()) return showMessage(tr(STR_WORKFLOWY_QUEUE_FULL));
++  const auto today = isoDate(0);
++  const auto source = validDate(date) ? date : isoDate(date == "tomorrow" ? 1 : 0);
++  if (today.empty() || source.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++  // Up to MAX_SAVE_QUEUE snapshots: the calendar may load another day before Save.
++  auto allocation = makeUniqueNoThrow<std::vector<Node>>();
++  if (!allocation) {
++    LOG_ERR("WF", "Could not allocate bulk schedule selection");
++    return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++  }
++  std::shared_ptr<std::vector<Node>> items(std::move(allocation));
++  items->reserve(count);
++  for (const auto& node : rows) if (node.selected && !node.divider && !itemPending(node.id)) items->push_back(node);
++  if (items->empty()) return;
++  cancelSelection();
++  openCalendar(false);
++  {
++    RenderLock lock(*this);
++    schedulingItems = std::move(items);
++    schedulingDate = source;
++    calendarAnchor = today;
++  }
++  reloadCalendar();
++}
++
++void WorkflowyDailyActivity::applyScheduledSelection(const std::vector<Node>& items, const std::string& source,
++                                                     const std::string& target, int start, int end) {
++  if (!workflowy::scheduleSelectionFits(start, end, items.size())) {
++    lastStatus = lastTransport = 0;
++    lastServerError = tr(STR_WORKFLOWY_SCHEDULE_OVERFLOW);
++    return showMessage(tr(STR_WORKFLOWY_SCHEDULE_OVERFLOW));
++  }
++  if (items.size() > MAX_SAVE_QUEUE - saves.size()) return showMessage(tr(STR_WORKFLOWY_QUEUE_FULL));
++  const int duration = end - start;
++  {
++    RenderLock lock(*this);
++    calendarVisible = false;
++    schedulingItem.reset();
++    schedulingItems.reset();
++    calendarFocus = items.front().id;
++    calendarFocusZoom = false;
++    if (std::any_of(items.begin(), items.end(), [](const Node& node) { return node.done; })) showDone = true;
++  }
++  for (const auto& item : items) {
++    saveTaskSchedule(item, source, target, start, start + duration, false);
++    start += duration;
++  }
++  if (target != date) moveToDate({}, target);
++  else {
++    const auto first = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == items.front().id; });
++    if (first != rows.end()) {
++      RenderLock lock(*this);
++      wrapAnchor = first - rows.begin();
++      layoutDirty = true;
++      calendarFocus.clear();
++    }
++  }
++  requestUpdate();
 +}
 +
 +void WorkflowyDailyActivity::scheduleItem(size_t row) {
@@ -5102,7 +5282,7 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +      calendarDrag = {};
 +    }
 +    if (selected) {
-+      if (schedulingItem) return createCalendarTask(selected->day, selected->start);
++      if (schedulingItem || schedulingItems) return createCalendarTask(selected->day, selected->start);
 +      return openCalendarTask(selected->day, selected->id);
 +    }
 +    const unsigned day = calendarWeek ? std::clamp((tapX - grid.x) * 7 / grid.width, 0, 6) : 0;
@@ -5405,10 +5585,10 @@ index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4ffa376410e62fec192e1b1526880e30d9706f62
+index 0000000000000000000000000000000000000000..5ecf7068b471199ae4a39f449104e1bbd53ebed7
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,321 @@
 +#pragma once
 +
 +#include <atomic>
@@ -5514,6 +5694,7 @@ index 0000000000000000000000000000000000000000..4ffa376410e62fec192e1b1526880e30
 +  void createCalendarTask(unsigned day, int start);
 +  std::shared_ptr<WorkflowyTimeChoices> timeChoices;
 +  std::optional<Node> schedulingItem;
++  std::shared_ptr<std::vector<Node>> schedulingItems;
 +  std::string schedulingDate;
 +  void scheduleItem(size_t row);
 +  void pollTimeChoices();
@@ -5552,7 +5733,7 @@ index 0000000000000000000000000000000000000000..4ffa376410e62fec192e1b1526880e30
 +  int dropRow = -1;
 +  bool dropAfter = false;
 +  bool dropInside = false;
-+  enum class BulkAction { None, Done, Undone, MoveDate, Delete };
++  enum class BulkAction { None, Done, Undone, ToTodo, ToBullet, MoveDate, MoveTop, MoveBottom, Delete };
 +  bool selecting = false;
 +  bool selectionEligible(const Node& node) const;
 +  size_t selectionCount() const;
@@ -5562,6 +5743,10 @@ index 0000000000000000000000000000000000000000..4ffa376410e62fec192e1b1526880e30
 +  void showBulkMenu();
 +  void startBulk(BulkAction action, std::string target = {});
 +  void showBulkMoveMenu();
++  void updateType(const std::string& id, bool todo);
++  void scheduleSelection();
++  void applyScheduledSelection(const std::vector<Node>& items, const std::string& source,
++                               const std::string& target, int start, int end);
 +  bool online = false;
 +  bool connectingWifi = false;
 +  unsigned long wifiStartedAt = 0;
@@ -6039,10 +6224,10 @@ index 0705cc3ee57e80ac6f51b365577c8e03235c0925..98c15702407ab756e3a4adeab8d97ca2
            returnAction(true);
 diff --git a/src/workflowy/WorkflowySchedule.h b/src/workflowy/WorkflowySchedule.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..bea0a0b77bb545da9b2baecf29c0e2561ebf6e85
+index 0000000000000000000000000000000000000000..6cf24981db88171dee6daf3319ed657afbfa9753
 --- /dev/null
 +++ b/src/workflowy/WorkflowySchedule.h
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,178 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -6136,6 +6321,11 @@ index 0000000000000000000000000000000000000000..bea0a0b77bb545da9b2baecf29c0e256
 +  return scheduleClock(start) + " – " + scheduleClock(end);
 +}
 +
++inline bool scheduleSelectionFits(int start, int end, size_t count) {
++  return count && start >= 0 && end > start && end <= 1440 &&
++         count <= static_cast<size_t>((1440 - start) / (end - start));
++}
++
 +inline std::string replaceTimeRange(std::string text, int start, int end) {
 +  const auto range = parseTimeRange(text);
 +  if (range) text.replace(range->begin, range->finish - range->begin, scheduleRange(start, end));
@@ -6217,15 +6407,17 @@ index 0000000000000000000000000000000000000000..bea0a0b77bb545da9b2baecf29c0e256
 +}
 +}  // namespace workflowy
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
-index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..9875394defd0b9d68970a44e9136420a185ded71 100644
+index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..e1492818bcdfc475937dd821dbf49383902c70f7 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -130,3 +130,5 @@ add_subdirectory(image_refresh_regions)
+@@ -130,3 +130,7 @@ add_subdirectory(image_refresh_regions)
  add_subdirectory(library_thumbnails)
 
  add_subdirectory(end_of_book_dismiss)
 +
 +add_subdirectory(workflowy_schedule)
++
++add_subdirectory(workflowy_bulk)
 diff --git a/test/workflowy_schedule/CMakeLists.txt b/test/workflowy_schedule/CMakeLists.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14a785a641
@@ -6239,10 +6431,10 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..241fe9466c44c45d9debe39a4805c5bc5cc114c1
+index 0000000000000000000000000000000000000000..8e66715fe2ec1be0ebcb59036419cf23a0435635
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,66 @@
 +#include "WorkflowySchedule.h"
 +#include <cassert>
 +#include <random>
@@ -6279,6 +6471,13 @@ index 0000000000000000000000000000000000000000..241fe9466c44c45d9debe39a4805c5bc
 +    assert(roundTrip && roundTrip->start == start && roundTrip->end == end);
 +    assert(roundTrip->finish == text.size());
 +  }
++  assert(scheduleSelectionFits(540, 570, 4));
++  assert(scheduleSelectionFits(1380, 1410, 2));
++  assert(!scheduleSelectionFits(1380, 1410, 3));
++  assert(!scheduleSelectionFits(540, 540, 1));
++  assert(!scheduleSelectionFits(540, 570, 0));
++  assert(!scheduleSelectionFits(-1, 30, 1));
++  assert(!scheduleSelectionFits(1425, 1455, 1));
 +  assert(shiftScheduleDate("2024-03-01", -1) == "2024-02-29");
 +  assert(shiftScheduleDate("2026-12-31", 1) == "2027-01-01");
 +  assert(scheduleWeekday("2026-11-16") == 0);
@@ -6328,3 +6527,186 @@ index c8632d51a6c0eea1826a12e30bcdc227c0437854..5927bc9c2b2b6ccc0544bf26b88bd6bf
                   OptionSelectionResult, PageResult, NetworkModeResult, FootnoteResult, BookmarkResult,
                   FileBrowserActionResult, FilePathResult, WordResult, ReadingStatsResult, ClippingResult,
                   TtfRenderOptionsResult, DictionaryClippingRequest, ClippingJumpResult, HighlightPageAction, FrontlightPanelResult>;
+diff --git a/test/workflowy_bulk/CMakeLists.txt b/test/workflowy_bulk/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4fced0bb7f826e1b19ca9b9119b64c3967618b4
+--- /dev/null
++++ b/test/workflowy_bulk/CMakeLists.txt
+@@ -0,0 +1,22 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(WORKFLOWY_JSON_DIR ${REPO_ROOT}/.pio/libdeps/x4-pro/ArduinoJson/src)
++if(NOT EXISTS ${WORKFLOWY_JSON_DIR}/ArduinoJson.h)
++  include(FetchContent)
++  FetchContent_Declare(workflowy_arduinojson
++    GIT_REPOSITORY https://github.com/bblanchon/ArduinoJson.git
++    GIT_TAG v7.4.2 GIT_SHALLOW TRUE)
++  FetchContent_MakeAvailable(workflowy_arduinojson)
++  set(WORKFLOWY_JSON_DIR ${workflowy_arduinojson_SOURCE_DIR}/src)
++endif()
++set(BULK_INC ${CMAKE_CURRENT_BINARY_DIR}/WorkflowyBulkUnderTest.inc)
++add_custom_command(OUTPUT ${BULK_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractBulk.py
++    ${REPO_ROOT}/src/activities/workflowy/WorkflowyDailyActivity.cpp ${BULK_INC}
++  DEPENDS ${REPO_ROOT}/src/activities/workflowy/WorkflowyDailyActivity.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/ExtractBulk.py VERBATIM)
++add_executable(workflowy_bulk_test WorkflowyBulkTest.cpp ${BULK_INC})
++target_include_directories(workflowy_bulk_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
++  ${REPO_ROOT}/src/workflowy ${WORKFLOWY_JSON_DIR})
++target_compile_features(workflowy_bulk_test PRIVATE cxx_std_20)
++target_compile_options(workflowy_bulk_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
++add_test(NAME workflowy_bulk COMMAND workflowy_bulk_test)
+diff --git a/test/workflowy_bulk/ExtractBulk.py b/test/workflowy_bulk/ExtractBulk.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3738f8cd7b3951c2b8cbbf707ed271a31b5e8a15
+--- /dev/null
++++ b/test/workflowy_bulk/ExtractBulk.py
+@@ -0,0 +1,11 @@
++from pathlib import Path
++import sys
++source = Path(sys.argv[1]).read_text()
++parts = []
++for begin, end in [
++    ("void WorkflowyDailyActivity::startBulk(", "void WorkflowyDailyActivity::actions("),
++    ("void WorkflowyDailyActivity::applyScheduledSelection(", "void WorkflowyDailyActivity::scheduleItem("),
++]:
++    start = source.index(begin)
++    parts.append(source[start:source.index(end, start)])
++Path(sys.argv[2]).write_text("\n".join(parts))
+diff --git a/test/workflowy_bulk/WorkflowyBulkTest.cpp b/test/workflowy_bulk/WorkflowyBulkTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c8d43cbbf036ac240afe9f67f60fe6e565f08ff
+--- /dev/null
++++ b/test/workflowy_bulk/WorkflowyBulkTest.cpp
+@@ -0,0 +1,132 @@
++
++#include <ArduinoJson.h>
++#include <algorithm>
++#include <cassert>
++#include <functional>
++#include <memory>
++#include <optional>
++#include "WorkflowySchedule.h"
++#include <string>
++#include <vector>
++constexpr size_t MAX_SAVE_QUEUE=24;
++enum class StrId {STR_WORKFLOWY_NETWORK_FAILED,STR_WORKFLOWY_MARK_DONE,STR_WORKFLOWY_MARK_UNDONE,STR_WORKFLOWY_TO_TODO,STR_WORKFLOWY_TO_BULLET,STR_WORKFLOWY_MOVE_TOP,STR_WORKFLOWY_MOVE_BOTTOM,STR_DELETE,STR_WORKFLOWY_MOVE,STR_WORKFLOWY_QUEUE_FULL,STR_WORKFLOWY_SEND_FAILED,STR_WORKFLOWY_SCHEDULE_OVERFLOW};
++using enum StrId;
++StrId tr(StrId id){return id;}
++bool validDate(const std::string& value){return value.size()==10 && value.front()=='2';}
++std::string isoDate(int day){return day ? "2026-11-20" : "2026-11-19";}
++std::string encode(JsonDocument& doc){std::string body;serializeJson(doc,body);return body;}
++struct RenderLock {template<typename T> explicit RenderLock(T&) {}};
++struct WorkflowyDailyActivity {
++ enum class BulkAction {None,Done,Undone,ToTodo,ToBullet,MoveDate,MoveTop,MoveBottom,Delete};
++ struct Node {std::string id,title;bool selected=true,todo=false,done=false,divider=false;};
++ struct Save {std::string item,title,path,body,method;int status=0;std::function<void(const Save&)> finish;};
++ struct View {std::vector<Node> rows;};
++ std::vector<View> viewStack;
++ std::vector<Node> rows;
++ std::vector<std::unique_ptr<Save>> saves;
++ std::string date="2026-11-19",zoomId;
++ bool online=true,selecting=true;
++ int loads=0,error=-1,removed=0,queueFailAt=-1;
++
++ struct Planned {std::string id,source,target;int start,end;};
++ std::vector<Planned> plans;
++ std::shared_ptr<std::vector<Node>> schedulingItems;
++ std::optional<Node> schedulingItem;
++ bool calendarVisible=true,calendarFocusZoom=true,showDone=false,layoutDirty=false;
++ int lastStatus=0,lastTransport=0,wrapAnchor=-1;
++ struct ErrorText {ErrorText& operator=(StrId){return *this;}} lastServerError;
++ std::string calendarFocus;
++ void startBulk(BulkAction,std::string target={});
++ void applyScheduledSelection(const std::vector<Node>&,const std::string&,const std::string&,int,int);
++ void saveTaskSchedule(Node node,std::string source,std::string target,int start,int end,bool) {
++  plans.push_back({node.id,source,target,start,end});
++ }
++ void moveToDate(std::string,std::string target){date=target;rows.clear();}
++
++ bool itemPending(const std::string& id) const {return std::any_of(saves.begin(),saves.end(),[&](const auto& job){return job->item==id;});}
++ size_t selectionCount()const{return std::count_if(rows.begin(),rows.end(),[](const Node& n){return n.selected;});}
++ void showMessage(StrId id){error=static_cast<int>(id);}
++ void loadDay(){++loads;}
++ void removeNode(const std::string&,bool){++removed;}
++ void updateCompletion(const std::string& id,bool done){for(auto& n:rows)if(n.id==id)n.done=done;}
++ void updateType(const std::string& id,bool todo){for(auto& n:rows)if(n.id==id)n.todo=todo;}
++ void appendChild(std::vector<Node>& nodes,const std::string& parent,Node node){
++  if(std::any_of(nodes.begin(),nodes.end(),[&](const Node& n){return n.id==parent;}))nodes.push_back(std::move(node));
++ }
++ void requestUpdate(){}
++ void cancelSelection(){selecting=false;for(auto& n:rows)n.selected=false;}
++ bool queueSave(std::string path,std::string body,bool,std::function<void(const Save&)> finish,const char* method,StrId,std::string id){
++  if(static_cast<int>(saves.size())==queueFailAt)return false;
++  auto job=std::make_unique<Save>();job->path=path;job->body=body;job->item=id;job->method=method;job->finish=std::move(finish);saves.push_back(std::move(job));return true;
++ }
++};
++
++#include "WorkflowyBulkUnderTest.inc"
++
++int main(){
++ using App=WorkflowyDailyActivity;using Action=App::BulkAction;
++ for(bool top:{true,false}) {
++  App app;app.rows={{"a","A"},{"b","B",false},{"c","C"},{"d","D",false}};
++  app.startBulk(top?Action::MoveTop:Action::MoveBottom);
++  assert(app.saves.size()==2 && !app.selecting);
++  std::vector<std::string> server={"a","b","c","d"};
++  for(auto& job:app.saves){JsonDocument doc;assert(!deserializeJson(doc,job->body));assert(doc["parent_id"]==app.date);
++   auto at=std::find(server.begin(),server.end(),job->item);assert(at!=server.end());server.erase(at);
++   if(doc["position"]=="top")server.insert(server.begin(),job->item);else server.push_back(job->item);
++   job->status=200;job->finish(*job);
++  }
++  assert((server==(top?std::vector<std::string>{"a","c","b","d"}:std::vector<std::string>{"b","d","a","c"})));
++  assert(app.loads==2 && app.removed==0);
++ }
++ {
++  App app;app.rows={{"a","A"},{"b","B",true,true},{"c","C"}};
++  app.startBulk(Action::ToTodo);assert(app.saves.size()==2 && app.rows[0].todo && app.rows[2].todo);
++  JsonDocument doc;assert(!deserializeJson(doc,app.saves[0]->body));assert(doc["layoutMode"]=="todo");
++  app.saves[0]->status=503;app.saves[0]->finish(*app.saves[0]);assert(!app.rows[0].todo && app.rows[1].todo && app.rows[2].todo);
++ }
++ {
++  App app;app.rows={{"a","A",true,true,false},{"b","B",true,false},{"c","C",true,true,true}};
++  app.startBulk(Action::Done);assert(app.saves.size()==1 && app.rows[0].done && !app.rows[1].done);
++  app.saves[0]->status=503;app.saves[0]->finish(*app.saves[0]);assert(!app.rows[0].done && app.rows[2].done);
++ }
++ {
++  App app;app.rows={{"a","A"},{"b","B"}};app.startBulk(Action::MoveDate,"2026-11-20");
++  for(auto& job:app.saves){JsonDocument doc;assert(!deserializeJson(doc,job->body));assert(doc["parent_id"]=="2026-11-20" && doc["position"]=="bottom");job->status=200;job->finish(*job);}assert(app.removed==2);
++ }
++ {
++  App app;for(int i=0;i<25;++i)app.rows.push_back({std::to_string(i),"Task"});app.startBulk(Action::ToTodo);
++  assert(app.saves.empty() && app.selecting && app.rows[0].selected && app.error==static_cast<int>(STR_WORKFLOWY_QUEUE_FULL));
++ }
++ {
++  App app;app.rows={{"a","A"},{"b","B"},{"c","C"}};app.queueFailAt=1;app.startBulk(Action::ToTodo);
++  assert(app.saves.size()==1 && app.selecting && !app.rows[0].selected && app.rows[1].selected && app.rows[2].selected);
++ }
++
++ {
++  App app;auto held=std::make_shared<std::vector<App::Node>>();
++  *held={{"a","A",true,true},{"b","B",true,true,true},{"c","C",true,true}};
++  app.rows=*held;app.schedulingItems=held;
++  app.applyScheduledSelection(*held,app.date,app.date,540,570);
++  assert(app.plans.size()==3 && !app.calendarVisible && !app.schedulingItems && app.showDone);
++  for(size_t i=0;i<app.plans.size();++i){assert(app.plans[i].id==(*held)[i].id);assert(app.plans[i].start==540+30*static_cast<int>(i));assert(app.plans[i].end==570+30*static_cast<int>(i));}
++  assert(app.wrapAnchor==0 && app.layoutDirty);
++ }
++ {
++  App app;auto held=std::make_shared<std::vector<App::Node>>();*held={{"a","A"},{"b","B"},{"c","C"}};
++  app.schedulingItems=held;app.applyScheduledSelection(*held,app.date,app.date,1380,1410);
++  assert(app.plans.empty() && app.calendarVisible && app.schedulingItems && app.error==static_cast<int>(STR_WORKFLOWY_SCHEDULE_OVERFLOW));
++ }
++ {
++  App app;auto held=std::make_shared<std::vector<App::Node>>();*held={{"a","A"}};app.schedulingItems=held;
++  app.applyScheduledSelection(*held,app.date,"2026-11-20",540,600);
++  assert(app.date=="2026-11-20" && app.calendarFocus=="a" && !app.calendarFocusZoom && app.plans[0].end==600);
++ }
++ {
++  App app;app.zoomId="parent";app.rows={{"a","A"},{"b","B"}};
++  app.viewStack.push_back({{{"grandparent","Grandparent",false}}});
++  app.startBulk(Action::MoveDate,"grandparent");
++  for(auto& job:app.saves){job->status=200;job->finish(*job);}
++  assert(app.removed==2 && app.layoutDirty && app.viewStack[0].rows.size()==3);
++  assert(app.viewStack[0].rows[1].id=="a" && app.viewStack[0].rows[2].id=="b");
++ }
++}

@@ -2,6 +2,9 @@
 
 ### Added
 
+- Workflowy bulk actions include scheduling consecutive time blocks, turning items into todos or bullets, moving to the top/bottom or a parent/date, and adding an item above/below the selection. Edit and Zoom are available for a single selected item.
+- Bulk moves preserve selection order, conversions restore the previous type on failure, and selections stay available when only part of a batch can be queued.
+
 - Library/Home has a direct Workflowy calendar shortcut. New calendar blocks default to 30 minutes.
 - Workflowy’s time-sort button moves timed items into chronological order above a reusable native divider, preserving the order of other items below it.
 
