@@ -2,6 +2,8 @@
 
 ### Added
 
+- A zoomed Workflowy item shows a down triangle that returns to its parent list when tapped. Collapsed items show a left triangle; the Back control remains available.
+
 - New Workflowy tasks show all tag choices immediately. Selected tags are grouped before the task body, preserve the todo marker and cursor, and avoid duplicate prefix tags.
 
 - Workflowy bulk actions include scheduling consecutive time blocks, turning items into todos or bullets, moving to the top/bottom or a parent/date, and adding an item above/below the selection. Edit and Zoom are available for a single selected item.

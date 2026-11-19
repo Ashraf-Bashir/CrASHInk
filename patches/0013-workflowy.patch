@@ -1043,10 +1043,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..47b78bdb75f5142f25745b3c6aedfc5620a75aef
+index 0000000000000000000000000000000000000000..170215dfa2b5064ff6c3d29764069562e1efa99d
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4565 @@
+@@ -0,0 +1,4573 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1138,6 +1138,18 @@ index 0000000000000000000000000000000000000000..47b78bdb75f5142f25745b3c6aedfc56
 +  const int stroke = size >= 12 ? 2 : 1;
 +  renderer.drawLine(x + size / 4, y + size / 2, x + size * 5 / 12, y + size * 3 / 4, stroke, false);
 +  renderer.drawLine(x + size * 5 / 12, y + size * 3 / 4, x + size * 4 / 5, y + size / 4, stroke, false);
++}
++
++void drawZoomArrow(GfxRenderer& renderer, int x, int y, bool expanded, bool confirmed) {
++  const int xs[3] = {expanded ? x - 6 : x + 4, expanded ? x + 5 : x - 5, expanded ? x : x + 4};
++  const int ys[3] = {expanded ? y + 9 : y + 8, expanded ? y + 9 : y + 13,
++                     expanded ? y + 17 : y + 18};
++  // Expanded: point down. Collapsed: point left, hollow until children are known.
++  if (expanded || confirmed) renderer.fillPolygon(xs, ys, 3, true);
++  else for (int i = 0; i < 3; ++i) {
++    const int next = (i + 1) % 3;
++    renderer.drawLine(xs[i], ys[i], xs[next], ys[next]);
++  }
 +}
 +
 +// Keep response and parsed fields out of the internal heap used by Wi-Fi/TLS.
@@ -2340,6 +2352,7 @@ index 0000000000000000000000000000000000000000..47b78bdb75f5142f25745b3c6aedfc56
 +
 +bool WorkflowyDailyActivity::tapArrow(int x, int y) {
 +  size_t row;
++  bool expanded;
 +  {
 +    RenderLock lock(*this);
 +    const int right = laidOut.x + laidOut.width;
@@ -2351,8 +2364,11 @@ index 0000000000000000000000000000000000000000..47b78bdb75f5142f25745b3c6aedfc56
 +    const auto node = std::find_if(rows.begin(), rows.end(), [&](const Node& item) { return item.id == hit->id; });
 +    if (node == rows.end()) return true;
 +    row = node - rows.begin();
++    expanded = node->id == zoomId;
 +  }
-+  if (!itemPending(rows[row].id)) zoom(row);
++  if (expanded) {
++    if (!viewStack.empty()) back();
++  } else if (!itemPending(rows[row].id)) zoom(row);
 +  return true;
 +}
 +
@@ -4466,17 +4482,9 @@ index 0000000000000000000000000000000000000000..47b78bdb75f5142f25745b3c6aedfc56
 +          renderer.drawText(UI_12_FONT_ID, tail + CONTINUATION_GAP, lineY, CONTINUATION);
 +      }
 +    }
-+    if (!selecting && firstFragment && !node.divider && !node.leaf && node.id != zoomId) {
++    if (!selecting && firstFragment && !node.divider && (node.id == zoomId || !node.leaf)) {
 +      paintedArrows.push_back({node.id, placement.top, placement.bottom});
-+      const int tipX = bounds.x + bounds.width - 10;
-+      const int xs[3] = {tipX - 5, tipX + 4, tipX - 5};
-+      const int ys[3] = {y + 8, y + 13, y + 18};
-+      if (node.childrenConfirmed) {
-+        renderer.fillPolygon(xs, ys, 3, true);
-+      } else {
-+        renderer.drawLine(tipX - 5, y + 8, tipX + 1, y + 13);
-+        renderer.drawLine(tipX + 1, y + 13, tipX - 5, y + 18);
-+      }
++      drawZoomArrow(renderer, bounds.x + bounds.width - 10, y, node.id == zoomId, node.childrenConfirmed);
 +    }
 +  }
 +  // Paint the marker over row artwork and keep its full thickness inside
@@ -6826,10 +6834,10 @@ index 0000000000000000000000000000000000000000..21e6e830d87caa108b5a7288b1b2ebf9
 +add_test(NAME workflowy_ui COMMAND workflowy_ui_test)
 diff --git a/test/workflowy_ui/ExtractStatus.py b/test/workflowy_ui/ExtractStatus.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..5cba7a62a3810912a440b8548a4c5a04b50e9403
+index 0000000000000000000000000000000000000000..3a2ca1d83c4e0a3a6c29664304ef49ef5932817a
 --- /dev/null
 +++ b/test/workflowy_ui/ExtractStatus.py
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,22 @@
 +from pathlib import Path
 +import sys
 +source = Path(sys.argv[1]).read_text()
@@ -6844,12 +6852,20 @@ index 0000000000000000000000000000000000000000..5cba7a62a3810912a440b8548a4c5a04
 +end = keyboard.index('bool KeyboardEntryActivity::insertTagAt', start)
 +with Path(sys.argv[2]).open('a') as output:
 +    output.write('\nnamespace {\n' + keyboard[tags:tags_end] + '\n}\n' + keyboard[start:end])
++
++for begin, end in [
++    ('void drawZoomArrow(', '// Keep response and parsed fields'),
++    ('bool WorkflowyDailyActivity::tapArrow(', 'void WorkflowyDailyActivity::edit('),
++]:
++    start = source.index(begin)
++    with Path(sys.argv[2]).open('a') as output:
++        output.write('\n' + source[start:source.index(end, start)])
 diff --git a/test/workflowy_ui/WorkflowyUiTest.cpp b/test/workflowy_ui/WorkflowyUiTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..727c2a50f57324ea57db24119422aec0f8afc538
+index 0000000000000000000000000000000000000000..a0851798548a3ff06f2dc3adaeba0988466d9050
 --- /dev/null
 +++ b/test/workflowy_ui/WorkflowyUiTest.cpp
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,152 @@
 +#include "workflowy/WorkflowyTagInput.h"
 +#include <algorithm>
 +#include <cassert>
@@ -6880,6 +6896,8 @@ index 0000000000000000000000000000000000000000..727c2a50f57324ea57db24119422aec0
 +  int textX=0,textY=0;
 +  Rect clip;
 +  std::vector<Line> lines;
++  std::vector<int> polygonX,polygonY;
++  void fillPolygon(const int* x,const int* y,int count,bool){polygonX.assign(x,x+count);polygonY.assign(y,y+count);}
 +  std::string truncatedText(int,const char* text,int width){return std::string(text).substr(0,std::max(0,width)/6);}
 +  int getTextWidth(int,const char* text){return std::strlen(text)*6;}
 +  int getLineHeight(int){return 18;}
@@ -6889,6 +6907,9 @@ index 0000000000000000000000000000000000000000..727c2a50f57324ea57db24119422aec0
 +  void drawText(int,int x,int y,const char* text){textX=x;textY=y;label=text;}
 +  void drawLine(int x1,int y1,int x2,int y2){lines.push_back({x1,y1,x2,y2});}
 +};
++using GfxRenderer = FakeRenderer;
++struct RenderLock {template<class T> explicit RenderLock(T&) {}};
++constexpr int ROW_ARROW_TARGET=34;
 +struct WorkflowyDailyActivity {
 +  struct Layout{};
 +  struct Job {StrId label=STR_WORKFLOWY_ADD;};
@@ -6900,6 +6921,19 @@ index 0000000000000000000000000000000000000000..727c2a50f57324ea57db24119422aec0
 +  FakeRenderer renderer;
 +  Rect statusArea()const{return area;}
 +  void drawStatus(const Layout&,size_t,const char*);
++  struct Node {std::string id;};
++  struct PaintedArrow {std::string id;int top,bottom;};
++  struct RowLayout {int x=8,width=464;} laidOut;
++  std::vector<Node> rows;
++  std::vector<PaintedArrow> paintedArrows;
++  std::vector<int> viewStack;
++  size_t page=0,paintedPage=0;
++  std::string zoomId,pending;
++  int zoomed=-1,zoomOut=0;
++  bool itemPending(const std::string& id)const{return id==pending;}
++  void zoom(size_t row){zoomed=row;}
++  void back(){++zoomOut;viewStack.pop_back();zoomId.clear();}
++  bool tapArrow(int,int);
 +};
 +struct KeyboardEntryActivity {
 +  bool workflowyTags=true,workflowyTagPalette=false;
@@ -6966,4 +7000,21 @@ index 0000000000000000000000000000000000000000..727c2a50f57324ea57db24119422aec0
 +  failed.drawStatus({},0,error.c_str());centered(failed);
 +  assert(failed.renderer.textX>=failed.area.x+14);
 +  WorkflowyDailyActivity narrow;narrow.area.width=20;narrow.drawStatus({},1,"Loading");assert(narrow.renderer.label.empty());
++  FakeRenderer down;drawZoomArrow(down,100,40,true,false);
++  assert(down.polygonY.size()==3 && down.polygonY[0]==down.polygonY[1] && down.polygonY[2]>down.polygonY[0]);
++  assert(down.polygonX[2]>down.polygonX[0] && down.polygonX[2]<down.polygonX[1]);
++  FakeRenderer left;drawZoomArrow(left,100,40,false,true);
++  assert(left.polygonX.size()==3 && left.polygonX[1]<left.polygonX[0] && left.polygonX[1]<left.polygonX[2]);
++  FakeRenderer unknown;drawZoomArrow(unknown,100,40,false,false);
++  assert(unknown.polygonX.empty() && unknown.lines.size()==3);
++  WorkflowyDailyActivity expanded;expanded.rows={{"root"},{"child"}};expanded.zoomId="root";
++  expanded.viewStack={1};expanded.paintedArrows={{"root",60,100},{"child",100,140}};
++  assert(expanded.tapArrow(460,80) && expanded.zoomOut==1 && expanded.zoomed==-1);
++  WorkflowyDailyActivity child;child.rows={{"root"},{"child"}};child.zoomId="root";
++  child.viewStack={1};child.paintedArrows={{"child",100,140}};
++  assert(child.tapArrow(460,120) && child.zoomed==1 && child.zoomOut==0);
++  child.zoomed=-1;child.page=1;assert(!child.tapArrow(460,120) && child.zoomed==-1);
++  WorkflowyDailyActivity busy;busy.rows={{"root"}};busy.zoomId="root";busy.pending="root";
++  busy.viewStack={1};busy.paintedArrows={{"root",60,100}};
++  assert(busy.tapArrow(460,80) && busy.zoomOut==1);
 +}
