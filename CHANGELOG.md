@@ -2,6 +2,10 @@
 
 ### Added
 
+- A Workflowy bottom-toolbar button moves unfinished todos in the current list to the following day using the background operation queue. Add remains the rightmost button.
+
+- Workflowy’s email toolbar button filters today’s todo list to reply/response actions. Tap again to show all tasks; the task counter and bulk selection follow the filter.
+
 - Workflowy item actions include Schedule: choose a spot in today’s calendar, adjust the time, and save to return to the task in its list. The time-block picker can also schedule an existing task from today.
 - The Workflowy calendar adds Schedule agenda view, vertical hour zoom, completed events with faded backgrounds and strikethrough, and background refresh every minute.
 
@@ -25,6 +29,8 @@
 - Workflowy can add items above or below a sibling and move an item to the top or bottom of its sibling list. An item starting with `[]` becomes a todo.
 
 ### Changed
+
+- Workflowy toolbars group navigation and view controls before actions, keeping Add at the far right. Item menus put Edit and completion first and Delete last.
 
 - Workflowy calendar blocks show event titles without repeating their time ranges. New ranges use a dash. Add stays at the far right of each toolbar, and one pending-action indicator sits beside the clock.
 

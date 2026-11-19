@@ -1021,10 +1021,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96b9f9ace5
+index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6c4b81f9b
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4213 @@
+@@ -0,0 +1,4278 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1097,7 +1097,9 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +constexpr int COUNT_TARGET = 76;
 +constexpr int CONTENT_TOP = 74;
 +constexpr unsigned long CALENDAR_REFRESH_MS = 60000;
-+constexpr int FOOTER_CONTROLS = 7;
++enum class TodoControl { Back, Calendar, ShowDone, Replies, Wrap, Refresh, Undo, MoveUnfinished, Add, Count };
++enum class CalendarControl { Back, Today, View, ZoomOut, ZoomIn, Refresh, Add, Count };
++constexpr int FOOTER_CONTROLS = static_cast<int>(TodoControl::Count);
 +constexpr size_t MAX_CALENDAR_ITEMS = MAX_ROWS;
 +constexpr unsigned long SAVED_WIFI_TIMEOUT = 10000;
 +constexpr int ROW_ARROW_TARGET = 34;
@@ -2459,7 +2461,8 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +}
 +
 +bool WorkflowyDailyActivity::selectionEligible(const Node& node) const {
-+  return node.depth == (zoomId.empty() ? 0u : 1u) && !itemPending(node.id) && (showDone || !node.done);
++  return node.depth == (zoomId.empty() ? 0u : 1u) && !itemPending(node.id) && (showDone || !node.done) &&
++         (!replyOnly || !zoomId.empty() || (node.todo && workflowy::isReplyTask(node.title)));
 +}
 +
 +size_t WorkflowyDailyActivity::selectionCount() const {
@@ -2564,6 +2567,7 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +  const auto label = completion ? (done ? StrId::STR_WORKFLOWY_MARK_DONE : StrId::STR_WORKFLOWY_MARK_UNDONE)
 +                                : (action == BulkAction::Delete ? StrId::STR_DELETE : StrId::STR_WORKFLOWY_MOVE);
 +  std::vector<std::string> items;
++  items.reserve(selectionCount());
 +  for (const auto& row : rows) {
 +    if (row.selected && !itemPending(row.id) && (!completion || (row.todo && row.done != done))) items.push_back(row.id);
 +  }
@@ -2597,42 +2601,52 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +
 +void WorkflowyDailyActivity::actions(const size_t row) {
 +  if (itemPending(rows[row].id)) return;
-+  std::vector<std::string> options{
-+      tr(STR_EDIT), tr(STR_WORKFLOWY_ZOOM), tr(STR_WORKFLOWY_MOVE),
-+      tr(STR_WORKFLOWY_TURN_INTO), tr(STR_DELETE)};
++  enum class Action { Edit, Complete, Schedule, Move, TurnInto, Zoom, AddAbove, AddBelow, Select, Delete };
++  std::vector<std::string> options;
++  std::vector<Action> commands;
++  options.reserve(10);
++  commands.reserve(10);
++  const auto add = [&](Action action, StrId label) {
++    commands.push_back(action);
++    options.emplace_back(I18n::getInstance().get(label));
++  };
++  add(Action::Edit, StrId::STR_EDIT);
++  if (rows[row].todo)
++    add(Action::Complete, rows[row].done ? StrId::STR_WORKFLOWY_MARK_UNDONE : StrId::STR_WORKFLOWY_MARK_DONE);
++  add(Action::Schedule, StrId::STR_WORKFLOWY_SCHEDULE_VIEW);
++  add(Action::Move, StrId::STR_WORKFLOWY_MOVE);
++  add(Action::TurnInto, StrId::STR_WORKFLOWY_TURN_INTO);
++  add(Action::Zoom, StrId::STR_WORKFLOWY_ZOOM);
 +  if (zoomId.empty() || row != 0) {
-+    options.emplace_back(tr(STR_WORKFLOWY_ADD_ABOVE));
-+    options.emplace_back(tr(STR_WORKFLOWY_ADD_BELOW));
++    add(Action::AddAbove, StrId::STR_WORKFLOWY_ADD_ABOVE);
++    add(Action::AddBelow, StrId::STR_WORKFLOWY_ADD_BELOW);
 +  }
-+  const int schedule = static_cast<int>(options.size());
-+  options.emplace_back(tr(STR_WORKFLOWY_SCHEDULE_VIEW));
-+  const int complete = rows[row].todo ? static_cast<int>(options.size()) : -1;
-+  if (complete >= 0)
-+    options.emplace_back(rows[row].done ? tr(STR_WORKFLOWY_MARK_UNDONE) : tr(STR_WORKFLOWY_MARK_DONE));
-+  const int multi = selectionEligible(rows[row]) ? static_cast<int>(options.size()) : -1;
-+  if (multi >= 0) options.emplace_back(tr(STR_WORKFLOWY_SELECT_MULTIPLE));
++  if (selectionEligible(rows[row])) add(Action::Select, StrId::STR_WORKFLOWY_SELECT_MULTIPLE);
++  add(Action::Delete, StrId::STR_DELETE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
 +                             0, false, true),
-+                         [this, row, complete, multi, schedule](const ActivityResult& result) {
++                         [this, row, commands = std::move(commands)](const ActivityResult& result) {
 +    if (result.isCancelled) return;
-+    const int selected = std::get<OptionSelectionResult>(result.data).index;
++    const size_t index = std::get<OptionSelectionResult>(result.data).index;
++    if (index >= commands.size() || row >= rows.size()) return;
++    const auto selected = commands[index];
 +    const auto id = rows[row].id;
-+    if (multi >= 0 && selected == multi) {
++    if (selected == Action::Select) {
 +      {
 +        RenderLock lock(*this);
 +        selecting = true;
 +      }
 +      return toggleSelection(row);
 +    }
-+    if (selected == schedule) return scheduleItem(row);
-+    if (complete >= 0 && selected == complete) return toggle(row);
-+    if (selected == 0) return edit(row);
-+    if ((zoomId.empty() || row != 0) && (selected == 5 || selected == 6))
-+      return edit(row, selected == 5 ? -1 : 1);
-+    if (selected == 1) return zoom(row);
-+    if (selected == 2) return showMoveMenu(row);
-+    if (selected == 3) {
++    if (selected == Action::Schedule) return scheduleItem(row);
++    if (selected == Action::Complete) return toggle(row);
++    if (selected == Action::Edit) return edit(row);
++    if ((zoomId.empty() || row != 0) && (selected == Action::AddAbove || selected == Action::AddBelow))
++      return edit(row, selected == Action::AddAbove ? -1 : 1);
++    if (selected == Action::Zoom) return zoom(row);
++    if (selected == Action::Move) return showMoveMenu(row);
++    if (selected == Action::TurnInto) {
 +      const bool todo = !rows[row].todo;
 +      const auto label = todo ? StrId::STR_WORKFLOWY_TO_TODO : StrId::STR_WORKFLOWY_TO_BULLET;
 +      startActivityForResult(std::make_unique<OptionSelectionActivity>(
@@ -2654,7 +2668,7 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +          applyTitle(id, title, todo);
 +        }
 +      });
-+    } else if (selected == 4) {
++    } else if (selected == Action::Delete) {
 +      startActivityForResult(std::make_unique<ConfirmationActivity>(
 +                                 renderer, mappedInput, tr(STR_DELETE), rows[row].title),
 +                             [this, id](const ActivityResult& confirmation) {
@@ -2743,6 +2757,40 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +  });
 +}
 +
++void WorkflowyDailyActivity::toggleReplyFilter() {
++  const bool enable = !replyOnly;
++  const auto today = isoDate(0);
++  if (today.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++  if (selecting) cancelSelection();
++  if (!viewStack.empty()) returnToDepth(0);
++  if (enable && date != "today" && date != today) moveToDate({}, today);
++  {
++    RenderLock lock(*this);
++    replyOnly = enable;
++    layoutDirty = true;
++    wrapAnchor = -1;
++    page = 0;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::moveUnfinishedForward() {
++  const auto source = validDate(date) ? date : isoDate(date == "tomorrow" ? 1 : 0);
++  const auto target = workflowy::shiftScheduleDate(source, 1);
++  if (target.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
++  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  const auto eligible = [&](const Node& node) { return node.todo && !node.done && selectionEligible(node); };
++  const size_t count = std::count_if(rows.begin(), rows.end(), eligible);
++  if (!count) return showMessage(tr(STR_WORKFLOWY_EMPTY));
++  if (count > MAX_SAVE_QUEUE - saves.size()) return showMessage(tr(STR_WORKFLOWY_QUEUE_FULL));
++  {
++    RenderLock lock(*this);
++    for (auto& node : rows) node.selected = eligible(node);
++    selecting = true;
++  }
++  startBulk(BulkAction::MoveDate, target);
++}
++
 +void WorkflowyDailyActivity::shiftDay(int delta) {
 +  auto source = validDate(date) ? date : isoDate(date == "tomorrow" ? 1 : 0);
 +  if (source.empty()) return chooseDate();
@@ -2767,6 +2815,7 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +    {
 +      RenderLock lock(*this);
 +      date = target;
++      replyOnly = false;
 +      zoomId.clear();
 +      viewStack.clear();
 +      selecting = false;
@@ -2838,6 +2887,7 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +  const auto placeRow = [&](size_t i) {
 +    const auto& node = rows[i];
 +    if (node.depth > visibleDepth) return;
++    if (replyOnly && zoomId.empty() && (!node.todo || !workflowy::isReplyTask(node.title))) return;
 +    if (node.done && !showDone && !itemPending(node.id) && (i != 0 || zoomId.empty())) return;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int width = std::max(1, bounds.width - indent - 25 - ROW_ARROW_TARGET);
@@ -3846,21 +3896,23 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +      if (x < bounds.x + bounds.width / 5) cancelSelection();
 +      return;
 +    }
-+    const int control = std::clamp((x - bounds.x) * FOOTER_CONTROLS / bounds.width, 0, FOOTER_CONTROLS - 1);
-+    if (control == 0) return back();
-+    if (control == 4) return openCalendar(false);
-+    if (control == 5) return refresh(held);
-+    if (control == 6) {
++    const auto control = static_cast<TodoControl>(std::clamp((x - bounds.x) * FOOTER_CONTROLS / bounds.width, 0, FOOTER_CONTROLS - 1));
++    if (control == TodoControl::Back) return back();
++    if (control == TodoControl::Calendar) return openCalendar(false);
++    if (control == TodoControl::Refresh) return refresh(held);
++    if (control == TodoControl::Replies) return toggleReplyFilter();
++    if (control == TodoControl::MoveUnfinished) return moveUnfinishedForward();
++    if (control == TodoControl::Add) {
 +      if (!credential.empty() && !date.empty()) edit(rows.size());
 +      return;
 +    }
-+    if (control == 2) {
++    if (control == TodoControl::Undo) {
 +      if (undoReady) undo();
 +      return;
 +    }
 +    {
 +      RenderLock lock(*this);
-+      if (control == 1) showDone = !showDone;
++      if (control == TodoControl::ShowDone) showDone = !showDone;
 +      else wrapItems = !wrapItems;
 +      message = nullptr;
 +      layoutDirty = true;
@@ -4079,7 +4131,8 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +    unsigned completed = 0, totalTodos = 0;
 +    const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
 +    for (const auto& row : rows) {
-+      if (row.depth == outlineDepth && row.todo) {
++      if (row.depth == outlineDepth && row.todo &&
++          (!replyOnly || !zoomId.empty() || workflowy::isReplyTask(row.title))) {
 +        ++totalTodos;
 +        if (row.done) ++completed;
 +      }
@@ -4242,12 +4295,12 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +  renderer.drawLine(bounds.x, bounds.footer, bounds.x + bounds.width - 1, bounds.footer);
 +  if (!selecting) {
 +    const int iconY = bounds.footer + 23;
-+    const auto iconX = [&](int slot) { return bounds.x + (2 * slot + 1) * bounds.width / (2 * FOOTER_CONTROLS); };
-+    int x = iconX(0);
++    const auto iconX = [&](TodoControl control) { return bounds.x + (2 * static_cast<int>(control) + 1) * bounds.width / (2 * FOOTER_CONTROLS); };
++    int x = iconX(TodoControl::Back);
 +    renderer.drawLine(x - 9, iconY, x + 9, iconY, ICON_STROKE, true);
 +    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, ICON_STROKE, true);
 +    renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, ICON_STROKE, true);
-+    const int viewX = iconX(1);
++    const int viewX = iconX(TodoControl::ShowDone);
 +    const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
 +    const int eyeY[] = {iconY, iconY - 4, iconY - 6, iconY - 4, iconY, iconY + 4, iconY + 6, iconY + 4};
 +    for (int i = 0; i < 8; ++i) {
@@ -4259,7 +4312,7 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +      renderer.drawLine(viewX - 10, iconY + 8, viewX + 10, iconY - 8, ICON_STROKE + 2, false);
 +      renderer.drawLine(viewX - 11, iconY + 7, viewX + 9, iconY - 9, ICON_STROKE, true);
 +    }
-+    x = iconX(2);
++    x = iconX(TodoControl::Undo);
 +    const int undoWidth = undoReady ? ICON_STROKE : ICON_STROKE - 1;
 +    renderer.drawLine(x - 10, iconY - 3, x + 4, iconY - 3, undoWidth, true);
 +    renderer.drawLine(x + 4, iconY - 3, x + 9, iconY + 2, undoWidth, true);
@@ -4267,7 +4320,7 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +    renderer.drawLine(x + 4, iconY + 8, x - 3, iconY + 8, undoWidth, true);
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY - 9, undoWidth, true);
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
-+    x = iconX(3);
++    x = iconX(TodoControl::Wrap);
 +    const int wrapWidth = wrapItems ? ICON_STROKE : ICON_STROKE - 1;
 +    renderer.drawLine(x - 11, iconY - 7, x + 4, iconY - 7, wrapWidth, true);
 +    renderer.drawLine(x - 11, iconY, x + 2, iconY, wrapWidth, true);
@@ -4275,18 +4328,30 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +    renderer.drawLine(x + 9, iconY - 7, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 5, iconY + 2, x + 9, iconY + 6, wrapWidth, true);
 +    renderer.drawLine(x + 9, iconY + 6, x + 13, iconY + 2, wrapWidth, true);
-+    const int calendarX = iconX(4);
++    const int calendarX = iconX(TodoControl::Calendar);
 +    renderer.drawRect(calendarX - 11, iconY - 10, 23, 22);
 +    renderer.drawLine(calendarX - 10, iconY - 3, calendarX + 10, iconY - 3, ICON_STROKE, true);
 +    renderer.drawLine(calendarX - 5, iconY - 13, calendarX - 5, iconY - 7, ICON_STROKE, true);
 +    renderer.drawLine(calendarX + 5, iconY - 13, calendarX + 5, iconY - 7, ICON_STROKE, true);
 +    const auto refresh = freeink::ui::bitmapFromIcon(icon_refresh_cw_32);
 +    freeink::ui::GfxRendererTarget target(renderer);
-+    target.bitmap({static_cast<int16_t>(iconX(5) - refresh.width / 2),
++    target.bitmap({static_cast<int16_t>(iconX(TodoControl::Refresh) - refresh.width / 2),
 +                   static_cast<int16_t>(iconY - icon_refresh_cw_32.opticalCenterY),
 +                   static_cast<int16_t>(refresh.width), static_cast<int16_t>(refresh.height)},
 +                  refresh, freeink::ui::BitmapMode::Center);
-+    const int addX = iconX(6);
++    const int mailX = iconX(TodoControl::Replies);
++    for (int inset = 0; inset < 2; ++inset)
++      renderer.drawRect(mailX - 12 + inset, iconY - 8 + inset, 25 - inset * 2, 18 - inset * 2);
++    renderer.drawLine(mailX - 11, iconY - 7, mailX, iconY + 1, ICON_STROKE, true);
++    renderer.drawLine(mailX, iconY + 1, mailX + 11, iconY - 7, ICON_STROKE, true);
++    if (replyOnly) renderer.drawLine(mailX - 12, iconY + 15, mailX + 12, iconY + 15, ICON_STROKE, true);
++    const int moveX = iconX(TodoControl::MoveUnfinished);
++    for (int inset = 0; inset < 2; ++inset)
++      renderer.drawRect(moveX - 13 + inset, iconY - 8 + inset, 14 - inset * 2, 17 - inset * 2);
++    renderer.drawLine(moveX - 2, iconY, moveX + 13, iconY, ICON_STROKE, true);
++    renderer.drawLine(moveX + 7, iconY - 6, moveX + 13, iconY, ICON_STROKE, true);
++    renderer.drawLine(moveX + 13, iconY, moveX + 7, iconY + 6, ICON_STROKE, true);
++    const int addX = iconX(TodoControl::Add);
 +    renderer.drawLine(addX - 9, iconY, addX + 9, iconY, ICON_STROKE, true);
 +    renderer.drawLine(addX, iconY - 9, addX, iconY + 9, ICON_STROKE, true);
 +  }
@@ -4848,8 +4913,8 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +    }
 +  }
 +  if (tapped && tapY >= bounds.footer) {
-+    const int slot = std::clamp((tapX - bounds.x) * 7 / bounds.width, 0, 6);
-+    if (slot == 0) {
++    const auto slot = static_cast<CalendarControl>(std::clamp((tapX - bounds.x) * 7 / bounds.width, 0, 6));
++    if (slot == CalendarControl::Back) {
 +      {
 +        RenderLock lock(*this);
 +        calendarVisible = false;
@@ -4857,16 +4922,16 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +      if (calendarFetch) calendarFetch->cancel.store(true, std::memory_order_relaxed);
 +      return requestUpdate();
 +    }
-+    if (slot == 1) return showCalendarMode();
-+    if (slot == 2 || slot == 3) return zoomCalendar(slot == 2 ? -1 : 1);
-+    if (slot == 6) {
++    if (slot == CalendarControl::View) return showCalendarMode();
++    if (slot == CalendarControl::ZoomOut || slot == CalendarControl::ZoomIn) return zoomCalendar(slot == CalendarControl::ZoomOut ? -1 : 1);
++    if (slot == CalendarControl::Add) {
 +      unsigned day = 0;
 +      if (calendarWeek) {
 +        for (unsigned i = 0; i < calendarDays.size(); ++i) if (calendarDays[i].date == calendarAnchor) day = i;
 +      }
 +      return createCalendarTask(day, calendarScroll);
 +    }
-+    if (slot == 4) {
++    if (slot == CalendarControl::Today) {
 +      const auto today = isoDate(0);
 +      if (today.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
 +      {
@@ -5151,20 +5216,20 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +void WorkflowyDailyActivity::calendarFooter(const Layout& bounds) {
 +  const int right = bounds.x + bounds.width;
 +  renderer.drawLine(bounds.x, bounds.footer, right, bounds.footer);
-+  const auto slot = [&](int value) { return bounds.x + (2 * value + 1) * bounds.width / 14; };
++  const auto slot = [&](CalendarControl control) { return bounds.x + (2 * static_cast<int>(control) + 1) * bounds.width / 14; };
 +  const int y = bounds.footer + 23;
-+  renderer.drawLine(slot(0) - 8, y, slot(0) + 8, y, 3, true);
-+  renderer.drawLine(slot(0) - 8, y, slot(0) - 2, y - 6, 3, true);
-+  renderer.drawLine(slot(0) - 8, y, slot(0) - 2, y + 6, 3, true);
++  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) + 8, y, 3, true);
++  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y - 6, 3, true);
++  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y + 6, 3, true);
 +  const auto label = calendarSchedule ? tr(STR_WORKFLOWY_SCHEDULE_VIEW) : calendarWeek ? tr(STR_WORKFLOWY_WEEK) : tr(STR_WORKFLOWY_DAY);
 +  const auto mode = renderer.truncatedText(SMALL_FONT_ID, label, bounds.width / 7 - 8);
-+  renderer.drawText(SMALL_FONT_ID, slot(1) - renderer.getTextWidth(SMALL_FONT_ID, mode.c_str()) / 2, y - 9,
++  renderer.drawText(SMALL_FONT_ID, slot(CalendarControl::View) - renderer.getTextWidth(SMALL_FONT_ID, mode.c_str()) / 2, y - 9,
 +                    mode.c_str(), true, EpdFontFamily::BOLD);
-+  renderer.drawLine(slot(1) - 3, y + 11, slot(1), y + 14, 2, true);
-+  renderer.drawLine(slot(1), y + 14, slot(1) + 3, y + 11, 2, true);
-+  for (int index = 2; index <= 3; ++index) {
-+    const int cx = slot(index);
-+    const int direction = index == 2 ? -1 : 1;
++  renderer.drawLine(slot(CalendarControl::View) - 3, y + 11, slot(CalendarControl::View), y + 14, 2, true);
++  renderer.drawLine(slot(CalendarControl::View), y + 14, slot(CalendarControl::View) + 3, y + 11, 2, true);
++  for (const auto control : {CalendarControl::ZoomOut, CalendarControl::ZoomIn}) {
++    const int cx = slot(control);
++    const int direction = control == CalendarControl::ZoomOut ? -1 : 1;
 +    for (int sign : {-1, 1}) {
 +      const int tipY = y + sign * (direction > 0 ? 10 : 2);
 +      const int tailY = y + sign * (direction > 0 ? 2 : 11);
@@ -5175,13 +5240,13 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +    }
 +  }
 +  const auto today = tr(STR_WORKFLOWY_TODAY);
-+  renderer.drawText(SMALL_FONT_ID, slot(4) - renderer.getTextWidth(SMALL_FONT_ID, today) / 2, y - 8, today);
++  renderer.drawText(SMALL_FONT_ID, slot(CalendarControl::Today) - renderer.getTextWidth(SMALL_FONT_ID, today) / 2, y - 8, today);
 +  const auto refresh = freeink::ui::bitmapFromIcon(icon_refresh_cw_32);
 +  freeink::ui::GfxRendererTarget target(renderer);
-+  target.bitmap({static_cast<int16_t>(slot(5) - 16), static_cast<int16_t>(y - icon_refresh_cw_32.opticalCenterY),
++  target.bitmap({static_cast<int16_t>(slot(CalendarControl::Refresh) - 16), static_cast<int16_t>(y - icon_refresh_cw_32.opticalCenterY),
 +                 32, 32}, refresh, freeink::ui::BitmapMode::Center);
-+  renderer.drawLine(slot(6) - 9, y, slot(6) + 9, y, 3, true);
-+  renderer.drawLine(slot(6), y - 9, slot(6), y + 9, 3, true);
++  renderer.drawLine(slot(CalendarControl::Add) - 9, y, slot(CalendarControl::Add) + 9, y, 3, true);
++  renderer.drawLine(slot(CalendarControl::Add), y - 9, slot(CalendarControl::Add), y + 9, 3, true);
 +}
 +
 +void WorkflowyDailyActivity::renderSchedule(const Layout& bounds) {
@@ -5240,10 +5305,10 @@ index 0000000000000000000000000000000000000000..4a88a899fabb2e903e15be2fce869f96
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2771613f75319e5302bc38ed8248784871e655b
+index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec1332f88e
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,313 @@
 +#pragma once
 +
 +#include <atomic>
@@ -5364,6 +5429,9 @@ index 0000000000000000000000000000000000000000..d2771613f75319e5302bc38ed8248784
 +  const char* message = nullptr;
 +  bool ownsWifi = false;
 +  bool showDone = false;
++  bool replyOnly = false;
++  void toggleReplyFilter();
++  void moveUnfinishedForward();
 +  bool wrapItems = true;
 +  int wrapAnchor = -1;
 +  size_t page = 0;
@@ -5601,10 +5669,10 @@ index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfc
 +inline constexpr freeink::Icon workflowyIcon{32, 32, 16, workflowyBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..2bb96dbc44c7c6b5c0f0fa7ba0a79e78b4e19d2b
+index 0000000000000000000000000000000000000000..3104b886b0c7d80f723b52787723292692b880e3
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,149 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -5613,6 +5681,29 @@ index 0000000000000000000000000000000000000000..2bb96dbc44c7c6b5c0f0fa7ba0a79e78
 +#include <vector>
 +
 +namespace workflowy {
++
++// Match whole action words without allocating or changing the stored task text.
++inline bool isReplyTask(std::string_view text) {
++  constexpr std::string_view actions[] = {"reply", "replies", "replying", "replied",
++                                         "respond", "responds", "responding", "responded", "response"};
++  const auto letter = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
++  for (size_t at = 0; at < text.size();) {
++    if (!letter(static_cast<unsigned char>(text[at]))) { ++at; continue; }
++    const size_t begin = at;
++    while (at < text.size() && letter(static_cast<unsigned char>(text[at]))) ++at;
++    const auto word = text.substr(begin, at - begin);
++    for (const auto action : actions) {
++      if (word.size() != action.size()) continue;
++      bool same = true;
++      for (size_t i = 0; i < word.size(); ++i) {
++        const char c = word[i] >= 'A' && word[i] <= 'Z' ? word[i] + ('a' - 'A') : word[i];
++        if (c != action[i]) { same = false; break; }
++      }
++      if (same) return true;
++    }
++  }
++  return false;
++}
 +
 +struct TextSpan {
 +  size_t begin;
