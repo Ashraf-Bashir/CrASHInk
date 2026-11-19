@@ -79,6 +79,10 @@
 
 ### Fixed
 
+- SD firmware picking uses the newest creation/copy or modification timestamp, with copy/modified dates and later directory entries breaking ties instead of alphabetical commit hashes.
+- Sorting when no unfinished tasks have a qualifying leading time is a harmless no-op; “No visible items” is no longer stored or classified as an operation error.
+- Today’s calendar positions the now-line one-third down the visible timeline and follows it on minute refresh while idle. Manual scrolling disables following until Today or a calendar view is opened again; day boundaries still constrain scrolling.
+
 - Calendar and Workflowy launcher icons use transparent backgrounds instead of filled black tiles.
 - Scheduled separators require a visible unfinished timed task above them on the same page and no longer create orphan pages.
 - Zooming an empty Workflowy note stays on the current list and removes its arrow after an empty fetch.

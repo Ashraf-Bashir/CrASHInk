@@ -1043,10 +1043,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9bb3a0a491
+index 0000000000000000000000000000000000000000..927ab1f954f2c4710f6a4e6aaa8d01c9054e0d19
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4776 @@
+@@ -0,0 +1,4804 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1488,7 +1488,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +};
 +
 +bool isErrorNotice(const char* text) {
-+  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED);
++  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED) && text != tr(STR_WORKFLOWY_EMPTY);
 +}
 +
 +class WorkflowyErrorDetails final : public Activity {
@@ -1692,7 +1692,9 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +void WorkflowyDailyActivity::showMessage(const char* text) {
 +  {
 +    RenderLock lock(*this);
-+    message = text;
++    // Empty is a view state, not an operation error. Render it only when the
++    // visible list really is empty, never as a sticky Sort/Move error banner.
++    message = text == tr(STR_WORKFLOWY_EMPTY) ? nullptr : text;
 +  }
 +  requestUpdate();
 +}
@@ -4811,6 +4813,24 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +  return {bounds.x + timeWidth, y, bounds.width - timeWidth, height, calendarHourHeight};
 +}
 +
++// Called while the UI render lock is held. Manual panning disables following
++// until Today or a new calendar view is opened; background refresh must not snap
++// a user's chosen time range back to the clock.
++void WorkflowyDailyActivity::positionCalendarNow() {
++  if (!calendarFollowNow || calendarSchedule) return;
++  const auto today = isoDate(0);
++  const auto utc = halClock.utcNowMs();
++  if (today.empty() || !utc) return;
++  if (calendarWeek) {
++    const auto first = workflowy::shiftScheduleDate(calendarAnchor, -workflowy::scheduleWeekday(calendarAnchor));
++    if (today < first || today > workflowy::shiftScheduleDate(first, 6)) return;
++  } else if (calendarAnchor != today) return;
++  const int64_t local = static_cast<int64_t>(utc / 60000) + (static_cast<int>(SETTINGS.clockUtcOffsetQ) - 48) * 15;
++  const int minute = (local % 1440 + 1440) % 1440;
++  const auto grid = calendarGrid();
++  calendarScroll = workflowy::scheduleScrollForNow(minute, grid.height, grid.hourHeight);
++}
++
 +void WorkflowyDailyActivity::openCalendar(bool week) {
 +  if (prefetch) prefetch->cancel.store(true, std::memory_order_relaxed);
 +  const auto current = validDate(date) ? date : isoDate(date == "tomorrow" ? 1 : 0);
@@ -4818,6 +4838,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +  {
 +    RenderLock lock(*this);
 +    calendarVisible = true;
++    calendarFollowNow = true;
 +    calendarWeek = week;
 +    calendarSchedule = false;
 +    schedulingItem.reset();
@@ -4859,6 +4880,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +      }
 +    }
 +    calendarHits.clear();
++    positionCalendarNow();
 +    message = nullptr;
 +  }
 +  requestUpdate();
@@ -4883,6 +4905,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +      RenderLock lock(*this);
 +      for (auto& day : calendarDays) if (!day.date.empty()) day.loaded = false;
 +      calendarRefreshAt = millis() + CALENDAR_REFRESH_MS;
++      positionCalendarNow();
 +    }
 +    requestUpdate();
 +  }
@@ -5449,6 +5472,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +      {
 +        RenderLock lock(*this);
 +        calendarAnchor = today;
++        calendarFollowNow = true;
 +        scheduleOffset = 0;
 +      }
 +    }
@@ -5465,6 +5489,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +        const auto now = millis();
 +        if (now - calendarDrag.scrollAt >= 650) {
 +          const int scrollDelta = y < grid.y + 20 ? -30 : y >= grid.y + grid.height - 20 ? 30 : 0;
++          if (scrollDelta) calendarFollowNow = false;
 +          calendarScroll = std::clamp(calendarScroll + scrollDelta, 0,
 +                                      std::max(0, 1440 - grid.height * 60 / grid.hourHeight));
 +          if (!calendarDrag.edge && (x < grid.x || x >= grid.x + grid.width)) {
@@ -5690,6 +5715,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +    const auto mode = std::get<OptionSelectionResult>(result.data).index;
 +    {
 +      RenderLock lock(*this);
++      calendarFollowNow = true;
 +      calendarWeek = mode == 1;
 +      calendarSchedule = mode == 2;
 +      scheduleOffset = 0;
@@ -5709,6 +5735,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +    calendarHourHeight = scales[std::clamp(index + direction, 0, static_cast<int>(std::size(scales)) - 1)];
 +    const auto grid = calendarGrid();
 +    calendarScroll = std::clamp(calendarScroll, 0, std::max(0, 1440 - grid.height * 60 / grid.hourHeight));
++    positionCalendarNow();
 +    calendarDrag = {};
 +  }
 +  requestUpdate();
@@ -5717,6 +5744,7 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +void WorkflowyDailyActivity::scrollCalendar(int direction) {
 +  {
 +    RenderLock lock(*this);
++    calendarFollowNow = false;
 +    const auto grid = calendarGrid();
 +    if (calendarSchedule) {
 +      const int rows = std::max(1, grid.height / 72);
@@ -5825,10 +5853,10 @@ index 0000000000000000000000000000000000000000..e2d58a92d9025c9d839b8d4ed1a50f9b
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bfd874fddd19d273cebaf4d6844724c2174cb4d
+index 0000000000000000000000000000000000000000..56516669de3f11bb0defd9123447efe4376b7a21
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,332 @@
 +#pragma once
 +
 +#include <atomic>
@@ -5894,6 +5922,7 @@ index 0000000000000000000000000000000000000000..6bfd874fddd19d273cebaf4d6844724c
 +  size_t scheduleOffset = 0;
 +  unsigned long calendarRefreshAt = 0;
 +  int calendarScroll = 8 * 60;
++  bool calendarFollowNow = true;
 +  std::array<CalendarDay, 7> calendarDays;
 +  std::shared_ptr<CalendarFetch> calendarFetch;
 +  std::string calendarAnchor, calendarFocus;
@@ -5921,6 +5950,7 @@ index 0000000000000000000000000000000000000000..6bfd874fddd19d273cebaf4d6844724c
 +    int minuteAt(int pixel) const;
 +  };
 +  CalendarGrid calendarGrid() const;
++  void positionCalendarNow();
 +  void openCalendar(bool week);
 +  void reloadCalendar();
 +  void pollCalendar();
@@ -6551,10 +6581,10 @@ index 0705cc3ee57e80ac6f51b365577c8e03235c0925..98c15702407ab756e3a4adeab8d97ca2
            returnAction(true);
 diff --git a/src/workflowy/WorkflowySchedule.h b/src/workflowy/WorkflowySchedule.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3d577e3fbcba8f0e34da297278d7d7bc6c159f4f
+index 0000000000000000000000000000000000000000..a621246b3fc78842981532b354aef93b87c10824
 --- /dev/null
 +++ b/src/workflowy/WorkflowySchedule.h
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,185 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -6566,6 +6596,13 @@ index 0000000000000000000000000000000000000000..3d577e3fbcba8f0e34da297278d7d7bc
 +#include <vector>
 +
 +namespace workflowy {
++// Put the clock one third down the visible day, clamped to the day bounds.
++inline int scheduleScrollForNow(int minute, int viewportHeight, int hourHeight) {
++  if (viewportHeight <= 0 || hourHeight <= 0) return 0;
++  const int visible = std::max(1, viewportHeight * 60 / hourHeight);
++  return std::clamp(minute - visible / 3, 0, std::max(0, 1440 - visible));
++}
++
 +struct TimeRange {
 +  int start = 0, end = 0;
 +  size_t begin = 0, finish = 0;
@@ -6760,10 +6797,10 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b0f6d17ff829b1b890433003407c7efa02696b8e
+index 0000000000000000000000000000000000000000..5ad7c4fde92745959e24d8e45b6aa049e452daae
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,114 @@
 +#include "WorkflowySchedule.h"
 +#include "WorkflowyOutlineLayout.h"
 +#include "WorkflowySettings.h"
@@ -6771,6 +6808,11 @@ index 0000000000000000000000000000000000000000..b0f6d17ff829b1b890433003407c7efa
 +#include <random>
 +int main() {
 +  using namespace workflowy;
++  assert(scheduleScrollForNow(720, 720, 72) == 520);
++  assert(scheduleScrollForNow(720, 720, 144) == 620);
++  assert(scheduleScrollForNow(0, 720, 72) == 0);
++  assert(scheduleScrollForNow(1439, 720, 72) == 840);
++  assert(scheduleScrollForNow(720, 720, 0) == 0);
 +  assert(!saveTimedOut(100, 180099));
 +  assert(saveTimedOut(100, 180100));
 +  assert(saveTimeRemaining(100, 180100) == 0);
@@ -7166,16 +7208,20 @@ index 0000000000000000000000000000000000000000..21e6e830d87caa108b5a7288b1b2ebf9
 +add_test(NAME workflowy_ui COMMAND workflowy_ui_test)
 diff --git a/test/workflowy_ui/ExtractStatus.py b/test/workflowy_ui/ExtractStatus.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3a2ca1d83c4e0a3a6c29664304ef49ef5932817a
+index 0000000000000000000000000000000000000000..94e129498ffc719f7ca5631ead582aeebbaa31ea
 --- /dev/null
 +++ b/test/workflowy_ui/ExtractStatus.py
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,26 @@
 +from pathlib import Path
 +import sys
 +source = Path(sys.argv[1]).read_text()
 +start = source.index('void WorkflowyDailyActivity::drawStatus(')
 +end = source.index('void WorkflowyDailyActivity::render(', start)
-+Path(sys.argv[2]).write_text(source[start:end])
++error_start = source.index('bool isErrorNotice(')
++error_end = source.index('class WorkflowyErrorDetails', error_start)
++notice_start = source.index('void WorkflowyDailyActivity::showMessage(')
++notice_end = source.index('void WorkflowyDailyActivity::showErrorDetails()', notice_start)
++Path(sys.argv[2]).write_text(source[error_start:error_end] + source[notice_start:notice_end] + source[start:end])
 +
 +keyboard = Path(sys.argv[3]).read_text()
 +tags = keyboard.index('constexpr const char* TAGS[]')
@@ -7194,10 +7240,10 @@ index 0000000000000000000000000000000000000000..3a2ca1d83c4e0a3a6c29664304ef49ef
 +        output.write('\n' + source[start:source.index(end, start)])
 diff --git a/test/workflowy_ui/WorkflowyUiTest.cpp b/test/workflowy_ui/WorkflowyUiTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..58381b01bfc5bec2061d9dd7b5b95d017989b15e
+index 0000000000000000000000000000000000000000..3cad69c8f9e14bd0b6d5bd5c6586654e1fbd005a
 --- /dev/null
 +++ b/test/workflowy_ui/WorkflowyUiTest.cpp
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,189 @@
 +#include "workflowy/WorkflowyTagInput.h"
 +#include <algorithm>
 +#include <cassert>
@@ -7207,12 +7253,14 @@ index 0000000000000000000000000000000000000000..58381b01bfc5bec2061d9dd7b5b95d01
 +#include <vector>
 +constexpr int SMALL_FONT_ID = 1;
 +enum class StrId { STR_WORKFLOWY_ACTION_PENDING, STR_WORKFLOWY_ACTIONS_PENDING,
-+  STR_WORKFLOWY_ZOOM, STR_LOADING_POPUP, STR_WORKFLOWY_SYNC_CHECK, STR_WORKFLOWY_ADD };
++  STR_WORKFLOWY_ZOOM, STR_LOADING_POPUP, STR_WORKFLOWY_SYNC_CHECK, STR_WORKFLOWY_ADD, STR_WORKFLOWY_EMPTY, STR_WORKFLOWY_CAPTURE_QUEUED };
 +using enum StrId;
 +const char* tr(StrId id) {
 +  switch(id) {
 +    case STR_WORKFLOWY_ACTION_PENDING: return "%u action pending";
 +    case STR_WORKFLOWY_ACTIONS_PENDING: return "%u actions pending";
++    case STR_WORKFLOWY_EMPTY: return "No visible items";
++    case STR_WORKFLOWY_CAPTURE_QUEUED: return "Queued";
 +    case STR_WORKFLOWY_ZOOM: return "Open";
 +    case STR_LOADING_POPUP: return "Loading";
 +    case STR_WORKFLOWY_SYNC_CHECK: return "Check";
@@ -7221,7 +7269,7 @@ index 0000000000000000000000000000000000000000..58381b01bfc5bec2061d9dd7b5b95d01
 +}
 +struct I18n { static I18n& getInstance(){static I18n instance;return instance;} const char* get(StrId id){return tr(id);} };
 +struct Rect {int x=0,y=0,width=0,height=0;};
-+bool isErrorNotice(const char* message){return message != nullptr;}
++bool isErrorNotice(const char*);
 +struct FakeRenderer {
 +  struct Line {int x1,y1,x2,y2;};
 +  std::string label;
@@ -7256,6 +7304,9 @@ index 0000000000000000000000000000000000000000..58381b01bfc5bec2061d9dd7b5b95d01
 +  Rect area{122,0,218,26};
 +  FakeRenderer renderer;
 +  Rect statusArea()const{return area;}
++  unsigned updates=0;
++  void requestUpdate(){++updates;}
++  void showMessage(const char*);
 +  void drawStatus(const Layout&,size_t,const char*);
 +  struct Node {std::string id;};
 +  struct PaintedArrow {std::string id;int top,bottom;};
@@ -7279,6 +7330,11 @@ index 0000000000000000000000000000000000000000..58381b01bfc5bec2061d9dd7b5b95d01
 +};
 +#include "WorkflowyStatusUnderTest.inc"
 +int main(){
++  assert(!isErrorNotice(tr(STR_WORKFLOWY_EMPTY)));
++  assert(!isErrorNotice(tr(STR_WORKFLOWY_CAPTURE_QUEUED)));
++  assert(isErrorNotice("Server error"));
++  WorkflowyDailyActivity noMatch;noMatch.showMessage(tr(STR_WORKFLOWY_EMPTY));
++  assert(noMatch.message==nullptr && noMatch.updates==1);
 +  using workflowy::prependTaskTag;
 +  std::string text="[] ";size_t cursor=text.size();
 +  assert(prependTaskTag(text,cursor,"#career",512));

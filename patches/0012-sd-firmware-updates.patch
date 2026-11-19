@@ -1,7 +1,8 @@
 diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+index 9b6b8d4ffec420f7a4fa71e739397ca8adb0dc55..1fa53fbea091c359ef012624e78d2c8c169eeb47 100644
 --- a/src/activities/home/FileBrowserActivity.cpp
 +++ b/src/activities/home/FileBrowserActivity.cpp
-@@ -100,10 +100,11 @@
+@@ -100,10 +100,11 @@ size_t estimateNextVectorCapacity(size_t size, size_t capacity) {
    return capacity * 2;
  }
 
@@ -15,7 +16,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
    const uint32_t stringBytes = static_cast<uint32_t>(entryLen + 1);
    const uint32_t largestNeeded = std::max(vectorGrowthBytes, stringBytes);
 
-@@ -133,7 +134,7 @@
+@@ -133,7 +134,7 @@ bool acceptFirmware(const char* name, bool isDir) {
    if (isMacOSMetadataEntry(name) || isWindowsMetadataEntry(name) || (!SETTINGS.showHiddenFiles && name[0] == '.')) {
      return false;
    }
@@ -24,7 +25,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
  }
 
  bool acceptDirectory(const char* name, const bool isDir) {
-@@ -224,8 +225,7 @@
+@@ -224,8 +225,7 @@ bool FileBrowserActivity::loadFilesIntoVector(size_t cap, bool& overflow) {
      return false;
    }
 
@@ -34,7 +35,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 
    files.reserve(std::min<size_t>(cap, INDEX_THRESHOLD));
    for (auto file = root.openNextFile(); file; file = root.openNextFile()) {
-@@ -282,12 +282,58 @@
+@@ -282,12 +282,66 @@ void FileBrowserActivity::loadFiles() {
    loadFilesLocked();
  }
 
@@ -45,7 +46,8 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 +
 +  struct FirmwareEntry {
 +    std::string name;
-+    uint32_t modified;
++    uint32_t modified, created;
++    size_t directoryOrder;
 +  };
 +  std::vector<FirmwareEntry> entries;
 +  for (auto file = root.openNextFile(); file; file = root.openNextFile()) {
@@ -57,7 +59,9 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 +        return;
 +      }
 +      const auto modified = file.modificationTime();
-+      entries.push_back({fileNameBuffer.get(), modified != 0 ? modified : file.creationTime()});
++      // Copies often preserve an old source modification time. Creation is
++      // the newer arrival/copy time on the card, while overwrites update mtime.
++      entries.push_back({fileNameBuffer.get(), modified, file.creationTime(), entries.size()});
 +    }
 +    file.close();
 +  }
@@ -68,8 +72,13 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 +  root.close();
 +
 +  std::sort(entries.begin(), entries.end(), [](const FirmwareEntry& a, const FirmwareEntry& b) {
++    const auto aNewest = std::max(a.modified, a.created), bNewest = std::max(b.modified, b.created);
++    if (aNewest != bNewest) return aNewest > bNewest;
++    if (a.created != b.created) return a.created > b.created;
 +    if (a.modified != b.modified) return a.modified > b.modified;
-+    return FsHelpers::naturalLess(a.name, b.name);
++    // FAT timestamps have two-second resolution and may be missing. Prefer
++    // later directory entries on ties; commit-hash spelling has no age meaning.
++    return a.directoryOrder > b.directoryOrder;
 +  });
 +  const auto bytes = entries.size() * sizeof(std::string);
 +  if (ESP.getMaxAllocHeap() < bytes + FILE_BROWSER_APPEND_MIN_MAX_ALLOC_AFTER_ALLOC) {
@@ -93,7 +102,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 
    bool overflow = false;
    if (!loadFilesIntoVector(INDEX_THRESHOLD, overflow)) {
-@@ -307,8 +353,7 @@
+@@ -307,8 +361,7 @@ void FileBrowserActivity::loadFilesLocked() {
    if (fileIndex && indexEntry) {
      GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
 
@@ -103,7 +112,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
      if (fileIndex->open(basepath.c_str(), accept)) {
        usingIndex = true;
        return;
-@@ -380,29 +425,31 @@
+@@ -380,29 +433,31 @@ void FileBrowserActivity::onEnter() {
    // its release — otherwise we'd immediately auto-open whatever is at index 0.
    lockNextConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
 
@@ -118,19 +127,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 -
 -  const bool rootIsDirectory = root.isDirectory();
 -  root.close();
--
--  if (!rootIsDirectory) {
--    lockLongPressBack = mappedInput.isPressed(MappedInputManager::Button::Back);
--
--    const std::string oldPath = basepath;
--    basepath = FsHelpers::extractFolderPath(basepath);
--    loadFiles();
--
--    const auto pos = oldPath.find_last_of('/');
--    const std::string fileName = oldPath.substr(pos + 1);
--    selectorIndex = findEntry(fileName);
-   } else {
--    loadFiles();
++  } else {
 +    auto root = Storage.open(basepath.c_str());
 +    if (!root) {
 +      basepath = "/";
@@ -138,16 +135,26 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
 +      requestUpdate();
 +      return;
 +    }
-+
+
+-  if (!rootIsDirectory) {
+-    lockLongPressBack = mappedInput.isPressed(MappedInputManager::Button::Back);
 +    const bool rootIsDirectory = root.isDirectory();
 +    root.close();
-+
+
+-    const std::string oldPath = basepath;
+-    basepath = FsHelpers::extractFolderPath(basepath);
+-    loadFiles();
 +    if (!rootIsDirectory) {
 +      lockLongPressBack = mappedInput.isPressed(MappedInputManager::Button::Back);
 +      const std::string oldPath = basepath;
 +      basepath = FsHelpers::extractFolderPath(basepath);
 +      loadFiles();
-+
+
+-    const auto pos = oldPath.find_last_of('/');
+-    const std::string fileName = oldPath.substr(pos + 1);
+-    selectorIndex = findEntry(fileName);
+-  } else {
+-    loadFiles();
 +      const auto pos = oldPath.find_last_of('/');
 +      selectorIndex = findEntry(oldPath.substr(pos + 1));
 +    } else {
@@ -156,7 +163,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
    }
 
    uiReady = false;
-@@ -1027,8 +1074,7 @@
+@@ -1027,8 +1082,7 @@ void FileBrowserActivity::activateSelected() {
    const std::string entry = entryNameAt(selectorIndex);
    const bool isDirectory = (entry.back() == '/');
 
@@ -166,7 +173,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
      std::string cleanBasePath = basepath;
      if (cleanBasePath.back() != '/') cleanBasePath += "/";
      ActivityResult res{FilePathResult{cleanBasePath + entry}};
-@@ -1243,7 +1289,7 @@
+@@ -1243,7 +1297,7 @@ void FileBrowserActivity::loop() {
  }
 
  void FileBrowserActivity::navigateBack() {
@@ -175,7 +182,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
      {
        RenderLock lock(*this);
        const std::string oldPath = basepath;
-@@ -1402,7 +1448,7 @@
+@@ -1402,7 +1456,7 @@ void FileBrowserActivity::buildListScreen(UiApp::ScreenType& screen) {
    for (size_t i = 0; i < drawCount; i++) {
      const size_t entryIndex = static_cast<size_t>(topIndex) + i;
      const std::string entry = entryNameAt(entryIndex);
@@ -184,7 +191,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
      if (SETTINGS.hideFileExtension == 0) values[i] = getFileExtension(entry);
      const std::string fullPath = buildFullPath(basepath, entry);
      if (isPinnedBootFavorite(fullPath)) {
-@@ -1488,11 +1534,7 @@
+@@ -1488,11 +1542,7 @@ void FileBrowserActivity::render(RenderLock&&) {
    const auto backLabel = (basepath == "/") ? (mode == Mode::Books ? mappedInput.withBackArrow(tr(STR_LIBRARY))
                                                                    : mappedInput.withBackArrow(tr(STR_BACK)))
                                             : mappedInput.withBackArrow(tr(STR_BACK));
