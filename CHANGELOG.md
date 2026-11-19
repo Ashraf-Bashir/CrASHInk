@@ -79,12 +79,17 @@
 
 ### Fixed
 
+- Calendar and Workflowy launcher icons use transparent backgrounds instead of filled black tiles.
+- Scheduled separators require a visible unfinished timed task above them on the same page and no longer create orphan pages.
+- Zooming an empty Workflowy note stays on the current list and removes its arrow after an empty fetch.
+- The calendar’s current-time marker is a bold, contrasting line with no time label, limited to today’s visible day/week column.
+
 - Workflowy keeps Wi-Fi while its task/calendar view or editor is open, but always disconnects when leaving for the reader/library or sleep, including inherited connections.
 - Pending Workflowy saves share a three-minute budget across queue wait and every request in a multi-step job. Expired work reports an error and releases the auto-sleep block; cancellation safely waits for the network worker to unwind.
 
 - Timed-task sorting marks only the affected timed tasks as pending. It accepts only leading time ranges (ignoring decorative emoji), and leaves completed tasks and tasks with words/tags before their time outside the scheduled section.
 - Scheduled separators disappear when no unfinished timed tasks remain above them, and are deleted/recreated in the background after completion or undo. Recent sorted parent lists are remembered on the device, including while their separator is absent.
-- Workflowy’s expanded/compact toggle uses distinct inward/outward arrows matching calendar sizing controls instead of resembling Sort.
+- Workflowy’s expanded/compact toggle uses four diagonal inward/outward arrows instead of resembling Sort.
 
 - Workflowy’s email filter also filters the zoomed parent note, instead of leaving non-matching parent text above reply/respond tasks. Breadcrumb navigation remains available.
 
