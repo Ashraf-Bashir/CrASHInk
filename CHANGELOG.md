@@ -20,6 +20,8 @@
 
 ### Changed
 
+- Workflowy removes the calendar icon, gives its tappable date more width, and puts the task counter on the far right. Relative dates keep the regular header font.
+
 - Workflowy displays loading, connection, pending actions, and errors above the outline, with pagination below. Relative day labels use a consistent font size. Navigation icons use stronger strokes on the light background.
 
 - Workflowy puts Refresh in the bottom toolbar and uses the top row for the full date, day arrows, task count, and calendar. The pending badge keeps pagination visible and includes requested item expansion.
