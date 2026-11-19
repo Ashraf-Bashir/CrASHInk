@@ -1043,10 +1043,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c0abeb8cf23bb228fe8315a2ec0b6ea2d757015f
+index 0000000000000000000000000000000000000000..8cb01a6aaa852028149efba9792f14b4404eee50
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4582 @@
+@@ -0,0 +1,4586 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -4278,7 +4278,11 @@ index 0000000000000000000000000000000000000000..c0abeb8cf23bb228fe8315a2ec0b6ea2
 +  if (textLimit <= 0) return;
 +  const auto fitted = renderer.truncatedText(SMALL_FONT_ID, label, textLimit);
 +  const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str());
-+  const int x = area.x + std::max(0, (area.width - textWidth) / 2);
++  // Center on the screen, not the asymmetric gap left by the status icons
++  // and clock. Only move away from that center when the label would collide.
++  const int inset = arrow + 4;
++  const int x = std::clamp((renderer.getScreenWidth() - textWidth) / 2,
++                           area.x + inset, area.x + area.width - inset - textWidth);
 +  const int y = area.y + (area.height - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
 +  renderer.fillRect(area.x, area.y, area.width, area.height, false);
 +  renderer.beginTextClip(area.x, area.y, area.width, area.height);
@@ -6871,10 +6875,10 @@ index 0000000000000000000000000000000000000000..3a2ca1d83c4e0a3a6c29664304ef49ef
 +        output.write('\n' + source[start:source.index(end, start)])
 diff --git a/test/workflowy_ui/WorkflowyUiTest.cpp b/test/workflowy_ui/WorkflowyUiTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a0851798548a3ff06f2dc3adaeba0988466d9050
+index 0000000000000000000000000000000000000000..d33ca3b4e8a8f490cb5e079fa7a63158a5f459ea
 --- /dev/null
 +++ b/test/workflowy_ui/WorkflowyUiTest.cpp
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,160 @@
 +#include "workflowy/WorkflowyTagInput.h"
 +#include <algorithm>
 +#include <cassert>
@@ -6910,6 +6914,7 @@ index 0000000000000000000000000000000000000000..a0851798548a3ff06f2dc3adaeba0988
 +  std::string truncatedText(int,const char* text,int width){return std::string(text).substr(0,std::max(0,width)/6);}
 +  int getTextWidth(int,const char* text){return std::strlen(text)*6;}
 +  int getLineHeight(int){return 18;}
++  int getScreenWidth(){return 480;}
 +  void fillRect(int,int,int,int,bool){}
 +  void beginTextClip(int x,int y,int width,int height){clip={x,y,width,height};}
 +  void endTextClip(){}
@@ -6998,12 +7003,19 @@ index 0000000000000000000000000000000000000000..a0851798548a3ff06f2dc3adaeba0988
 +  assert(plain.renderer.label==pending.renderer.label && plain.renderer.textX==pending.renderer.textX);
 +  const auto centered=[](WorkflowyDailyActivity& app){
 +    const int width=app.renderer.getTextWidth(SMALL_FONT_ID,app.renderer.label.c_str());
-+    assert(std::abs((app.renderer.textX*2+width)-(app.area.x*2+app.area.width))<=1);
++    const int inset=app.renderer.lines.empty()?4:14;
++    const int expected=std::clamp((app.renderer.getScreenWidth()-width)/2,
++                                 app.area.x+inset,app.area.x+app.area.width-inset-width);
++    assert(app.renderer.textX==expected);
 +    assert(app.renderer.clip.x==app.area.x && app.renderer.clip.width==app.area.width);
 +    assert(app.renderer.textX>=app.area.x && app.renderer.textX+width<=app.area.x+app.area.width);
 +    for(const auto& line:app.renderer.lines){assert(line.x1>=app.area.x && line.x2<app.area.x+app.area.width);}
 +  };
 +  centered(plain);centered(pending);
++  assert(plain.renderer.textX*2+plain.renderer.getTextWidth(SMALL_FONT_ID,"Loading")==480);
++  WorkflowyDailyActivity asymmetric;asymmetric.area={150,0,210,26};
++  asymmetric.drawStatus({},0,"Loading");centered(asymmetric);
++  assert(asymmetric.renderer.textX==plain.renderer.textX);
 +  WorkflowyDailyActivity calendar;calendar.calendarVisible=true;calendar.drawStatus({},3,"Loading");centered(calendar);
 +  std::string error(200,'X');WorkflowyDailyActivity failed;failed.message=error.c_str();
 +  failed.drawStatus({},0,error.c_str());centered(failed);

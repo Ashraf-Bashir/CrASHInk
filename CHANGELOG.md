@@ -73,6 +73,8 @@
 
 ### Fixed
 
+- Workflowy loading and operation messages center on the screen across task and calendar views, shifting only to avoid status icons or the clock.
+
 - Workflowy tag backgrounds follow the rendered text advance, leaving spaces before and between #/@ tags unhighlighted.
 
 - Ordinary screen transitions and book opening use fast refresh in both light and dark modes instead of forcing a cleaning pulse. Manual refresh and the configured reader cleaning cadence remain available.
