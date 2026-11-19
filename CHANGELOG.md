@@ -36,6 +36,8 @@
 
 ### Changed
 
+- Workflowy times match existing calendar entries exactly: `7:15pm - 9:00pm`, with lowercase suffixes, no space before am/pm, and a spaced hyphen.
+
 - Workflowy calendar labels, schedule times, time controls, and newly saved task ranges use 12-hour AM/PM format. Time columns reserve enough space for the longer labels.
 
 - The reply filter applies to the current day or zoomed item, including matching bullets. It keeps the current location.
