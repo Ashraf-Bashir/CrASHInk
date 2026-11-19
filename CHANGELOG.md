@@ -33,6 +33,8 @@
 
 ### Changed
 
+- Workflowy calendar labels, schedule times, time controls, and newly saved task ranges use 12-hour AM/PM format. Time columns reserve enough space for the longer labels.
+
 - The reply filter applies to the current day or zoomed item, including matching bullets. It keeps the current location.
 - Workflowy status messages are centered and clipped between the left actions and clock across task, calendar, queue, and time-picker views. Selected calendar resize edges have a bold bar and contrasting grip.
 

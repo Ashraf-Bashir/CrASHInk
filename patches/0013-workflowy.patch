@@ -1023,10 +1023,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..21380086bfafab04dd580b1947844c07b65c20bc
+index 0000000000000000000000000000000000000000..26856ec359367df6f1748247344b28a9352160ec
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4374 @@
+@@ -0,0 +1,4376 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -4456,7 +4456,8 @@ index 0000000000000000000000000000000000000000..21380086bfafab04dd580b1947844c07
 +  const auto bounds = layout();
 +  const int y = bounds.top + CONTENT_TOP + (calendarWeek ? 44 : 8);
 +  const int height = std::max(120, bounds.footer - y - 6);
-+  return {bounds.x + 43, y, bounds.width - 43, height, calendarHourHeight};
++  const int timeWidth = renderer.getTextWidth(SMALL_FONT_ID, "12:00 PM") + 8;
++  return {bounds.x + timeWidth, y, bounds.width - timeWidth, height, calendarHourHeight};
 +}
 +
 +void WorkflowyDailyActivity::openCalendar(bool week) {
@@ -5374,7 +5375,8 @@ index 0000000000000000000000000000000000000000..21380086bfafab04dd580b1947844c07
 +    const auto start = workflowy::scheduleClock(block.start), end = workflowy::scheduleClock(block.end);
 +    renderer.drawText(SMALL_FONT_ID, bounds.x + 4, y + 6, start.c_str(), true, EpdFontFamily::BOLD);
 +    renderer.drawText(SMALL_FONT_ID, bounds.x + 4, y + 30, end.c_str());
-+    const int x = bounds.x + 90, width = bounds.width - 94;
++    const int timeWidth = renderer.getTextWidth(SMALL_FONT_ID, "12:00 PM", EpdFontFamily::BOLD) + 12;
++    const int x = bounds.x + timeWidth, width = bounds.width - timeWidth - 4;
 +    renderer.fillRoundedRect(x, y + 2, width, rowHeight - 7, 5, Color::White);
 +    if (!node.done) renderer.fillRectDither(x, y + 2, width, rowHeight - 7,
 +                                           itemPending(node.id) ? Color::DarkGray : Color::LightGray);
@@ -6037,10 +6039,10 @@ index 0705cc3ee57e80ac6f51b365577c8e03235c0925..98c15702407ab756e3a4adeab8d97ca2
            returnAction(true);
 diff --git a/src/workflowy/WorkflowySchedule.h b/src/workflowy/WorkflowySchedule.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0fdb37aace9c08c4e51a17e0ad1d36fff090c984
+index 0000000000000000000000000000000000000000..bea0a0b77bb545da9b2baecf29c0e2561ebf6e85
 --- /dev/null
 +++ b/src/workflowy/WorkflowySchedule.h
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,173 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -6123,8 +6125,10 @@ index 0000000000000000000000000000000000000000..0fdb37aace9c08c4e51a17e0ad1d36ff
 +
 +inline std::string scheduleClock(int minutes) {
 +  char value[12];
-+  if (minutes == 1440) return "12am";
-+  snprintf(value, sizeof(value), "%d:%02d", minutes / 60, minutes % 60);
++  minutes = std::clamp(minutes, 0, 1440) % 1440;
++  const int hour = minutes / 60;
++  snprintf(value, sizeof(value), "%d:%02d %s", hour % 12 ? hour % 12 : 12, minutes % 60,
++           hour < 12 ? "AM" : "PM");
 +  return value;
 +}
 +
@@ -6235,10 +6239,10 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..60046c2d37ccfc71d1170225788ad75ff6ab2b50
+index 0000000000000000000000000000000000000000..241fe9466c44c45d9debe39a4805c5bc5cc114c1
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,59 @@
 +#include "WorkflowySchedule.h"
 +#include <cassert>
 +#include <random>
@@ -6260,8 +6264,21 @@ index 0000000000000000000000000000000000000000..60046c2d37ccfc71d1170225788ad75f
 +  assert(!parseTimeRange("12:00 to 12:00"));
 +  assert(!parseTimeRange("Contact 123:00 to 14:00"));
 +  assert(!parseTimeRange("8:30 to 12amp"));
-+  assert(replaceTimeRange("#P0 8:30 to 12:00 Task", 540, 780) == "#P0 9:00 – 13:00 Task");
-+  assert(scheduleRange(0, 1440) == "0:00 – 12am");
++  assert(replaceTimeRange("#P0 8:30 to 12:00 Task", 540, 780) == "#P0 9:00 AM – 1:00 PM Task");
++  assert(scheduleRange(0, 1440) == "12:00 AM – 12:00 AM");
++  assert(scheduleClock(0) == "12:00 AM");
++  assert(scheduleClock(510) == "8:30 AM");
++  assert(scheduleClock(720) == "12:00 PM");
++  assert(scheduleClock(780) == "1:00 PM");
++  assert(scheduleClock(1439) == "11:59 PM");
++  assert(scheduleClock(1440) == "12:00 AM");
++  for (int start = 0; start < 1440; start += 15) {
++    const int end = std::min(start + 30, 1440);
++    const auto text = scheduleRange(start, end);
++    const auto roundTrip = parseTimeRange(text);
++    assert(roundTrip && roundTrip->start == start && roundTrip->end == end);
++    assert(roundTrip->finish == text.size());
++  }
 +  assert(shiftScheduleDate("2024-03-01", -1) == "2024-02-29");
 +  assert(shiftScheduleDate("2026-12-31", 1) == "2027-01-01");
 +  assert(scheduleWeekday("2026-11-16") == 0);
