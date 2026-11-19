@@ -2,6 +2,9 @@
 
 ### Added
 
+- Library/Home has a direct Workflowy calendar shortcut. New calendar blocks default to 30 minutes.
+- Workflowy’s time-sort button moves timed items into chronological order above a reusable native divider, preserving the order of other items below it.
+
 - A Workflowy bottom-toolbar button moves unfinished todos in the current list to the following day using the background operation queue. Add remains the rightmost button.
 
 - Workflowy’s email toolbar button filters today’s todo list to reply/response actions. Tap again to show all tasks; the task counter and bulk selection follow the filter.
@@ -29,6 +32,9 @@
 - Workflowy can add items above or below a sibling and move an item to the top or bottom of its sibling list. An item starting with `[]` becomes a todo.
 
 ### Changed
+
+- The reply filter applies to the current day or zoomed item, including matching bullets. It keeps the current location.
+- Workflowy status messages are centered and clipped between the left actions and clock across task, calendar, queue, and time-picker views. Selected calendar resize edges have a bold bar and contrasting grip.
 
 - Workflowy toolbars group navigation and view controls before actions, keeping Add at the far right. Item menus put Edit and completion first and Delete last.
 

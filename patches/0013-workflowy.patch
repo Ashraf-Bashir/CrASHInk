@@ -195,7 +195,7 @@ index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index 3698935155402bc82ba87531c94fda1eb02a3739..14c22290bc6f918f81f31f098929e819c2a1bc8e 100644
+index 3698935155402bc82ba87531c94fda1eb02a3739..d2493a36d1c14f18cd7c70a02311ad0e975e8ac9 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
 @@ -25,6 +25,10 @@
@@ -218,23 +218,25 @@ index 3698935155402bc82ba87531c94fda1eb02a3739..14c22290bc6f918f81f31f098929e819
 +#ifdef SIMULATOR
 +    4;
 +#else
-+    5;
++    6;
 +#endif
  constexpr int BATCH_CANCEL_CONTROL = NAV_FIRST + NAV_COUNT;
  constexpr int BATCH_APPLY_CONTROL = BATCH_CANCEL_CONTROL + 1;
  int gridColumns() { return CoverGridLayout::Columns; }
-@@ -789,6 +798,10 @@ void LibraryActivity::activateControl(const int control) {
+@@ -789,6 +798,12 @@ void LibraryActivity::activateControl(const int control) {
    if (control == NAV_FIRST + 1) activityManager.goToFileTransfer();
    if (control == NAV_FIRST + 2) activityManager.goToFileBrowser();
    if (control == NAV_FIRST + 3) activityManager.goToSettings();
 +#ifndef SIMULATOR
 +  if (control == NAV_FIRST + 4)
 +    startActivityForResult(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput), {});
++  if (control == NAV_FIRST + 5)
++    startActivityForResult(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput, true), {});
 +#endif
  }
 
  void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-@@ -1085,7 +1098,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -1085,7 +1100,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      } else if (!mappedInput.hasTouchHardware()) {
        static constexpr StrId choices[] = {StrId::STR_LIBRARY, StrId::STR_FILE_TRANSFER, StrId::STR_BROWSE,
                                            StrId::STR_SETTINGS_SHORT};
@@ -243,14 +245,14 @@ index 3698935155402bc82ba87531c94fda1eb02a3739..14c22290bc6f918f81f31f098929e819
                         [this](int selected) { activateControl(NAV_FIRST + selected); });
        requestUpdate();
      }
-@@ -1312,7 +1325,11 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1312,7 +1327,11 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
                                                  static_cast<int16_t>(bounds[3])});
    if (touch && !selectingBooks) {
      static constexpr const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32,
 -                                                   &icon_folder_32, &icon_lyra_settings_32};
 +                                                   &icon_folder_32, &icon_lyra_settings_32,
 +#ifndef SIMULATOR
-+                                                   &workflowyIcon,
++                                                   &workflowyIcon, &workflowyCalendarIcon,
 +#endif
 +    };
      const int width = renderer.getScreenWidth() - bounds[1] - bounds[3];
@@ -1021,10 +1023,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6c4b81f9b
+index 0000000000000000000000000000000000000000..21380086bfafab04dd580b1947844c07b65c20bc
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4278 @@
+@@ -0,0 +1,4374 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1097,7 +1099,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +constexpr int COUNT_TARGET = 76;
 +constexpr int CONTENT_TOP = 74;
 +constexpr unsigned long CALENDAR_REFRESH_MS = 60000;
-+enum class TodoControl { Back, Calendar, ShowDone, Replies, Wrap, Refresh, Undo, MoveUnfinished, Add, Count };
++enum class TodoControl { Back, Calendar, ShowDone, Replies, Wrap, Sort, Refresh, Undo, MoveUnfinished, Add, Count };
 +enum class CalendarControl { Back, Today, View, ZoomOut, ZoomIn, Refresh, Add, Count };
 +constexpr int FOOTER_CONTROLS = static_cast<int>(TodoControl::Count);
 +constexpr size_t MAX_CALENDAR_ITEMS = MAX_ROWS;
@@ -1275,10 +1277,10 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 + public:
 +  WorkflowyTimeRangePicker(GfxRenderer& renderer, MappedInputManager& input, int start,
 +                          std::shared_ptr<WorkflowyTimeChoices> choices, std::function<void()> poll,
-+                          std::string fixedItem = {}, std::string fixedTitle = {})
++                          std::string fixedItem = {}, std::string fixedTitle = {}, std::function<void()> paintStatus = {})
 +      : Activity("WorkflowyTimeRange", renderer, input), start(std::clamp(start, 0, 1425)),
-+        end(std::min(1440, this->start + 60)), choices(std::move(choices)), poll(std::move(poll)),
-+        selected(std::move(fixedItem)), fixedTitle(std::move(fixedTitle)) {}
++        end(std::min(1440, this->start + 30)), choices(std::move(choices)), poll(std::move(poll)),
++        selected(std::move(fixedItem)), fixedTitle(std::move(fixedTitle)), paintStatus(std::move(paintStatus)) {}
 +  void onEnter() override {
 +    Activity::onEnter();
 +    requestUpdate();
@@ -1378,8 +1380,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    if (choices) {
 +      renderer.drawText(SMALL_FONT_ID, bounds.x + 4, bounds.y + 230, tr(STR_WORKFLOWY_TODAY));
 +      if (!choices->ready.load(std::memory_order_acquire)) {
-+        const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
-+        renderer.drawText(SMALL_FONT_ID, bounds.x + bounds.width - 110, header.y + 12, tr(STR_LOADING_POPUP));
++        if (paintStatus) paintStatus();
 +      } else if (choices->status != 200) {
 +        renderer.drawText(SMALL_FONT_ID, bounds.x + 4, bounds.y + 260, tr(STR_WORKFLOWY_DAILY_READ_FAILED));
 +      } else {
@@ -1405,7 +1406,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 + private:
 +  int start, end;
 +  std::shared_ptr<WorkflowyTimeChoices> choices;
-+  std::function<void()> poll;
++  std::function<void()> poll, paintStatus;
 +  std::string selected, fixedTitle;
 +  int listOffset = 0;
 +  bool choicesPainted = false;
@@ -1556,8 +1557,8 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +}
 +}  // namespace
 +
-+WorkflowyDailyActivity::WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input)
-+    : Activity("WorkflowyDaily", renderer, input) {}
++WorkflowyDailyActivity::WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input, bool calendar)
++    : Activity("WorkflowyDaily", renderer, input), startInCalendar(calendar) {}
 +
 +void WorkflowyDailyActivity::onEnter() {
 +  Activity::onEnter();
@@ -1571,6 +1572,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    outboxUncertain = saved["sending"] | false;
 +  }
 +  online = hasActiveStationWifiConnection();
++  if (startInCalendar) openCalendar(false);
 +  requestUpdate();
 +}
 +
@@ -1848,7 +1850,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +bool WorkflowyDailyActivity::itemPending(const std::string& id) const {
 +  return !id.empty() &&
 +         (id == pendingDelete || std::any_of(saves.begin(), saves.end(), [&](const auto& save) {
-+           return save->item == id;
++           return save->item == id || (!save->scope.empty() && save->scope == (zoomId.empty() ? date : zoomId));
 +         }));
 +}
 +
@@ -2078,6 +2080,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  node["priority"] = true;
 +  node["completed"] = true;
 +  node["data"]["layoutMode"] = true;
++  node["note"] = true;
 +  ResponseAllocator allocator;
 +  JsonDocument doc(&allocator);
 +  if (deserializeJson(doc, response.get(), received, DeserializationOption::Filter(filter)) || !doc["nodes"].is<JsonArray>()) {
@@ -2093,6 +2096,8 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    if (id.empty() || id.find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos) continue;
 +    result.push_back({std::move(id), plainTitle(value["name"] | ""), depth, value["priority"] | 0,
 +                      strcmp(value["data"]["layoutMode"] | "", "todo") == 0, value["completed"] | false});
++    result.back().divider = strcmp(value["data"]["layoutMode"] | "", "divider") == 0;
++    result.back().scheduledDivider = result.back().divider && strcmp(value["note"] | "", "crASHink:scheduled-divider") == 0;
 +  }
 +  std::stable_sort(result.begin(), result.end(), [](const Node& a, const Node& b) { return a.priority < b.priority; });
 +  return 200;
@@ -2191,7 +2196,8 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  auto current = first;
 +  for (const auto& sibling : siblings) {
 +    if (current == end || current->id != sibling.id || current->title != sibling.title ||
-+        current->todo != sibling.todo || current->done != sibling.done) {
++        current->todo != sibling.todo || current->done != sibling.done ||
++        current->divider != sibling.divider || current->scheduledDivider != sibling.scheduledDivider) {
 +      changed = true;
 +      break;
 +    }
@@ -2461,8 +2467,8 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +}
 +
 +bool WorkflowyDailyActivity::selectionEligible(const Node& node) const {
-+  return node.depth == (zoomId.empty() ? 0u : 1u) && !itemPending(node.id) && (showDone || !node.done) &&
-+         (!replyOnly || !zoomId.empty() || (node.todo && workflowy::isReplyTask(node.title)));
++  return !node.divider && node.depth == (zoomId.empty() ? 0u : 1u) && !itemPending(node.id) && (showDone || !node.done) &&
++         (!replyOnly || workflowy::isReplyTask(node.title));
 +}
 +
 +size_t WorkflowyDailyActivity::selectionCount() const {
@@ -2610,6 +2616,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    commands.push_back(action);
 +    options.emplace_back(I18n::getInstance().get(label));
 +  };
++  if (!rows[row].divider) {
 +  add(Action::Edit, StrId::STR_EDIT);
 +  if (rows[row].todo)
 +    add(Action::Complete, rows[row].done ? StrId::STR_WORKFLOWY_MARK_UNDONE : StrId::STR_WORKFLOWY_MARK_DONE);
@@ -2622,6 +2629,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    add(Action::AddBelow, StrId::STR_WORKFLOWY_ADD_BELOW);
 +  }
 +  if (selectionEligible(rows[row])) add(Action::Select, StrId::STR_WORKFLOWY_SELECT_MULTIPLE);
++  }
 +  add(Action::Delete, StrId::STR_DELETE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
@@ -2758,18 +2766,71 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +}
 +
 +void WorkflowyDailyActivity::toggleReplyFilter() {
-+  const bool enable = !replyOnly;
-+  const auto today = isoDate(0);
-+  if (today.empty()) return showMessage(tr(STR_WORKFLOWY_CLOCK_FAILED));
 +  if (selecting) cancelSelection();
-+  if (!viewStack.empty()) returnToDepth(0);
-+  if (enable && date != "today" && date != today) moveToDate({}, today);
 +  {
 +    RenderLock lock(*this);
-+    replyOnly = enable;
++    replyOnly = !replyOnly;
 +    layoutDirty = true;
 +    wrapAnchor = -1;
 +    page = 0;
++  }
++  requestUpdate();
++}
++
++void WorkflowyDailyActivity::sortTimedItems() {
++  if (!online) return showMessage(tr(STR_WORKFLOWY_NETWORK_FAILED));
++  if (!saves.empty() || awaitingOutline || !requestedBranch.empty()) return;
++  const auto parent = zoomId.empty() ? date : zoomId;
++  const unsigned depth = zoomId.empty() ? 0 : 1;
++  // At most MAX_ROWS IDs, retained by one queued worker until its moves finish.
++  std::vector<std::pair<int, std::string>> timed;
++  timed.reserve(rows.size());
++  std::string divider;
++  for (const auto& node : rows) {
++    if (node.depth != depth || node.id == zoomId) continue;
++    if (node.scheduledDivider) divider = node.id;
++    if (node.divider || itemPending(node.id)) continue;
++    if (const auto range = workflowy::parseTimeRange(node.title)) timed.emplace_back(range->start, node.id);
++  }
++  if (timed.empty()) return showMessage(tr(STR_WORKFLOWY_EMPTY));
++  std::stable_sort(timed.begin(), timed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++  if (!queueSave({}, {}, false, [this, parent](const Save& save) {
++        if ((zoomId.empty() ? date : zoomId) == parent) loadDay();
++        if (save.status < 200 || save.status >= 300) showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
++      }, "POST", StrId::STR_SORT, {},
++      [parent, divider = std::move(divider), timed = std::move(timed)](Save& save) mutable {
++        if (divider.empty()) {
++          JsonDocument create;
++          create["parent_id"] = parent;
++          create["name"] = "";
++          create["layoutMode"] = "divider";
++          create["note"] = "crASHink:scheduled-divider";
++          create["position"] = "top";
++          save.status = requestWithKey(save.key, "POST", {}, encode(create), save.response.data(), &save.received,
++                                       save.response.size(), nullptr, nullptr, &save.transport, &save.error);
++          if (save.status < 200 || save.status >= 300) return;
++          JsonDocument response;
++          if (save.received > save.response.size() ||
++              deserializeJson(response, save.response.data(), save.received)) { save.status = -3; return; }
++          divider = response["item_id"] | "";
++          if (divider.empty()) { save.status = -3; return; }
++        }
++        const auto moveTop = [&](const std::string& id) {
++          JsonDocument move;
++          move["parent_id"] = parent;
++          move["position"] = "top";
++          save.status = requestWithKey(save.key, "POST", "/" + id + "/move", encode(move), nullptr, nullptr, 0,
++                                       nullptr, nullptr, &save.transport, &save.error);
++          return save.status >= 200 && save.status < 300;
++        };
++        if (!moveTop(divider)) return;
++        // Top insertion in reverse time order leaves untimed siblings untouched.
++        for (auto item = timed.rbegin(); item != timed.rend(); ++item)
++          if (!moveTop(item->second)) return;
++      })) return;
++  {
++    RenderLock lock(*this);
++    saves.back()->scope = parent;
 +  }
 +  requestUpdate();
 +}
@@ -2887,7 +2948,15 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  const auto placeRow = [&](size_t i) {
 +    const auto& node = rows[i];
 +    if (node.depth > visibleDepth) return;
-+    if (replyOnly && zoomId.empty() && (!node.todo || !workflowy::isReplyTask(node.title))) return;
++    if (node.divider && !replyOnly) {
++      if (y + 20 > bounds.rowBottom) { pageStarts.push_back(placements.size()); y = bounds.rowTop; }
++      const auto first = outlineLines.size();
++      outlineLines.push_back({0, 0});
++      placements.push_back({i, first, 1, y, y + 20});
++      y += 20;
++      return;
++    }
++    if (replyOnly && node.id != zoomId && !workflowy::isReplyTask(node.title)) return;
 +    if (node.done && !showDone && !itemPending(node.id) && (i != 0 || zoomId.empty())) return;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int width = std::max(1, bounds.width - indent - 25 - ROW_ARROW_TARGET);
@@ -2930,10 +2999,13 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  };
 +  const size_t firstItem = !zoomId.empty() && !rows.empty() ? 1 : 0;
 +  if (firstItem) placeRow(0);
++  const bool scheduledSections = std::any_of(rows.begin(), rows.end(), [&](const Node& node) {
++    return node.depth == visibleDepth && node.scheduledDivider;
++  });
 +  for (size_t i = firstItem; i < rows.size(); ++i) {
-+    if (!rows[i].done) placeRow(i);
++    if (scheduledSections || !rows[i].done) placeRow(i);
 +  }
-+  if (showDone) {
++  if (showDone && !scheduledSections) {
 +    for (size_t i = firstItem; i < rows.size(); ++i) {
 +      if (rows[i].done) placeRow(i);
 +    }
@@ -3900,6 +3972,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    if (control == TodoControl::Back) return back();
 +    if (control == TodoControl::Calendar) return openCalendar(false);
 +    if (control == TodoControl::Refresh) return refresh(held);
++    if (control == TodoControl::Sort) return sortTimedItems();
 +    if (control == TodoControl::Replies) return toggleReplyFilter();
 +    if (control == TodoControl::MoveUnfinished) return moveUnfinishedForward();
 +    if (control == TodoControl::Add) {
@@ -3931,6 +4004,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  if (dragged) return;
 +  const int indent = std::min<unsigned>(rows[row].depth, 8) * 16;
 +  if (held) return actions(row);
++  if (rows[row].divider) return;
 +  size_t cursor = std::string::npos;
 +  bool checkboxHit = false;
 +  {
@@ -4011,8 +4085,10 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  const int reserve = std::max(0, iconsRight - leftEdge) + 4;
 +  fitReaderStatusBarSideWidths(widths, rightEdge - leftEdge, reserve, 8);
 +  const auto space = layoutReaderStatusBarItems(leftEdge, rightEdge, widths, reserve, 8);
-+  return Rect{space.centerLeft, bounds.top + UITheme::getTopStatusBarInset(renderer) + 1,
-+              std::max(0, space.centerRight - space.centerLeft), 26};
++  const int safeLeft = std::max(space.centerLeft, iconsRight + 8);
++  const int safeRight = space.centerRight - 4;
++  return Rect{safeLeft, bounds.top + UITheme::getTopStatusBarInset(renderer) + 1,
++              std::max(0, safeRight - safeLeft), 26};
 +}
 +
 +void WorkflowyDailyActivity::drawStatus(const Layout&, const size_t pending, const char* notice) {
@@ -4041,12 +4117,14 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  const int arrow = clickable ? 10 : 0;
 +  const auto fitted = renderer.truncatedText(SMALL_FONT_ID, label, area.width - arrow - 4);
 +  const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str());
-+  const int x = area.x + std::max(0, area.width - textWidth - arrow - 2);
++  const int x = area.x + std::max(0, (area.width - textWidth - arrow) / 2);
 +  const int y = area.y + (area.height - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
 +  renderer.fillRect(area.x, area.y, area.width, area.height, false);
++  renderer.beginTextClip(area.x, area.y, area.width, area.height);
 +  renderer.drawText(SMALL_FONT_ID, x, y, fitted.c_str());
++  renderer.endTextClip();
 +  if (clickable) {
-+    const int tip = area.x + area.width - 1, mid = area.y + area.height / 2;
++    const int tip = std::min(area.x + area.width - 1, x + textWidth + arrow - 1), mid = area.y + area.height / 2;
 +    renderer.drawLine(tip - 4, mid - 4, tip, mid);
 +    renderer.drawLine(tip, mid, tip - 4, mid + 4);
 +  }
@@ -4103,6 +4181,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    }
 +    if (!total) renderer.drawCenteredText(UI_12_FONT_ID, bounds.rowTop + 12, tr(STR_WORKFLOWY_QUEUE_EMPTY));
 +    renderer.drawCenteredText(SMALL_FONT_ID, bounds.footer + 13, tr(STR_BACK));
++    drawStatus(bounds, pendingOperationsCount(), statusNotice());
 +    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +    return;
 +  }
@@ -4132,7 +4211,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    const unsigned outlineDepth = zoomId.empty() ? 0 : 1;
 +    for (const auto& row : rows) {
 +      if (row.depth == outlineDepth && row.todo &&
-+          (!replyOnly || !zoomId.empty() || workflowy::isReplyTask(row.title))) {
++          (!replyOnly || workflowy::isReplyTask(row.title))) {
 +        ++totalTodos;
 +        if (row.done) ++completed;
 +      }
@@ -4180,6 +4259,11 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    const int y = placement.top + 6;
 +    const int indent = std::min<unsigned>(node.depth, 8) * 16;
 +    const int start = bounds.x + indent;
++    if (node.divider) {
++      renderer.drawLine(start + 4, (placement.top + placement.bottom) / 2,
++                        bounds.x + bounds.width - 4, (placement.top + placement.bottom) / 2, 2, true);
++      continue;
++    }
 +    if ((selecting && node.selected) || itemPending(node.id)) {
 +      renderer.fillRectDither(start, placement.top + 1, bounds.x + bounds.width - start,
 +                              placement.bottom - placement.top - 2, Color::LightGray);
@@ -4242,7 +4326,7 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +          renderer.drawText(UI_12_FONT_ID, tail + CONTINUATION_GAP, lineY, CONTINUATION);
 +      }
 +    }
-+    if (!selecting && firstFragment && !node.leaf && node.id != zoomId) {
++    if (!selecting && firstFragment && !node.divider && !node.leaf && node.id != zoomId) {
 +      paintedArrows.push_back({node.id, placement.top, placement.bottom});
 +      const int tipX = bounds.x + bounds.width - 10;
 +      const int xs[3] = {tipX - 5, tipX + 4, tipX - 5};
@@ -4333,6 +4417,12 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +    renderer.drawLine(calendarX - 10, iconY - 3, calendarX + 10, iconY - 3, ICON_STROKE, true);
 +    renderer.drawLine(calendarX - 5, iconY - 13, calendarX - 5, iconY - 7, ICON_STROKE, true);
 +    renderer.drawLine(calendarX + 5, iconY - 13, calendarX + 5, iconY - 7, ICON_STROKE, true);
++    const int sortX = iconX(TodoControl::Sort);
++    for (int line = 0; line < 3; ++line)
++      renderer.drawLine(sortX - 10, iconY - 7 + line * 7, sortX + 2 - line * 3, iconY - 7 + line * 7, ICON_STROKE, true);
++    renderer.drawLine(sortX + 9, iconY - 9, sortX + 9, iconY + 8, ICON_STROKE, true);
++    renderer.drawLine(sortX + 5, iconY + 4, sortX + 9, iconY + 8, ICON_STROKE, true);
++    renderer.drawLine(sortX + 9, iconY + 8, sortX + 13, iconY + 4, ICON_STROKE, true);
 +    const auto refresh = freeink::ui::bitmapFromIcon(icon_refresh_cw_32);
 +    freeink::ui::GfxRendererTarget target(renderer);
 +    target.bitmap({static_cast<int16_t>(iconX(TodoControl::Refresh) - refresh.width / 2),
@@ -4560,7 +4650,8 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +  }
 +  auto picker = makeUniqueNoThrow<WorkflowyTimeRangePicker>(
 +      renderer, mappedInput, start, choices, [this] { pollTimeChoices(); },
-+      fixed ? fixed->id : "", fixed ? fixed->title : "");
++      fixed ? fixed->id : "", fixed ? fixed->title : "",
++      [this] { drawStatus(layout(), 1, tr(STR_LOADING_POPUP)); });
 +  if (!picker) {
 +    LOG_ERR("WF", "Could not allocate time-block picker");
 +    return showMessage(tr(STR_WORKFLOWY_DAILY_READ_FAILED));
@@ -5123,6 +5214,13 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +      renderer.drawLine(cx - 5, y + 3, cx + 5, y + 3, 2, true);
 +      renderer.drawLine(cx - 5, y + height - 4, cx + 5, y + height - 4, 2, true);
 +    }
++    if (preview && calendarDrag.edge && width >= 8) {
++      const int edgeY = calendarDrag.edge < 0 ? y : y + std::max(0, height - 6);
++      renderer.fillRect(x, edgeY, width, std::min(6, height), true);
++      const int gripWidth = std::min(20, width - 4);
++      if (height >= 6) renderer.drawLine(x + (width - gripWidth) / 2, edgeY + 3,
++                                        x + (width + gripWidth) / 2, edgeY + 3, 2, false);
++    }
 +    if (!preview) calendarHits.push_back({node.id, column, x, y, width, height, start, end});
 +  };
 +  for (unsigned column = 0; column < columns; ++column) {
@@ -5305,10 +5403,10 @@ index 0000000000000000000000000000000000000000..384d9712dafffa9274b4539e3b937fd6
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec1332f88e
+index 0000000000000000000000000000000000000000..4ffa376410e62fec192e1b1526880e30d9706f62
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,316 @@
 +#pragma once
 +
 +#include <atomic>
@@ -5332,7 +5430,7 @@ index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec
 +
 +class WorkflowyDailyActivity final : public Activity {
 + public:
-+  WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input);
++  WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input, bool calendar = false);
 +  void onEnter() override;
 +  void onExit() override;
 +  void loop() override;
@@ -5352,6 +5450,7 @@ index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec
 +    bool leaf = false;
 +    bool childrenConfirmed = false;
 +    bool selected = false;
++    bool divider = false, scheduledDivider = false;
 +  };
 +
 +  struct Layout;
@@ -5366,6 +5465,7 @@ index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec
 +    int status = 0, transport = 0;
 +    std::atomic<bool> cancel{false}, ready{false};
 +  };
++  bool startInCalendar = false;
 +  bool calendarVisible = false, calendarWeek = false, calendarSchedule = false;
 +  int calendarHourHeight = 96;
 +  size_t scheduleOffset = 0;
@@ -5432,6 +5532,7 @@ index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec
 +  bool replyOnly = false;
 +  void toggleReplyFilter();
 +  void moveUnfinishedForward();
++  void sortTimedItems();
 +  bool wrapItems = true;
 +  int wrapAnchor = -1;
 +  size_t page = 0;
@@ -5520,7 +5621,7 @@ index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec
 +    std::vector<Node> children;
 +  };
 +  struct Save {
-+    std::string key, path, body, error, item, title;
++    std::string key, path, body, error, item, title, scope;
 +    StrId label = StrId::STR_EDIT;
 +    std::function<void(Save&)> work;
 +    std::array<uint8_t, 256> response{};
@@ -5624,10 +5725,10 @@ index 0000000000000000000000000000000000000000..93d14c0b0faef2c29b6210817b498aec
 +};
 diff --git a/src/workflowy/WorkflowyIcon.h b/src/workflowy/WorkflowyIcon.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfcf3dc3375
+index 0000000000000000000000000000000000000000..857b43e7a8480a99133db2c6ce43246377588817
 --- /dev/null
 +++ b/src/workflowy/WorkflowyIcon.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,59 @@
 +#pragma once
 +#include <Icon.h>
 +
@@ -5667,6 +5768,26 @@ index 0000000000000000000000000000000000000000..ff43071de61d3023bf3f7f37eb073dfc
 +    0xff, 0xff, 0xff, 0xff,
 +};
 +inline constexpr freeink::Icon workflowyIcon{32, 32, 16, workflowyBits};
++
++inline constexpr uint8_t workflowyCalendarBits[] = {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x38, 0x0e, 0x00, 0x00, 0x38, 0x0e, 0x00,
++    0x00, 0x38, 0x0e, 0x00, 0x00, 0x38, 0x0e, 0x00,
++    0x0f, 0xff, 0xff, 0xf0, 0x0f, 0xff, 0xff, 0xf0,
++    0x0f, 0xff, 0xff, 0xf0, 0x0e, 0x38, 0x0e, 0x70,
++    0x0e, 0x38, 0x0e, 0x70, 0x0e, 0x00, 0x00, 0x70,
++    0x0e, 0x00, 0x00, 0x70, 0x0f, 0xff, 0xff, 0xf0,
++    0x0f, 0xff, 0xff, 0xf0, 0x0f, 0xff, 0xff, 0xf0,
++    0x0e, 0x00, 0x00, 0x70, 0x0e, 0x00, 0x00, 0x70,
++    0x0e, 0x00, 0x00, 0x70, 0x0e, 0x38, 0x1c, 0x70,
++    0x0e, 0x38, 0x1c, 0x70, 0x0e, 0x38, 0x1c, 0x70,
++    0x0e, 0x00, 0x00, 0x70, 0x0e, 0x00, 0x00, 0x70,
++    0x0e, 0x38, 0x1c, 0x70, 0x0e, 0x38, 0x1c, 0x70,
++    0x0e, 0x00, 0x00, 0x70, 0x0f, 0xff, 0xff, 0xf0,
++    0x0f, 0xff, 0xff, 0xf0, 0x0f, 0xff, 0xff, 0xf0,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++inline constexpr freeink::Icon workflowyCalendarIcon{32, 32, 16, workflowyCalendarBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..3104b886b0c7d80f723b52787723292692b880e3
