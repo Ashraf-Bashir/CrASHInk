@@ -77,6 +77,8 @@
 
 ### Fixed
 
+- Workflowy’s email filter also filters the zoomed parent note, instead of leaving non-matching parent text above reply/respond tasks. Breadcrumb navigation remains available.
+
 - Workflowy loading and operation messages center on the screen across task and calendar views, shifting only to avoid status icons or the clock.
 
 - Workflowy tag backgrounds follow the rendered text advance, leaving spaces before and between #/@ tags unhighlighted.
