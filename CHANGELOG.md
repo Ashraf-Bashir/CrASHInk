@@ -40,6 +40,8 @@
 
 ### Changed
 
+- Workflowy task toolbar order is Back, Calendar, Email, Show completed, Wrap, Refresh, Sort by time, Move unfinished, Undo, Add. Calendar and Email are adjacent, with Add at the far right.
+
 - Workflowy times match existing calendar entries exactly: `7:15pm - 9:00pm`, with lowercase suffixes, no space before am/pm, and a spaced hyphen.
 
 - Workflowy calendar labels, schedule times, time controls, and newly saved task ranges use 12-hour AM/PM format. Time columns reserve enough space for the longer labels.
