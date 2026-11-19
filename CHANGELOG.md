@@ -65,6 +65,8 @@
 
 ### Fixed
 
+- Completed calendar items show a checked checkbox alongside strikethrough in Day, Week, and Schedule views, including during dragging.
+
 - The Library icon keeps a single base line, with the extra active-tab underline removed.
 
 - Calendar swipes take priority over taps, preventing scrolling gestures from opening a task or a time-block picker.

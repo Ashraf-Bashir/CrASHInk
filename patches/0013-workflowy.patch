@@ -1025,10 +1025,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..e2788243578576377c77445c370342af
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed998265e74d7c6
+index 0000000000000000000000000000000000000000..6db68bbfa4b6a438bf4d40e94f8149875de32f91
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4554 @@
+@@ -0,0 +1,4580 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1114,6 +1114,13 @@ index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed99826
 +constexpr size_t OUTBOX_ITEMS = 24;
 +constexpr unsigned long DELETE_GRACE = 8000;
 +constexpr char API[] = "https://workflowy.com/api/v1/nodes";
++
++void drawCheckedBox(GfxRenderer& renderer, int x, int y, int size) {
++  renderer.fillRect(x, y, size, size, true);
++  const int stroke = size >= 12 ? 2 : 1;
++  renderer.drawLine(x + size / 4, y + size / 2, x + size * 5 / 12, y + size * 3 / 4, stroke, false);
++  renderer.drawLine(x + size * 5 / 12, y + size * 3 / 4, x + size * 4 / 5, y + size / 4, stroke, false);
++}
 +
 +// Keep response and parsed fields out of the internal heap used by Wi-Fi/TLS.
 +struct ResponseAllocator final : ArduinoJson::Allocator {
@@ -5369,14 +5376,22 @@ index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed99826
 +      renderer.fillRectDither(x, y, width, height, preview || itemPending(node.id) ? Color::DarkGray : Color::LightGray);
 +    renderer.drawRoundedRect(x, y, width, height, preview ? 2 : 1, 4, true);
 +    renderer.fillRect(x, y + 3, std::min(3, width), std::max(1, height - 6), true);
-+    if (width > 22 && height >= renderer.getLineHeight(SMALL_FONT_ID)) {
++    const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
++    const int boxSize = node.done ? std::min({14, width - 6, height - 6}) : 0;
++    const int checkInset = boxSize >= 7 ? boxSize + 5 : 0;
++    if (checkInset) {
++      const int boxY = y + std::clamp(3 + (lineHeight - boxSize) / 2, 3, height - boxSize - 3);
++      drawCheckedBox(renderer, x + 4, boxY, boxSize);
++    }
++    if (width > 22 && height >= lineHeight) {
 +      auto title = node.title;
 +      if (const auto range = workflowy::parseTimeRange(title)) title.erase(range->begin, range->finish - range->begin);
 +      while (!title.empty() && title.front() == ' ') title.erase(0, 1);
-+      const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
 +      const int capacity = std::max(0, (height - 6) / lineHeight);
 +      calendarTextLines.clear();
-+      workflowy::wrapOutlineText(std::string_view(title), width - 10,
++      workflowy::wrapOutlineTextByLine(std::string_view(title), [&](size_t line) {
++        return std::max(1, width - 10 - (line == 0 ? checkInset : 0));
++      },
 +                                [&](std::string_view value) {
 +        return renderer.getTextWidth(SMALL_FONT_ID, std::string(value).c_str());
 +      }, calendarTextLines);
@@ -5384,10 +5399,14 @@ index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed99826
 +        const auto span = calendarTextLines[line];
 +        const auto text = title.substr(span.begin, span.end - span.begin);
 +        const int textY = y + 3 + line * lineHeight;
-+        renderer.drawText(SMALL_FONT_ID, x + 6, textY, text.c_str());
-+        if (node.done) renderer.drawLine(x + 6, textY + lineHeight / 2,
-+                                         x + 6 + renderer.getTextWidth(SMALL_FONT_ID, text.c_str()),
++        const int textX = x + 6 + (line == 0 ? checkInset : 0);
++        if (textX >= x + width - 5) continue;
++        renderer.beginTextClip(x + 5, textY, width - 10, std::min(lineHeight, y + height - textY));
++        renderer.drawText(SMALL_FONT_ID, textX, textY, text.c_str());
++        if (node.done) renderer.drawLine(textX, textY + lineHeight / 2,
++                                         std::min(x + width - 5, textX + renderer.getTextWidth(SMALL_FONT_ID, text.c_str())),
 +                                         textY + lineHeight / 2);
++        renderer.endTextClip();
 +      }
 +    }
 +    if (height > 18 && width > 20) {
@@ -5420,7 +5439,7 @@ index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed99826
 +      drawBlock(day.items[block.item], column, block.start, block.end, block.lane, block.lanes, false);
 +  }
 +  if (calendarDrag.active) {
-+    const Node preview{calendarDrag.id, calendarDrag.title};
++    const Node preview{calendarDrag.id, calendarDrag.title, 0, 0, calendarDrag.todo, calendarDrag.done};
 +    drawBlock(preview, calendarDrag.day, calendarDrag.start, calendarDrag.end, 0, 1, true);
 +  }
 +  if (calendarAnchor == isoDate(0) || calendarWeek) {
@@ -5564,8 +5583,12 @@ index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed99826
 +    auto title = node.title;
 +    const auto range = workflowy::parseTimeRange(title);
 +    title.erase(range->begin, range->finish - range->begin);
++    const int checkInset = node.done ? 23 : 0;
++    if (node.done) drawCheckedBox(renderer, x + 8, y + 10, 17);
 +    calendarTextLines.clear();
-+    workflowy::wrapOutlineText(std::string_view(title), width - 16, [&](std::string_view value) {
++    workflowy::wrapOutlineTextByLine(std::string_view(title), [&](size_t line) {
++      return std::max(1, width - 16 - (line == 0 ? checkInset : 0));
++    }, [&](std::string_view value) {
 +      return renderer.getTextWidth(UI_12_FONT_ID, std::string(value).c_str());
 +    }, calendarTextLines);
 +    const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
@@ -5574,10 +5597,13 @@ index 0000000000000000000000000000000000000000..8c6ae7d4d4881fbcfa91c336fed99826
 +      const auto span = calendarTextLines[line];
 +      const auto text = title.substr(span.begin, span.end - span.begin);
 +      const int textY = y + 7 + static_cast<int>(line) * lineHeight;
-+      renderer.drawText(UI_12_FONT_ID, x + 8, textY, text.c_str());
-+      if (node.done) renderer.drawLine(x + 8, textY + lineHeight / 2,
-+                                      x + 8 + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()),
++      const int textX = x + 8 + (line == 0 ? checkInset : 0);
++      renderer.beginTextClip(x + 8, textY, width - 16, std::min(lineHeight, y + rowHeight - 5 - textY));
++      renderer.drawText(UI_12_FONT_ID, textX, textY, text.c_str());
++      if (node.done) renderer.drawLine(textX, textY + lineHeight / 2,
++                                      std::min(x + width - 8, textX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str())),
 +                                      textY + lineHeight / 2);
++      renderer.endTextClip();
 +    }
 +    calendarHits.push_back({node.id, 0, bounds.x, y, bounds.width, rowHeight,
 +                           block.start, block.end});
