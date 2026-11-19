@@ -2,6 +2,8 @@
 
 ### Added
 
+- Wrapped Workflowy tasks render tags and time ranges below the task body in a much smaller font. Compact tasks use a smaller inline font. This is display-only; stored text and edit-cursor positions are preserved, with metadata included in paging.
+
 - Workflowy task time ranges share the light-grey highlighting used for tags, including wrapped ranges.
 
 - A zoomed Workflowy item shows a down triangle that returns to its parent list when tapped. Collapsed items show a left triangle; the Back control remains available.

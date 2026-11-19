@@ -1043,10 +1043,10 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    std::string displayTextForCurrentState() const;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267da9f07e1
+index 0000000000000000000000000000000000000000..c4d3189270dc188f26e6bcdf6233e059860dd3c5
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,4589 @@
+@@ -0,0 +1,4607 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2495,13 +2495,13 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +  requestUpdate();
 +}
 +
-+size_t WorkflowyDailyActivity::cursorAt(std::string_view text, workflowy::TextSpan line, int width) const {
++size_t WorkflowyDailyActivity::cursorAt(std::string_view text, workflowy::TextSpan line, int width, int font) const {
 +  line.end = std::min(line.end, text.size());
 +  auto caret = std::min(line.begin, line.end);
 +  int previousWidth = 0;
 +  while (caret < line.end) {
 +    const auto next = std::min(line.end, workflowy::nextCharacter(text, caret));
-+    const int nextWidth = renderer.getTextWidth(UI_12_FONT_ID,
++    const int nextWidth = renderer.getTextWidth(font,
 +                                               std::string(text.substr(line.begin, next - line.begin)).c_str());
 +    if (width < (previousWidth + nextWidth) / 2) break;
 +    previousWidth = nextWidth;
@@ -3088,7 +3088,7 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +  const int footer = renderer.getScreenHeight() - bottom - 52;
 +  const int pageLabel = std::max(32, renderer.getLineHeight(SMALL_FONT_ID) + 3);
 +  return {left + 8, top, renderer.getScreenWidth() - right - left - 16, rowTop, footer,
-+          footer - pageLabel, std::max(1, renderer.getLineHeight(UI_12_FONT_ID))};
++          footer - pageLabel, std::max(1, renderer.getLineHeight(wrapItems ? UI_12_FONT_ID : UI_10_FONT_ID))};
 +}
 +
 +void WorkflowyDailyActivity::layoutRows(const Layout& bounds) {
@@ -3118,25 +3118,32 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +    const int width = std::max(1, bounds.width - indent - 25 - ROW_ARROW_TARGET);
 +    size_t first = outlineLines.size();
 +    if (wrapItems) {
-+      const auto measure = [&](std::string_view text) {
-+        return renderer.getTextWidth(UI_12_FONT_ID, std::string(text).c_str());
-+      };
-+      workflowy::wrapOutlineText(node.title, width, measure, outlineLines);
-+      const auto capacityAt = [&](int top) {
-+        return static_cast<size_t>(std::max(1, 1 + (bounds.rowBottom - top - firstLineHeight) / bounds.lineHeight));
-+      };
-+      const auto firstCapacity = capacityAt(y + firstLineHeight <= bounds.rowBottom ? y : bounds.rowTop);
-+      if (outlineLines.size() - first > firstCapacity) {
++      const workflowy::TaskTextProjection projection(node.title);
++      const auto appendLines = [&](bool metadata) {
++        const auto text = projection.text(metadata);
++        if (text.empty() && metadata) return;
++        const int font = metadata ? SMALL_FONT_ID : UI_12_FONT_ID;
++        const auto measure = [&](std::string_view part) {
++          return renderer.getTextWidth(font, std::string(part).c_str());
++        };
++        const auto lineStart = outlineLines.size();
++        const auto capacityAt = [&](int top) {
++          return static_cast<size_t>(std::max(1, 1 + (bounds.rowBottom - top - firstLineHeight) / bounds.lineHeight));
++        };
++        const auto firstCapacity = capacityAt(y + firstLineHeight <= bounds.rowBottom ? y : bounds.rowTop);
 +        const auto fullCapacity = capacityAt(bounds.rowTop);
-+        const int allowance = renderer.getTextWidth(UI_12_FONT_ID, CONTINUATION) + CONTINUATION_GAP;
-+        outlineLines.resize(first);
-+        workflowy::wrapOutlineTextByLine(node.title, [&](size_t line) {
++        const int allowance = renderer.getTextWidth(font, CONTINUATION) + CONTINUATION_GAP;
++        workflowy::wrapOutlineTextByLine(text, [&](size_t line) {
++          line += lineStart - first;
 +          const bool leading = line >= firstCapacity && (line - firstCapacity) % fullCapacity == 0;
 +          const bool trailing = line < firstCapacity ? line + 1 == firstCapacity
 +                                                     : (line - firstCapacity + 1) % fullCapacity == 0;
 +          return std::max(1, width - (static_cast<int>(leading) + static_cast<int>(trailing)) * allowance);
 +        }, measure, outlineLines);
-+      }
++        for (auto i = lineStart; i < outlineLines.size(); ++i) outlineLines[i].metadata = metadata;
++      };
++      appendLines(false);
++      appendLines(true);
 +    } else {
 +      outlineLines.push_back({0, node.title.size()});
 +    }
@@ -4177,9 +4184,16 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +      if (!checkboxHit) {
 +        const auto line = std::min(placement.lineCount - 1,
 +                                  static_cast<size_t>(std::max(0, y - placement.top - 6) / bounds.lineHeight));
++        const auto span = outlineLines[placement.firstLine + line];
++        const int font = wrapItems ? (span.metadata ? SMALL_FONT_ID : UI_12_FONT_ID) : UI_10_FONT_ID;
 +        const int prefix = !firstFragment && line == 0
-+                               ? renderer.getTextWidth(UI_12_FONT_ID, CONTINUATION) + CONTINUATION_GAP : 0;
-+        cursor = cursorAt(rows[row].title, outlineLines[placement.firstLine + line], x - bounds.x - indent - 25 - prefix);
++                               ? renderer.getTextWidth(font, CONTINUATION) + CONTINUATION_GAP : 0;
++        if (wrapItems) {
++          const workflowy::TaskTextProjection projection(rows[row].title);
++          const auto text = projection.text(span.metadata);
++          cursor = projection.originalOffset(span.metadata,
++                      cursorAt(text, span, x - bounds.x - indent - 25 - prefix, font));
++        } else cursor = cursorAt(rows[row].title, span, x - bounds.x - indent - 25 - prefix, font);
 +      }
 +      break;
 +    }
@@ -4454,21 +4468,25 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +      }
 +    }
 +    const int textX = start + 25;
-+    const auto title = std::string_view(node.title);
-+    const auto timeRange = workflowy::parseTimeRange(title);
++    const workflowy::TaskTextProjection projection(wrapItems ? std::string_view(node.title) : std::string_view{});
++    const auto bodyText = wrapItems ? projection.text(false) : std::string{};
++    const auto metadataText = wrapItems ? projection.text(true) : std::string{};
 +    const bool continues = i + 1 == end && end < placements.size() && placements[end].row == placement.row;
 +    for (size_t line = 0; line < placement.lineCount; ++line) {
 +      auto span = outlineLines[placement.firstLine + line];
++      const int font = wrapItems ? (span.metadata ? SMALL_FONT_ID : UI_12_FONT_ID) : UI_10_FONT_ID;
++      const auto title = wrapItems ? std::string_view(span.metadata ? metadataText : bodyText) : std::string_view(node.title);
++      const auto timeRange = workflowy::parseTimeRange(title);
 +      const int lineY = y + static_cast<int>(line) * bounds.lineHeight;
 +      const bool leading = !firstFragment && line == 0;
-+      const int prefix = leading ? renderer.getTextWidth(UI_12_FONT_ID, CONTINUATION) + CONTINUATION_GAP : 0;
++      const int prefix = leading ? renderer.getTextWidth(font, CONTINUATION) + CONTINUATION_GAP : 0;
 +      const int lineX = textX + prefix;
 +      std::string text;
 +      if (wrapItems) {
 +        text = title.substr(span.begin, span.end - span.begin);
 +      } else {
 +        const int width = bounds.x + bounds.width - textX - ROW_ARROW_TARGET;
-+        text = renderer.truncatedText(UI_12_FONT_ID, node.title.c_str(), width);
++        text = renderer.truncatedText(font, node.title.c_str(), width);
 +        if (text != title && text.ends_with("…")) span.end = text.size() - 3;
 +      }
 +      const auto measure = [&](size_t end) {
@@ -4476,7 +4494,7 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +        // so the gap before a tag never becomes part of its background.
 +        const uint32_t following = end < title.size() && static_cast<unsigned char>(title[end]) < 0x80
 +                                       ? static_cast<unsigned char>(title[end]) : 0;
-+        return renderer.getTextAdvanceX(UI_12_FONT_ID,
++        return renderer.getTextAdvanceX(font,
 +                                        std::string(title.substr(span.begin, end - span.begin)).c_str(),
 +                                        EpdFontFamily::REGULAR, following);
 +      };
@@ -4485,17 +4503,17 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +        const int startX = lineX + measure(std::max(tag.begin, span.begin));
 +        const int endX = lineX + measure(std::min(tag.end, span.end));
 +        if (endX - startX > 2)
-+          renderer.fillRectDither(startX + 1, lineY, endX - startX - 2, bounds.lineHeight, Color::LightGray);
++          renderer.fillRectDither(startX + 1, lineY, endX - startX - 2, renderer.getLineHeight(font), Color::LightGray);
 +      };
 +      workflowy::forEachTag(title, highlightSpan);
 +      if (timeRange) highlightSpan({timeRange->begin, timeRange->finish});
-+      if (leading) renderer.drawText(UI_12_FONT_ID, textX, lineY, CONTINUATION);
-+      renderer.drawText(UI_12_FONT_ID, lineX, lineY, text.c_str());
++      if (leading) renderer.drawText(font, textX, lineY, CONTINUATION);
++      renderer.drawText(font, lineX, lineY, text.c_str());
 +      if (node.done || (continues && line + 1 == placement.lineCount)) {
-+        const int tail = lineX + renderer.getTextWidth(UI_12_FONT_ID, text.c_str());
-+        if (node.done) renderer.drawLine(lineX, lineY + 12, tail, lineY + 12);
++        const int tail = lineX + renderer.getTextWidth(font, text.c_str());
++        if (node.done) renderer.drawLine(lineX, lineY + renderer.getLineHeight(font) / 2, tail, lineY + renderer.getLineHeight(font) / 2);
 +        if (continues && line + 1 == placement.lineCount)
-+          renderer.drawText(UI_12_FONT_ID, tail + CONTINUATION_GAP, lineY, CONTINUATION);
++          renderer.drawText(font, tail + CONTINUATION_GAP, lineY, CONTINUATION);
 +      }
 +    }
 +    if (!selecting && firstFragment && !node.divider && (node.id == zoomId || !node.leaf)) {
@@ -5638,7 +5656,7 @@ index 0000000000000000000000000000000000000000..688fdbc916b16c3b82bd7e82506a5267
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..5ecf7068b471199ae4a39f449104e1bbd53ebed7
+index 0000000000000000000000000000000000000000..0392e5b233c79d0bbfd999ffb56c9bb25e9f8005
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
 @@ -0,0 +1,321 @@
@@ -5956,7 +5974,7 @@ index 0000000000000000000000000000000000000000..5ecf7068b471199ae4a39f449104e1bb
 +  void actions(size_t row);
 +  void edit(size_t row, int relative = 0, size_t cursor = std::string::npos,
 +            std::string initialText = {}, std::string targetDate = {});
-+  size_t cursorAt(std::string_view text, workflowy::TextSpan line, int width) const;
++  size_t cursorAt(std::string_view text, workflowy::TextSpan line, int width, int font) const;
 +  void chooseDate(std::string moveId = {});
 +  void showMoveMenu(size_t row);
 +  void shiftDay(int delta);
@@ -6030,13 +6048,14 @@ index 0000000000000000000000000000000000000000..857b43e7a8480a99133db2c6ce432463
 +inline constexpr freeink::Icon workflowyCalendarIcon{32, 32, 16, workflowyCalendarBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3104b886b0c7d80f723b52787723292692b880e3
+index 0000000000000000000000000000000000000000..315489ebf8bcff6f4470d7ff1557fc6881d3b7a4
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,205 @@
 +#pragma once
 +
 +#include <cstddef>
++#include "WorkflowySchedule.h"
 +#include <string>
 +#include <string_view>
 +#include <vector>
@@ -6069,6 +6088,7 @@ index 0000000000000000000000000000000000000000..3104b886b0c7d80f723b527877232926
 +struct TextSpan {
 +  size_t begin;
 +  size_t end;
++  bool metadata = false;
 +};
 +
 +inline size_t nextCharacter(std::string_view text, size_t at) {
@@ -6169,6 +6189,60 @@ index 0000000000000000000000000000000000000000..3104b886b0c7d80f723b527877232926
 +    i = end - 1;
 +  }
 +}
++
++// Temporary rendering projection; never written back to the node. Keep only
++// source spans so cursor positions can be mapped without a per-character cache.
++struct TaskTextProjection {
++  std::string_view source;
++  std::vector<TextSpan> metadata;
++  explicit TaskTextProjection(std::string_view text) : source(text) {
++    if (text.empty()) return;
++    metadata.reserve(4);
++    forEachTag(text, [&](TextSpan span) { metadata.push_back(span); });
++    if (const auto time = parseTimeRange(text)) metadata.push_back({time->begin, time->finish});
++    std::sort(metadata.begin(), metadata.end(), [](TextSpan a, TextSpan b) { return a.begin < b.begin; });
++  }
++  template <typename Visit>
++  void parts(bool meta, Visit visit) const {
++    const auto emit = [&](size_t begin, size_t end) {
++      while (begin < end && source[begin] == ' ') ++begin;
++      while (end > begin && source[end - 1] == ' ') --end;
++      if (begin < end) visit(TextSpan{begin, end});
++    };
++    size_t at = 0;
++    for (const auto span : metadata) {
++      if (meta) emit(span.begin, span.end);
++      else if (span.begin > at) emit(at, span.begin);
++      at = std::max(at, span.end);
++    }
++    if (!meta && at < source.size()) emit(at, source.size());
++  }
++  std::string text(bool meta) const {
++    std::string result;
++    result.reserve(source.size());
++    parts(meta, [&](TextSpan span) {
++      if (!result.empty()) result += ' ';
++      result.append(source.substr(span.begin, span.end - span.begin));
++    });
++    return result;
++  }
++  size_t originalOffset(bool meta, size_t offset) const {
++    size_t drawn = 0, result = source.size();
++    bool first = true, found = false;
++    parts(meta, [&](TextSpan span) {
++      if (found) return;
++      if (!first) ++drawn;
++      first = false;
++      const auto length = span.end - span.begin;
++      if (offset <= drawn + length) {
++        result = span.begin + (offset > drawn ? offset - drawn : 0);
++        found = true;
++      }
++      drawn += length;
++    });
++    return result;
++  }
++};
 +
 +// With only top/bottom moves, the longest already ordered contiguous section
 +// of the target order can stay put. Move the remaining ends around it.
@@ -6486,15 +6560,41 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..74c6fc0f1970ef34b536aee300ab2ea2579eae1c
+index 0000000000000000000000000000000000000000..063c31e859c371ee1230a975af99863207e9e800
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,93 @@
 +#include "WorkflowySchedule.h"
++#include "WorkflowyOutlineLayout.h"
 +#include <cassert>
 +#include <random>
 +int main() {
 +  using namespace workflowy;
++  const std::string original = "#career 8:30am - 12pm Plan project @INSIDE with team #P0";
++  TaskTextProjection projected(original);
++  assert(projected.text(false) == "Plan project with team");
++  assert(projected.text(true) == "#career 8:30am - 12pm @INSIDE #P0");
++  assert(projected.originalOffset(false, 0) == original.find("Plan"));
++  assert(projected.originalOffset(false, 13) == original.find("with"));
++  assert(projected.originalOffset(true, 8) == original.find("8:30"));
++  assert(original == "#career 8:30am - 12pm Plan project @INSIDE with team #P0");
++  assert(TaskTextProjection("Only task text").text(false) == "Only task text");
++  assert(TaskTextProjection("#P0 @INSIDE").text(false).empty());
++  for (bool meta : {false, true}) {
++    const auto display = projected.text(meta);
++    for (size_t at = 0; at < display.size(); ++at)
++      if (display[at] != ' ') assert(original[projected.originalOffset(meta, at)] == display[at]);
++    std::vector<TextSpan> wrapped;
++    wrapOutlineText(display, 10, [](std::string_view part) { return static_cast<int>(part.size()); }, wrapped);
++    for (const auto line : wrapped) {
++      assert(line.begin <= line.end && line.end <= display.size());
++      if (line.begin < line.end)
++        assert(original[projected.originalOffset(meta, line.begin)] == display[line.begin]);
++    }
++  }
++  TaskTextProjection unicode("#health Réviser café @INSIDE");
++  assert(unicode.text(false) == "Réviser café");
++  assert(unicode.text(true) == "#health @INSIDE");
 +  auto range = parseTimeRange("8:30 to 12:00 Focus");
 +  assert(range && range->start == 510 && range->end == 720);
 +  assert(range->begin == 0 && range->finish == 13);
