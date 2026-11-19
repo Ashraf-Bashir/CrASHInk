@@ -73,6 +73,8 @@
 
 ### Fixed
 
+- Workflowy tag backgrounds follow the rendered text advance, leaving spaces before and between #/@ tags unhighlighted.
+
 - Ordinary screen transitions and book opening use fast refresh in both light and dark modes instead of forcing a cleaning pulse. Manual refresh and the configured reader cleaning cadence remain available.
 - Zoomed Workflowy breadcrumbs use the text width for short day and parent labels, avoiding large empty gaps.
 
