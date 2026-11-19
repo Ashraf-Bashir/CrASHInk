@@ -73,6 +73,9 @@
 
 ### Fixed
 
+- Ordinary screen transitions and book opening use fast refresh in both light and dark modes instead of forcing a cleaning pulse. Manual refresh and the configured reader cleaning cadence remain available.
+- Zoomed Workflowy breadcrumbs use the text width for short day and parent labels, avoiding large empty gaps.
+
 - Workflowy status text is horizontally centered independently of its log arrow. Time-picker loading/errors share the same header lane, with clipping that protects the clock and left icons.
 
 - Completed items in the Workflowy task list show a checked checkbox alongside strikethrough, including completed bullet-type items. Their checkbox and Mark incomplete actions can restore them; calendar events retain strikethrough without a checkbox.
