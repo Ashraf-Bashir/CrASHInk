@@ -2,6 +2,8 @@
 
 ### Added
 
+- Workflowy task time ranges share the light-grey highlighting used for tags, including wrapped ranges.
+
 - A zoomed Workflowy item shows a down triangle that returns to its parent list when tapped. Collapsed items show a left triangle; the Back control remains available.
 
 - New Workflowy tasks show all tag choices immediately. Selected tags are grouped before the task body, preserve the todo marker and cursor, and avoid duplicate prefix tags.
