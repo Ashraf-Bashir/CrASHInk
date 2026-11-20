@@ -2,6 +2,14 @@
 
 ### Added
 
+- Workflowy offers the Wi-Fi network picker when automatic connection fails. Its Library shortcut is now rightmost; Calendar returns to the screen that opened it.
+- Move → Parent opens a destination list of known day/outline nodes. Workflowy action menus have icons and omit the redundant Selected badge.
+- Loaded Workflowy outlines use a bounded, temporary SD session cache, removed when Workflowy closes. Calendar views reuse fresh cached days and revalidate stale data in the background.
+- Workflowy sorts timed tasks automatically on first load, sends only necessary move requests, and updates the local outline without reloading the whole day. Generated dividers are light grey and no longer carry the internal marker note.
+- Only leading tags move to wrapped metadata; compact mode hides those prefixes, uses smaller text and displays time ranges in 24-hour fractional form, such as 8¼–9½. Whitespace trimming affects display only.
+- Tapping the completed/total counter toggles completed-only tasks. Refresh and Sort lead the footer; Email, Calendar and Add finish it.
+- Failed Workflowy operations remain clickable in the queue with request-specific error details, even after subsequent operations succeed.
+
 - Wi-Fi file transfer closes to the originating reader/library after five minutes without a transfer, shutting down Wi-Fi. Active uploads (including fonts, WebSocket and WebDAV) are protected; downloads reset the idle period when they return. Browser polling does not keep Wi-Fi awake.
 
 - Wrapped Workflowy tasks render tags and time ranges below the task body in a much smaller font. Compact tasks use a smaller inline font. This is display-only; stored text and edit-cursor positions are preserved, with metadata included in paging.
