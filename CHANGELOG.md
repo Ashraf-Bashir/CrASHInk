@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+### Fixed
+
+- Inline highlight adjustment maps exact visible lines when intervening chapter text prevents a whole-page match, and handles imported punctuation differences. Unsafe mappings open the text editor instead of an empty handle view; failed saves keep the unsaved draft and handles visible for retry.
+- Dark-grey and solid highlights request the existing stronger page waveform to reduce dense highlight ghosting. Moving handles still uses fast differential updates, and image-only refresh behavior is unchanged.
+- The highlight editor uses a compact Workflowy icon instead of the competing header label.
+
 ### Added
 
 - Workflowy offers the Wi-Fi network picker when automatic connection fails. Its Library shortcut is now rightmost; Calendar returns to the screen that opened it.
@@ -53,6 +59,8 @@
 - Workflowy can add items above or below a sibling and move an item to the top or bottom of its sibling list. An item starting with `[]` becomes a todo.
 
 ### Changed
+
+- Workflowy uses larger text in the condensed task list and places Back at the far left of its footer.
 
 - Workflowy task toolbar order is Back, Calendar, Email, Show completed, Wrap, Refresh, Sort by time, Move unfinished, Undo, Add. Calendar and Email are adjacent, with Add at the far right.
 
