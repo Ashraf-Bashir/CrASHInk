@@ -637,7 +637,7 @@ diff --git a/src/activities/reader/EpubGrayscale.h b/src/activities/reader/EpubG
 
  // Preserves the live BW buffer and existing controller synchronization. False
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..a97e10039d27d65e0122da813c450eb2d45dc687 100644
+index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52f5c91497 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -105,7 +105,8 @@ constexpr uint8_t PRE_DICTIONARY_FONT_SIZE_READER_SETTINGS_FILE_VERSION = 6;
@@ -781,63 +781,51 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..a97e10039d27d65e0122da813c450eb2
  #if CROSSINK_APP_CAP_TOUCH
    if (mappedInput.hasTouchHardware()) {
      if (!touchReaderPreviewAllocationAttempted) {
-@@ -7580,6 +7618,13 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7579,7 +7617,12 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   if (deferImageLoading) {
      needsImageGrayscale = false;
    }
-   const bool pageHasImagesNeedingDecode = !deferImageLoading && pageHasImages && page->hasImagesNeedingDecode();
-+  auto combinedImagePlane = updatePanel && needsImageGrayscale && renderer.supportsCombinedGrayscale()
+-  const bool pageHasImagesNeedingDecode = !deferImageLoading && pageHasImages && page->hasImagesNeedingDecode();
++  auto combinedImagePlane = updatePanel && needsImageGrayscale && foregroundBlack && renderer.supportsRegionalGrayscale()
 +                                ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                                : HeapByteBuffer{};
-+  auto regionalImageMsb = combinedImagePlane && pageHasImagesNeedingDecode && foregroundBlack &&
-+                                  renderer.supportsRegionalGrayscale()
++  auto regionalImageMsb = combinedImagePlane
 +                              ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                              : HeapByteBuffer{};
 
    const auto finalizeBufferComposition = [&]() {
      if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
-@@ -7601,6 +7646,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
-     if (deferImageLoading) {
-       page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
-                                         /*renderCachedImages=*/false);
-+    } else if (regionalImageMsb) {
-+      page->renderText(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
-     } else {
-       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
-     }
-@@ -7616,14 +7663,15 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7616,17 +7659,9 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      }
      finalizeBufferComposition();
    };
 -  if (updatePanel && pageHasImagesNeedingDecode) {
-+  if (updatePanel && pageHasImagesNeedingDecode && !combinedImagePlane && foregroundBlack) {
-+    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
-     page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
-     finalizeBufferComposition();
-     renderStatusBar();
-     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-     renderer.clearScreen(ReaderUtils::readerBackgroundColor());
-   }
--  if (pageHasImages && !deferImageLoading) {
-+  if (pageHasImages && !deferImageLoading && !regionalImageMsb) {
-     // Show the new page's placeholders before ZIP extraction or sidecar
-     // materialization. The loan can overwrite the framebuffer, so rebuild
-     // the complete page after returning it; the panel keeps the preview.
-@@ -7667,47 +7715,70 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+-    page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+-    finalizeBufferComposition();
+-    renderStatusBar();
+-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+-    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+-  }
+   if (pageHasImages && !deferImageLoading) {
+-    // Show the new page's placeholders before ZIP extraction or sidecar
+-    // materialization. The loan can overwrite the framebuffer, so rebuild
+-    // the complete page after returning it; the panel keeps the preview.
++    // Decode before the one visible BW composition. The framebuffer loan is
++    // private scratch; never display its temporary pixels or a blank box.
+     GfxRenderer::FrameBufferLoan loan(renderer);
+     page->prepareImageCaches();
+     loan.end();
+@@ -7673,47 +7708,56 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    if (!updatePanel) {
      return true;
    }
 +  if (regionalImageMsb) {
-+    // Paint the text immediately. Image decoding/upload happens after the text
-+    // is visible, and the panel only drives the individual image windows.
-+    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
++    // Use a real BW image as the first visible stage, never an empty image box.
++    // The grayscale stage below drives individual image windows; page text is
++    // already final and does not need another whole-page clearing activation.
++    renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::FAST_REFRESH);
++    cleanImageBasePending = false;
 +    const auto frameSize = renderer.getBufferSize();
-+    if (pageHasImagesNeedingDecode) {
-+      std::memcpy(combinedImagePlane.get(), renderer.getFrameBuffer(), frameSize);
-+      GfxRenderer::FrameBufferLoan loan(renderer);
-+      page->prepareImageCaches();
-+      loan.end();
-+      std::memcpy(renderer.getFrameBuffer(), combinedImagePlane.get(), frameSize);
-+    }
 +
 +    bool rendered = renderer.displayDirectGrayscaleBase();
 +    if (rendered) {
@@ -864,18 +852,13 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..a97e10039d27d65e0122da813c450eb2
 +      renderer.setRenderMode(GfxRenderer::BW);
 +    }
 +    regionalImageMsb.reset();
-+    page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
 +    renderer.cleanupGrayscaleWithFrameBuffer();
-+    if (rendered) {
-+      cleanImageBasePending = false;
-+      return true;
-+    }
-+  }
-+  if (EpubGrayscale::runCombinedImagePass(renderer, *page, fontId, orientedMarginLeft, orientedMarginTop,
-+                                         combinedImagePlane.get())) {
-+    cleanImageBasePending = false;
++    if (!rendered) LOG_ERR("ERS", "Image-only grayscale failed; keeping the BW image without a page repaint");
 +    return true;
 +  }
++  // Non-regional controllers retain their BW-base/gray-overlay sequence.
++  // A complete direct/absolute frame can visibly condition blank image areas
++  // (or the whole page) before settling; do not use it for in-book images.
 +  combinedImagePlane.reset();
    const bool needsAnyGrayscale = needsTextGrayscale || needsImageGrayscale;
    const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
@@ -908,15 +891,9 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..a97e10039d27d65e0122da813c450eb2
 -      // planes below. On X3, use the same grayscale-aware base waveform as
 -      // text-only grayscale turns; other panels keep the FAST fallback behavior.
 -      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-+    // Send the composed image as the base. A separate blank image rectangle
-+    // can appear as a black box when the panel or reader is inverted.
-+    if (cleanImageBasePending) {
-+      renderer.displayGrayscaleBase(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
-+      cleanImageBasePending = false;
-     } else {
+-    } else {
 -      renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::HALF_REFRESH);
-+      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-     }
+-    }
 -    // The image's own page is handled above and doesn't count toward the full
 -    // refresh cadence. But the grayscale pass below leaves gray charge in the
 -    // image region that a plain fast diff on the *next* page can't clear, so
@@ -924,10 +901,14 @@ index 5825b6bbdf741fbec5c09315a972ecfaf13a519d..a97e10039d27d65e0122da813c450eb2
 -    // HALF ghost-cleanup path, which drives every pixel to its target
 -    // regardless of residue.
 -    pagesUntilFullRefresh = 1;
++    // Send the composed image as the base. A separate blank image rectangle
++    // can appear as a black box when the panel or reader is inverted.
++    renderer.displayGrayscaleBase(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::FAST_REFRESH);
++    cleanImageBasePending = false;
    } else if (needsAnyGrayscale) {
      if (pagesUntilFullRefresh <= 1) {
        // Cleanup turns still need the stronger HALF pass, but X3 grayscale
-@@ -8959,6 +9030,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+@@ -8966,6 +9010,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
      ImageBlock::setExtractor(nullptr, nullptr, nullptr);
    }
    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
@@ -1408,9 +1389,10 @@ new file mode 100644
 +add_test(NAME image_refresh_regions COMMAND image_refresh_regions_test)
 diff --git a/test/image_refresh_regions/ExtractImageRefresh.py b/test/image_refresh_regions/ExtractImageRefresh.py
 new file mode 100644
+index 0000000000000000000000000000000000000000..301d3bc35ffe747cb9ca74b5486fdfad580de228
 --- /dev/null
 +++ b/test/image_refresh_regions/ExtractImageRefresh.py
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,14 @@
 +from pathlib import Path
 +import sys
 +header=Path(sys.argv[1]).read_text()
@@ -1421,18 +1403,25 @@ new file mode 100644
 +a=source.index("  if (pageHasImages && !deferImageLoading) {",source.index("  const bool overlapRefresh ="))
 +b=source.index("  } else if (needsAnyGrayscale)",a)
 +Path(sys.argv[4]).write_text("void Reader::renderImageBase() {\n"+source[a:b]+"  }\n}\n")
++a=source.index('  if (regionalImageMsb) {\n    // Use a real BW image')
++b=source.index('  // Non-regional controllers',a)
++with Path(sys.argv[4]).open('a') as out:
++    out.write('\nbool Reader::renderRegionalImage() {\n'+source[a:b]+'  return false;\n}\n')
 diff --git a/test/image_refresh_regions/ImageRefreshRegionsTest.cpp b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..5829d0de42ceab8f543a31fc53dae944fccd9fd8
+index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069adf0031c
 --- /dev/null
 +++ b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,127 @@
 +#include <algorithm>
++#include <array>
++#include <cstring>
 +#include <cassert>
 +#include <cstdint>
 +#include <iostream>
 +#include <memory>
 +#include <vector>
++#define LOG_ERR(...) do {} while(0)
 +constexpr int TAG_PageLine=1,TAG_PageImage=2;
 +struct Block {int16_t width,height;int16_t getWidth()const{return width;}int16_t getHeight()const{return height;}};
 +struct Element {int16_t xPos=0,yPos=0;virtual ~Element()=default;virtual int getTag()const{return TAG_PageLine;}};
@@ -1442,13 +1431,42 @@ index 0000000000000000000000000000000000000000..5829d0de42ceab8f543a31fc53dae944
 + int getTag()const override{return TAG_PageImage;}
 + const Block& getImageBlock()const{return block;}
 +};
++struct Renderer;
 +struct Page {
++ void renderImages(Renderer&,int,int,int) const;
 + std::vector<std::unique_ptr<Element>>elements;
 + #include "ImageRects.inc"
 + int imageArea()const{int area=0;forEachImageRect([&](int,int,int w,int h){area+=w*h;});return area;}
 +};
 +namespace HalDisplay {enum {FAST_REFRESH=1,HALF_REFRESH=2};}
 +struct Renderer {
++ enum RenderMode {BW,GRAYSCALE_LSB,GRAYSCALE_MSB};
++ RenderMode mode=BW;
++ uint8_t* target=nullptr;
++ std::vector<uint8_t> lsb,msb;
++ std::vector<std::array<int,4>> regions;
++ unsigned baseCalls=0,cleanups=0;
++ bool grayFails=false;
++ bool displayDirectGrayscaleBase(){++baseCalls;return true;}
++ uint8_t* getFrameBuffer(){return pixels.data();}
++ size_t getBufferSize()const{return pixels.size();}
++ int getDisplayHeight()const{return 160;}
++ void setRenderMode(RenderMode next){mode=next;}
++ void beginStripTarget(uint8_t* data,int,int){target=data;}
++ void endStripTarget(){target=nullptr;}
++ void copyGrayscaleLsbBuffers(uint8_t* data){lsb.assign(data,data+pixels.size());}
++ void copyGrayscaleMsbBuffers(uint8_t* data){msb.assign(data,data+pixels.size());}
++ bool displayDirectGrayRegion(int x,int y,int w,int h){
++  if(grayFails)return false;
++  regions.push_back({x,y,w,h});
++  // The panel changes only the requested image. Page text stays untouched.
++  auto next=frames.back();
++  for(int j=y;j<y+h;++j)for(int i=x;i<x+w;++i)next[j*100+i]=2+lsb[j*100+i]+msb[j*100+i];
++  frames.push_back(std::move(next));return true;
++ }
++ void cleanupGrayscaleWithFrameBuffer(){++cleanups;}
++ void displayBuffer(int mode){displayGrayscaleBase(mode);}
++
 + std::vector<uint8_t> pixels = std::vector<uint8_t>(100 * 160);
 + std::vector<std::vector<uint8_t>> frames;
 + std::vector<int> modes;
@@ -1457,7 +1475,18 @@ index 0000000000000000000000000000000000000000..5829d0de42ceab8f543a31fc53dae944
 +  modes.push_back(mode);
 + }
 +};
++using GfxRenderer=Renderer;
++void Page::renderImages(Renderer& renderer,int,int,int) const {
++ forEachImageRect([&](int x,int y,int w,int h){
++  for(int j=y;j<y+h;++j)for(int i=x;i<x+w;++i)
++   renderer.target[j*100+i]=(renderer.mode==Renderer::GRAYSCALE_LSB ? (i+j)%2 : i%2);
++ });
++}
 +struct Reader {
++ Page* page=nullptr;
++ std::unique_ptr<uint8_t[]> combinedImagePlane,regionalImageMsb;
++ int fontId=0,orientedMarginLeft=0,orientedMarginTop=0;
++ bool renderRegionalImage();
 + Renderer renderer;
 + bool pageHasImages = true, deferImageLoading = false, cleanImageBasePending = false;
 + int pagesUntilFullRefresh = 3;
@@ -1474,9 +1503,39 @@ index 0000000000000000000000000000000000000000..5829d0de42ceab8f543a31fc53dae944
 +  reader.renderImageBase();
 +  assert(reader.renderer.frames.size() == 1);
 +  assert(reader.renderer.frames.front() == composed);
-+  assert(reader.renderer.modes.front() == (cleanup ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH));
++  assert(reader.renderer.modes.front() == HalDisplay::FAST_REFRESH);
 +  assert(reader.pagesUntilFullRefresh == 3 && !reader.cleanImageBasePending);
 + }
++ // Cached and freshly decoded images use the same image-only refinement.
++ for(bool cleanup:{false,true}) {
++  Page images;images.elements.push_back(std::make_unique<PageImage>(8,12,16,16));
++  images.elements.push_back(std::make_unique<PageImage>(8,90,16,16));
++  Reader reader;reader.page=&images;reader.cleanImageBasePending=cleanup;
++  reader.combinedImagePlane=std::make_unique<uint8_t[]>(reader.renderer.getBufferSize());
++  reader.regionalImageMsb=std::make_unique<uint8_t[]>(reader.renderer.getBufferSize());
++  for(size_t i=0;i<reader.renderer.pixels.size();++i)reader.renderer.pixels[i]=i%3!=0;
++  const auto composed=reader.renderer.pixels;
++  assert(reader.renderRegionalImage());
++  assert(reader.renderer.modes==std::vector<int>{HalDisplay::FAST_REFRESH});
++  assert(reader.renderer.frames.front()==composed); // actual darker image, no blank rectangle
++  assert(reader.renderer.regions.size()==2);
++  assert((reader.renderer.regions[0]==std::array<int,4>{8,12,16,16}));
++  assert((reader.renderer.regions[1]==std::array<int,4>{8,90,16,16}));
++  for(const auto& frame:reader.renderer.frames)
++   for(int y=28;y<90;++y)for(int x=0;x<100;++x)assert(frame[y*100+x]==composed[y*100+x]);
++  assert(reader.renderer.pixels==composed && reader.renderer.mode==Renderer::BW);
++  assert(reader.renderer.cleanups==1 && !reader.cleanImageBasePending && reader.pagesUntilFullRefresh==3);
++ }
++ // A failed refinement keeps the already visible BW image; no full-page retry.
++ Page failurePage;failurePage.elements.push_back(std::make_unique<PageImage>(8,12,16,16));
++ Reader failed;failed.page=&failurePage;failed.renderer.grayFails=true;
++ failed.combinedImagePlane=std::make_unique<uint8_t[]>(failed.renderer.getBufferSize());
++ failed.regionalImageMsb=std::make_unique<uint8_t[]>(failed.renderer.getBufferSize());
++ const auto bwFailure=failed.renderer.pixels;
++ assert(failed.renderRegionalImage() && failed.renderer.frames.size()==1);
++ assert(failed.renderer.frames.front()==bwFailure && failed.renderer.mode==Renderer::BW);
++ Reader manual;manual.pagesUntilFullRefresh=-1;manual.renderImageBase();
++ assert(manual.renderer.modes==std::vector<int>{HalDisplay::HALF_REFRESH});
 + Page empty;empty.elements.push_back(std::make_unique<Element>());
 + int count=0;assert(!empty.forEachImageRect([&](int,int,int,int){++count;}));assert(count==0);
 + std::cout<<"Image refresh sends the composed page without a blank rectangle\n";

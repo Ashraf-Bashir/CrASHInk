@@ -2,6 +2,8 @@
 
 ### Fixed
 
+- Book images show their actual BW rendition before grayscale, including cached images. Regional grayscale updates each image independently, preserving intervening text; a failed refinement keeps the BW image without repainting the page. Removed blank loading previews and automatic clean-base activations from the image path; explicit screen refresh remains available.
+
 - Inline highlight adjustment maps exact visible lines when intervening chapter text prevents a whole-page match, and handles imported punctuation differences. Unsafe mappings open the text editor instead of an empty handle view; failed saves keep the unsaved draft and handles visible for retry.
 - Dark-grey and solid highlights request the existing stronger page waveform to reduce dense highlight ghosting. Moving handles still uses fast differential updates, and image-only refresh behavior is unchanged.
 - The highlight editor uses a compact Workflowy icon instead of the competing header label.
