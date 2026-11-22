@@ -3,13 +3,13 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -2,6 +2,8 @@
-
+ 
  ### Added
-
+ 
 +- The Library opens your Workflowy daily outline. Page vertically, swipe left for item actions, and swipe right to toggle completion.
 +
  - Display settings offer light grey, dark grey, and solid saved highlights, with contrasting text and a White option in Dark Mode.
-
+ 
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
 index 3a6af292478e11d385b42e6c43786a5b840ea21d..925fda481f32911fb00db7287f22d6e101b46f5c 100644
@@ -138,10 +138,10 @@ index 0245eec70e9ad390f23cfb19bd796537d1237753..823e952591381fd2c406f85b19356d08
 +    if (clipping.noteLength) clipping.noteOffset = f.position() - clipping.noteLength;
      out.push_back(std::move(clipping));
    }
-
+ 
 @@ -703,8 +711,10 @@ bool ClippingStore::readFromFile(const std::string& path, std::vector<Clipping>&
  }
-
+ 
  bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
 -                                const std::string* sourcePathOverride) {
 -  Storage.mkdir("/.crosspoint");
@@ -150,7 +150,7 @@ index 0245eec70e9ad390f23cfb19bd796537d1237753..823e952591381fd2c406f85b19356d08
 +  if (loadFailed_) return false;
 +  Storage.mkdir("/.crashink");
    Storage.mkdir(CLIPPINGS_DIR);
-
+ 
    const std::string tmpPath = storeFilePath + ".tmp";
 @@ -791,7 +801,16 @@ bool ClippingStore::writeToFile(const std::string* replacementText, const size_t
      } else if (textLen > 0) {
@@ -196,6 +196,77 @@ index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882
    bool readClippingPreview(size_t index, std::string& out) const;
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index ac3bc1d0f5791e55b5e36ac6dbca219ecb352b0b..aa5017216ef6a136a72431c3da1126155e25af35 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -39,10 +39,12 @@
+ #include "reader/BookStatsTracking.h"
+ #include "reader/GlobalReadingStats.h"
+ #include "reader/ReaderActivity.h"
++#include "reader/WorkflowyShareActivity.h"
+ #include "settings/OpdsServerListActivity.h"
+ #include "settings/SettingsActivity.h"
+ #include "util/FrontlightPanelActivity.h"
+ #include "util/FullScreenMessageActivity.h"
++#include "util/OptionSelectionActivity.h"
+ #include "util/SwipeAdjustment.h"
+ #include "util/TwoFingerSwipe.h"
+ 
+@@ -586,6 +588,13 @@ void ActivityManager::loop() {
+     mappedInput.setPowerAsConfirmInReaderMode(false);
+   }
+ 
++  if (pendingAction == PendingAction::None) {
++    if (const auto error = workflowy::takeShareError()) {
++      pushActivity(std::make_unique<OptionSelectionActivity>(
++          renderer, mappedInput, "WorkflowyShareError", *error, std::vector<std::string>{tr(STR_OK)}, 0, false, true));
++    }
++  }
++
+   while (pendingAction != PendingAction::None) {
+     if (pendingAction == PendingAction::Pop) {
+       RenderLock lock;
+@@ -1086,7 +1095,9 @@ void ActivityManager::popActivity() {
+   pendingAction = PendingAction::Pop;
+ }
+ 
+-bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
++bool ActivityManager::preventAutoSleep() const {
++  return workflowy::shareInProgress() || (currentActivity && currentActivity->preventAutoSleep());
++}
+ 
+ bool ActivityManager::requiresExclusiveStorageLoop() const {
+   return currentActivity && currentActivity->requiresExclusiveStorageLoop();
+diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
+index c8632d51a6c0eea1826a12e30bcdc227c0437854..8d9cfcd5f30a4e9e7254e437587e06c95e6f02fa 100644
+--- a/src/activities/ActivityResult.h
++++ b/src/activities/ActivityResult.h
+@@ -16,8 +16,15 @@ struct WifiResult {
+   std::string ip;
+ };
+ 
++struct WorkflowyBlockResult {
++  int start = 0;
++  int end = 0;
++  std::string itemId;
++};
++
+ struct KeyboardResult {
+   std::string text;
++  std::string workflowyStyles{};
+ };
+ 
+ struct MenuResult {
+@@ -137,7 +144,7 @@ struct HighlightPageAction {
+ };
+ 
+ using ResultVariant =
+-    std::variant<std::monostate, WifiResult, KeyboardResult, MenuResult, ChapterResult, PercentResult, IntervalResult,
++    std::variant<std::monostate, WifiResult, KeyboardResult, WorkflowyBlockResult, MenuResult, ChapterResult, PercentResult, IntervalResult,
+                  OptionSelectionResult, PageResult, NetworkModeResult, FootnoteResult, BookmarkResult,
+                  FileBrowserActionResult, FilePathResult, WordResult, ReadingStatsResult, ClippingResult,
+                  TtfRenderOptionsResult, DictionaryClippingRequest, ClippingJumpResult, HighlightPageAction, FrontlightPanelResult>;
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
 index a53cced410b6bc88ecbfdb0fb30d4f8053f8dd68..4439cd35a622ab376505aee62dc8bafd256a4f67 100644
 --- a/src/activities/library/LibraryActivity.cpp
@@ -236,7 +307,7 @@ index a53cced410b6bc88ecbfdb0fb30d4f8053f8dd68..4439cd35a622ab376505aee62dc8bafd
 +    startActivityForResult(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput), {});
 +#endif
  }
-
+ 
  void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
 @@ -1085,7 +1100,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      } else if (!mappedInput.hasTouchHardware()) {
@@ -267,7 +338,7 @@ index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..a9dff5c0c6aa777667942e72d8f499ef
 @@ -38,6 +38,15 @@ Rect clippingHeaderRect(const Rect& safe, const ThemeMetrics& metrics, const Map
    return Rect{safe.x, safe.y + metrics.topPadding, safe.width, TouchHeaderBackButton::height(metrics, mappedInput)};
  }
-
+ 
 +Rect colorFilterButton(const Rect& header) {
 +  return Rect{header.x + header.width - 92, header.y + header.height - 42, 88, 40};
 +}
@@ -290,6 +361,71 @@ index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..a9dff5c0c6aa777667942e72d8f499ef
      return;
    }
    const auto filter = colorFilterButton(header);
+diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/reader/HighlightEditActivity.cpp
+index 01464c836ce33b553ec56865b26d96604cd526d4..a07dda907741c186c1cb44e3764ad97a1cb91efe 100644
+--- a/src/activities/reader/HighlightEditActivity.cpp
++++ b/src/activities/reader/HighlightEditActivity.cpp
+@@ -15,6 +15,7 @@
+ #include "components/TouchHeaderBackButton.h"
+ #include "components/UITheme.h"
+ #include "fontIds.h"
++#include "workflowy/WorkflowyIcon.h"
+ 
+ namespace {
+ // KOReader's boundary controls use the symbols ◁▒▒, ▷☓▒, ▒☓◁, ▒▒▷.
+@@ -258,7 +259,7 @@ void HighlightEditActivity::openSavedClipping() {
+ 
+ Rect HighlightEditActivity::shareRect() const {
+   const auto close = closeRect();
+-  return Rect{close.x - 124, close.y, 116, close.height};
++  return Rect{close.x - close.width, close.y, close.width, close.height};
+ }
+ 
+ void HighlightEditActivity::loop() {
+@@ -269,8 +270,8 @@ void HighlightEditActivity::loop() {
+   }
+   const auto share = shareRect();
+   if (mappedInput.wasTapInRect(share.x, share.y, share.width, share.height) && CLIPPINGS.clippingAt(index)) {
+-    startActivityForResult(std::make_unique<WorkflowyShareActivity>(renderer, mappedInput, index),
+-                           [](const ActivityResult&) {});
++    workflowy::shareClippings(index);
++    cancel();
+     return;
+   }
+   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+@@ -324,7 +325,13 @@ void HighlightEditActivity::render(RenderLock&&) {
+   renderer.drawText(UI_10_FONT_ID, title.x + 12, title.y + 12, tr(STR_EDIT_HIGHLIGHT));
+   const Rect close = closeRect();
+   const auto share = shareRect();
+-  renderer.drawText(UI_10_FONT_ID, share.x + 8, share.y + 12, "Workflowy");
++  // Draw the small transparent logo in logical coordinates, matching the
++  // existing Workflowy button without a text label competing with the title.
++  const int iconX = share.x + (share.width - 32) / 2;
++  const int iconY = share.y + (share.height - 32) / 2;
++  for (int y = 0; y < 32; ++y)
++    for (int x = 0; x < 32; ++x)
++      if (!(workflowyBits[y * 4 + x / 8] & (0x80 >> (x & 7)))) renderer.drawPixel(iconX + x, iconY + y, true);
+   renderer.drawLine(close.x + 14, close.y + 14, close.x + close.width - 14, close.y + close.height - 14, 2, true);
+   renderer.drawLine(close.x + close.width - 14, close.y + 14, close.x + 14, close.y + close.height - 14, 2, true);
+   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
+index 34e9d1d552236d3e553525141de3e0804f0cb9e5..f9815c73dc2e5b4c3a17309d9d95dcf20b6b8e98 100644
+--- a/src/activities/reader/OnPageHighlightActivity.cpp
++++ b/src/activities/reader/OnPageHighlightActivity.cpp
+@@ -427,11 +427,8 @@ void OnPageHighlightActivity::loop() {
+           break;
+         }
+         case HighlightToolbar::Action::Share:
+-          startActivityForResult(std::make_unique<WorkflowyShareActivity>(renderer, mappedInput, index),
+-                                 [this](const ActivityResult&) {
+-                                   dragFrameReady = false;
+-                                   requestUpdate();
+-                                 });
++          workflowy::shareClippings(index);
++          finish();
+           break;
+         case HighlightToolbar::Action::Edit:
+           returnAction(true);
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c75d6ac86
@@ -595,26 +731,27 @@ index 0000000000000000000000000000000000000000..ffc991db741a2782c4fccf0a1a381611
 +std::optional<StrId> takeShareError();
 +}
 diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
-index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c4a0287d9 100644
+index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9c8928a7b 100644
 --- a/src/activities/util/KeyboardEntryActivity.cpp
 +++ b/src/activities/util/KeyboardEntryActivity.cpp
 @@ -7,6 +7,7 @@
-
+ 
  #include <algorithm>
  #include <cstring>
 +#include <new>
-
+ 
  #include "DeviceCapabilities.h"
  #include "KeyboardLayoutSet.h"
-@@ -14,6 +15,7 @@
+@@ -14,6 +15,8 @@
  #include "components/TouchHeaderBackButton.h"
  #include "components/UITheme.h"
  #include "fontIds.h"
 +#include "workflowy/WorkflowyTagInput.h"
-
++#include "workflowy/WorkflowyTextDrawing.h"
+ 
  namespace fui = freeink::ui;
-
-@@ -137,11 +139,12 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
+ 
+@@ -137,11 +140,12 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
  void KeyboardEntryActivity::onEnter() {
    Activity::onEnter();
    inputLineHeight = renderer.getLineHeight(UI_12_FONT_ID);
@@ -628,15 +765,40 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
    symbols = false;
    urlPanel = false;
    cursorMode = false;
-@@ -161,6 +164,7 @@ void KeyboardEntryActivity::onEnter() {
+@@ -161,6 +165,7 @@ void KeyboardEntryActivity::onEnter() {
    touchRouter.holdMs = TOUCH_LONG_PRESS_MS;
    touchRouter.overrideHoldMs = TOUCH_DEL_LONG_PRESS_MS;
    interactionsReady = false;
 +  textOnlyPaint = false;
    requestUpdate();
  }
-
-@@ -280,6 +284,7 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+ 
+@@ -263,6 +268,12 @@ void KeyboardEntryActivity::insertUtf8(const char* out) {
+   const size_t n = strlen(out);
+   if (maxLength != 0 && text.length() + n > maxLength) return;
+   if (cursorPos > text.length()) cursorPos = text.length();
++  if (!workflowyStyles.empty()) {
++    const char style = cursorPos && cursorPos < text.size() && workflowyStyles[cursorPos - 1] == workflowyStyles[cursorPos]
++                           ? workflowyStyles[cursorPos] : 0;
++    workflowyStyles.insert(cursorPos, n, style);
++  }
++  selectionAnchor = selectionEnd = std::string::npos;
+   text.insert(cursorPos, out, n);
+   cursorPos += n;
+ }
+@@ -270,6 +281,11 @@ void KeyboardEntryActivity::insertUtf8(const char* out) {
+ bool KeyboardEntryActivity::backspaceUtf8() {
+   if (text.empty() || cursorPos == 0) return false;
+   const size_t prev = utf8Prev(text, cursorPos);
++  if (!workflowyStyles.empty()) {
++    workflowyStyles.erase(prev, cursorPos - prev);
++    workflowy::normalizeStyles(workflowyStyles);
++  }
++  selectionAnchor = selectionEnd = std::string::npos;
+   text.erase(prev, cursorPos - prev);
+   cursorPos = prev;
+   return true;
+@@ -280,6 +296,7 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
      case fui::QWERTY_KEY_SHIFT:
        delPressCount = 0;
        hintVisible = false;
@@ -644,7 +806,16 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
        // Letters: case toggle. Symbols: pages between "?123" and "#+=".
        shifted = !shifted;
        clampSelection();
-@@ -342,8 +347,11 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+@@ -321,6 +338,8 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+       if (longPress) {
+         if (text.empty()) return false;
+         text.clear();
++        workflowyStyles.clear();
++        selectionAnchor = selectionEnd = std::string::npos;
+         cursorPos = 0;
+         return true;
+       }
+@@ -342,8 +361,11 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
        const auto oldLength = text.size();
        insertUtf8(out);
        if (text.size() == oldLength) return false;
@@ -658,8 +829,29 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
          clampSelection();
        }
        return true;
-@@ -410,10 +418,14 @@ bool KeyboardEntryActivity::rangeIsRtl(std::string& s, const int start, const in
-
+@@ -356,6 +378,8 @@ bool KeyboardEntryActivity::clearAllOrAltOnSelected() {
+   if (!key) return false;
+   if (key->value == fui::QWERTY_KEY_BACKSPACE) {
+     text.clear();
++    workflowyStyles.clear();
++    selectionAnchor = selectionEnd = std::string::npos;
+     cursorPos = 0;
+     return true;
+   }
+@@ -389,6 +413,11 @@ std::string KeyboardEntryActivity::displayTextForCurrentState() const {
+ }
+ 
+ int KeyboardEntryActivity::measureRange(std::string& s, const int start, const int end) const {
++  if (!workflowyStyles.empty() && workflowyStyles.size() == s.size() && start >= 0 && end >= start &&
++      static_cast<size_t>(end) <= s.size()) {
++    return workflowy::layoutStyledText(renderer, UI_12_FONT_ID, 0, 0, std::string_view(s).substr(start, end - start),
++                                     std::string_view(workflowyStyles).substr(start, end - start), false);
++  }
+   if (end <= start) return 0;
+   // s[end] is writable even at s.length() (the terminator slot); only '\0' may
+   // be written there, which is exactly what the measurement needs.
+@@ -410,10 +439,14 @@ bool KeyboardEntryActivity::rangeIsRtl(std::string& s, const int start, const in
+ 
  int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const int maxWidth) const {
    const int len = static_cast<int>(s.length());
 -  if (measureRange(s, start, len) <= maxWidth) return len;
@@ -676,10 +868,10 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
    while (lo <= hi) {
      const int mid = lo + (hi - lo) / 2;
      if (measureRange(s, start, mid) <= maxWidth) {
-@@ -435,6 +447,18 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
+@@ -435,6 +468,18 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
    return best < firstCharEnd ? firstCharEnd : best;
  }
-
+ 
 +int KeyboardEntryActivity::firstVisibleInputLine(std::string& display, int width, int capacity) const {
 +  if (!keepCursorVisible) return 0;
 +  int first = 0, start = 0, before = 0;
@@ -695,31 +887,31 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
  KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTouchTargetFromPoint(
      const int x, const int y, size_t& position) const {
    // Key taps are the overwhelmingly common case; they land on the keyboard,
-@@ -464,7 +488,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+@@ -464,7 +509,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
    const bool centerText = metrics.keyboardCenteredText;
    std::string displayText = displayTextForCurrentState();
-
+ 
 -  int lineStartIdx = 0;
-+  const int inputBottom = tagStart() != std::string::npos ? tagPanel().y : keyboardRect().y;
++  const int inputBottom = textInputBottom();
 +  const int capacity = std::max(1, (inputBottom - inputStartY - 6) / lineHeight);
 +  int lineStartIdx = firstVisibleInputLine(displayText, maxLineWidth, capacity);
    int lineY = inputStartY;
    int lastLineStartIdx = 0;
    int lastLineEndIdx = static_cast<int>(displayText.length());
-@@ -516,7 +542,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+@@ -516,7 +563,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
        return InputFieldTouchTarget::Cursor;
      }
-
+ 
 -    if (lineEndIdx == static_cast<int>(displayText.length())) {
 +    if (lineEndIdx == static_cast<int>(displayText.length()) ||
 +        (keepCursorVisible && lineY + lineHeight >= inputStartY + capacity * lineHeight)) {
        break;
      }
-
-@@ -555,19 +582,106 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
+ 
+@@ -555,19 +603,226 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
                     static_cast<int16_t>(hasTouch ? pageHeight - y : height)};
  }
-
+ 
 -void KeyboardEntryActivity::loop() {
 -#if CROSSINK_APP_CAP_TOUCH
 -  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
@@ -730,7 +922,8 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +                                 "#P0", "#P1", "#P2", "#P3", "#P4", "@OUTSIDE", "@INSIDE"};
 +constexpr int TAG_COLUMNS = 3;
 +constexpr int TAG_ROW_HEIGHT = 30;
-+constexpr int TAG_ROWS = (std::size(TAGS) + TAG_COLUMNS - 1) / TAG_COLUMNS;
++constexpr int TAG_ROWS = (std::size(TAGS) + TAG_COLUMNS) / TAG_COLUMNS;
++constexpr int DATE_CELL = TAG_ROWS * TAG_COLUMNS - 1;
 +}  // namespace
 +
 +fui::Rect KeyboardEntryActivity::tagPanel() const {
@@ -751,10 +944,12 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +            return tag.starts_with(prefix);
 +          })) return start;
 +    }
-+  }
+   }
 +  return workflowyTagPalette ? std::min(cursorPos, text.size()) : std::string::npos;
 +}
-+
+ 
+-  int tx = 0;
+-  int ty = 0;
 +bool KeyboardEntryActivity::insertTagAt(int x, int y) {
 +  const auto start = tagStart();
 +  if (start == std::string::npos) return false;
@@ -762,10 +957,29 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +  if (x < panel.x || x >= panel.right() || y < panel.y || y >= panel.bottom()) return false;
 +  const auto prefix = std::string_view(text).substr(start, cursorPos - start);
 +  const int cell = (y - panel.y) / TAG_ROW_HEIGHT * TAG_COLUMNS + (x - panel.x) * TAG_COLUMNS / panel.width;
++  if (cell == DATE_CELL && workflowyDatePicker) {
++    startActivityForResult(workflowyDatePicker(), [this](const ActivityResult& result) {
++      if (result.isCancelled) return;
++      const auto& date = std::get<KeyboardResult>(result.data).text;
++      if (date.empty()) return;
++      std::string token = "[" + date + "]";
++      const auto cursor = std::min(cursorPos, text.size());
++      if (cursor > 0 && text[cursor - 1] != ' ') token.insert(token.begin(), ' ');
++      if (cursor < text.size() && text[cursor] != ' ') token += ' ';
++      {
++        RenderLock lock(*this);
++        insertUtf8(token.c_str());
++        keepCursorVisible = true;
++      }
++      requestUpdate();
++    });
++    return true;
++  }
 +  int matched = 0;
 +  for (const auto* tag : TAGS) {
 +    if (!std::string_view(tag).starts_with(prefix)) continue;
 +    if (matched++ != cell) continue;
++    const auto previousText = workflowyStyles.empty() ? std::string{} : text;
 +    if (workflowyTagPalette) {
 +      if (!workflowy::completeTaskPrefixTag(text, cursorPos, tag, maxLength,
 +                                            prefix.empty() ? std::string::npos : start)) return true;
@@ -779,6 +993,8 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +      if (cursorPos < text.size() && text[cursorPos] == ' ') text.erase(cursorPos, 1);
 +    }
 +    symbols = false;
++    workflowy::rebaseTextStyles(previousText, text, workflowyStyles);
++    selectionAnchor = selectionEnd = std::string::npos;
 +    shifted = !workflowyTagPalette || cursorPos == 0 || cursorPos > text.size() ||
 +              text[cursorPos - 1] == ' ';
 +    capitalizeAfterTag = shifted;
@@ -786,37 +1002,133 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +    touchRouter.reset();
 +    requestUpdate();
 +    return true;
-   }
++  }
 +  return false;
 +}
-
--  int tx = 0;
--  int ty = 0;
++
 +void KeyboardEntryActivity::drawTags() const {
 +  const auto start = tagStart();
 +  if (start == std::string::npos) return;
 +  const auto panel = tagPanel();
 +  const auto prefix = std::string_view(text).substr(start, cursorPos - start);
-+  int cell = 0;
-+  for (const auto* tag : TAGS) {
-+    if (!std::string_view(tag).starts_with(prefix)) continue;
++  const auto drawCell = [&](const char* label, int cell) {
 +    const int column = cell % TAG_COLUMNS;
 +    const int left = panel.x + column * panel.width / TAG_COLUMNS;
 +    const int right = panel.x + (column + 1) * panel.width / TAG_COLUMNS;
-+    const int y = panel.y + cell++ / TAG_COLUMNS * TAG_ROW_HEIGHT;
++    const int y = panel.y + cell / TAG_COLUMNS * TAG_ROW_HEIGHT;
 +    renderer.drawRoundedRect(left + 3, y + 2, right - left - 6, TAG_ROW_HEIGHT - 4, 1, 4, true);
-+    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, tag, right - left - 12);
++    const auto fitted = renderer.truncatedText(SMALL_FONT_ID, label, right - left - 12);
 +    renderer.drawText(SMALL_FONT_ID, left + (right - left - renderer.getTextWidth(SMALL_FONT_ID, fitted.c_str())) / 2,
 +                      y + (TAG_ROW_HEIGHT - renderer.getLineHeight(SMALL_FONT_ID)) / 2, fitted.c_str());
++  };
++  int cell = 0;
++  for (const auto* tag : TAGS) {
++    if (std::string_view(tag).starts_with(prefix)) drawCell(tag, cell++);
++  }
++  if (workflowyDatePicker) drawCell(tr(STR_DATE), DATE_CELL);
++}
+ 
+-  if (mappedInput.wasScreenTapped(tx, ty)) {
++bool KeyboardEntryActivity::hasTextSelection() const {
++  return selectionAnchor != std::string::npos && selectionEnd != std::string::npos && selectionAnchor != selectionEnd;
++}
++
++fui::Rect KeyboardEntryActivity::formattingPanel() const {
++  const auto panel = tagPanel();
++  return {panel.x, static_cast<int16_t>(panel.y - TAG_ROW_HEIGHT), panel.width, TAG_ROW_HEIGHT};
++}
++
++int KeyboardEntryActivity::textInputBottom() const {
++  if (workflowyFormatting) return formattingPanel().y;
++  return tagStart() != std::string::npos ? tagPanel().y : keyboardRect().y;
++}
++
++void KeyboardEntryActivity::drawFormatting() const {
++  const auto panel = formattingPanel();
++  const int count = workflowy::textStyles.size();
++  const int y = panel.y + (panel.height - renderer.getLineHeight(UI_10_FONT_ID)) / 2;
++  const char* labels[] = {"B", "I", "U", "S"};
++  for (int i = 0; i < count; ++i) {
++    const int left = panel.x + i * panel.width / count;
++    const int right = panel.x + (i + 1) * panel.width / count;
++    renderer.drawRoundedRect(left + 3, panel.y + 2, right - left - 6, panel.height - 4, 1, 4, true);
++    if (i == 4) {
++      renderer.fillRectDither((left + right) / 2 - 10, y + 4, 20, 12, Color::LightGray);
++    } else {
++      const char flag = static_cast<char>(workflowy::textStyles[i]);
++      const int x = (left + right - renderer.getTextWidth(UI_10_FONT_ID, labels[i])) / 2;
++      workflowy::layoutStyledText(renderer, UI_10_FONT_ID, x, y, labels[i], std::string_view(&flag, 1), true);
++    }
 +  }
 +}
-
--  if (mappedInput.wasScreenTapped(tx, ty)) {
++
++bool KeyboardEntryActivity::handleFormattingTouch(bool tapped, int x, int y) {
++  const auto panel = formattingPanel();
++  if (tapped && x >= panel.x && x < panel.right() && y >= panel.y && y < panel.bottom()) {
++    if (hasTextSelection()) {
++      const auto begin = std::min(selectionAnchor, selectionEnd);
++      const auto end = std::max(selectionAnchor, selectionEnd);
++      auto index = (x - panel.x) * workflowy::textStyles.size() / panel.width;
++      {
++        RenderLock lock(*this);
++        workflowy::toggleTextStyle(workflowyStyles, text.size(), begin, end, workflowy::textStyles[index]);
++      }
++      requestUpdate();
++    }
++    return true;
++  }
++  int heldX = 0, heldY = 0;
++  if (mappedInput.wasScreenTouchDown(heldX, heldY)) {
++    touchSelectionStart = std::string::npos;
++    draggingSelection = false;
++    if (heldY < panel.y) {
++      size_t offset = 0;
++      if (inputFieldTouchTargetFromPoint(heldX, heldY, offset) == InputFieldTouchTarget::Cursor) {
++        touchSelectionStart = offset;
++        selectionTouchX = heldX;
++        selectionTouchY = heldY;
++      }
++    }
++  }
++  if (touchSelectionStart == std::string::npos) return false;
++  if (mappedInput.isScreenTouchHeld(heldX, heldY)) {
++    const bool displaced = std::abs(heldX - selectionTouchX) >= 8 || std::abs(heldY - selectionTouchY) >= 8;
++    int longX = 0, longY = 0;
++    const bool longPress = mappedInput.isScreenTouchLongPress(longX, longY, 420);
++    if (draggingSelection || displaced || longPress) {
++      size_t offset = touchSelectionStart;
++      if (inputFieldTouchTargetFromPoint(heldX, std::min<int>(heldY, panel.y - 1), offset) !=
++          InputFieldTouchTarget::Cursor) return true;
++      size_t begin = touchSelectionStart, end = offset;
++      if (!displaced && longPress) {
++        while (begin > 0 && text[utf8Prev(text, begin)] != ' ') begin = utf8Prev(text, begin);
++        while (end < text.size() && text[end] != ' ') end = utf8Next(text, end);
++      }
++      const bool changed = selectionAnchor != begin || selectionEnd != end;
++      draggingSelection = true;
++      if (changed) {
++        selectionAnchor = begin;
++        selectionEnd = end;
++        requestUpdate();
++      }
++      return true;
++    }
++  }
++  if (mappedInput.wasScreenTouchReleased() || tapped) {
++    const bool consumed = draggingSelection;
++    touchSelectionStart = std::string::npos;
++    draggingSelection = false;
++    return consumed;
++  }
++  return false;
++}
++
 +void KeyboardEntryActivity::loop() {
 +#if CROSSINK_APP_CAP_TOUCH
 +  int tapX = 0;
 +  int tapY = 0;
 +  const bool tapped = mappedInput.wasScreenTapped(tapX, tapY);
++  if (workflowyFormatting && handleFormattingTouch(tapped, tapX, tapY)) return;
 +  if (tapped) {
 +    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
 +    const auto back = TouchHeaderBackButton::layout(header).touchRect;
@@ -832,9 +1144,17 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
      if (inputTarget == InputFieldTouchTarget::PasswordToggle) {
        buttonSelectionVisible = false;
        passwordVisible = !passwordVisible;
-@@ -594,11 +708,10 @@ void KeyboardEntryActivity::loop() {
+@@ -578,6 +833,7 @@ void KeyboardEntryActivity::loop() {
+     }
+     if (inputTarget == InputFieldTouchTarget::Cursor) {
+       buttonSelectionVisible = false;
++      selectionAnchor = selectionEnd = std::string::npos;
+       cursorPos = std::min(touchedCursorPos, text.length());
+       cursorMode = false;
+       togglePos = false;
+@@ -594,11 +850,10 @@ void KeyboardEntryActivity::loop() {
    }
-
+ 
    if (!cursorMode && interactionsReady.load(std::memory_order_acquire)) {
 +    int tx = 0;
 +    int ty = 0;
@@ -846,7 +1166,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
      int hx = 0;
      int hy = 0;
      const bool inContact = mappedInput.isScreenTouchHeld(hx, hy);
-@@ -607,9 +720,11 @@ void KeyboardEntryActivity::loop() {
+@@ -607,9 +862,11 @@ void KeyboardEntryActivity::loop() {
          touchRouter.update(interactions, tapCandidate, static_cast<int16_t>(tx), static_cast<int16_t>(ty), tapped,
                             static_cast<int16_t>(tapX), static_cast<int16_t>(tapY), inContact, millis());
      if (result.event) {
@@ -859,9 +1179,9 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
          requestUpdate();
        }
        return;
-@@ -780,22 +895,36 @@ void KeyboardEntryActivity::loop() {
+@@ -780,22 +1037,36 @@ void KeyboardEntryActivity::loop() {
  }
-
+ 
  void KeyboardEntryActivity::render(RenderLock&&) {
 -  renderer.clearScreen();
 +  auto* const frameBuffer = renderer.getFrameBuffer();
@@ -869,7 +1189,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +  const bool windowRefresh = mappedInput.hasTouchHardware() && frameBuffer && renderer.supportsWindowRefresh();
 +  // An intervening overlay or another full-screen paint invalidates the cached baseline.
 +  const bool sameScreen = windowRefresh && displayedFrame && memcmp(displayedFrame.get(), frameBuffer, frameSize) == 0;
-
+ 
    const auto pageWidth = renderer.getScreenWidth();
 +  const auto pageHeight = renderer.getScreenHeight();
    const auto& metrics = UITheme::getInstance().getMetrics();
@@ -902,21 +1222,62 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +      GUI.drawHeader(renderer, header, title.c_str());
 +    }
 +  }
-
+ 
    std::string displayText = displayTextForCurrentState();
-
-@@ -832,7 +961,9 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+ 
+@@ -832,7 +1103,9 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      if (w > cursorCharWidth) cursorCharWidth = w;
    }
-
+ 
 -  int lineStartIdx = 0;
-+  const int inputBottom = tagStart() != std::string::npos ? tagPanel().y : kbRect.y;
++  const int inputBottom = textInputBottom();
 +  const int capacity = std::max(1, (inputBottom - inputStartY - 6) / lineHeight);
 +  int lineStartIdx = firstVisibleInputLine(displayText, maxLineWidth, capacity);
    int textWidth = 0;
    int cursorPixelX = effectiveMargin;
    int cursorLineY = inputStartY;
-@@ -892,7 +1023,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -841,7 +1114,7 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+   while (true) {
+     const int lineEndIdx = lineBreakEnd(displayText, lineStartIdx, maxLineWidth);
+     const std::string lineText = displayText.substr(lineStartIdx, lineEndIdx - lineStartIdx);
+-    textWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, lineText.c_str(), EpdFontFamily::REGULAR);
++    textWidth = measureRange(displayText, lineStartIdx, lineEndIdx);
+     {
+       const bool isRtl = rangeIsRtl(displayText, lineStartIdx, lineEndIdx);
+       const int lineStartX = centerText ? effectiveMargin + (maxLineWidth - textWidth) / 2 : effectiveMargin;
+@@ -855,10 +1128,11 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+         } else {
+           beforeCursor = displayText.substr(lineStartIdx, cursorPos - lineStartIdx);
+         }
+-        int beforeWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeCursor.c_str(), EpdFontFamily::REGULAR);
++        int beforeWidth = workflowyFormatting ? measureRange(displayText, lineStartIdx, cursorPos) :
++            renderer.getTextAdvanceX(UI_12_FONT_ID, beforeCursor.c_str(), EpdFontFamily::REGULAR);
+         int throughCursorWidth = beforeWidth;
+         int kernOffset = 0;
+-        if (cursorCharBytes > 0) {
++        if (cursorCharBytes > 0 && !workflowyFormatting) {
+           std::string beforeAndCursor = beforeCursor + displayCursorChar;
+           throughCursorWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeAndCursor.c_str(), EpdFontFamily::REGULAR);
+           int charAdvance = renderer.getTextAdvanceX(UI_12_FONT_ID, displayCursorChar, EpdFontFamily::REGULAR);
+@@ -889,10 +1163,26 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+           const std::string part3 = displayText.substr(afterStart, afterEnd - afterStart);
+           renderer.drawText(UI_12_FONT_ID, cursorPixelX + cursorCharWidth, inputStartY + inputHeight, part3.c_str());
+         }
++      } else if (workflowyFormatting && !isRtl) {
++        const int y = inputStartY + inputHeight;
++        if (hasTextSelection()) {
++          const auto low = std::max<size_t>(lineStartIdx, std::min(selectionAnchor, selectionEnd));
++          const auto high = std::min<size_t>(lineEndIdx, std::max(selectionAnchor, selectionEnd));
++          if (low < high) {
++            const int left = measureRange(displayText, lineStartIdx, low);
++            const int right = measureRange(displayText, lineStartIdx, high);
++            renderer.fillRectDither(lineStartX + left, y, right - left, lineHeight, Color::DarkGray);
++          }
++        }
++        const auto styles = workflowyStyles.size() == text.size()
++                                ? std::string_view(workflowyStyles).substr(lineStartIdx, lineText.size())
++                                : std::string_view{};
++        workflowy::layoutStyledText(renderer, UI_12_FONT_ID, lineStartX, y, lineText, styles, true);
        } else {
          renderer.drawText(UI_12_FONT_ID, lineStartX, inputStartY + inputHeight, lineText.c_str());
        }
@@ -925,13 +1286,14 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +          (keepCursorVisible && inputHeight + lineHeight >= capacity * lineHeight)) {
          break;
        }
-
-@@ -964,7 +1096,13 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+ 
+@@ -964,7 +1254,14 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      }
    }
-
+ 
 -  const fui::Rect kbRect = keyboardRect();
 +  drawTags();
++  if (workflowyFormatting) drawFormatting();
 +  if (onlyText) {
 +    renderer.displayChangedWindow(displayedFrame.get());
 +    memcpy(displayedFrame.get(), frameBuffer, frameSize);
@@ -941,7 +1303,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
    const int keysHeight = std::min(keyboardKeysHeight(metrics, currentLayout().rowCount, mappedInput.hasTouchHardware()),
                                    static_cast<int>(kbRect.height));
    const auto orientation = renderer.getOrientation();
-@@ -1122,8 +1260,20 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -1122,8 +1419,20 @@ void KeyboardEntryActivity::render(RenderLock&&) {
  #if CROSSINK_APP_CAP_TOUCH
    interactions.beginPublishCycle();
    interactions.clear();
@@ -963,10 +1325,10 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
    }
  #endif
    interactions.publish();
-@@ -1135,7 +1285,17 @@ void KeyboardEntryActivity::render(RenderLock&&) {
-
+@@ -1135,11 +1444,21 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+ 
    GUI.drawSideButtonHints(renderer, ">", "<");
-
+ 
 -  renderer.displayBuffer();
 +  if (sameScreen) {
 +    renderer.displayChangedWindow(displayedFrame.get());
@@ -980,34 +1342,48 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..ecc310de446eec9afe510fd555962d2c
 +    displayedFrame.reset();
 +  }
  }
-
+ 
  void KeyboardEntryActivity::onComplete(std::string text) {
+-  setResult(KeyboardResult{std::move(text)});
++  setResult(KeyboardResult{std::move(text), workflowyStyles});
+   finish();
+ }
+ 
 diff --git a/src/activities/util/KeyboardEntryActivity.h b/src/activities/util/KeyboardEntryActivity.h
-index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac9338564e10a 100644
+index 5335aef83dbecd89835ed12f65ce8085a31f071f..8c1b84e08c89c2c5f35e3b6994e451ba206898e0 100644
 --- a/src/activities/util/KeyboardEntryActivity.h
 +++ b/src/activities/util/KeyboardEntryActivity.h
-@@ -1,9 +1,11 @@
+@@ -1,9 +1,12 @@
  #pragma once
 +
  #include <FreeInkUIGfxRenderer.h>
  #include <GfxRenderer.h>
-
+ 
  #include <atomic>
  #include <cstdint>
++#include <functional>
 +#include <memory>
  #include <string>
  #include <utility>
-
-@@ -29,14 +31,34 @@ class KeyboardEntryActivity : public Activity {
+ 
+@@ -29,14 +32,55 @@ class KeyboardEntryActivity : public Activity {
          inputType(inputType),
          minLength(minLength) {}
-
+ 
 +  void setInitialCursor(size_t cursor) {
 +    initialCursor = cursor;
 +    keepCursorVisible = true;
 +  }
 +
-+  void enableWorkflowyTags(bool newTask = false) { workflowyTags = true; workflowyTagPalette = newTask; }
++  void enableWorkflowyTags(bool showPalette = false) { workflowyTags = true; workflowyTagPalette = showPalette; }
++  void setWorkflowyDatePicker(std::function<std::unique_ptr<Activity>()> picker) {
++    workflowyDatePicker = std::move(picker);
++  }
++
++  void enableWorkflowyFormatting(std::string styles) {
++    workflowyFormatting = true;
++    if (styles.size() == text.size()) workflowyStyles = std::move(styles);
++  }
 +
    void onEnter() override;
    void onExit() override;
@@ -1016,10 +1392,23 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    bool preventAutoSleep() override { return true; }
 +  bool allowEdgeSlideGestures() const override { return false; }
    uint8_t inputPollDelayMs() const override { return mappedInput.hasTouchHardware() ? 2 : 10; }
-
+ 
   private:
++  bool workflowyFormatting = false;
++  std::string workflowyStyles;
++  size_t selectionAnchor = std::string::npos;
++  size_t selectionEnd = std::string::npos;
++  size_t touchSelectionStart = std::string::npos;
++  int selectionTouchX = 0, selectionTouchY = 0;
++  bool draggingSelection = false;
++  bool hasTextSelection() const;
++  bool handleFormattingTouch(bool tapped, int x, int y);
++  void drawFormatting() const;
++  freeink::ui::Rect formattingPanel() const;
++  int textInputBottom() const;
 +  bool workflowyTags = false;
 +  bool workflowyTagPalette = false;
++  std::function<std::unique_ptr<Activity>()> workflowyDatePicker;
 +  bool capitalizeAfterTag = false;
 +  std::atomic<bool> textOnlyPaint{false};
 +  int lastPaintWidth = 0, lastPaintHeight = 0, lastPaintKeyboardY = -1;
@@ -1033,20 +1422,92 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..f520a7360e9cdc742c1bc6cfab1ac933
    std::string title;
    std::string text;
    size_t maxLength;
-@@ -107,6 +129,7 @@ class KeyboardEntryActivity : public Activity {
+@@ -107,6 +151,7 @@ class KeyboardEntryActivity : public Activity {
    enum class InputFieldTouchTarget { None, Cursor, PasswordToggle };
-
+ 
    void onComplete(std::string text);
 +  int firstVisibleInputLine(std::string& display, int width, int capacity) const;
    void onCancel();
    InputFieldTouchTarget inputFieldTouchTargetFromPoint(int x, int y, size_t& position) const;
    std::string displayTextForCurrentState() const;
+diff --git a/src/activities/util/OptionSelectionActivity.cpp b/src/activities/util/OptionSelectionActivity.cpp
+index 2389d887417b68c47c2a45de7bf6784fe617d2ca..2cf700fc871ade52753dad77b06e06e0eca2ee0e 100644
+--- a/src/activities/util/OptionSelectionActivity.cpp
++++ b/src/activities/util/OptionSelectionActivity.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <GfxRenderer.h>
+ #include <I18n.h>
++#include <FreeInkUIIcon.h>
+ 
+ #include <utility>
+ 
+@@ -33,10 +34,13 @@ Rect optionListRect(const GfxRenderer& renderer, const MappedInputManager& mappe
+ OptionSelectionActivity::OptionSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                                                  std::string activityName, const StrId titleId,
+                                                  std::vector<std::string> options, const uint8_t selectedIndex,
+-                                                 const bool readerMode, const bool showTouchHeaderBackButton)
++                                                 const bool readerMode, const bool showTouchHeaderBackButton,
++                                                 std::vector<const freeink::Icon*> icons, std::vector<bool> expandable)
+     : Activity(std::move(activityName), renderer, mappedInput),
+       titleId_(titleId),
+       options_(std::move(options)),
++      icons_(std::move(icons)),
++      expandable_(std::move(expandable)),
+       currentIndex_(selectedIndex),
+       selectedIndex_(selectedIndex),
+       readerMode_(readerMode),
+@@ -143,7 +147,12 @@ void OptionSelectionActivity::buildOptionsScreen(UiApp::ScreenType& screen) {
+   for (size_t i = 0; i < options_.size(); ++i) {
+     fui::ListItem item;
+     item.label = options_[i].c_str();
+-    item.value = i == static_cast<size_t>(currentIndex_) ? tr(STR_SELECTED) : nullptr;
++    if(i<icons_.size() && icons_[i]) item.icon=fui::bitmapFromIcon(*icons_[i]);
++    if (i < expandable_.size() && expandable_[i]) {
++      item.value = "›";
++    } else if (!name.starts_with("Workflowy") && i == static_cast<size_t>(currentIndex_)) {
++      item.value = tr(STR_SELECTED);
++    }
+     item.actionValue = static_cast<int16_t>(i);
+     items.push_back(item);
+   }
+diff --git a/src/activities/util/OptionSelectionActivity.h b/src/activities/util/OptionSelectionActivity.h
+index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3724c2ba6 100644
+--- a/src/activities/util/OptionSelectionActivity.h
++++ b/src/activities/util/OptionSelectionActivity.h
+@@ -3,6 +3,7 @@
+ #include <FreeInkApp.h>
+ #include <FreeInkUIGfxRenderer.h>
+ #include <I18n.h>
++#include <Icon.h>
+ 
+ #include <atomic>
+ #include <string>
+@@ -15,7 +16,8 @@ class OptionSelectionActivity final : public Activity {
+  public:
+   OptionSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string activityName,
+                           StrId titleId, std::vector<std::string> options, uint8_t selectedIndex,
+-                          bool readerMode = false, bool showTouchHeaderBackButton = false);
++                          bool readerMode = false, bool showTouchHeaderBackButton = false,
++                          std::vector<const freeink::Icon*> icons = {}, std::vector<bool> expandable = {});
+ 
+   void onEnter() override;
+   void loop() override;
+@@ -29,6 +31,8 @@ class OptionSelectionActivity final : public Activity {
+   ButtonNavigator buttonNavigator_;
+   StrId titleId_;
+   std::vector<std::string> options_;
++  std::vector<const freeink::Icon*> icons_;
++  std::vector<bool> expandable_;
+   int currentIndex_ = 0;
+   int selectedIndex_ = 0;
+   bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c5592aacbcf9
+index 0000000000000000000000000000000000000000..c8622118d11545568b8b62c78b932f7a5f5f68c7
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5130 @@
+@@ -0,0 +1,5269 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1090,6 +1551,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
 +#include "workflowy/WorkflowySettings.h"
++#include "workflowy/WorkflowyTextDrawing.h"
 +#include "workflowy/WorkflowyIcon.h"
 +
 +// One day, capped by fetchChildren's MAX_ROWS. Shared across the picker/parent
@@ -1137,17 +1599,20 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +constexpr size_t OUTBOX_LIMIT = 24 * 1024;
 +constexpr size_t OUTBOX_ITEMS = 24;
 +constexpr unsigned long DELETE_GRACE = 8000;
++constexpr uint32_t IDLE_CLOSE_MS = 5 * 60 * 1000;
 +constexpr char API[] = "https://workflowy.com/api/v1/nodes";
 +
 +const freeink::Icon* workflowyActionIcon(StrId label) {
 +  if(label==StrId::STR_EDIT)return &workflowyActionEditIcon;
 +  if(label==StrId::STR_DELETE)return &workflowyActionDeleteIcon;
-+  if(label==StrId::STR_WORKFLOWY_MARK_DONE || label==StrId::STR_WORKFLOWY_MARK_UNDONE)return &workflowyActionDoneIcon;
++  if (label == StrId::STR_WORKFLOWY_MARK_DONE) return &workflowyActionDoneIcon;
++  if (label == StrId::STR_WORKFLOWY_MARK_UNDONE) return &workflowyActionUndoneIcon;
 +  if(label==StrId::STR_WORKFLOWY_SCHEDULE_VIEW || label==StrId::STR_WORKFLOWY_MOVE_DATE ||
 +     label==StrId::STR_WORKFLOWY_MOVE_TODAY || label==StrId::STR_WORKFLOWY_MOVE_TOMORROW || label==StrId::STR_WORKFLOWY_MOVE_YESTERDAY)return &workflowyActionCalendarIcon;
 +  if(label==StrId::STR_WORKFLOWY_ZOOM)return &workflowyActionZoomIcon;
 +  if(label==StrId::STR_WORKFLOWY_TURN_INTO || label==StrId::STR_WORKFLOWY_SELECT_MULTIPLE)return &workflowyActionConvertIcon;
-+  if(label==StrId::STR_WORKFLOWY_ADD_ABOVE || label==StrId::STR_WORKFLOWY_ADD_BELOW)return &workflowyActionAddIcon;
++  if(label==StrId::STR_WORKFLOWY_ADD || label==StrId::STR_WORKFLOWY_ADD_ABOVE ||
++     label==StrId::STR_WORKFLOWY_ADD_BELOW)return &workflowyActionAddIcon;
 +  return &workflowyActionMoveIcon;
 +}
 +
@@ -1587,12 +2052,55 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  int offset = 0, maxOffset = 0, pageLines = 1;
 +};
 +
-+std::string plainTitle(const char* value) {
++std::string plainTitle(const char* value, std::string* styles = nullptr) {
 +  std::string title;
++  struct InlineStyle { std::string_view name; uint8_t flags; };
++  std::vector<InlineStyle> stack;
++  uint8_t flags = 0;
++  if (styles) styles->clear();
++  const auto appendStyle = [&](size_t bytes) {
++    if (styles) styles->append(bytes, static_cast<char>(flags));
++  };
 +  while (*value) {
++    if (strncmp(value, "<time ", 6) == 0) {
++      int year = 0, month = 0, day = 0, consumed = 0;
++      if (sscanf(value, "<time startYear=\"%4d\" startMonth=\"%2d\" startDay=\"%2d\">%n",
++                 &year, &month, &day, &consumed) == 3 && consumed > 0) {
++        const char* closing = strstr(value + consumed, "</time>");
++        char date[16];
++        snprintf(date, sizeof(date), "%04d-%02d-%02d", year, month, day);
++        if (closing && validDate(date)) {
++          title += '[';
++          title += date;
++          title += ']';
++          appendStyle(12);
++          value = closing + 7;
++          continue;
++        }
++      }
++    }
 +    if (*value == '<') {
 +      const char* end = strchr(value, '>');
 +      if (end) {
++        if (styles) {
++          std::string_view tag(value + 1, end - value - 1);
++          const bool closing = tag.starts_with('/');
++          if (closing) tag.remove_prefix(1);
++          const auto delimiter = tag.find_first_of(" \t\r\n/");
++          const auto name = tag.substr(0, delimiter);
++          if (closing) {
++            const auto match = std::find_if(stack.rbegin(), stack.rend(),
++                                            [&](const InlineStyle& item) { return item.name == name; });
++            if (match != stack.rend()) {
++              stack.erase(match.base() - 1, stack.end());
++              flags = stack.empty() ? 0 : stack.back().flags;
++            }
++          } else if (stack.size() < 32 && !tag.ends_with('/') && !name.empty()) {
++            flags |= workflowy::htmlTextStyle(name, delimiter == std::string_view::npos ? std::string_view{} :
++                                                                               tag.substr(delimiter));
++            stack.push_back({name, flags});
++          }
++        }
 +        value = end + 1;
 +        continue;
 +      }
@@ -1603,6 +2111,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +      const auto len = strlen(name);
 +      if (strncmp(value, name, len) == 0) {
 +        title += character;
++        appendStyle(1);
 +        value += len;
 +        entity = true;
 +        break;
@@ -1611,15 +2120,33 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +    if (!entity) {
 +      const char c = *value++;
 +      title += c == '\r' || c == '\n' || c == '\t' ? ' ' : c;
++      appendStyle(1);
 +    }
 +  }
-+  workflowy::dropEmoji(title);
++  workflowy::dropEmoji(title, styles);
++  if (styles) workflowy::normalizeStyles(*styles);
 +  return title;
 +}
 +
 +std::string escapedTitle(const std::string& text, const bool creating) {
 +  std::string output;
-+  for (const char c : text) {
++  for (size_t i = 0; i < text.size(); ++i) {
++    const char c = text[i];
++    if (c == '[' && i + 11 < text.size() && text[i + 11] == ']') {
++      const auto date = text.substr(i + 1, 10);
++      if (validDate(date)) {
++        if (creating) {
++          output.append(text, i, 12);
++        } else {
++          const auto month = (date[5] - '0') * 10 + date[6] - '0';
++          const auto day = (date[8] - '0') * 10 + date[9] - '0';
++          output += "<time startYear=\"" + date.substr(0, 4) + "\" startMonth=\"" + std::to_string(month) +
++                    "\" startDay=\"" + std::to_string(day) + "\">" + date + "</time>";
++        }
++        i += 11;
++        continue;
++      }
++    }
 +    if (!creating && c == '&') output += "&amp;";
 +    else if (!creating && c == '<') output += "&lt;";
 +    else if (!creating && c == '>') output += "&gt;";
@@ -1659,7 +2186,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +
 +void WorkflowyDailyActivity::cacheChildren(const std::string& parent, const std::vector<Node>& children) {
 +  if (parent.empty() || parent.size() > 80 || parent.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-") != std::string::npos || children.size() > MAX_ROWS) return;
-+  for (const auto& node : children) if (node.id.empty() || node.id.size() > 80 || node.title.size() > 8192) return;
++  for (const auto& node : children) if (node.id.empty() || node.id.size() > 80 || node.title.size() > 8192 || node.textStyles.size() > 8192) return;
 +  Storage.mkdir("/.crashink");
 +  Storage.mkdir(SESSION_CACHE);
 +  const auto path = std::string(SESSION_CACHE) + "/" + parent;
@@ -1684,17 +2211,18 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  auto file = Storage.open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
 +  if (!file) return;
 +  const auto write = [&](const void* data, size_t bytes) { return file.write(reinterpret_cast<const uint8_t*>(data), bytes) == bytes; };
-+  const uint32_t header[] = {0x57464332, static_cast<uint32_t>(millis())};
++  const uint32_t header[] = {0x57464333, static_cast<uint32_t>(millis())};
 +  const uint16_t count = children.size();
 +  bool ok = write(header, sizeof(header)) && write(&count, sizeof(count));
 +  for (const auto& node : children) {
 +    if (!ok) break;
 +    const uint8_t idLength = node.id.size(); const uint16_t titleLength = node.title.size();
++    const uint16_t stylesLength = node.textStyles.size();
 +    const int32_t priority = node.priority;
 +    const uint8_t flags = node.todo | (node.done << 1) | (node.leaf << 2) | (node.childrenConfirmed << 3) |
 +                          (node.divider << 4) | (node.scheduledDivider << 5) | (node.legacyDividerNote << 6);
-+    ok = write(&idLength, 1) && write(&titleLength, 2) && write(&priority, 4) && write(&flags, 1) &&
-+         write(node.id.data(), idLength) && write(node.title.data(), titleLength);
++    ok = write(&idLength, 1) && write(&titleLength, 2) && write(&stylesLength, 2) && write(&priority, 4) && write(&flags, 1) &&
++         write(node.id.data(), idLength) && write(node.title.data(), titleLength) && write(node.textStyles.data(), stylesLength);
 +  }
 +  ok = ok && file.sync();file.close();
 +  if (ok) { Storage.remove(path.c_str()); Storage.rename(temp.c_str(), path.c_str()); }
@@ -1707,15 +2235,15 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  if (!file || file.size() > 512 * 1024) return false;
 +  const auto read = [&](void* data, size_t bytes) { return file.read(reinterpret_cast<uint8_t*>(data), bytes) == static_cast<int>(bytes); };
 +  uint32_t header[2]{};uint16_t count=0;
-+  if (!read(header, sizeof(header)) || header[0] != 0x57464332 || !read(&count,2) || count > MAX_ROWS ||
++  if (!read(header, sizeof(header)) || header[0] != 0x57464333 || !read(&count,2) || count > MAX_ROWS ||
 +      ESP.getMaxAllocHeap() < count * sizeof(Node) + 32768) return false;
 +  children.clear();children.reserve(count);
 +  for (unsigned i=0;i<count;++i) {
-+    uint8_t idLength=0, flags=0;uint16_t titleLength=0;int32_t priority=0;
-+    if (!read(&idLength,1) || !read(&titleLength,2) || !read(&priority,4) || !read(&flags,1) ||
-+        !idLength || idLength>80 || titleLength>8192) {children.clear();return false;}
-+    Node node;node.id.resize(idLength);node.title.resize(titleLength);
-+    if (!read(node.id.data(),idLength) || !read(node.title.data(),titleLength)) {children.clear();return false;}
++    uint8_t idLength=0, flags=0;uint16_t titleLength=0, stylesLength=0;int32_t priority=0;
++    if (!read(&idLength,1) || !read(&titleLength,2) || !read(&stylesLength,2) || !read(&priority,4) || !read(&flags,1) ||
++        !idLength || idLength>80 || titleLength>8192 || (stylesLength && stylesLength != titleLength)) {children.clear();return false;}
++    Node node;node.id.resize(idLength);node.title.resize(titleLength);node.textStyles.resize(stylesLength);
++    if (!read(node.id.data(),idLength) || !read(node.title.data(),titleLength) || !read(node.textStyles.data(),stylesLength)) {children.clear();return false;}
 +    node.depth=depth;node.priority=priority;node.todo=flags&1;node.done=flags&2;node.leaf=flags&4;
 +    node.childrenConfirmed=flags&8;node.divider=flags&16;node.scheduledDivider=flags&32;node.legacyDividerNote=flags&64;
 +    children.push_back(std::move(node));
@@ -1725,6 +2253,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +
 +void WorkflowyDailyActivity::onEnter() {
 +  Activity::onEnter();
++  onUserInput();
 +  clearSessionCache();
 +  credential = workflowy::readSetting(workflowy::KEY_FILE, workflowy::KEY_MAX);
 +  date = isoDate(0);
@@ -2066,6 +2595,12 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  }
 +}
 +
++void WorkflowyDailyActivity::onUserInput() { lastUserInputAt = static_cast<uint32_t>(millis()); }
++
++bool WorkflowyDailyActivity::idleTimeoutExpired() const {
++  return static_cast<uint32_t>(millis()) - lastUserInputAt >= IDLE_CLOSE_MS;
++}
++
 +bool WorkflowyDailyActivity::preventAutoSleep() {
 +  const auto now = static_cast<uint32_t>(millis());
 +  return std::any_of(saves.begin(), saves.end(), [&](const auto& save) {
@@ -2210,7 +2745,6 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +}
 +
 +bool WorkflowyDailyActivity::pollSave() {
-+  serviceBackgroundWork();
 +  if (saves.empty() || !saves.front()->ready.load(std::memory_order_acquire)) return false;
 +  std::unique_ptr<Save> completed;
 +  {
@@ -2386,8 +2920,11 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  for (const auto value : nodes) {
 +    std::string id = value["id"] | "";
 +    if (id.empty() || id.find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos) continue;
-+    result.push_back({std::move(id), plainTitle(value["name"] | ""), depth, value["priority"] | 0,
++    std::string styles;
++    auto title = plainTitle(value["name"] | "", &styles);
++    result.push_back({std::move(id), std::move(title), depth, value["priority"] | 0,
 +                      strcmp(value["data"]["layoutMode"] | "", "todo") == 0, value["completed"] | false});
++    result.back().textStyles = std::move(styles);
 +    result.back().divider = strcmp(value["data"]["layoutMode"] | "", "divider") == 0;
 +    result.back().legacyDividerNote = result.back().divider && strcmp(value["note"] | "", "crASHink:scheduled-divider") == 0;
 +    const auto marker = "=" + result.back().id;
@@ -2577,7 +3114,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +}
 +
 +void WorkflowyDailyActivity::toggle(const size_t row) {
-+  if (itemPending(rows[row].id) || (!rows[row].todo && !rows[row].done)) return;
++  if (row >= rows.size() || itemPending(rows[row].id) || rows[row].divider) return;
 +  const bool completed = rows[row].done;
 +  const char* failed = completed ? tr(STR_WORKFLOWY_UNCOMPLETE_FAILED) : tr(STR_WORKFLOWY_COMPLETE_FAILED);
 +  if (!online) {
@@ -2604,6 +3141,9 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +        updateCompletion(id, completed);
 +        return true;
 +      });
++      if (!completed && zoomId == id && !viewStack.empty() && !calendarVisible && !queueVisible) {
++        returnToDepth(viewStack.size() - 1);
++      }
 +    }, "POST", label, id)) {
 +    updateCompletion(id, !completed);
 +  }
@@ -2639,6 +3179,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  const std::string id = row < rows.size() ? rows[row].id : "";
 +  const std::string initial = adding ? (initialText.empty() ? "[] " : std::move(initialText)) : rows[row].title;
 +  const bool originalTodo = !adding && rows[row].todo;
++  const auto originalStyles = adding ? std::string{} : rows[row].textStyles;
 +  const int parentIndex = relative ? parentRow(row) : -1;
 +  const bool scheduled = !targetDate.empty();
 +  const std::string createDate = scheduled ? std::move(targetDate) : date;
@@ -2646,22 +3187,33 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  auto keyboard = std::make_unique<KeyboardEntryActivity>(
 +      renderer, mappedInput, adding ? tr(STR_WORKFLOWY_ADD) : tr(STR_EDIT), initial, 512);
 +  keyboard->setInitialCursor(adding ? initial.size() : cursor);
-+  keyboard->enableWorkflowyTags(adding);
-+  startActivityForResult(std::move(keyboard), [this, id, initial, originalTodo, parent, adding, relative, createDate, scheduled](const ActivityResult& result) {
++  keyboard->enableWorkflowyTags(true);
++  keyboard->enableWorkflowyFormatting(originalStyles);
++  const auto today = isoDate(0);
++  const auto selectedDate = validDate(createDate) ? createDate : createDate == "tomorrow" ? isoDate(1) : today;
++  keyboard->setWorkflowyDatePicker([this, selectedDate, today]() {
++    return std::make_unique<WorkflowyDatePicker>(renderer, mappedInput, StrId::STR_DATE, selectedDate, today);
++  });
++  startActivityForResult(std::move(keyboard), [this, id, initial, originalTodo, originalStyles, parent, adding, relative, createDate, scheduled](const ActivityResult& result) {
 +    if (result.isCancelled) return;
-+    auto text = std::get<KeyboardResult>(result.data).text;
-+    workflowy::dropEmoji(text);
++    auto entered = std::get<KeyboardResult>(result.data);
++    auto& text = entered.text;
++    auto& styles = entered.workflowyStyles;
++    workflowy::dropEmoji(text, &styles);
 +    const auto first = text.find_first_not_of(" ");
 +    const bool makeTodo = first != std::string::npos && (text.compare(first, 2, "[]") == 0 ||
 +                                                         text.compare(first, 3, "[ ]") == 0);
 +    if (makeTodo) {
 +      const auto start = text.find_first_not_of(" ", first + (text[first + 1] == ']' ? 2 : 3));
-+      text = start == std::string::npos ? "" : text.substr(start);
++      if (!styles.empty()) styles.erase(0, start);
++      text.erase(0, start);
 +    }
-+    if (text == initial && !makeTodo) return;
++    workflowy::normalizeStyles(styles);
++    if (text == initial && styles == originalStyles && !makeTodo) return;
 +    if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
 +    JsonDocument update;
-+    update["name"] = escapedTitle(text, adding);
++    update["name"] = styles.empty() ? escapedTitle(text, adding) :
++        workflowy::styledHtml(text, styles, [](std::string_view run) { return escapedTitle(std::string(run), false); });
 +    if (makeTodo) update["layoutMode"] = "todo";
 +    if (adding) {
 +      update["parent_id"] = parent.empty() ? createDate : parent;
@@ -2677,7 +3229,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +    const auto capturedDate = createDate;
 +    const auto label = adding ? StrId::STR_WORKFLOWY_ADD : StrId::STR_EDIT;
 +    if (!queueSave(adding ? "" : "/" + id, encode(update), adding,
-+              [this, id, localId, parent, initial, originalTodo, adding, relative, capturedDate](const Save& save) {
++              [this, id, localId, parent, initial, originalTodo, originalStyles, adding, relative, capturedDate](const Save& save) {
 +      if (save.status < 200 || save.status >= 300) {
 +        if (adding) {
 +          {
@@ -2687,7 +3239,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +            }
 +          }
 +          removeNode(localId);
-+        } else applyTitle(id, initial, originalTodo);
++        } else applyTitle(id, initial, originalTodo, &originalStyles);
 +        return showMessage(tr(STR_WORKFLOWY_SEND_FAILED));
 +      }
 +      if (!adding) return;
@@ -2718,10 +3270,11 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +        if (anchor != rows.end() && added != rows.end()) reorder(added - rows.begin(), anchor - rows.begin(), relative > 0);
 +      }
 +    }, "POST", label, localId)) return;
-+    if (!adding) return applyTitle(id, text, makeTodo || originalTodo);
++    if (!adding) return applyTitle(id, text, makeTodo || originalTodo, &styles);
 +    {
 +      RenderLock lock(*this);
 +      Node added{localId, text, 0, 0, makeTodo, false};
++      added.textStyles = styles;
 +      added.leaf = true;
 +      if (scheduled) {
 +        for (auto& day : calendarDays) if (day.date == createDate) day.items.push_back(added);
@@ -2737,18 +3290,21 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  });
 +}
 +
-+void WorkflowyDailyActivity::applyTitle(const std::string& id, const std::string& text, bool todo) {
++void WorkflowyDailyActivity::applyTitle(const std::string& id, const std::string& text, bool todo, const std::string* styles) {
 +  {
 +    RenderLock lock(*this);
 +    const auto apply = [&](std::vector<Node>& outline) {
 +      for (auto& item : outline) {
 +        if (item.id != id) continue;
++        if (styles) item.textStyles = *styles;
++        else workflowy::rebaseTextStyles(item.title, text, item.textStyles);
 +        item.title = text;
 +        item.todo = todo;
 +      }
 +    };
 +    apply(rows);
 +    for (auto& view : viewStack) apply(view.rows);
++    for (auto& day : calendarDays) apply(day.items);
 +    layoutDirty = true;
 +  }
 +  requestUpdate();
@@ -2809,11 +3365,15 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  if (!count) return;
 +  const bool hasTodo = std::any_of(rows.begin(), rows.end(), [](const Node& node) { return node.selected && node.todo; });
 +  const bool hasBullet = std::any_of(rows.begin(), rows.end(), [](const Node& node) { return node.selected && !node.todo; });
-+  const bool hasCompletable = std::any_of(rows.begin(), rows.end(), [](const Node& node) {
-+    return node.selected && (node.todo || node.done);
++  const bool hasIncomplete = std::any_of(rows.begin(), rows.end(), [](const Node& node) {
++    return node.selected && node.todo && !node.done && !node.divider;
 +  });
-+  enum class Command { Edit, Done, Undone, Schedule, Move, Convert, Zoom, Above, Below, Delete };
++  const bool hasComplete = std::any_of(rows.begin(), rows.end(), [](const Node& node) {
++    return node.selected && node.done && !node.divider;
++  });
++  enum class Command { Edit, Done, Undone, Schedule, Move, Convert, Zoom, Add, Delete };
 +  std::vector<std::string> labels;
++  std::vector<bool> expandable;
 +  std::vector<const freeink::Icon*> icons;icons.reserve(12);
 +  std::vector<Command> commands;
 +  labels.reserve(10);
@@ -2822,22 +3382,21 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +    commands.push_back(command);
 +    labels.emplace_back(I18n::getInstance().get(label));
 +    icons.push_back(workflowyActionIcon(label));
++    expandable.push_back(command == Command::Add || command == Command::Schedule ||
++                         command == Command::Move || command == Command::Convert);
 +  };
 +  if (count == 1) add(Command::Edit, StrId::STR_EDIT);
-+  if (hasCompletable) {
-+    add(Command::Done, StrId::STR_WORKFLOWY_MARK_DONE);
-+    add(Command::Undone, StrId::STR_WORKFLOWY_MARK_UNDONE);
-+  }
++  if (hasIncomplete) add(Command::Done, StrId::STR_WORKFLOWY_MARK_DONE);
++  if (hasComplete) add(Command::Undone, StrId::STR_WORKFLOWY_MARK_UNDONE);
 +  add(Command::Schedule, StrId::STR_WORKFLOWY_SCHEDULE_VIEW);
 +  add(Command::Move, StrId::STR_WORKFLOWY_MOVE);
 +  add(Command::Convert, StrId::STR_WORKFLOWY_TURN_INTO);
 +  if (count == 1) add(Command::Zoom, StrId::STR_WORKFLOWY_ZOOM);
-+  add(Command::Above, StrId::STR_WORKFLOWY_ADD_ABOVE);
-+  add(Command::Below, StrId::STR_WORKFLOWY_ADD_BELOW);
++  add(Command::Add, StrId::STR_WORKFLOWY_ADD);
 +  add(Command::Delete, StrId::STR_DELETE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyBulk", StrId::STR_WORKFLOWY_BULK_ACTIONS,
-+                             std::move(labels), 0, false, true, std::move(icons)),
++                             std::move(labels), 0, false, true, std::move(icons), std::move(expandable)),
 +                         [this, commands = std::move(commands), hasTodo, hasBullet](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const size_t index = std::get<OptionSelectionResult>(result.data).index;
@@ -2872,16 +3431,15 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +      return;
 +    }
 +    auto node = std::find_if(rows.begin(), rows.end(), [](const Node& node) { return node.selected; });
-+    if (command == Command::Below) {
-+      const auto last = std::find_if(rows.rbegin(), rows.rend(), [](const Node& node) { return node.selected; });
-+      if (last != rows.rend()) node = std::prev(last.base());
-+    }
 +    if (node == rows.end() || itemPending(node->id)) return;
++    if (command == Command::Add) {
++      const auto last = std::find_if(rows.rbegin(), rows.rend(), [](const Node& node) { return node.selected; });
++      return showAddMenu(node->id, last->id, true);
++    }
 +    const size_t row = node - rows.begin();
 +    cancelSelection();
 +    if (command == Command::Edit) return edit(row);
 +    if (command == Command::Zoom) return zoom(row);
-+    edit(row, command == Command::Above ? -1 : 1);
 +  });
 +}
 +
@@ -2889,6 +3447,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  struct Choice { BulkAction action; std::string target; };
 +  std::vector<Choice> choices;
 +  std::vector<std::string> labels;
++  std::vector<bool> expandable;
 +  std::vector<const freeink::Icon*> icons;icons.reserve(8);
 +  choices.reserve(7);
 +  labels.reserve(7);
@@ -2896,6 +3455,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +    choices.push_back({action, std::move(target)});
 +    labels.emplace_back(I18n::getInstance().get(label));
 +    icons.push_back(workflowyActionIcon(label));
++    expandable.push_back(action == BulkAction::None || choices.back().target == "@parent");
 +  };
 +  add(BulkAction::MoveTop, StrId::STR_WORKFLOWY_MOVE_TOP);
 +  add(BulkAction::MoveBottom, StrId::STR_WORKFLOWY_MOVE_BOTTOM);
@@ -2913,7 +3473,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  add(BulkAction::None, StrId::STR_WORKFLOWY_MOVE_DATE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyBulkMove", StrId::STR_WORKFLOWY_MOVE,
-+                             std::move(labels), 0, false, true, std::move(icons)),
++                             std::move(labels), 0, false, true, std::move(icons), std::move(expandable)),
 +                         [this, choices = std::move(choices)](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const size_t index = std::get<OptionSelectionResult>(result.data).index;
@@ -3027,8 +3587,9 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +
 +void WorkflowyDailyActivity::actions(const size_t row) {
 +  if (itemPending(rows[row].id)) return;
-+  enum class Action { Edit, Complete, Schedule, Move, TurnInto, Zoom, AddAbove, AddBelow, Select, Delete };
++  enum class Action { Edit, Complete, Schedule, Move, TurnInto, Zoom, Add, Select, Delete };
 +  std::vector<std::string> options;
++  std::vector<bool> expandable;
 +  std::vector<const freeink::Icon*> icons;icons.reserve(12);
 +  std::vector<Action> commands;
 +  options.reserve(10);
@@ -3037,25 +3598,23 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +    commands.push_back(action);
 +    options.emplace_back(I18n::getInstance().get(label));
 +    icons.push_back(workflowyActionIcon(label));
++    expandable.push_back(action == Action::Add || action == Action::Schedule ||
++                         action == Action::Move || action == Action::TurnInto);
 +  };
 +  if (!rows[row].divider) {
 +  add(Action::Edit, StrId::STR_EDIT);
-+  if (rows[row].todo || rows[row].done)
-+    add(Action::Complete, rows[row].done ? StrId::STR_WORKFLOWY_MARK_UNDONE : StrId::STR_WORKFLOWY_MARK_DONE);
++  add(Action::Complete, rows[row].done ? StrId::STR_WORKFLOWY_MARK_UNDONE : StrId::STR_WORKFLOWY_MARK_DONE);
 +  add(Action::Schedule, StrId::STR_WORKFLOWY_SCHEDULE_VIEW);
 +  add(Action::Move, StrId::STR_WORKFLOWY_MOVE);
 +  add(Action::TurnInto, StrId::STR_WORKFLOWY_TURN_INTO);
 +  add(Action::Zoom, StrId::STR_WORKFLOWY_ZOOM);
-+  if (zoomId.empty() || row != 0) {
-+    add(Action::AddAbove, StrId::STR_WORKFLOWY_ADD_ABOVE);
-+    add(Action::AddBelow, StrId::STR_WORKFLOWY_ADD_BELOW);
-+  }
++  if (zoomId.empty() || row != 0) add(Action::Add, StrId::STR_WORKFLOWY_ADD);
 +  if (selectionEligible(rows[row])) add(Action::Select, StrId::STR_WORKFLOWY_SELECT_MULTIPLE);
 +  }
 +  add(Action::Delete, StrId::STR_DELETE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyItem", StrId::STR_WORKFLOWY, std::move(options),
-+                             0, false, true, std::move(icons)),
++                             0, false, true, std::move(icons), std::move(expandable)),
 +                         [this, row, commands = std::move(commands)](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const size_t index = std::get<OptionSelectionResult>(result.data).index;
@@ -3072,8 +3631,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +    if (selected == Action::Schedule) return scheduleItem(row);
 +    if (selected == Action::Complete) return toggle(row);
 +    if (selected == Action::Edit) return edit(row);
-+    if ((zoomId.empty() || row != 0) && (selected == Action::AddAbove || selected == Action::AddBelow))
-+      return edit(row, selected == Action::AddAbove ? -1 : 1);
++    if (selected == Action::Add) return showAddMenu(id, id, false);
 +    if (selected == Action::Zoom) return zoom(row);
 +    if (selected == Action::Move) return showMoveMenu(row);
 +    if (selected == Action::TurnInto) {
@@ -3120,6 +3678,23 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +        }, true);
 +      });
 +    }
++  });
++}
++
++void WorkflowyDailyActivity::showAddMenu(std::string aboveId, std::string belowId, bool bulk) {
++  std::vector<std::string> choices{tr(STR_WORKFLOWY_ADD_ABOVE), tr(STR_WORKFLOWY_ADD_BELOW)};
++  std::vector<const freeink::Icon*> icons{&workflowyActionAddIcon, &workflowyActionAddIcon};
++  startActivityForResult(std::make_unique<OptionSelectionActivity>(
++                             renderer, mappedInput, "WorkflowyAdd", StrId::STR_WORKFLOWY_ADD,
++                             std::move(choices), 0, false, true, std::move(icons)),
++                         [this, aboveId = std::move(aboveId), belowId = std::move(belowId), bulk](const ActivityResult& result) {
++    if (result.isCancelled) return;
++    const bool below = std::get<OptionSelectionResult>(result.data).index == 1;
++    const auto& id = below ? belowId : aboveId;
++    const auto item = std::find_if(rows.begin(), rows.end(), [&](const Node& node) { return node.id == id; });
++    if (item == rows.end() || itemPending(id) || id == zoomId) return;
++    if (bulk) cancelSelection();
++    edit(item - rows.begin(), below ? 1 : -1);
 +  });
 +}
 +
@@ -3181,11 +3756,13 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  struct Choice { Move action; std::string target; };
 +  std::vector<Choice> choices;
 +  std::vector<std::string> labels;
++  std::vector<bool> expandable;
 +  std::vector<const freeink::Icon*> icons;icons.reserve(12);
 +  const auto add = [&](Move move, StrId label, std::string target = {}) {
 +    choices.push_back({move, std::move(target)});
 +    labels.emplace_back(I18n::getInstance().get(label));
 +    icons.push_back(workflowyActionIcon(label));
++    expandable.push_back(move == Move::Parent || move == Move::Date);
 +  };
 +  if (sibling && origin.after) add(Move::Top, StrId::STR_WORKFLOWY_MOVE_TOP);
 +  const auto next = std::find_if(rows.begin() + row + 1, rows.end(),
@@ -3203,7 +3780,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  add(Move::Date, StrId::STR_WORKFLOWY_MOVE_DATE);
 +  startActivityForResult(std::make_unique<OptionSelectionActivity>(
 +                             renderer, mappedInput, "WorkflowyMove", StrId::STR_WORKFLOWY_MOVE,
-+                             std::move(labels), 0, false, true, std::move(icons)),
++                             std::move(labels), 0, false, true, std::move(icons), std::move(expandable)),
 +                         [this, id, choices = std::move(choices)](const ActivityResult& result) {
 +    if (result.isCancelled) return;
 +    const auto choice = std::get<OptionSelectionResult>(result.data).index;
@@ -4329,6 +4906,16 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +}
 +
 +void WorkflowyDailyActivity::loop() {
++  // Service requests before handling gestures, including back-to-back page turns.
++  serviceBackgroundWork();
++  if (idleTimeoutExpired()) {
++    // Finish already accepted writes, including any delete whose undo window
++    // expired, before closing the full Workflowy screen from any zoom level.
++    if (saves.empty()) commitDelete();
++    if (saves.empty()) return finish();
++    pollSave();
++    return;
++  }
 +  using Button = MappedInputManager::Button;
 +  using Swipe = MappedInputManager::SwipeDir;
 +  if (mappedInput.wasReleased(Button::Back)) {
@@ -4737,7 +5324,7 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +  if (!pending && !notice) return;
 +  char count[52];
 +  const char* label = notice;
-+  if (!error && pending) {
++  if (pending) {
 +    if (pending > 1 || calendarVisible) {
 +      snprintf(count, sizeof(count), pending == 1 ? tr(STR_WORKFLOWY_ACTION_PENDING)
 +                                                : tr(STR_WORKFLOWY_ACTIONS_PENDING),
@@ -4989,9 +5576,22 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +      workflowy::forEachTag(title, highlightSpan);
 +      if (timeRange) highlightSpan({timeRange->begin, timeRange->finish});
 +      if (leading) renderer.drawText(font, textX, lineY, CONTINUATION);
-+      renderer.drawText(font, lineX, lineY, text.c_str());
++      int richWidth = -1;
++      if (!node.textStyles.empty() && !text.empty()) {
++        std::string styles(text.size(), '\0');
++        const auto count = std::min(text.size(), span.end - span.begin);
++        for (size_t byte = 0; byte < count; ++byte) {
++          const auto offset = wrapItems ? span.begin + byte :
++              workflowy::compactTaskOriginalOffset(bodyText, span.begin + byte);
++          const auto original = projection.originalOffset(span.metadata, offset);
++          if (original < node.textStyles.size()) styles[byte] = node.textStyles[original];
++        }
++        richWidth = workflowy::layoutStyledText(renderer, font, lineX, lineY, text, styles, true);
++      } else {
++        renderer.drawText(font, lineX, lineY, text.c_str());
++      }
 +      if (node.done || (continues && line + 1 == placement.lineCount)) {
-+        const int tail = lineX + renderer.getTextWidth(font, text.c_str());
++        const int tail = lineX + (richWidth >= 0 ? richWidth : renderer.getTextWidth(font, text.c_str()));
 +        if (node.done) renderer.drawLine(lineX, lineY + renderer.getLineHeight(font) / 2, tail, lineY + renderer.getLineHeight(font) / 2);
 +        if (continues && line + 1 == placement.lineCount)
 +          renderer.drawText(font, tail + CONTINUATION_GAP, lineY, CONTINUATION);
@@ -6179,10 +6779,10 @@ index 0000000000000000000000000000000000000000..8eea3e8ba45c8ef93ac94cf459f9c559
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..7bb40c7973bb9677c489dbdbcd9de9c1a5904327
+index 0000000000000000000000000000000000000000..082a9843283df4024034481b432cfc8bd9bb46e7
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,352 @@
 +#pragma once
 +
 +#include <atomic>
@@ -6210,6 +6810,10 @@ index 0000000000000000000000000000000000000000..7bb40c7973bb9677c489dbdbcd9de9c1
 +  WorkflowyDailyActivity(GfxRenderer& renderer, MappedInputManager& input, bool calendar = false);
 +  void onEnter() override;
 +  void onExit() override;
++  void onUserInput() override;
++  void onChildUserInput() override { onUserInput(); }
++  bool idleTimeoutExpired() const override;
++  bool closeBeforeSleep() const override { return true; }
 +  void loop() override;
 +  void serviceBackgroundWork() override;
 +  void render(RenderLock&&) override;
@@ -6228,6 +6832,7 @@ index 0000000000000000000000000000000000000000..7bb40c7973bb9677c489dbdbcd9de9c1
 +    bool childrenConfirmed = false;
 +    bool selected = false;
 +    bool divider = false, scheduledDivider = false, legacyDividerNote = false;
++    std::string textStyles{};
 +  };
 +
 +  struct Layout;
@@ -6437,6 +7042,7 @@ index 0000000000000000000000000000000000000000..7bb40c7973bb9677c489dbdbcd9de9c1
 +  void refreshOfflineQueuePreview();
 +  unsigned temporaryId = 0;
 +  bool leaveAfterSave = false;
++  uint32_t lastUserInputAt = 0;
 +  static void saveTask(void* argument);
 +  bool queueSave(std::string path, std::string body, bool capture, std::function<void(const Save&)> finish,
 +                 const char* method = "POST", StrId label = StrId::STR_EDIT, std::string item = {},
@@ -6518,6 +7124,7 @@ index 0000000000000000000000000000000000000000..7bb40c7973bb9677c489dbdbcd9de9c1
 +  void loadDay();
 +  void toggle(size_t row);
 +  void actions(size_t row);
++  void showAddMenu(std::string aboveId, std::string belowId, bool bulk);
 +  void edit(size_t row, int relative = 0, size_t cursor = std::string::npos,
 +            std::string initialText = {}, std::string targetDate = {});
 +  size_t cursorAt(std::string_view text, workflowy::TextSpan line, int width, int font) const;
@@ -6525,15 +7132,15 @@ index 0000000000000000000000000000000000000000..7bb40c7973bb9677c489dbdbcd9de9c1
 +  void chooseParent(const std::string& id, bool bulk = false);
 +  void showMoveMenu(size_t row);
 +  void shiftDay(int delta);
-+  void applyTitle(const std::string& id, const std::string& text, bool todo);
++  void applyTitle(const std::string& id, const std::string& text, bool todo, const std::string* styles = nullptr);
 +  void moveToDate(const std::string& id, const std::string& target);
 +};
 diff --git a/src/workflowy/WorkflowyIcon.h b/src/workflowy/WorkflowyIcon.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..6b8340cbf96fdcfe936c21958129245038aec466
+index 0000000000000000000000000000000000000000..be85ab98da0c693c07c446bd60bc8bcc76b8bc51
 --- /dev/null
 +++ b/src/workflowy/WorkflowyIcon.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,144 @@
 +#pragma once
 +#include <Icon.h>
 +
@@ -6624,6 +7231,15 @@ index 0000000000000000000000000000000000000000..6b8340cbf96fdcfe936c219581292450
 +  0xe0, 0x00, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 +};
 +inline constexpr freeink::Icon workflowyActionDoneIcon{24,24,12,workflowyActionDoneBits};
++inline constexpr uint8_t workflowyActionUndoneBits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x00, 0x07,
++  0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7,
++  0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7,
++  0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7,
++  0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7, 0xef, 0xff, 0xf7,
++  0xe0, 0x00, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon workflowyActionUndoneIcon{24,24,12,workflowyActionUndoneBits};
 +inline constexpr uint8_t workflowyActionCalendarBits[] = {
 +  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, 0x3f, 0xff, 0x3f, 0x3f,
 +  0xf0, 0x00, 0x07, 0xf7, 0x3f, 0x37, 0xf7, 0x3f, 0x37, 0xf7, 0x7f, 0x77,
@@ -6671,10 +7287,10 @@ index 0000000000000000000000000000000000000000..6b8340cbf96fdcfe936c219581292450
 +inline constexpr freeink::Icon workflowyActionAddIcon{24,24,12,workflowyActionAddBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0c17ba94713927b61e945f0505b679a67234d71c
+index 0000000000000000000000000000000000000000..71bfba9622a42daef1aa143a12a3500a07075d16
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,266 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -6727,7 +7343,8 @@ index 0000000000000000000000000000000000000000..0c17ba94713927b61e945f0505b679a6
 +  return at;
 +}
 +
-+inline void dropEmoji(std::string& text) {
++inline void dropEmoji(std::string& text, std::string* styles = nullptr) {
++  if (styles && styles->size() != text.size()) styles = nullptr;
 +  size_t write = 0;
 +  for (size_t at = 0; at < text.size();) {
 +    const auto end = nextCharacter(text, at);
@@ -6753,11 +7370,15 @@ index 0000000000000000000000000000000000000000..0c17ba94713927b61e945f0505b679a6
 +                       (cp >= 0xe0020 && cp <= 0xe007f) || cp == 0xfe0f || cp == 0x200d ||
 +                       cp == 0x231a || cp == 0x231b || cp == 0x2b50 || cp == 0x2b55;
 +    if (!emoji) {
-+      for (auto i = at; i < end; ++i) text[write++] = text[i];
++      for (auto i = at; i < end; ++i) {
++        if (styles) (*styles)[write] = (*styles)[i];
++        text[write++] = text[i];
++      }
 +    }
 +    at = end;
 +  }
 +  text.resize(write);
++  if (styles) styles->resize(write);
 +}
 +
 +// Only a leading time range schedules a task for sorting. Decorative emoji
@@ -6936,139 +7557,108 @@ index 0000000000000000000000000000000000000000..0c17ba94713927b61e945f0505b679a6
 +}
 +
 +}  // namespace workflowy
-diff --git a/src/workflowy/WorkflowySettings.h b/src/workflowy/WorkflowySettings.h
+diff --git a/src/workflowy/WorkflowyRichText.h b/src/workflowy/WorkflowyRichText.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..332ecb56e7c7e8709f7e93ae0d4d351b9cf2a00f
+index 0000000000000000000000000000000000000000..893bd971022b576509bff1f12bf9592c57644202
 --- /dev/null
-+++ b/src/workflowy/WorkflowySettings.h
-@@ -0,0 +1,20 @@
++++ b/src/workflowy/WorkflowyRichText.h
+@@ -0,0 +1,96 @@
 +#pragma once
 +
-+#include <cstddef>
++#include <algorithm>
++#include <array>
 +#include <cstdint>
 +#include <string>
++#include <string_view>
 +
 +namespace workflowy {
-+inline constexpr uint32_t SAVE_TIMEOUT_MS = 180000;
-+inline bool saveTimedOut(uint32_t queuedAt, uint32_t now) {
-+  return static_cast<uint32_t>(now - queuedAt) >= SAVE_TIMEOUT_MS;
-+}
-+inline uint32_t saveTimeRemaining(uint32_t queuedAt, uint32_t now) {
-+  const auto elapsed = static_cast<uint32_t>(now - queuedAt);
-+  return elapsed >= SAVE_TIMEOUT_MS ? 0 : SAVE_TIMEOUT_MS - elapsed;
-+}
-+inline constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
-+inline constexpr size_t KEY_MAX = 256;
-+std::string readSetting(const char* path, size_t limit);
-+bool writeSetting(const char* path, const std::string& value);
-+}  // namespace workflowy
-diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index 1613cb5198a5c07350f4e20892b1372a9751ad11..729b5ed24869bfbf3c9b3379bea9e00761081b43 100644
---- a/src/activities/ActivityManager.cpp
-+++ b/src/activities/ActivityManager.cpp
-@@ -39,10 +39,12 @@
- #include "reader/BookStatsTracking.h"
- #include "reader/GlobalReadingStats.h"
- #include "reader/ReaderActivity.h"
-+#include "reader/WorkflowyShareActivity.h"
- #include "settings/OpdsServerListActivity.h"
- #include "settings/SettingsActivity.h"
- #include "util/FrontlightPanelActivity.h"
- #include "util/FullScreenMessageActivity.h"
-+#include "util/OptionSelectionActivity.h"
- #include "util/SwipeAdjustment.h"
- #include "util/TwoFingerSwipe.h"
-
-@@ -584,6 +586,13 @@ void ActivityManager::loop() {
-     mappedInput.setPowerAsConfirmInReaderMode(false);
-   }
-
-+  if (pendingAction == PendingAction::None) {
-+    if (const auto error = workflowy::takeShareError()) {
-+      pushActivity(std::make_unique<OptionSelectionActivity>(
-+          renderer, mappedInput, "WorkflowyShareError", *error, std::vector<std::string>{tr(STR_OK)}, 0, false, true));
-+    }
-+  }
 +
-   while (pendingAction != PendingAction::None) {
-     if (pendingAction == PendingAction::Pop) {
-       RenderLock lock;
-@@ -1084,7 +1093,9 @@ void ActivityManager::popActivity() {
-   pendingAction = PendingAction::Pop;
- }
-
--bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
-+bool ActivityManager::preventAutoSleep() const {
-+  return workflowy::shareInProgress() || (currentActivity && currentActivity->preventAutoSleep());
++enum TextStyle : uint8_t {
++  Bold = 1,
++  Italic = 2,
++  Underline = 4,
++  Strike = 8,
++  Highlight = 16
++};
++
++inline constexpr std::array<TextStyle, 5> textStyles{Bold, Italic, Underline, Strike, Highlight};
++inline constexpr std::array<std::string_view, 5> styleOpen{
++    "<b>", "<i>", "<u>", "<s>", "<span class=\"colored bc-yellow\">"};
++inline constexpr std::array<std::string_view, 5> styleClose{"</b>", "</i>", "</u>", "</s>", "</span>"};
++
++inline uint8_t htmlTextStyle(std::string_view name, std::string_view attributes) {
++  if (name == "b" || name == "strong") return Bold;
++  if (name == "i" || name == "em") return Italic;
++  if (name == "u" || (name == "span" && attributes.find("underline") != std::string_view::npos)) return Underline;
++  if (name == "s" || name == "strike" || name == "del") return Strike;
++  if (name == "mark" || name == "font" ||
++      (name == "span" && (attributes.find("bc-") != std::string_view::npos ||
++                          attributes.find("colored") != std::string_view::npos ||
++                          attributes.find("color:") != std::string_view::npos))) return Highlight;
++  return 0;
 +}
-
- bool ActivityManager::requiresExclusiveStorageLoop() const {
-   return currentActivity && currentActivity->requiresExclusiveStorageLoop();
-diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/reader/HighlightEditActivity.cpp
-index 01464c836ce33b553ec56865b26d96604cd526d4..a07dda907741c186c1cb44e3764ad97a1cb91efe 100644
---- a/src/activities/reader/HighlightEditActivity.cpp
-+++ b/src/activities/reader/HighlightEditActivity.cpp
-@@ -15,6 +15,7 @@
- #include "components/TouchHeaderBackButton.h"
- #include "components/UITheme.h"
- #include "fontIds.h"
-+#include "workflowy/WorkflowyIcon.h"
-
- namespace {
- // KOReader's boundary controls use the symbols ◁▒▒, ▷☓▒, ▒☓◁, ▒▒▷.
-@@ -258,7 +259,7 @@ void HighlightEditActivity::openSavedClipping() {
-
- Rect HighlightEditActivity::shareRect() const {
-   const auto close = closeRect();
--  return Rect{close.x - 124, close.y, 116, close.height};
-+  return Rect{close.x - close.width, close.y, close.width, close.height};
- }
-
- void HighlightEditActivity::loop() {
-@@ -269,8 +270,8 @@ void HighlightEditActivity::loop() {
-   }
-   const auto share = shareRect();
-   if (mappedInput.wasTapInRect(share.x, share.y, share.width, share.height) && CLIPPINGS.clippingAt(index)) {
--    startActivityForResult(std::make_unique<WorkflowyShareActivity>(renderer, mappedInput, index),
--                           [](const ActivityResult&) {});
-+    workflowy::shareClippings(index);
-+    cancel();
-     return;
-   }
-   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-@@ -324,7 +325,13 @@ void HighlightEditActivity::render(RenderLock&&) {
-   renderer.drawText(UI_10_FONT_ID, title.x + 12, title.y + 12, tr(STR_EDIT_HIGHLIGHT));
-   const Rect close = closeRect();
-   const auto share = shareRect();
--  renderer.drawText(UI_10_FONT_ID, share.x + 8, share.y + 12, "Workflowy");
-+  // Draw the small transparent logo in logical coordinates, matching the
-+  // existing Workflowy button without a text label competing with the title.
-+  const int iconX = share.x + (share.width - 32) / 2;
-+  const int iconY = share.y + (share.height - 32) / 2;
-+  for (int y = 0; y < 32; ++y)
-+    for (int x = 0; x < 32; ++x)
-+      if (!(workflowyBits[y * 4 + x / 8] & (0x80 >> (x & 7)))) renderer.drawPixel(iconX + x, iconY + y, true);
-   renderer.drawLine(close.x + 14, close.y + 14, close.x + close.width - 14, close.y + close.height - 14, 2, true);
-   renderer.drawLine(close.x + close.width - 14, close.y + 14, close.x + 14, close.y + close.height - 14, 2, true);
-   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
-index 0705cc3ee57e80ac6f51b365577c8e03235c0925..98c15702407ab756e3a4adeab8d97ca2a7f4dcf2 100644
---- a/src/activities/reader/OnPageHighlightActivity.cpp
-+++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -390,11 +390,8 @@ void OnPageHighlightActivity::loop() {
-           break;
-         }
-         case HighlightToolbar::Action::Share:
--          startActivityForResult(std::make_unique<WorkflowyShareActivity>(renderer, mappedInput, index),
--                                 [this](const ActivityResult&) {
--                                   dragFrameReady = false;
--                                   requestUpdate();
--                                 });
-+          workflowy::shareClippings(index);
-+          finish();
-           break;
-         case HighlightToolbar::Action::Edit:
-           returnAction(true);
++
++inline void normalizeStyles(std::string& styles) {
++  if (styles.find_first_not_of('\0') == std::string::npos) styles.clear();
++}
++
++inline void rebaseTextStyles(std::string_view oldText, std::string_view newText, std::string& styles) {
++  if (styles.empty()) return;
++  if (styles.size() != oldText.size()) {
++    styles.clear();
++    return;
++  }
++  size_t begin = 0;
++  while (begin < oldText.size() && begin < newText.size() && oldText[begin] == newText[begin]) ++begin;
++  size_t tail = 0;
++  while (tail < oldText.size() - begin && tail < newText.size() - begin &&
++         oldText[oldText.size() - tail - 1] == newText[newText.size() - tail - 1]) ++tail;
++  const char inherited = begin && begin < styles.size() && styles[begin - 1] == styles[begin] ? styles[begin] : 0;
++  styles.replace(begin, oldText.size() - begin - tail, newText.size() - begin - tail, inherited);
++  normalizeStyles(styles);
++}
++
++inline void toggleTextStyle(std::string& styles, size_t length, size_t begin, size_t end, TextStyle flag) {
++  if (begin >= end || end > length) return;
++  styles.resize(length, '\0');
++  const auto first = styles.begin() + begin;
++  const auto last = styles.begin() + end;
++  const bool remove = std::all_of(first, last, [&](uint8_t style) { return style & flag; });
++  for (auto it = first; it != last; ++it) {
++    *it = static_cast<char>(remove ? (*it & ~flag) : (*it | flag));
++  }
++  normalizeStyles(styles);
++}
++
++template <typename Visitor>
++void forEachStyleRun(std::string_view text, std::string_view styles, Visitor visit) {
++  if (text.empty()) return;
++  if (styles.size() != text.size()) {
++    visit(text, uint8_t{0});
++    return;
++  }
++  for (size_t begin = 0; begin < text.size();) {
++    size_t end = begin + 1;
++    while (end < text.size() && styles[end] == styles[begin]) ++end;
++    visit(text.substr(begin, end - begin), static_cast<uint8_t>(styles[begin]));
++    begin = end;
++  }
++}
++
++template <typename Escape>
++std::string styledHtml(std::string_view text, std::string_view styles, Escape escape) {
++  std::string html;
++  forEachStyleRun(text, styles, [&](std::string_view run, uint8_t flags) {
++    for (size_t i = 0; i < textStyles.size(); ++i)
++      if (flags & textStyles[i]) html += styleOpen[i];
++    html += escape(run);
++    for (size_t i = textStyles.size(); i-- > 0;)
++      if (flags & textStyles[i]) html += styleClose[i];
++  });
++  return html;
++}
++
++}  // namespace workflowy
 diff --git a/src/workflowy/WorkflowySchedule.h b/src/workflowy/WorkflowySchedule.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..9bbc7f940ddf5201b898f4174852b34a5a91e596
@@ -7276,13 +7866,129 @@ index 0000000000000000000000000000000000000000..9bbc7f940ddf5201b898f4174852b34a
 +  assignScheduleLanes(blocks, laneEnds);
 +}
 +}  // namespace workflowy
+diff --git a/src/workflowy/WorkflowySettings.h b/src/workflowy/WorkflowySettings.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..332ecb56e7c7e8709f7e93ae0d4d351b9cf2a00f
+--- /dev/null
++++ b/src/workflowy/WorkflowySettings.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++namespace workflowy {
++inline constexpr uint32_t SAVE_TIMEOUT_MS = 180000;
++inline bool saveTimedOut(uint32_t queuedAt, uint32_t now) {
++  return static_cast<uint32_t>(now - queuedAt) >= SAVE_TIMEOUT_MS;
++}
++inline uint32_t saveTimeRemaining(uint32_t queuedAt, uint32_t now) {
++  const auto elapsed = static_cast<uint32_t>(now - queuedAt);
++  return elapsed >= SAVE_TIMEOUT_MS ? 0 : SAVE_TIMEOUT_MS - elapsed;
++}
++inline constexpr char KEY_FILE[] = "/.crashink/workflowy.key";
++inline constexpr size_t KEY_MAX = 256;
++std::string readSetting(const char* path, size_t limit);
++bool writeSetting(const char* path, const std::string& value);
++}  // namespace workflowy
+diff --git a/src/workflowy/WorkflowyTagInput.h b/src/workflowy/WorkflowyTagInput.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c12fe7b5ce0b3d267161e5c5d5e82d43cbc2e78
+--- /dev/null
++++ b/src/workflowy/WorkflowyTagInput.h
+@@ -0,0 +1,46 @@
++#pragma once
++#include <cctype>
++#include <string>
++#include <string_view>
++#include <utility>
++
++namespace workflowy {
++// Keep the todo marker first and group selected tags before the task body.
++inline bool prependTaskTag(std::string& text, size_t& cursor, std::string_view tag, size_t maxLength = 0) {
++  if (tag.empty() || (tag.front() != '#' && tag.front() != '@')) return false;
++  const auto space = [](unsigned char c) { return std::isspace(c) != 0; };
++  size_t at = 0;
++  while (at < text.size() && space(text[at])) ++at;
++  if (text.compare(at, 2, "[]") == 0) at += 2;
++  else if (text.compare(at, 3, "[ ]") == 0) at += 3;
++  while (at < text.size() && space(text[at])) ++at;
++  while (at < text.size() && (text[at] == '#' || text[at] == '@')) {
++    const auto begin = at;
++    while (at < text.size() && !space(text[at])) ++at;
++    if (std::string_view(text).substr(begin, at - begin) == tag) return true;
++    while (at < text.size() && space(text[at])) ++at;
++  }
++  const bool leading = at && !space(text[at - 1]);
++  const size_t added = tag.size() + 1 + leading;
++  if (maxLength && (added > maxLength || text.size() > maxLength - added)) return false;
++  if (leading) text.insert(at++, 1, ' ');
++  text.insert(at, tag.data(), tag.size());
++  text.insert(at + tag.size(), 1, ' ');
++  if (cursor >= at - leading) cursor += added;
++  return true;
++}
++// Typed prefixes are resolved atomically before moving the tag to the front.
++// The temporary is bounded by the Workflowy keyboard's 512-character limit.
++inline bool completeTaskPrefixTag(std::string& text, size_t& cursor, std::string_view tag,
++                                  size_t maxLength, size_t prefix = std::string::npos) {
++  if (prefix == std::string::npos) return prependTaskTag(text, cursor, tag, maxLength);
++  if (prefix > cursor || cursor > text.size()) return false;
++  std::string updated = text;
++  updated.erase(prefix, cursor - prefix);
++  size_t position = prefix;
++  if (!prependTaskTag(updated, position, tag, maxLength)) return false;
++  text = std::move(updated);
++  cursor = position;
++  return true;
++}
++}  // namespace workflowy
+diff --git a/src/workflowy/WorkflowyTextDrawing.h b/src/workflowy/WorkflowyTextDrawing.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cbebac96602cba8ee3aef9c6b37e74ad5464e80
+--- /dev/null
++++ b/src/workflowy/WorkflowyTextDrawing.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <GfxRenderer.h>
++#include "fontIds.h"
++#include "workflowy/WorkflowyRichText.h"
++
++namespace workflowy {
++
++inline int layoutStyledText(GfxRenderer& renderer, int font, int x, int y, std::string_view text,
++                            std::string_view styles, bool draw) {
++  const int origin = x;
++  forEachStyleRun(text, styles, [&](std::string_view run, uint8_t flags) {
++    const auto face = static_cast<EpdFontFamily::Style>((flags & Bold ? EpdFontFamily::BOLD : 0) |
++                                                       (flags & Italic ? EpdFontFamily::ITALIC : 0));
++    // The regular UI font has no italic faces. Use the installed bitmap Bitter faces for italic runs.
++    const int runFont = flags & Italic ? (font == UI_12_FONT_ID ? BITTER_12_FONT_ID : BITTER_10_FONT_ID)
++                                     : (font == SMALL_FONT_ID && (flags & Bold) ? UI_10_FONT_ID : font);
++    const std::string rendered(run);
++    const int width = renderer.getTextAdvanceX(runFont, rendered.c_str(), face);
++    const int height = renderer.getLineHeight(font);
++    if (draw) {
++      if ((flags & Highlight) && width > 0) renderer.fillRectDither(x, y, width, height, Color::LightGray);
++      renderer.drawText(runFont, x, y, rendered.c_str(), true, face);
++      if ((flags & Underline) && width > 0) renderer.drawLine(x, y + height - 2, x + width - 1, y + height - 2);
++      if ((flags & Strike) && width > 0) renderer.drawLine(x, y + height / 2, x + width - 1, y + height / 2);
++    }
++    x += width;
++  });
++  return x - origin;
++}
++
++}  // namespace workflowy
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
 index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..b56581603573131fa86dfdd003ed5be6f90af21a 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
 @@ -130,3 +130,9 @@ add_subdirectory(image_refresh_regions)
  add_subdirectory(library_thumbnails)
-
+ 
  add_subdirectory(end_of_book_dismiss)
 +
 +add_subdirectory(workflowy_schedule)
@@ -7290,184 +7996,6 @@ index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..b56581603573131fa86dfdd003ed5be6
 +add_subdirectory(workflowy_bulk)
 +
 +add_subdirectory(workflowy_ui)
-diff --git a/test/workflowy_schedule/CMakeLists.txt b/test/workflowy_schedule/CMakeLists.txt
-new file mode 100644
-index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14a785a641
---- /dev/null
-+++ b/test/workflowy_schedule/CMakeLists.txt
-@@ -0,0 +1,5 @@
-+add_executable(workflowy_schedule_test WorkflowyScheduleTest.cpp)
-+target_include_directories(workflowy_schedule_test PRIVATE ${REPO_ROOT}/src/workflowy)
-+target_compile_features(workflowy_schedule_test PRIVATE cxx_std_20)
-+add_test(NAME workflowy_schedule COMMAND workflowy_schedule_test)
-+target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
-diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..b9dee4d39f3819b833d736f825ba02a04df1dc77
---- /dev/null
-+++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,135 @@
-+#include "WorkflowySchedule.h"
-+#include "WorkflowyOutlineLayout.h"
-+#include "WorkflowySettings.h"
-+#include <cassert>
-+#include <random>
-+int main() {
-+  using namespace workflowy;
-+  assert(scheduleScrollForNow(720, 720, 72) == 520);
-+  assert(scheduleScrollForNow(720, 720, 144) == 620);
-+  assert(scheduleScrollForNow(0, 720, 72) == 0);
-+  assert(scheduleScrollForNow(1439, 720, 72) == 840);
-+  assert(scheduleScrollForNow(720, 720, 0) == 0);
-+  assert(!saveTimedOut(100, 180099));
-+  assert(saveTimedOut(100, 180100));
-+  assert(saveTimeRemaining(100, 180100) == 0);
-+  assert(saveTimeRemaining(100, 1100) == 179000);
-+  constexpr uint32_t nearWrap = UINT32_MAX - 30000;
-+  assert(!saveTimedOut(nearWrap, static_cast<uint32_t>(nearWrap + 179999)));
-+  assert(saveTimedOut(nearWrap, static_cast<uint32_t>(nearWrap + 180000)));
-+  assert(saveTimeRemaining(nearWrap, static_cast<uint32_t>(nearWrap + 179999)) == 1);
-+  assert(leadingTaskTimeRange("8:30am - 12pm Task"));
-+  assert(leadingTaskTimeRange("  📅 8:30am - 12pm Task #career"));
-+  assert(leadingTaskTimeRange("⏰ 9:00 – 10:00 Task"));
-+  assert(!leadingTaskTimeRange("Task 8:30am - 12pm"));
-+  assert(!leadingTaskTimeRange("#career 8:30am - 12pm Task"));
-+  assert(!leadingTaskTimeRange("@INSIDE 8:30am - 12pm Task"));
-+  assert(!leadingTaskTimeRange("Tomorrow 📅 8:30am - 12pm Task"));
-+  const std::string original = "#career 8:30am - 12pm Plan project @INSIDE with team #P0";
-+  TaskTextProjection projected(original);
-+  assert(projected.text(false) == "Plan project @INSIDE with team #P0");
-+  assert(projected.text(true) == "#career 8:30am - 12pm");
-+  assert(projected.originalOffset(false, 0) == original.find("Plan"));
-+  assert(projected.originalOffset(false, 13) == original.find("@INSIDE"));
-+  assert(projected.originalOffset(true, 8) == original.find("8:30"));
-+  assert(original == "#career 8:30am - 12pm Plan project @INSIDE with team #P0");
-+  assert(TaskTextProjection("Only task text").text(false) == "Only task text");
-+  assert(TaskTextProjection("#P0 @INSIDE").text(false).empty());
-+  for (bool meta : {false, true}) {
-+    const auto display = projected.text(meta);
-+    for (size_t at = 0; at < display.size(); ++at)
-+      if (display[at] != ' ') assert(original[projected.originalOffset(meta, at)] == display[at]);
-+    std::vector<TextSpan> wrapped;
-+    wrapOutlineText(display, 10, [](std::string_view part) { return static_cast<int>(part.size()); }, wrapped);
-+    for (const auto line : wrapped) {
-+      assert(line.begin <= line.end && line.end <= display.size());
-+      if (line.begin < line.end)
-+        assert(original[projected.originalOffset(meta, line.begin)] == display[line.begin]);
-+    }
-+  }
-+  TaskTextProjection unicode("#health Réviser café @INSIDE");
-+  assert(unicode.text(false) == "Réviser café @INSIDE");
-+  assert(unicode.text(true) == "#health");
-+  assert(TaskTextProjection("Task #health @INSIDE").text(false)=="Task #health @INSIDE");
-+  assert(TaskTextProjection("Task #health @INSIDE").text(true).empty());
-+  assert(TaskTextProjection("  #health @INSIDE Task #career ").text(true)=="#health @INSIDE");
-+  assert(TaskTextProjection("  #health @INSIDE Task #career ",false).text(false)=="Task #career");
-+  assert(compactTaskText("8:15am - 9:30am Task")=="8¼–9½ Task");
-+  assert(compactTaskText("8:45pm - 12am Task")=="20¾–24 Task");
-+  assert(compactScheduleClock(0)=="0" && compactScheduleClock(480)=="8");
-+  assert(compactScheduleClock(485)=="8:05");
-+  assert(compactTaskOriginalOffset("8:15am - 9:30am Task",compactTaskText("8:15am - 9:30am Task").find("Task"))==std::string("8:15am - 9:30am Task").find("Task"));
-+  assert(timedPrefixMoves({0,1,2,-1},3)==0);
-+  assert(timedPrefixMoves({1,0,2,-1},3)==1);
-+  assert(timedPrefixMoves({1,2,-1,0},3)==1);
-+  assert(timedPrefixMoves({-1,0,1,2},3)==3);
-+  for(int iteration=0;iteration<100;++iteration){
-+    std::vector<int> original={-1,0,1,2,3,-2};
-+    std::mt19937 random(iteration);std::shuffle(original.begin(),original.end(),random);
-+    const auto moves=timedPrefixMoves(original,4);
-+    auto apply=[&](size_t count){auto result=original;for(size_t n=count;n>0;--n){auto it=std::find(result.begin(),result.end(),n-1);result.erase(it);result.insert(result.begin(),n-1);}return result;};
-+    const auto result=apply(moves);for(int i=0;i<4;++i)assert(result[i]==i);
-+    for(size_t fewer=0;fewer<moves;++fewer){const auto wrong=apply(fewer);assert(!std::equal(wrong.begin(),wrong.begin()+4,std::vector<int>{0,1,2,3}.begin()));}
-+  }
-+  auto range = parseTimeRange("8:30 to 12:00 Focus");
-+  assert(range && range->start == 510 && range->end == 720);
-+  assert(range->begin == 0 && range->finish == 13);
-+  range = parseTimeRange("#career 8:30am to 12pm Review");
-+  assert(range && range->start == 510 && range->end == 720);
-+  range = parseTimeRange("12am to 8:30am Sleep");
-+  assert(range && range->start == 0 && range->end == 510);
-+  range = parseTimeRange("8:30pm to 12am Read");
-+  assert(range && range->start == 1230 && range->end == 1440);
-+  range = parseTimeRange("  [ ] 9:00 – 10:15 Work #P0");
-+  assert(range && range->start == 540 && range->end == 615);
-+  assert(!parseTimeRange("9:60 to 12:00"));
-+  assert(!parseTimeRange("25:00 to 26:00"));
-+  assert(!parseTimeRange("12:00 to 12:00"));
-+  assert(!parseTimeRange("Contact 123:00 to 14:00"));
-+  assert(!parseTimeRange("8:30 to 12amp"));
-+  assert(replaceTimeRange("#P0 8:30 to 12:00 Task", 540, 780) == "#P0 9:00am - 1:00pm Task");
-+  assert(scheduleRange(0, 1440) == "12:00am - 12:00am");
-+  assert(scheduleRange(1155, 1260) == "7:15pm - 9:00pm");
-+  assert(scheduleClock(0) == "12:00am");
-+  assert(scheduleClock(510) == "8:30am");
-+  assert(scheduleClock(720) == "12:00pm");
-+  assert(scheduleClock(780) == "1:00pm");
-+  assert(scheduleClock(1439) == "11:59pm");
-+  assert(scheduleClock(1440) == "12:00am");
-+  for (int start = 0; start < 1440; start += 15) {
-+    const int end = std::min(start + 30, 1440);
-+    const auto text = scheduleRange(start, end);
-+    const auto roundTrip = parseTimeRange(text);
-+    assert(roundTrip && roundTrip->start == start && roundTrip->end == end);
-+    assert(roundTrip->finish == text.size());
-+  }
-+  assert(scheduleSelectionFits(540, 570, 4));
-+  assert(scheduleSelectionFits(1380, 1410, 2));
-+  assert(!scheduleSelectionFits(1380, 1410, 3));
-+  assert(!scheduleSelectionFits(540, 540, 1));
-+  assert(!scheduleSelectionFits(540, 570, 0));
-+  assert(!scheduleSelectionFits(-1, 30, 1));
-+  assert(!scheduleSelectionFits(1425, 1455, 1));
-+  assert(shiftScheduleDate("2024-03-01", -1) == "2024-02-29");
-+  assert(shiftScheduleDate("2026-12-31", 1) == "2027-01-01");
-+  assert(scheduleWeekday("2026-11-16") == 0);
-+  assert(scheduleWeekday("2026-11-22") == 6);
-+  assert(shiftScheduleDate("2026-11-19", -scheduleWeekday("2026-11-19")) == "2026-11-16");
-+  std::mt19937 random(19);
-+  for (int iteration = 0; iteration < 100; ++iteration) {
-+    std::vector<ScheduleLane> blocks;
-+    for (size_t i = 0; i < 40; ++i) {
-+      int start = random() % 1400;
-+      blocks.push_back({start, std::min(start + 15 + int(random()%180), 1440), i});
-+    }
-+    assignScheduleLanes(blocks);
-+    for (size_t i = 0; i < blocks.size(); ++i) {
-+      assert(blocks[i].lane < blocks[i].lanes);
-+      for (size_t j = i+1; j < blocks.size(); ++j) {
-+        if (blocks[j].start >= blocks[i].end || blocks[i].start >= blocks[j].end) continue;
-+        assert(blocks[i].lane != blocks[j].lane);
-+        assert(blocks[i].lanes == blocks[j].lanes);
-+      }
-+    }
-+  }
-+}
-diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
-index c8632d51a6c0eea1826a12e30bcdc227c0437854..5927bc9c2b2b6ccc0544bf26b88bd6bfa1521e3d 100644
---- a/src/activities/ActivityResult.h
-+++ b/src/activities/ActivityResult.h
-@@ -16,6 +16,12 @@ struct WifiResult {
-   std::string ip;
- };
-
-+struct WorkflowyBlockResult {
-+  int start = 0;
-+  int end = 0;
-+  std::string itemId;
-+};
-+
- struct KeyboardResult {
-   std::string text;
- };
-@@ -137,7 +143,7 @@ struct HighlightPageAction {
- };
-
- using ResultVariant =
--    std::variant<std::monostate, WifiResult, KeyboardResult, MenuResult, ChapterResult, PercentResult, IntervalResult,
-+    std::variant<std::monostate, WifiResult, KeyboardResult, WorkflowyBlockResult, MenuResult, ChapterResult, PercentResult, IntervalResult,
-                  OptionSelectionResult, PageResult, NetworkModeResult, FootnoteResult, BookmarkResult,
-                  FileBrowserActionResult, FilePathResult, WordResult, ReadingStatsResult, ClippingResult,
-                  TtfRenderOptionsResult, DictionaryClippingRequest, ClippingJumpResult, HighlightPageAction, FrontlightPanelResult>;
 diff --git a/test/workflowy_bulk/CMakeLists.txt b/test/workflowy_bulk/CMakeLists.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..f4fced0bb7f826e1b19ca9b9119b64c3967618b4
@@ -7661,58 +8189,158 @@ index 0000000000000000000000000000000000000000..aa5caf0395dfd88c5733455a6cf88c3c
 +  assert(app.rows[0].done && !app.rows[0].todo && !app.rows[1].done);
 + }
 +}
-diff --git a/src/workflowy/WorkflowyTagInput.h b/src/workflowy/WorkflowyTagInput.h
+diff --git a/test/workflowy_schedule/CMakeLists.txt b/test/workflowy_schedule/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c12fe7b5ce0b3d267161e5c5d5e82d43cbc2e78
+index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14a785a641
 --- /dev/null
-+++ b/src/workflowy/WorkflowyTagInput.h
-@@ -0,0 +1,46 @@
-+#pragma once
-+#include <cctype>
-+#include <string>
-+#include <string_view>
-+#include <utility>
-+
-+namespace workflowy {
-+// Keep the todo marker first and group selected tags before the task body.
-+inline bool prependTaskTag(std::string& text, size_t& cursor, std::string_view tag, size_t maxLength = 0) {
-+  if (tag.empty() || (tag.front() != '#' && tag.front() != '@')) return false;
-+  const auto space = [](unsigned char c) { return std::isspace(c) != 0; };
-+  size_t at = 0;
-+  while (at < text.size() && space(text[at])) ++at;
-+  if (text.compare(at, 2, "[]") == 0) at += 2;
-+  else if (text.compare(at, 3, "[ ]") == 0) at += 3;
-+  while (at < text.size() && space(text[at])) ++at;
-+  while (at < text.size() && (text[at] == '#' || text[at] == '@')) {
-+    const auto begin = at;
-+    while (at < text.size() && !space(text[at])) ++at;
-+    if (std::string_view(text).substr(begin, at - begin) == tag) return true;
-+    while (at < text.size() && space(text[at])) ++at;
++++ b/test/workflowy_schedule/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_executable(workflowy_schedule_test WorkflowyScheduleTest.cpp)
++target_include_directories(workflowy_schedule_test PRIVATE ${REPO_ROOT}/src/workflowy)
++target_compile_features(workflowy_schedule_test PRIVATE cxx_std_20)
++add_test(NAME workflowy_schedule COMMAND workflowy_schedule_test)
++target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9dee4d39f3819b833d736f825ba02a04df1dc77
+--- /dev/null
++++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
+@@ -0,0 +1,135 @@
++#include "WorkflowySchedule.h"
++#include "WorkflowyOutlineLayout.h"
++#include "WorkflowySettings.h"
++#include <cassert>
++#include <random>
++int main() {
++  using namespace workflowy;
++  assert(scheduleScrollForNow(720, 720, 72) == 520);
++  assert(scheduleScrollForNow(720, 720, 144) == 620);
++  assert(scheduleScrollForNow(0, 720, 72) == 0);
++  assert(scheduleScrollForNow(1439, 720, 72) == 840);
++  assert(scheduleScrollForNow(720, 720, 0) == 0);
++  assert(!saveTimedOut(100, 180099));
++  assert(saveTimedOut(100, 180100));
++  assert(saveTimeRemaining(100, 180100) == 0);
++  assert(saveTimeRemaining(100, 1100) == 179000);
++  constexpr uint32_t nearWrap = UINT32_MAX - 30000;
++  assert(!saveTimedOut(nearWrap, static_cast<uint32_t>(nearWrap + 179999)));
++  assert(saveTimedOut(nearWrap, static_cast<uint32_t>(nearWrap + 180000)));
++  assert(saveTimeRemaining(nearWrap, static_cast<uint32_t>(nearWrap + 179999)) == 1);
++  assert(leadingTaskTimeRange("8:30am - 12pm Task"));
++  assert(leadingTaskTimeRange("  📅 8:30am - 12pm Task #career"));
++  assert(leadingTaskTimeRange("⏰ 9:00 – 10:00 Task"));
++  assert(!leadingTaskTimeRange("Task 8:30am - 12pm"));
++  assert(!leadingTaskTimeRange("#career 8:30am - 12pm Task"));
++  assert(!leadingTaskTimeRange("@INSIDE 8:30am - 12pm Task"));
++  assert(!leadingTaskTimeRange("Tomorrow 📅 8:30am - 12pm Task"));
++  const std::string original = "#career 8:30am - 12pm Plan project @INSIDE with team #P0";
++  TaskTextProjection projected(original);
++  assert(projected.text(false) == "Plan project @INSIDE with team #P0");
++  assert(projected.text(true) == "#career 8:30am - 12pm");
++  assert(projected.originalOffset(false, 0) == original.find("Plan"));
++  assert(projected.originalOffset(false, 13) == original.find("@INSIDE"));
++  assert(projected.originalOffset(true, 8) == original.find("8:30"));
++  assert(original == "#career 8:30am - 12pm Plan project @INSIDE with team #P0");
++  assert(TaskTextProjection("Only task text").text(false) == "Only task text");
++  assert(TaskTextProjection("#P0 @INSIDE").text(false).empty());
++  for (bool meta : {false, true}) {
++    const auto display = projected.text(meta);
++    for (size_t at = 0; at < display.size(); ++at)
++      if (display[at] != ' ') assert(original[projected.originalOffset(meta, at)] == display[at]);
++    std::vector<TextSpan> wrapped;
++    wrapOutlineText(display, 10, [](std::string_view part) { return static_cast<int>(part.size()); }, wrapped);
++    for (const auto line : wrapped) {
++      assert(line.begin <= line.end && line.end <= display.size());
++      if (line.begin < line.end)
++        assert(original[projected.originalOffset(meta, line.begin)] == display[line.begin]);
++    }
 +  }
-+  const bool leading = at && !space(text[at - 1]);
-+  const size_t added = tag.size() + 1 + leading;
-+  if (maxLength && (added > maxLength || text.size() > maxLength - added)) return false;
-+  if (leading) text.insert(at++, 1, ' ');
-+  text.insert(at, tag.data(), tag.size());
-+  text.insert(at + tag.size(), 1, ' ');
-+  if (cursor >= at - leading) cursor += added;
-+  return true;
++  TaskTextProjection unicode("#health Réviser café @INSIDE");
++  assert(unicode.text(false) == "Réviser café @INSIDE");
++  assert(unicode.text(true) == "#health");
++  assert(TaskTextProjection("Task #health @INSIDE").text(false)=="Task #health @INSIDE");
++  assert(TaskTextProjection("Task #health @INSIDE").text(true).empty());
++  assert(TaskTextProjection("  #health @INSIDE Task #career ").text(true)=="#health @INSIDE");
++  assert(TaskTextProjection("  #health @INSIDE Task #career ",false).text(false)=="Task #career");
++  assert(compactTaskText("8:15am - 9:30am Task")=="8¼–9½ Task");
++  assert(compactTaskText("8:45pm - 12am Task")=="20¾–24 Task");
++  assert(compactScheduleClock(0)=="0" && compactScheduleClock(480)=="8");
++  assert(compactScheduleClock(485)=="8:05");
++  assert(compactTaskOriginalOffset("8:15am - 9:30am Task",compactTaskText("8:15am - 9:30am Task").find("Task"))==std::string("8:15am - 9:30am Task").find("Task"));
++  assert(timedPrefixMoves({0,1,2,-1},3)==0);
++  assert(timedPrefixMoves({1,0,2,-1},3)==1);
++  assert(timedPrefixMoves({1,2,-1,0},3)==1);
++  assert(timedPrefixMoves({-1,0,1,2},3)==3);
++  for(int iteration=0;iteration<100;++iteration){
++    std::vector<int> original={-1,0,1,2,3,-2};
++    std::mt19937 random(iteration);std::shuffle(original.begin(),original.end(),random);
++    const auto moves=timedPrefixMoves(original,4);
++    auto apply=[&](size_t count){auto result=original;for(size_t n=count;n>0;--n){auto it=std::find(result.begin(),result.end(),n-1);result.erase(it);result.insert(result.begin(),n-1);}return result;};
++    const auto result=apply(moves);for(int i=0;i<4;++i)assert(result[i]==i);
++    for(size_t fewer=0;fewer<moves;++fewer){const auto wrong=apply(fewer);assert(!std::equal(wrong.begin(),wrong.begin()+4,std::vector<int>{0,1,2,3}.begin()));}
++  }
++  auto range = parseTimeRange("8:30 to 12:00 Focus");
++  assert(range && range->start == 510 && range->end == 720);
++  assert(range->begin == 0 && range->finish == 13);
++  range = parseTimeRange("#career 8:30am to 12pm Review");
++  assert(range && range->start == 510 && range->end == 720);
++  range = parseTimeRange("12am to 8:30am Sleep");
++  assert(range && range->start == 0 && range->end == 510);
++  range = parseTimeRange("8:30pm to 12am Read");
++  assert(range && range->start == 1230 && range->end == 1440);
++  range = parseTimeRange("  [ ] 9:00 – 10:15 Work #P0");
++  assert(range && range->start == 540 && range->end == 615);
++  assert(!parseTimeRange("9:60 to 12:00"));
++  assert(!parseTimeRange("25:00 to 26:00"));
++  assert(!parseTimeRange("12:00 to 12:00"));
++  assert(!parseTimeRange("Contact 123:00 to 14:00"));
++  assert(!parseTimeRange("8:30 to 12amp"));
++  assert(replaceTimeRange("#P0 8:30 to 12:00 Task", 540, 780) == "#P0 9:00am - 1:00pm Task");
++  assert(scheduleRange(0, 1440) == "12:00am - 12:00am");
++  assert(scheduleRange(1155, 1260) == "7:15pm - 9:00pm");
++  assert(scheduleClock(0) == "12:00am");
++  assert(scheduleClock(510) == "8:30am");
++  assert(scheduleClock(720) == "12:00pm");
++  assert(scheduleClock(780) == "1:00pm");
++  assert(scheduleClock(1439) == "11:59pm");
++  assert(scheduleClock(1440) == "12:00am");
++  for (int start = 0; start < 1440; start += 15) {
++    const int end = std::min(start + 30, 1440);
++    const auto text = scheduleRange(start, end);
++    const auto roundTrip = parseTimeRange(text);
++    assert(roundTrip && roundTrip->start == start && roundTrip->end == end);
++    assert(roundTrip->finish == text.size());
++  }
++  assert(scheduleSelectionFits(540, 570, 4));
++  assert(scheduleSelectionFits(1380, 1410, 2));
++  assert(!scheduleSelectionFits(1380, 1410, 3));
++  assert(!scheduleSelectionFits(540, 540, 1));
++  assert(!scheduleSelectionFits(540, 570, 0));
++  assert(!scheduleSelectionFits(-1, 30, 1));
++  assert(!scheduleSelectionFits(1425, 1455, 1));
++  assert(shiftScheduleDate("2024-03-01", -1) == "2024-02-29");
++  assert(shiftScheduleDate("2026-12-31", 1) == "2027-01-01");
++  assert(scheduleWeekday("2026-11-16") == 0);
++  assert(scheduleWeekday("2026-11-22") == 6);
++  assert(shiftScheduleDate("2026-11-19", -scheduleWeekday("2026-11-19")) == "2026-11-16");
++  std::mt19937 random(19);
++  for (int iteration = 0; iteration < 100; ++iteration) {
++    std::vector<ScheduleLane> blocks;
++    for (size_t i = 0; i < 40; ++i) {
++      int start = random() % 1400;
++      blocks.push_back({start, std::min(start + 15 + int(random()%180), 1440), i});
++    }
++    assignScheduleLanes(blocks);
++    for (size_t i = 0; i < blocks.size(); ++i) {
++      assert(blocks[i].lane < blocks[i].lanes);
++      for (size_t j = i+1; j < blocks.size(); ++j) {
++        if (blocks[j].start >= blocks[i].end || blocks[i].start >= blocks[j].end) continue;
++        assert(blocks[i].lane != blocks[j].lane);
++        assert(blocks[i].lanes == blocks[j].lanes);
++      }
++    }
++  }
 +}
-+// Typed prefixes are resolved atomically before moving the tag to the front.
-+// The temporary is bounded by the Workflowy keyboard's 512-character limit.
-+inline bool completeTaskPrefixTag(std::string& text, size_t& cursor, std::string_view tag,
-+                                  size_t maxLength, size_t prefix = std::string::npos) {
-+  if (prefix == std::string::npos) return prependTaskTag(text, cursor, tag, maxLength);
-+  if (prefix > cursor || cursor > text.size()) return false;
-+  std::string updated = text;
-+  updated.erase(prefix, cursor - prefix);
-+  size_t position = prefix;
-+  if (!prependTaskTag(updated, position, tag, maxLength)) return false;
-+  text = std::move(updated);
-+  cursor = position;
-+  return true;
-+}
-+}  // namespace workflowy
 diff --git a/test/workflowy_ui/CMakeLists.txt b/test/workflowy_ui/CMakeLists.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..21e6e830d87caa108b5a7288b1b2ebf91b5d2b97
@@ -7965,69 +8593,3 @@ index 0000000000000000000000000000000000000000..4f3f7a70e57cd3bf2dc26291d46a6b00
 +  busy.viewStack={1};busy.paintedArrows={{"root",60,100}};
 +  assert(busy.tapArrow(460,80) && busy.zoomOut==1);
 +}
-diff --git a/src/activities/util/OptionSelectionActivity.cpp b/src/activities/util/OptionSelectionActivity.cpp
-index 2389d887417b68c47c2a45de7bf6784fe617d2ca..150d550cddd75e76a8f7e4fdd36adfb6caf06ccc 100644
---- a/src/activities/util/OptionSelectionActivity.cpp
-+++ b/src/activities/util/OptionSelectionActivity.cpp
-@@ -2,6 +2,7 @@
-
- #include <GfxRenderer.h>
- #include <I18n.h>
-+#include <FreeInkUIIcon.h>
-
- #include <utility>
-
-@@ -33,10 +34,12 @@ Rect optionListRect(const GfxRenderer& renderer, const MappedInputManager& mappe
- OptionSelectionActivity::OptionSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                  std::string activityName, const StrId titleId,
-                                                  std::vector<std::string> options, const uint8_t selectedIndex,
--                                                 const bool readerMode, const bool showTouchHeaderBackButton)
-+                                                 const bool readerMode, const bool showTouchHeaderBackButton,
-+                                                 std::vector<const freeink::Icon*> icons)
-     : Activity(std::move(activityName), renderer, mappedInput),
-       titleId_(titleId),
-       options_(std::move(options)),
-+      icons_(std::move(icons)),
-       currentIndex_(selectedIndex),
-       selectedIndex_(selectedIndex),
-       readerMode_(readerMode),
-@@ -143,7 +146,8 @@ void OptionSelectionActivity::buildOptionsScreen(UiApp::ScreenType& screen) {
-   for (size_t i = 0; i < options_.size(); ++i) {
-     fui::ListItem item;
-     item.label = options_[i].c_str();
--    item.value = i == static_cast<size_t>(currentIndex_) ? tr(STR_SELECTED) : nullptr;
-+    if(i<icons_.size() && icons_[i]) item.icon=fui::bitmapFromIcon(*icons_[i]);
-+    item.value = !name.starts_with("Workflowy") && i == static_cast<size_t>(currentIndex_) ? tr(STR_SELECTED) : nullptr;
-     item.actionValue = static_cast<int16_t>(i);
-     items.push_back(item);
-   }
-diff --git a/src/activities/util/OptionSelectionActivity.h b/src/activities/util/OptionSelectionActivity.h
-index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..371bfcf41241fda962bc38ee54265cc9944ede40 100644
---- a/src/activities/util/OptionSelectionActivity.h
-+++ b/src/activities/util/OptionSelectionActivity.h
-@@ -3,6 +3,7 @@
- #include <FreeInkApp.h>
- #include <FreeInkUIGfxRenderer.h>
- #include <I18n.h>
-+#include <Icon.h>
-
- #include <atomic>
- #include <string>
-@@ -15,7 +16,8 @@ class OptionSelectionActivity final : public Activity {
-  public:
-   OptionSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string activityName,
-                           StrId titleId, std::vector<std::string> options, uint8_t selectedIndex,
--                          bool readerMode = false, bool showTouchHeaderBackButton = false);
-+                          bool readerMode = false, bool showTouchHeaderBackButton = false,
-+                          std::vector<const freeink::Icon*> icons = {});
-
-   void onEnter() override;
-   void loop() override;
-@@ -29,6 +31,7 @@ class OptionSelectionActivity final : public Activity {
-   ButtonNavigator buttonNavigator_;
-   StrId titleId_;
-   std::vector<std::string> options_;
-+  std::vector<const freeink::Icon*> icons_;
-   int currentIndex_ = 0;
-   int selectedIndex_ = 0;
-   bool readerMode_ = false;

@@ -1,24 +1,72 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 02183e56fbc0bfcd472949df53e9cf5183c401cb..a05d82bc1baa6a4e02430b47f0368bbc4b1ddc9d 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -13,6 +13,8 @@
- ### Fixed
-
+@@ -14,6 +14,8 @@
+ 
  - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
-+
+ 
 +- Image refresh blanks each image separately, keeping text between inline images visible while images are prepared for display. Pending images use an empty background instead of a temporary box border.
-
++
  - Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
-
+ 
+ - Saved highlights stop at the selected text before a joined dash; the floating Edit/Delete toolbar has larger high-contrast icons. Highlights also continue across page breaks inside hyphenated words, without changing saved clipping text.
+diff --git a/docs/file-formats.md b/docs/file-formats.md
+index 38c7341f4f2bffc752dfc0d9bfefd6a22a3623c0..ec4f77be0638480dd0333dc32d4dceafdb58e094 100644
+--- a/docs/file-formats.md
++++ b/docs/file-formats.md
+@@ -378,7 +378,7 @@ if (parsedSize != fileSize) {
+ 
+ ## `reader_settings.bin`
+ 
+-### Version 10
++### Version 11
+ 
+ Each EPUB cache directory may contain `reader_settings.bin`. Missing files mean
+ the book uses global Reader settings and the default auto-page-turn interval.
+@@ -396,7 +396,10 @@ point sizes, version 7 appends the dictionary font's selected point size, and
+ version 8 splits the screen margin into vertical and horizontal values. Version
+ 9 removes the obsolete per-book Dark Mode byte: Dark Mode is now a global
+ display setting. Version 10 appends a field mask so a book overrides only the
+-reader settings that differ from its current global defaults. Version 2-9
++reader settings that differ from its current global defaults. Version 11 adds
++three optional per-book overrides for image contrast, white-background
++transparency, and monochrome rendering. Older books inherit their defaults.
++Version 2-9
+ records with the custom-settings flag keep their full snapshot as an override
+ when migrated; they cannot distinguish past manual edits from automatic ones.
+ The file can preserve an auto-page-turn interval without forcing custom
+@@ -409,7 +412,7 @@ fallback successfully opens a difficult book.
+ 
+ ```c++
+ struct ReaderSettingsBin {
+-    u8 version; // 10
++    u8 version; // 11
+     u8 flags;   // bit 0 = at least one custom reader field, bit 1 = custom auto-page-turn interval, bit 2 = render mode override, bit 3 = dictionary font override, bit 4 = Safe Mode override
+     u16 autoPageTurnSeconds;
+     u8 renderMode; // 0 = CrossInk Default, 1 = Balanced, 2 = Light
+@@ -436,7 +439,12 @@ struct ReaderSettingsBin {
+     char sdFontFamilyName[64];
+     char dictionarySdFontFamilyName[64]; // meaningful only when flag bit 3 is set
+     u8 dictionaryFontPointSize; // 0 = follow reader size
+-    u32 readerSettingsOverrideMask; // bits 0-17 correspond to snapshot fields above, excluding snapshotRenderMode; bit 18 = sdFontFamilyName
++    u32 readerSettingsOverrideMask; // field-override bits
++    u8 textWeight;
++    u8 invertImagesDark;
++    u8 imageContrast; // 0-200, neutral is 100
++    u8 transparentImageBackground;
++    u8 monochromeImages;
+ };
+ ```
+ 
 diff --git a/lib/Epub/Epub/Page.h b/lib/Epub/Epub/Page.h
+index c1522eb17e2e88584abc064576ac99db809c9891..b696a01eeb597f9f55d3bfac504a605bb61b4bc4 100644
 --- a/lib/Epub/Epub/Page.h
 +++ b/lib/Epub/Epub/Page.h
-@@ -222,6 +222,34 @@
-       return element->getTag() == TAG_PageImage &&
-              static_cast<const PageImage&>(*element).getImageBlock().needsDecode();
+@@ -224,6 +224,34 @@ class Page {
      });
-+  }
-+
+   }
+ 
 +  // Visit individual image rectangles without collecting/merging them. The
 +  // space between separate inline images can contain readable page text.
 +  template <typename Callback>
@@ -45,15 +93,17 @@ diff --git a/lib/Epub/Epub/Page.h b/lib/Epub/Epub/Page.h
 +      }
 +    }
 +    return area;
-   }
-
++  }
++
    // Get bounding box of all images on the page (union of image rects)
+   // Returns false if no images. Coordinates are relative to page origin.
+   bool getImageBoundingBox(int16_t& outX, int16_t& outY, int16_t& outW, int16_t& outH) const {
 diff --git a/lib/Epub/Epub/blocks/ImageBlock.cpp b/lib/Epub/Epub/blocks/ImageBlock.cpp
 index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16dadb0bc1b 100644
 --- a/lib/Epub/Epub/blocks/ImageBlock.cpp
 +++ b/lib/Epub/Epub/blocks/ImageBlock.cpp
 @@ -269,7 +269,7 @@ bool renderCachedPixels(GfxRenderer& renderer, const uint8_t* pixels, const uint
-
+ 
    const int bytesPerRow = (cachedWidth + 3) / 4;
    DirectPixelWriter pw;
 -  pw.init(renderer);
@@ -63,16 +113,16 @@ index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16d
      pw.beginRow(y + row);
 @@ -361,7 +361,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
    }
-
+ 
    DirectPixelWriter pw;
 -  pw.init(renderer);
 +  pw.init(renderer, renderer.getImageContrast());
-
+ 
    const size_t dataOffset = 4U + static_cast<size_t>(clip.y0) * static_cast<size_t>(bytesPerRowInt);
    if (!cacheFile.seek(dataOffset)) {
 @@ -464,10 +464,8 @@ void ImageBlock::releaseSessionPixelCache() {
  }
-
+ 
  void ImageBlock::renderPlaceholder(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) const {
 -  renderer.fillRect(x, y, width, height, foregroundBlack);
 -  if (width > 2 && height > 2) {
@@ -81,12 +131,12 @@ index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16d
 +  // Reserve only the image's background while decoding; no temporary outline.
 +  if (width > 0 && height > 0) renderer.fillRect(x, y, width, height, !foregroundBlack);
  }
-
+ 
  void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const bool foregroundBlack) {
 @@ -511,10 +509,13 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
      return;
    }
-
+ 
 +  // A transparent background uses the page polarity, so a dark page shows light image ink.
 +  const bool preservePolarity = !renderer.invertImages() && !renderer.transparentImageBackground();
 +
@@ -97,7 +147,7 @@ index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16d
 +    if (preservePolarity) renderer.preserveImagePolarity(x, y, width, height);
      return;  // Successfully rendered from cache
    }
-
+ 
 @@ -543,6 +544,7 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
    config.maxWidth = width;
    config.maxHeight = height;
@@ -109,11 +159,11 @@ index d326dd65f77993a59713e1f8dbfc55a6b1b61020..001aefa36e0c84e1caa3e4170519b16d
 @@ -569,7 +571,7 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y, const b
      return;
    }
-
+ 
 -  renderer.preserveImagePolarity(x, y, width, height);
 +  if (preservePolarity) renderer.preserveImagePolarity(x, y, width, height);
  }
-
+ 
  bool ImageBlock::serialize(FsFile& file) {
 diff --git a/lib/Epub/Epub/converters/DirectPixelWriter.h b/lib/Epub/Epub/converters/DirectPixelWriter.h
 index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b6ee31692 100644
@@ -121,13 +171,13 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b
 +++ b/lib/Epub/Epub/converters/DirectPixelWriter.h
 @@ -1,13 +1,13 @@
  #pragma once
-
+ 
 +#include <BitmapHelpers.h>
  #include <GfxRenderer.h>
 -#include <HalDisplay.h>
 +#include <ImageContrast.h>
  #include <stdint.h>
-
+ 
  // Direct framebuffer writer that eliminates per-pixel overhead from the image
  // rendering hot path.  Pre-computes orientation transform as linear coefficients
 -// and caches render-mode state so the inner loop is: one multiply, one add,
@@ -150,7 +200,7 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b
 @@ -33,11 +37,15 @@ struct DirectPixelWriter {
    // Row-precomputed: the Y-dependent portion of the physical coords
    int rowPhyXBase, rowPhyYBase;
-
+ 
 -  void init(GfxRenderer& renderer) {
 +  void init(GfxRenderer& renderer, uint8_t imageContrast = NORMAL_IMAGE_CONTRAST) {
      fb = renderer.getWriteTarget();
@@ -162,7 +212,7 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b
 +    monochrome = renderer.monochromeImages();
 +    contrast = imageContrast;
      displayWidthBytes = renderer.getDisplayWidthBytes();
-
+ 
      const int phyW = renderer.getDisplayWidth();
 @@ -103,31 +111,24 @@ struct DirectPixelWriter {
    // Must be called after beginRow() for the current row.
@@ -201,9 +251,9 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b
 +      draw = pixel.write;
 +      state = pixel.black;
      }
-
+ 
      if (!draw) return;
-
+ 
 -    const int phyX = rowPhyXBase + logicalX * phyXStepX;
 -    const int phyY = rowPhyYBase + logicalX * phyYStepX;
 -
@@ -211,77 +261,80 @@ index debe10c9037d4cf9a38794031d3f5ac5f934b712..6d05d28c215f79602a6e4d366df3cd9b
      // mode) and any out-of-frame row (full-frame mode) in one branch.
      const int sy = phyY - originY;
 diff --git a/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h b/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h
+index a3ae99e3268aa558f4e8244c3834e972be55a6a5..231acdad5627d5d8b99c2dfeae4d121f0db17c40 100644
 --- a/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h
 +++ b/lib/Epub/Epub/converters/ImageToFramebufferDecoder.h
 @@ -1,5 +1,6 @@
  #pragma once
  #include <HalStorage.h>
 +#include <ImageContrast.h>
-
+ 
  #include <cstdint>
  #include <memory>
-@@ -19,6 +20,7 @@
+@@ -19,6 +20,7 @@ struct RenderConfig {
    bool useDithering = true;
    bool performanceMode = false;
    bool useExactDimensions = false;  // If true, use maxWidth/maxHeight as exact output size (no recalculation)
 +  uint8_t imageContrast = NORMAL_IMAGE_CONTRAST;
    std::string cachePath;            // If non-empty, decoder will write pixel cache to this path
  };
-
+ 
 diff --git a/lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp b/lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp
+index 2798a6021527e6edebf7d089b30b4af0776f0d92..c44dd9abc46254d455caccb177e63f7d7881a5c8 100644
 --- a/lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp
 +++ b/lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp
-@@ -230,7 +230,7 @@
-
+@@ -230,7 +230,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
+ 
    // Pre-compute orientation and render-mode state once per callback invocation
    DirectPixelWriter pw;
 -  pw.init(renderer);
 +  pw.init(renderer, ctx->config->imageContrast);
-
+ 
    // The cache streams to disk one MCU-row band at a time. Flushing rows below
    // this block (raster order guarantees they are final) repositions the band;
 diff --git a/lib/Epub/Epub/converters/PngToFramebufferConverter.cpp b/lib/Epub/Epub/converters/PngToFramebufferConverter.cpp
+index 58b129b9fca491e4b48c50e30367ac37a88568f2..c663f385b1c7aa6d0ab8afc25ca604d8084481c3 100644
 --- a/lib/Epub/Epub/converters/PngToFramebufferConverter.cpp
 +++ b/lib/Epub/Epub/converters/PngToFramebufferConverter.cpp
-@@ -241,7 +241,7 @@
-
+@@ -241,7 +241,7 @@ int pngDrawCallback(PNGDRAW* pDraw) {
+ 
    // Pre-compute orientation and render-mode state once per callback.
    DirectPixelWriter pw;
 -  pw.init(*ctx->renderer);
 +  pw.init(*ctx->renderer, ctx->config->imageContrast);
-
+ 
    for (int dstY = firstDstY; dstY < endDstY; dstY++) {
      ctx->lastDstY = dstY;
 diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index 61f511da85d2cb2b4afaf2f2cb440218e5ea4c29..b312584d6f75cde6e3fc1d0cb2678e5a1a85460a 100644
 --- a/lib/GfxRenderer/GfxRenderer.cpp
 +++ b/lib/GfxRenderer/GfxRenderer.cpp
-@@ -3231,9 +3231,19 @@
+@@ -3231,9 +3231,19 @@ void GfxRenderer::preconditionGrayscale(int x, int y, int w, int h) const {
                                  static_cast<uint16_t>(x1 - x0 + 1), static_cast<uint16_t>(y1 - y0 + 1));
  }
-
+ 
 -void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuffers(frameBuffer); }
--
--void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
 +void GfxRenderer::copyGrayscaleLsbBuffers(uint8_t* plane) const {
 +  if (!plane) plane = frameBuffer;
 +  // Zero encodes black in an absolute plane and no gray in an overlay.
 +  display.maskLightLeakBorder(plane, 0, panelHeight, false);
 +  display.copyGrayscaleLsbBuffers(plane);
 +}
-+
+ 
+-void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
 +void GfxRenderer::copyGrayscaleMsbBuffers(uint8_t* plane) const {
 +  if (!plane) plane = frameBuffer;
 +  // Zero encodes black in an absolute plane and no gray in an overlay.
 +  display.maskLightLeakBorder(plane, 0, panelHeight, false);
 +  display.copyGrayscaleMsbBuffers(plane);
 +}
-
+ 
  void GfxRenderer::displayGrayBuffer(const bool turnOffScreen) const {
    display.displayGrayBuffer(fadingFix || turnOffScreen);
-@@ -3387,6 +3397,46 @@
+@@ -3387,6 +3397,46 @@ bool GfxRenderer::supportsDirectGrayscale() const {
  #endif
  }
-
+ 
 +bool GfxRenderer::supportsCombinedGrayscale() const {
 +#ifdef SIMULATOR
 +  return false;
@@ -331,10 +384,10 @@ index 1074ecce03413a49979152e0d0c5956211daccce..f9285087f20fa9f00b04d7ded4418208
 +++ b/lib/GfxRenderer/GfxRenderer.h
 @@ -24,6 +24,7 @@ class SdCardFont;
  #include <vector>
-
+ 
  #include "Bitmap.h"
 +#include "ImageContrast.h"
-
+ 
  namespace glyphBitmap {
  struct Frame;
 @@ -84,6 +85,8 @@ class GfxRenderer {
@@ -422,36 +475,38 @@ index dc631727a74d04962643bb5a51ce628aa48520c4..836a95fffe9246d8dd244a785650b491
  STR_TAP_AND_SWIPE: "Tap & Swipe"
  STR_TAP_ONLY: "Tap Only"
 diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
+index 8691ae6ae732e06b7f83af0f9220312974546071..76e34ddbfe38a9ab42c85f8eae063094f76d0343 100644
 --- a/lib/hal/HalDisplay.cpp
 +++ b/lib/hal/HalDisplay.cpp
-@@ -25,11 +25,6 @@
-
+@@ -26,11 +26,6 @@ HalDisplay::~HalDisplay() {}
  void HalDisplay::begin(bool seamless) {
    HalSpiBus::Lock spiLock;
--
+ 
 -  // Set X3-specific panel mode before initializing.
 -  if (gpio.deviceIsX3()) {
 -    einkDisplay.setDisplayX3();
 -  }
-
+-
    einkDisplay.begin();
-
-@@ -73,11 +68,8 @@
+ 
+   if (seamless) {
+@@ -73,12 +68,9 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
  }
-
+ 
  void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
 +  maskBwLightLeakBorder();
    HalSpiBus::Lock spiLock;
--
+ 
 -  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
 -    einkDisplay.requestResync(1);
 -  }
-
+-
    einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
  }
-@@ -97,10 +89,7 @@
+ 
+@@ -97,10 +89,7 @@ bool HalDisplay::restoreVisibleFrame() {
  }
-
+ 
  void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
 -  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
 -    einkDisplay.requestResync(1);
@@ -460,23 +515,24 @@ diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
 +  maskBwLightLeakBorder();
    einkDisplay.displayBufferAsyncNoShadow(convertRefreshMode(mode));
  }
-
-@@ -121,11 +110,8 @@
+ 
+@@ -121,12 +110,9 @@ bool HalDisplay::displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback,
  }
-
+ 
  void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
 +  maskBwLightLeakBorder();
    HalSpiBus::Lock spiLock;
--
+ 
 -  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
 -    einkDisplay.requestResync(1);
 -  }
-
+-
    einkDisplay.refreshDisplay(convertRefreshMode(mode), turnOffScreen);
  }
-@@ -148,16 +134,7 @@
+ 
+@@ -148,16 +134,7 @@ void HalDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* m
  }
-
+ 
  void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
 -  // X3: a HALF or FULL fallback means the caller wants a clean base (e.g. the
 -  // sleep cover, a full-screen swap from arbitrary prior content). Without
@@ -491,29 +547,30 @@ diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
 +  maskBwLightLeakBorder();
    einkDisplay.displayGrayscaleBase(convertRefreshMode(fallback), turnOffScreen);
  }
-
-@@ -172,6 +149,11 @@
- void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay.copyGrayscaleMsbBuffers(msbBuffer); }
-
+ 
+@@ -173,6 +150,11 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
+ 
  void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
-+
+ 
 +bool HalDisplay::displayDirectGrayRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool turnOffScreen) {
 +  HalSpiBus::Lock spiLock;
 +  return einkDisplay.displayDirectGrayRegion({x, y, width, height}, turnOffScreen);
 +}
-
++
  void HalDisplay::displayGrayBuffer(bool turnOffScreen) {
    HalSpiBus::Lock spiLock;
+   einkDisplay.displayGrayBuffer(turnOffScreen);
 diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
+index 0af13081810c56a06b26068b8eed4144cb0e1a1f..b03f917fbd73e0b88321d1970ac61045995a9cfe 100644
 --- a/lib/hal/HalDisplay.h
 +++ b/lib/hal/HalDisplay.h
-@@ -101,6 +101,7 @@
+@@ -101,6 +101,7 @@ class HalDisplay {
    void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
    void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
-
+ 
 +  bool displayDirectGrayRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool turnOffScreen);
    void displayGrayBuffer(bool turnOffScreen = false);
-
+ 
    // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
 index a091acf49617d86e0429c9e2ca6410ac8fc58457..13255967af14691b5e8106cb0bf8a08223693a69 100644
@@ -553,7 +610,7 @@ index 2ff41f9ff60fc1796a30a6973305e47a9de4968a..4a2339a523d539be6b35eecda9191c3d
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
 @@ -765,7 +765,7 @@ inline void addSettingByName(std::vector<SettingInfo>& target, const std::vector
-
+ 
  inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<SettingInfo>& allSettings) {
    std::vector<SettingInfo> readerSettings;
 -  readerSettings.reserve(12);
@@ -572,7 +629,7 @@ index 2ff41f9ff60fc1796a30a6973305e47a9de4968a..4a2339a523d539be6b35eecda9191c3d
    addSettingByName(readerSettings, allSettings, StrId::STR_GUIDE_READING);
    addSettingByName(readerSettings, allSettings, StrId::STR_DICTIONARY);
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index cd652d64a7c7419e6b10b32b78f2e45d006c9fb7..286cd07b9f3b2618647080f9c58e1db46f1f0ab7 100644
+index 417fc66fd71630d6221d4056c787efebd31f27fd..dc1c033e07f86c7abc056ed3274d7105f5ec96c2 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
 @@ -487,6 +487,9 @@ void ActivityManager::renderTaskLoop() {
@@ -585,17 +642,52 @@ index cd652d64a7c7419e6b10b32b78f2e45d006c9fb7..286cd07b9f3b2618647080f9c58e1db4
        currentActivity->render(std::move(lock));
        restoredActivityNeedsRender = false;
      }
+diff --git a/src/activities/ScreenTransitionRefresh.h b/src/activities/ScreenTransitionRefresh.h
+index efee36e11b664431bed0cc87565a7ea17debd10a..9f6f8a3252077b8f27ea89ff8a84eabcfadace90 100644
+--- a/src/activities/ScreenTransitionRefresh.h
++++ b/src/activities/ScreenTransitionRefresh.h
+@@ -1,24 +1,15 @@
+ #pragma once
+ 
+ #include <HalDisplay.h>
+-#include <HalGPIO.h>
+ 
+ #include <cstdint>
+ 
+-// Network workflows replace large parts of the screen as their state changes.
+-// X4-class panels use a single-pass clean refresh for those transitions;
+-// repeated renders within the same state (progress, signal strength, selection)
+-// remain fast.
++// Ordinary navigation must not insert a black/white cleaning pulse. The panel
++// driver still handles its required boot/wake baseline; explicit cleaning and
++// the reader's configured refresh cadence remain separate.
+ class ScreenTransitionRefresh {
+  public:
+-  HalDisplay::RefreshMode modeFor(const uint8_t screenState) {
+-    const bool screenChanged = !hasRendered_ || screenState != lastScreenState_;
+-    lastScreenState_ = screenState;
+-    hasRendered_ = true;
+-    return screenChanged && !gpio.deviceIsX3() ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
++  HalDisplay::RefreshMode modeFor(const uint8_t /*screenState*/) {
++    return HalDisplay::FAST_REFRESH;
+   }
+-
+- private:
+-  uint8_t lastScreenState_ = 0;
+-  bool hasRendered_ = false;
+ };
 diff --git a/src/activities/reader/EpubGrayscale.cpp b/src/activities/reader/EpubGrayscale.cpp
+index 2febdb4def32a27403062a6803bfb766df7b4b34..23b1d7a98d966d187c0c98e5499dcbd3b1b8defc 100644
 --- a/src/activities/reader/EpubGrayscale.cpp
 +++ b/src/activities/reader/EpubGrayscale.cpp
-@@ -8,8 +8,31 @@
+@@ -8,9 +8,32 @@
  #include <MemoryBudget.h>
-
+ 
  #include <algorithm>
 +#include <cstring>
-
+ 
  namespace EpubGrayscale {
-+
+ 
 +bool runCombinedImagePass(GfxRenderer& renderer, const Page& page, const int fontId, const int marginLeft,
 +                          const int marginTop, uint8_t* plane) {
 +  if (!plane || !renderer.beginCombinedGrayscale()) return false;
@@ -617,15 +709,17 @@ diff --git a/src/activities/reader/EpubGrayscale.cpp b/src/activities/reader/Epu
 +  return true;
 +}
 +
-
++
  bool runTiledGrayscalePass(GfxRenderer& renderer, const Page& page, const int fontId, const int marginLeft,
                             const int marginTop, const bool foregroundBlack, const bool needsTextGrayscale,
+                            const bool needsImageGrayscale, uint8_t* scratch, const size_t scratchSize,
 diff --git a/src/activities/reader/EpubGrayscale.h b/src/activities/reader/EpubGrayscale.h
+index bcae0a6e17d4e78715b00b632b5b1fbb44a39917..28ac298b9379d130e4649cb356b7d96c9e789f49 100644
 --- a/src/activities/reader/EpubGrayscale.h
 +++ b/src/activities/reader/EpubGrayscale.h
-@@ -7,6 +7,12 @@
+@@ -7,6 +7,12 @@ class GfxRenderer;
  class Page;
-
+ 
  namespace EpubGrayscale {
 +
 +// Copies the finished BW composition into each complete plane as a text and UI
@@ -634,10 +728,10 @@ diff --git a/src/activities/reader/EpubGrayscale.h b/src/activities/reader/EpubG
 +                          uint8_t* plane);
 +
  constexpr int GRAYSCALE_STRIP_ROWS = 80;
-
+ 
  // Preserves the live BW buffer and existing controller synchronization. False
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52f5c91497 100644
+index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..de6f3f50aadb3e5bcde2b51ca382a506606385ab 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -105,7 +105,8 @@ constexpr uint8_t PRE_DICTIONARY_FONT_SIZE_READER_SETTINGS_FILE_VERSION = 6;
@@ -693,7 +787,7 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
 +constexpr uint32_t READER_LAYOUT_SETTING_OVERRIDES =
 +    LEGACY_READER_SETTING_OVERRIDES & ~(1U << 11) & ~TEXT_WEIGHT_OVERRIDE & ~INVERT_IMAGES_OVERRIDE;
  constexpr uint32_t SAFE_MODE_SETTING_OVERRIDES = (1U << 9) | (1U << 15) | (1U << 16);
-
+ 
  uint32_t changedReaderSettingsMask(const ReaderSettingsSnapshot& current, const ReaderSettingsSnapshot& global) {
 @@ -1345,6 +1363,9 @@ uint32_t changedReaderSettingsMask(const ReaderSettingsSnapshot& current, const
    if (std::strcmp(current.sdFontFamilyName, global.sdFontFamilyName) != 0) mask |= SD_FONT_FAMILY_OVERRIDE;
@@ -704,7 +798,7 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
 +  if (current.monochromeImages != global.monochromeImages) mask |= MONOCHROME_IMAGE_OVERRIDE;
    return mask;
  }
-
+ 
 @@ -1361,6 +1382,9 @@ void applyReaderSettingsOverrides(ReaderSettingsSnapshot& target, const ReaderSe
    }
    if (mask & TEXT_WEIGHT_OVERRIDE) target.textWeight = book.textWeight;
@@ -713,7 +807,7 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
 +  if (mask & TRANSPARENT_IMAGE_OVERRIDE) target.transparentImageBackground = book.transparentImageBackground;
 +  if (mask & MONOCHROME_IMAGE_OVERRIDE) target.monochromeImages = book.monochromeImages;
  }
-
+ 
  using BookReaderSettingsData = EpubReaderActivity::BookReaderSettingsData;
 @@ -1456,7 +1480,8 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath)
        version != PRE_DICTIONARY_FONT_SIZE_READER_SETTINGS_FILE_VERSION &&
@@ -781,21 +875,59 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
  #if CROSSINK_APP_CAP_TOUCH
    if (mappedInput.hasTouchHardware()) {
      if (!touchReaderPreviewAllocationAttempted) {
-@@ -7579,7 +7617,12 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
-   if (deferImageLoading) {
-     needsImageGrayscale = false;
+@@ -7553,7 +7591,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+ 
+   const bool pageHasImages = page->hasImages();
+   const bool foregroundBlack = ReaderUtils::readerForegroundBlack();
+-  bool needsImageGrayscale = pageHasImages;
++  const bool needsImageGrayscale = pageHasImages;
+   bool needsTextGrayscale = SETTINGS.textAntiAliasing && foregroundBlack &&
+                             !sdFontSystem.fontUsesMonochromeRaster(renderer, fontId, SETTINGS.sdFontFamilyName);
+   const int contentBottom = renderer.getScreenHeight() - orientedMarginBottom;
+@@ -7564,7 +7602,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   // the final page will immediately replace.
+   bool deferQueuedTurnRendering = false;
+   if (updatePanel) {
+-    const bool canDeferRendering = needsTextGrayscale || pageHasImages;
++    const bool canDeferRendering = needsTextGrayscale && !pageHasImages;
+     if (canDeferRendering && pendingManualPageTurns.hasPending()) {
+       queuedTurnRendering.beginDecision();
+       deferQueuedTurnRendering = queuedTurnRendering.finishDecision(pendingManualPageTurns.hasPending());
+@@ -7572,14 +7610,16 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+       queuedTurnRendering.clear();
+     }
    }
+-  const bool deferImageLoading = deferQueuedTurnRendering && pageHasImages;
+   if (deferQueuedTurnRendering) {
+     needsTextGrayscale = false;
+   }
+-  if (deferImageLoading) {
+-    needsImageGrayscale = false;
+-  }
 -  const bool pageHasImagesNeedingDecode = !deferImageLoading && pageHasImages && page->hasImagesNeedingDecode();
-+  auto combinedImagePlane = updatePanel && needsImageGrayscale && foregroundBlack && renderer.supportsRegionalGrayscale()
++  const bool pageHasImagesNeedingDecode = pageHasImages && page->hasImagesNeedingDecode();
++  auto regionalImageLsb = updatePanel && needsImageGrayscale && renderer.supportsRegionalGrayscale()
 +                                ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                                : HeapByteBuffer{};
-+  auto regionalImageMsb = combinedImagePlane
++  auto regionalImageMsb = regionalImageLsb
 +                              ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                              : HeapByteBuffer{};
-
+ 
    const auto finalizeBufferComposition = [&]() {
      if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
-@@ -7616,17 +7659,9 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7598,9 +7638,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+ 
+   const auto composePageBuffer = [&]() {
+     const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+-    if (deferImageLoading) {
+-      page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
+-                                        /*renderCachedImages=*/false);
++    if (regionalImageMsb) {
++      page->renderText(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     } else {
+       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     }
+@@ -7616,17 +7655,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      }
      finalizeBufferComposition();
    };
@@ -806,65 +938,86 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
 -    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 -    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
 -  }
-   if (pageHasImages && !deferImageLoading) {
+-  if (pageHasImages && !deferImageLoading) {
 -    // Show the new page's placeholders before ZIP extraction or sidecar
 -    // materialization. The loan can overwrite the framebuffer, so rebuild
 -    // the complete page after returning it; the panel keeps the preview.
-+    // Decode before the one visible BW composition. The framebuffer loan is
-+    // private scratch; never display its temporary pixels or a blank box.
++  if (pageHasImages && !regionalImageMsb) {
++    // Without a regional pass, prepare the photo before the normal page turn.
      GfxRenderer::FrameBufferLoan loan(renderer);
      page->prepareImageCaches();
      loan.end();
-@@ -7673,47 +7708,56 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -7673,48 +7703,73 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    if (!updatePanel) {
      return true;
    }
 +  if (regionalImageMsb) {
-+    // Use a real BW image as the first visible stage, never an empty image box.
-+    // The grayscale stage below drives individual image windows; page text is
-+    // already final and does not need another whole-page clearing activation.
++    // Advance the page with text only. Each photo goes straight from the page
++    // background to grayscale in its own window.
 +    renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::FAST_REFRESH);
 +    cleanImageBasePending = false;
 +    const auto frameSize = renderer.getBufferSize();
++    if (pageHasImagesNeedingDecode) {
++      std::memcpy(regionalImageLsb.get(), renderer.getFrameBuffer(), frameSize);
++      GfxRenderer::FrameBufferLoan loan(renderer);
++      page->prepareImageCaches();
++      loan.end();
++      std::memcpy(renderer.getFrameBuffer(), regionalImageLsb.get(), frameSize);
++    }
 +
-+    bool rendered = renderer.displayDirectGrayscaleBase();
-+    if (rendered) {
++    bool rendered = false;
++    if (renderer.displayDirectGrayscaleBase()) {
 +      auto renderImagePlane = [&](const GfxRenderer::RenderMode mode, uint8_t* plane) {
 +        std::memcpy(plane, renderer.getFrameBuffer(), frameSize);
 +        renderer.setRenderMode(mode);
 +        renderer.beginStripTarget(plane, 0, renderer.getDisplayHeight());
-+        page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop);
++        page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
 +        renderer.endStripTarget();
 +      };
-+      renderImagePlane(GfxRenderer::GRAYSCALE_LSB, combinedImagePlane.get());
++      renderImagePlane(GfxRenderer::GRAYSCALE_LSB, regionalImageLsb.get());
 +      renderImagePlane(GfxRenderer::GRAYSCALE_MSB, regionalImageMsb.get());
 +      bool firstRegion = true;
 +      page->forEachImageRect([&](int16_t x, int16_t y, int16_t width, int16_t height) {
-+        if (!rendered) return;
-+        if (!firstRegion) rendered = renderer.displayDirectGrayscaleBase();
++        if (!firstRegion && !renderer.displayDirectGrayscaleBase()) {
++          LOG_ERR("ERS", "Could not start grayscale for image at %d,%d", x, y);
++          return;
++        }
 +        firstRegion = false;
-+        if (!rendered) return;
-+        renderer.copyGrayscaleLsbBuffers(combinedImagePlane.get());
-+        renderer.copyGrayscaleMsbBuffers(regionalImageMsb.get());
-+        rendered = renderer.displayDirectGrayRegion(x + orientedMarginLeft, y + orientedMarginTop, width, height);
++        const auto displayRegion = [&]() {
++          renderer.copyGrayscaleLsbBuffers(regionalImageLsb.get());
++          renderer.copyGrayscaleMsbBuffers(regionalImageMsb.get());
++          return renderer.displayDirectGrayRegion(x + orientedMarginLeft, y + orientedMarginTop, width, height);
++        };
++        if (displayRegion() || (renderer.displayDirectGrayscaleBase() && displayRegion())) {
++          rendered = true;
++        } else {
++          LOG_ERR("ERS", "Could not update image window at %d,%d", x, y);
++        }
 +      });
-+      rendered = rendered && !firstRegion;
 +      renderer.setRenderMode(GfxRenderer::BW);
 +    }
 +    regionalImageMsb.reset();
++    regionalImageLsb.reset();
++    if (rendered) {
++      // Keep the controller's monochrome baseline in sync for the next turn.
++      page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
++    } else {
++      LOG_ERR("ERS", "Image-only grayscale failed");
++    }
 +    renderer.cleanupGrayscaleWithFrameBuffer();
-+    if (!rendered) LOG_ERR("ERS", "Image-only grayscale failed; keeping the BW image without a page repaint");
 +    return true;
 +  }
-+  // Non-regional controllers retain their BW-base/gray-overlay sequence.
-+  // A complete direct/absolute frame can visibly condition blank image areas
-+  // (or the whole page) before settling; do not use it for in-book images.
-+  combinedImagePlane.reset();
++  if (pageHasImages) {
++    // Use a single monochrome page turn when a photo-only grayscale window is unavailable.
++    renderer.displayBuffer(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::FAST_REFRESH);
++    cleanImageBasePending = false;
++    return true;
++  }
    const bool needsAnyGrayscale = needsTextGrayscale || needsImageGrayscale;
    const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
    const bool overlapRefresh =
-       tiledGrayscale && !pageHasImages && pagesUntilFullRefresh > 1 && renderer.supportsAsyncGrayscaleBase();
-   if (pageHasImages && !deferImageLoading) {
+-      tiledGrayscale && !pageHasImages && pagesUntilFullRefresh > 1 && renderer.supportsAsyncGrayscaleBase();
+-  if (pageHasImages && !deferImageLoading) {
 -    // Keep the legacy blank/base sequence unless the controller can transition
 -    // directly to the complete image base.
 -    int16_t imgX, imgY, imgW, imgH;
@@ -901,14 +1054,13 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
 -    // HALF ghost-cleanup path, which drives every pixel to its target
 -    // regardless of residue.
 -    pagesUntilFullRefresh = 1;
-+    // Send the composed image as the base. A separate blank image rectangle
-+    // can appear as a black box when the panel or reader is inverted.
-+    renderer.displayGrayscaleBase(pagesUntilFullRefresh < 0 ? manualScreenRefreshMode() : HalDisplay::FAST_REFRESH);
-+    cleanImageBasePending = false;
-   } else if (needsAnyGrayscale) {
+-  } else if (needsAnyGrayscale) {
++      tiledGrayscale && pagesUntilFullRefresh > 1 && renderer.supportsAsyncGrayscaleBase();
++  if (needsAnyGrayscale) {
      if (pagesUntilFullRefresh <= 1) {
        // Cleanup turns still need the stronger HALF pass, but X3 grayscale
-@@ -8966,6 +9010,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+       // overlays settle better if the OEM precondition step runs before the
+@@ -8966,6 +9021,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
      ImageBlock::setExtractor(nullptr, nullptr, nullptr);
    }
    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
@@ -917,7 +1069,7 @@ index 25fb4f5c31c0654d7c0ec0bb291ab6f75629d720..c278cc874b60a15e06c10be1fa7f6f52
    drawPublisherPageMarkers(renderer, *page, layout.marginTop, renderer.getScreenHeight() - layout.marginBottom,
                             ReaderUtils::readerForegroundBlack());
 diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
-index d8f5b5ead701bc8cc95b6cfe0fc02e5e9ec50c37..77420c0a7014be5b070a66adb22c094f8f369a4c 100644
+index 47e50d6409541c3c54279b9c2ff200ac6c6080db..ff9e99d2c536e1377a4660ad827896adb10355be 100644
 --- a/src/activities/reader/EpubReaderActivity.h
 +++ b/src/activities/reader/EpubReaderActivity.h
 @@ -58,6 +58,10 @@ class EpubReaderActivity final : public Activity {
@@ -980,7 +1132,7 @@ index 3be3ac2c4b4390e18e4d159f312af8db4e49b558..bf01bbff621eea19230fa76e3e996c40
 +    }
    }
  }
-
+ 
 @@ -1561,6 +1577,10 @@ void EpubReaderDrawerActivity::openPane(const ReaderDrawerPane pane) {
      paneRows = {RowId::FontFamily, RowId::FontSize, RowId::TextWeight};
      refreshTtfRenderingRow();
@@ -1151,11 +1303,12 @@ index 3be3ac2c4b4390e18e4d159f312af8db4e49b558..bf01bbff621eea19230fa76e3e996c40
        return false;
    }
 diff --git a/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp b/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp
+index d7267967d82721339eb5dbcdb8950d0856128313..d7aa239e77642e08d293337b71e57df1ee18160f 100644
 --- a/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp
 +++ b/src/activities/reader/EpubReaderFootnoteSelectActivity.cpp
-@@ -185,6 +185,7 @@
+@@ -185,6 +185,7 @@ void EpubReaderFootnoteSelectActivity::render(RenderLock&&) {
    }
-
+ 
    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
 +  renderer.setInvertImages(SETTINGS.invertImagesDark != 0);
    page->render(renderer, fontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
@@ -1171,7 +1324,7 @@ index 24b1e219bff1893f6245f8a82f4e5631c3e70a8e..033c310427edbddd9e0de1e190d7055c
    TtfRendering,
 +  Images,
  };
-
+ 
  enum class ReaderButtonSliderInput : uint8_t { Next, Previous, Confirm, Back };
 @@ -154,6 +155,10 @@ enum class ReaderDrawerCatalogItem : uint8_t {
    ReadestSync,
@@ -1182,7 +1335,7 @@ index 24b1e219bff1893f6245f8a82f4e5631c3e70a8e..033c310427edbddd9e0de1e190d7055c
 +  TransparentImageBackground,
 +  MonochromeImages,
  };
-
+ 
  struct ReaderDrawerAvailability {
 @@ -335,6 +340,9 @@ struct ReaderSettingsDraft {
    uint8_t textAntiAliasing = 0;
@@ -1195,9 +1348,10 @@ index 24b1e219bff1893f6245f8a82f4e5631c3e70a8e..033c310427edbddd9e0de1e190d7055c
    uint8_t guideReadingEnabled = 0;
    uint8_t hyphenationEnabled = 0;
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index a73ba4640f9b9fc3a39ef7c59456672471d1fefa..c93bbd33e2e683df7661d28652f49ca107310e08 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
-@@ -209,7 +209,8 @@
+@@ -209,7 +209,8 @@ std::string formatSettingValue(const SettingInfo& setting) {
               static_cast<unsigned int>(SETTINGS.*(setting.valuePtr)));
      return valueBuffer;
    }
@@ -1207,12 +1361,10 @@ diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/setti
      return std::to_string(SETTINGS.*(setting.valuePtr)) + "%";
    }
    if (setting.valuePtr == &CrossPointSettings::readingIdleTimeThresholdUnits) {
-@@ -1052,6 +1053,23 @@
-   if (setting.value16Ptr == &CrossPointSettings::frontlightScheduleStart ||
-       setting.value16Ptr == &CrossPointSettings::frontlightScheduleEnd) {
+@@ -1054,6 +1055,23 @@ void SettingsActivity::toggleCurrentSetting() {
      openFrontlightScheduleTimePicker(setting.value16Ptr, setting.nameId);
-+    return;
-+  }
+     return;
+   }
 +  if (setting.valuePtr == &CrossPointSettings::imageContrast) {
 +    startActivityForResult(
 +        std::make_unique<IntervalSelectionActivity>(
@@ -1228,22 +1380,26 @@ diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/setti
 +          }
 +          requestUpdate();
 +        });
-     return;
-   }
++    return;
++  }
    if (setting.valuePtr == &CrossPointSettings::lineHeightPercent) {
+     openLineHeightPicker();
+     return;
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 44e17aafe45525e04695ad6081dece97610c6ddc..afe274ae416daee520c45dd99bb30686ea64a58c 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -124,3 +124,5 @@
+@@ -124,3 +124,5 @@ add_subdirectory(readest_position_sync)
  add_subdirectory(readest_source_position)
-
+ 
  add_subdirectory(clipping_list_visibility)
 +
 +add_subdirectory(image_refresh_regions)
 diff --git a/test/epub_grayscale/CMakeLists.txt b/test/epub_grayscale/CMakeLists.txt
+index b7555ba1b07ee331d85f362826af9a9ebb765a04..4b584972d13b90b681b0a5f9410c93c0bd3b3fe4 100644
 --- a/test/epub_grayscale/CMakeLists.txt
 +++ b/test/epub_grayscale/CMakeLists.txt
-@@ -2,7 +2,7 @@
+@@ -2,7 +2,7 @@ add_executable(EpubGrayscaleTest EpubGrayscaleTest.cpp
    ${REPO_ROOT}/src/activities/reader/EpubGrayscale.cpp)
  target_include_directories(EpubGrayscaleTest PRIVATE stubs ../memory_policy/stubs
    ${REPO_ROOT}/lib/Epub ${REPO_ROOT}/lib/Memory ${REPO_ROOT}/lib/MemoryBudget
@@ -1252,7 +1408,7 @@ diff --git a/test/epub_grayscale/CMakeLists.txt b/test/epub_grayscale/CMakeLists
  target_compile_definitions(EpubGrayscaleTest PRIVATE ARDUINO_ARCH_ESP32=1 CROSSINK_MEMORY_TEST=1)
  target_link_libraries(EpubGrayscaleTest PRIVATE crosspoint_test_common GTest::gtest_main)
  gtest_discover_tests(EpubGrayscaleTest PROPERTIES ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1")
-@@ -41,7 +41,7 @@
+@@ -41,7 +41,7 @@ add_executable(RetainedPxcCacheTest RetainedPxcCacheTest.cpp
    ${REPO_ROOT}/src/activities/reader/EpubGrayscale.cpp)
  target_include_directories(RetainedPxcCacheTest PRIVATE stubs ../memory_policy/stubs
    ${REPO_ROOT}/lib/Epub ${REPO_ROOT}/lib/Memory ${REPO_ROOT}/lib/MemoryBudget
@@ -1262,14 +1418,13 @@ diff --git a/test/epub_grayscale/CMakeLists.txt b/test/epub_grayscale/CMakeLists
  target_link_libraries(RetainedPxcCacheTest PRIVATE crosspoint_test_common GTest::gtest_main)
  gtest_discover_tests(RetainedPxcCacheTest PROPERTIES ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1")
 diff --git a/test/epub_grayscale/EpubGrayscaleTest.cpp b/test/epub_grayscale/EpubGrayscaleTest.cpp
+index b5787d1444a34e3abd9121d1ad0249abeb2a270e..5b076ebdc3560dac41b89c8dd99602510c2d3fbe 100644
 --- a/test/epub_grayscale/EpubGrayscaleTest.cpp
 +++ b/test/epub_grayscale/EpubGrayscaleTest.cpp
-@@ -224,6 +224,45 @@
-   ASSERT_TRUE(renderFromCache(r, "large.pxc", 0, 0, 479, 789));
-   EXPECT_EQ(r.bw, reference(r, 479, 789, 0, 0, 0, r.height));
+@@ -226,6 +226,45 @@ TEST_F(EpubGrayscaleTest, RetentionFailureFallsBackWithoutOverrunningOldBuffer)
    EXPECT_EQ(retainedPxcCapacity, 39u);
-+}
-+
+ }
+ 
 +TEST_F(EpubGrayscaleTest, CombinedImagePagePublishesOnlyFinalGrayscaleAndKeepsText) {
 +  GfxRenderer r(32, 24);
 +  r.orientation = GfxRenderer::LandscapeCounterClockwise;
@@ -1307,21 +1462,24 @@ diff --git a/test/epub_grayscale/EpubGrayscaleTest.cpp b/test/epub_grayscale/Epu
 +      EXPECT_EQ(renderer.placeholderRects[0], expected);
 +    }
 +  }
- }
-
++}
++
  TEST_F(EpubGrayscaleTest, ImageBlockPreservesScanAndFailureFallback) {
+   GfxRenderer r;
+   ImageBlock block("image.jpg", "", 21, 23);
 diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs/GfxRenderer.h
+index b3d24441fa3e2c1648027672670600b08880cc0e..5592dec7204786b8d45282d976bff4dcff9e0c41 100644
 --- a/test/epub_grayscale/stubs/GfxRenderer.h
 +++ b/test/epub_grayscale/stubs/GfxRenderer.h
 @@ -2,6 +2,7 @@
  #include <FontCacheManager.h>
-
+ 
  #include <algorithm>
 +#include <array>
  #include <cassert>
  #include <cstdint>
  #include <cstring>
-@@ -18,7 +19,9 @@
+@@ -18,7 +19,9 @@ class GfxRenderer {
    Orientation orientation = Portrait;
    RenderMode mode = BW;
    bool supported = true, inverted = false, active = false;
@@ -1331,7 +1489,7 @@ diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs
    uint8_t* target = nullptr;
    std::vector<uint8_t> bw, lsb, msb;
    std::vector<std::string> events;
-@@ -32,6 +35,17 @@
+@@ -32,6 +35,17 @@ class GfxRenderer {
    int getScreenHeight() const { return orientation == Portrait || orientation == PortraitInverted ? width : height; }
    Orientation getOrientation() const { return orientation; }
    RenderMode getRenderMode() const { return mode; }
@@ -1349,7 +1507,7 @@ diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs
    void setRenderMode(RenderMode m) { mode = m; }
    bool supportsStripGrayscale() const { return supported && !inverted; }
    bool isStripTargetActive() const { return active; }
-@@ -59,7 +73,8 @@
+@@ -59,7 +73,8 @@ class GfxRenderer {
      memcpy((low ? lsb : msb).data() + size_t(y) * stride, p, size_t(count) * stride);
    }
    void displayGrayBuffer() {
@@ -1359,7 +1517,7 @@ diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs
      events.push_back("gray");
    }
    void cleanupGrayscaleWithFrameBuffer() {
-@@ -67,8 +82,9 @@
+@@ -67,8 +82,9 @@ class GfxRenderer {
      events.push_back("cleanup");
    }
    FontCacheManager* getFontCacheManager() { return &fonts; }
@@ -1372,6 +1530,7 @@ diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs
      int lo, hi;
 diff --git a/test/image_refresh_regions/CMakeLists.txt b/test/image_refresh_regions/CMakeLists.txt
 new file mode 100644
+index 0000000000000000000000000000000000000000..a41cca990f8ef1fb25ec0d4fba9f6c0ac2acb98f
 --- /dev/null
 +++ b/test/image_refresh_regions/CMakeLists.txt
 @@ -0,0 +1,12 @@
@@ -1389,7 +1548,7 @@ new file mode 100644
 +add_test(NAME image_refresh_regions COMMAND image_refresh_regions_test)
 diff --git a/test/image_refresh_regions/ExtractImageRefresh.py b/test/image_refresh_regions/ExtractImageRefresh.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..301d3bc35ffe747cb9ca74b5486fdfad580de228
+index 0000000000000000000000000000000000000000..313b30af0263cc75c38cd540779f6a03579271b2
 --- /dev/null
 +++ b/test/image_refresh_regions/ExtractImageRefresh.py
 @@ -0,0 +1,14 @@
@@ -1400,19 +1559,19 @@ index 0000000000000000000000000000000000000000..301d3bc35ffe747cb9ca74b5486fdfad
 +b=header.index("  // Total area of all images",a)
 +Path(sys.argv[3]).write_text(header[a:b])
 +source=Path(sys.argv[2]).read_text()
-+a=source.index("  if (pageHasImages && !deferImageLoading) {",source.index("  const bool overlapRefresh ="))
-+b=source.index("  } else if (needsAnyGrayscale)",a)
-+Path(sys.argv[4]).write_text("void Reader::renderImageBase() {\n"+source[a:b]+"  }\n}\n")
-+a=source.index('  if (regionalImageMsb) {\n    // Use a real BW image')
-+b=source.index('  // Non-regional controllers',a)
++a=source.index('  if (regionalImageMsb) {\n    // Advance the page with text only.')
++b=source.index('  const bool needsAnyGrayscale',a)
++Path(sys.argv[4]).write_text('bool Reader::renderImage() {\n'+source[a:b]+'  return false;\n}\n')
++a=source.index('    if (regionalImageMsb) {',source.index('  const auto composePageBuffer'))
++b=source.index('    finalizeBufferComposition();',a)
 +with Path(sys.argv[4]).open('a') as out:
-+    out.write('\nbool Reader::renderRegionalImage() {\n'+source[a:b]+'  return false;\n}\n')
++    out.write('\nvoid Reader::composePage() {\n'+source[a:b]+'}\n')
 diff --git a/test/image_refresh_regions/ImageRefreshRegionsTest.cpp b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069adf0031c
+index 0000000000000000000000000000000000000000..3e6abe39b615665fa9087524365166b5a59f3f3a
 --- /dev/null
 +++ b/test/image_refresh_regions/ImageRefreshRegionsTest.cpp
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,174 @@
 +#include <algorithm>
 +#include <array>
 +#include <cstring>
@@ -1433,7 +1592,14 @@ index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069
 +};
 +struct Renderer;
 +struct Page {
-+ void renderImages(Renderer&,int,int,int) const;
++ void renderImages(Renderer&,int,int,int,bool) const;
++ void renderText(Renderer&,int,int,int,bool) const;
++ void render(Renderer&,int,int,int,bool) const;
++ void renderWithImagePlaceholders(Renderer& renderer,int font,int left,int top,bool foreground,bool) const {
++  renderText(renderer,font,left,top,foreground);
++ }
++ unsigned decodes = 0;
++ void prepareImageCaches() { ++decodes; }
 + std::vector<std::unique_ptr<Element>>elements;
 + #include "ImageRects.inc"
 + int imageArea()const{int area=0;forEachImageRect([&](int,int,int w,int h){area+=w*h;});return area;}
@@ -1441,12 +1607,21 @@ index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069
 +namespace HalDisplay {enum {FAST_REFRESH=1,HALF_REFRESH=2};}
 +struct Renderer {
 + enum RenderMode {BW,GRAYSCALE_LSB,GRAYSCALE_MSB};
++ struct FrameBufferLoan {
++  Renderer& renderer;
++  explicit FrameBufferLoan(Renderer& renderer) : renderer(renderer) {
++   std::fill(renderer.pixels.begin(), renderer.pixels.end(), 9);
++  }
++  void end() {}
++ };
 + RenderMode mode=BW;
 + uint8_t* target=nullptr;
 + std::vector<uint8_t> lsb,msb;
 + std::vector<std::array<int,4>> regions;
 + unsigned baseCalls=0,cleanups=0;
 + bool grayFails=false;
++ int failY = -1;
++ unsigned failedWindows = 0;
 + bool displayDirectGrayscaleBase(){++baseCalls;return true;}
 + uint8_t* getFrameBuffer(){return pixels.data();}
 + size_t getBufferSize()const{return pixels.size();}
@@ -1457,7 +1632,7 @@ index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069
 + void copyGrayscaleLsbBuffers(uint8_t* data){lsb.assign(data,data+pixels.size());}
 + void copyGrayscaleMsbBuffers(uint8_t* data){msb.assign(data,data+pixels.size());}
 + bool displayDirectGrayRegion(int x,int y,int w,int h){
-+  if(grayFails)return false;
++  if (grayFails || y == failY) { ++failedWindows; return false; }
 +  regions.push_back({x,y,w,h});
 +  // The panel changes only the requested image. Page text stays untouched.
 +  auto next=frames.back();
@@ -1476,22 +1651,33 @@ index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069
 + }
 +};
 +using GfxRenderer=Renderer;
-+void Page::renderImages(Renderer& renderer,int,int,int) const {
++void Page::renderText(Renderer& renderer,int,int,int,bool) const {
++ forEachImageRect([&](int x,int y,int w,int h){
++  for(int j=y;j<y+h;++j)for(int i=x;i<x+w;++i)renderer.pixels[j*100+i]=0;
++ });
++}
++void Page::render(Renderer& renderer,int font,int left,int top,bool foreground) const {
++ renderText(renderer,font,left,top,foreground);
++ renderImages(renderer,font,left,top,foreground);
++}
++void Page::renderImages(Renderer& renderer,int,int,int,bool) const {
 + forEachImageRect([&](int x,int y,int w,int h){
 +  for(int j=y;j<y+h;++j)for(int i=x;i<x+w;++i)
-+   renderer.target[j*100+i]=(renderer.mode==Renderer::GRAYSCALE_LSB ? (i+j)%2 : i%2);
++   if (renderer.mode == Renderer::BW) renderer.pixels[j*100+i] = 1;
++   else renderer.target[j*100+i]=(renderer.mode==Renderer::GRAYSCALE_LSB ? (i+j)%2 : i%2);
 + });
 +}
 +struct Reader {
 + Page* page=nullptr;
-+ std::unique_ptr<uint8_t[]> combinedImagePlane,regionalImageMsb;
++ std::unique_ptr<uint8_t[]> regionalImageLsb,regionalImageMsb;
 + int fontId=0,orientedMarginLeft=0,orientedMarginTop=0;
-+ bool renderRegionalImage();
++ bool renderImage();
++ void composePage();
++ bool foregroundBlack = true, pageHasImagesNeedingDecode = false;
 + Renderer renderer;
 + bool pageHasImages = true, deferImageLoading = false, cleanImageBasePending = false;
 + int pagesUntilFullRefresh = 3;
 + int manualScreenRefreshMode() { return HalDisplay::HALF_REFRESH; }
-+ void renderImageBase();
 +};
 +#include "ImageRefresh.inc"
 +int main() {
@@ -1500,50 +1686,71 @@ index 0000000000000000000000000000000000000000..9a04338069992c0c3c99956d06e7b069
 +  reader.cleanImageBasePending = cleanup;
 +  for (size_t i = 0; i < reader.renderer.pixels.size(); ++i) reader.renderer.pixels[i] = (i % 3 != 0);
 +  const auto composed = reader.renderer.pixels;
-+  reader.renderImageBase();
++  assert(reader.renderImage());
 +  assert(reader.renderer.frames.size() == 1);
 +  assert(reader.renderer.frames.front() == composed);
 +  assert(reader.renderer.modes.front() == HalDisplay::FAST_REFRESH);
 +  assert(reader.pagesUntilFullRefresh == 3 && !reader.cleanImageBasePending);
 + }
 + // Cached and freshly decoded images use the same image-only refinement.
-+ for(bool cleanup:{false,true}) {
++ for(bool uncached : {false,true}) {
 +  Page images;images.elements.push_back(std::make_unique<PageImage>(8,12,16,16));
 +  images.elements.push_back(std::make_unique<PageImage>(8,90,16,16));
-+  Reader reader;reader.page=&images;reader.cleanImageBasePending=cleanup;
-+  reader.combinedImagePlane=std::make_unique<uint8_t[]>(reader.renderer.getBufferSize());
++  Reader reader;reader.page=&images;reader.cleanImageBasePending=true;
++  reader.pageHasImagesNeedingDecode=uncached;
++  reader.regionalImageLsb=std::make_unique<uint8_t[]>(reader.renderer.getBufferSize());
 +  reader.regionalImageMsb=std::make_unique<uint8_t[]>(reader.renderer.getBufferSize());
 +  for(size_t i=0;i<reader.renderer.pixels.size();++i)reader.renderer.pixels[i]=i%3!=0;
++  reader.composePage();
 +  const auto composed=reader.renderer.pixels;
-+  assert(reader.renderRegionalImage());
++  assert(reader.renderImage());
 +  assert(reader.renderer.modes==std::vector<int>{HalDisplay::FAST_REFRESH});
-+  assert(reader.renderer.frames.front()==composed); // actual darker image, no blank rectangle
++  assert(reader.renderer.frames.front()==composed);
++  assert(reader.renderer.frames.front()[12*100+8]==0);
++  assert(reader.renderer.frames[1][12*100+8]>=2);
++  assert(images.decodes==unsigned(uncached));
 +  assert(reader.renderer.regions.size()==2);
 +  assert((reader.renderer.regions[0]==std::array<int,4>{8,12,16,16}));
 +  assert((reader.renderer.regions[1]==std::array<int,4>{8,90,16,16}));
 +  for(const auto& frame:reader.renderer.frames)
 +   for(int y=28;y<90;++y)for(int x=0;x<100;++x)assert(frame[y*100+x]==composed[y*100+x]);
-+  assert(reader.renderer.pixels==composed && reader.renderer.mode==Renderer::BW);
++  assert(reader.renderer.pixels[12*100+8]==1 && reader.renderer.mode==Renderer::BW);
++  assert(reader.renderer.pixels[45*100+8]==composed[45*100+8]);
 +  assert(reader.renderer.cleanups==1 && !reader.cleanImageBasePending && reader.pagesUntilFullRefresh==3);
 + }
-+ // A failed refinement keeps the already visible BW image; no full-page retry.
++ // A failed regional pass leaves the initial frame and makes no full-page retry.
 + Page failurePage;failurePage.elements.push_back(std::make_unique<PageImage>(8,12,16,16));
 + Reader failed;failed.page=&failurePage;failed.renderer.grayFails=true;
-+ failed.combinedImagePlane=std::make_unique<uint8_t[]>(failed.renderer.getBufferSize());
++ failed.regionalImageLsb=std::make_unique<uint8_t[]>(failed.renderer.getBufferSize());
 + failed.regionalImageMsb=std::make_unique<uint8_t[]>(failed.renderer.getBufferSize());
 + const auto bwFailure=failed.renderer.pixels;
-+ assert(failed.renderRegionalImage() && failed.renderer.frames.size()==1);
++ assert(failed.renderImage() && failed.renderer.frames.size()==1);
 + assert(failed.renderer.frames.front()==bwFailure && failed.renderer.mode==Renderer::BW);
-+ Reader manual;manual.pagesUntilFullRefresh=-1;manual.renderImageBase();
++ assert(failed.renderer.failedWindows == 2);
++ Page separate;
++ separate.elements.push_back(std::make_unique<PageImage>(8,12,16,16));
++ separate.elements.push_back(std::make_unique<PageImage>(8,90,16,16));
++ Reader partial;
++ partial.page = &separate;
++ partial.renderer.failY = 12;
++ partial.regionalImageLsb = std::make_unique<uint8_t[]>(partial.renderer.getBufferSize());
++ partial.regionalImageMsb = std::make_unique<uint8_t[]>(partial.renderer.getBufferSize());
++ partial.composePage();
++ assert(partial.renderImage());
++ assert(partial.renderer.failedWindows == 2);
++ assert((partial.renderer.regions == std::vector<std::array<int,4>>{{8,90,16,16}}));
++ assert(partial.renderer.modes == std::vector<int>{HalDisplay::FAST_REFRESH});
++ Reader manual;manual.pagesUntilFullRefresh=-1;assert(manual.renderImage());
 + assert(manual.renderer.modes==std::vector<int>{HalDisplay::HALF_REFRESH});
 + Page empty;empty.elements.push_back(std::make_unique<Element>());
 + int count=0;assert(!empty.forEachImageRect([&](int,int,int,int){++count;}));assert(count==0);
-+ std::cout<<"Image refresh sends the composed page without a blank rectangle\n";
++ std::cout<<"Image refresh paints text once and updates only photo windows\n";
 +}
 diff --git a/test/memory_policy/CMakeLists.txt b/test/memory_policy/CMakeLists.txt
+index bdc9feaf303a32c18e0e875ed97b132bbac433b3..49d1561fe55625a97cfc932b5052f3a1df587648 100644
 --- a/test/memory_policy/CMakeLists.txt
 +++ b/test/memory_policy/CMakeLists.txt
-@@ -8,7 +8,7 @@
+@@ -8,7 +8,7 @@ add_executable(JpegDecoderPolicyTest JpegDecoderPolicyTest.cpp
    ${REPO_ROOT}/lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp
    ${REPO_ROOT}/lib/Epub/Epub/converters/ImageToFramebufferDecoder.cpp)
  target_include_directories(JpegDecoderPolicyTest PRIVATE jpeg_decoder_stubs stubs
@@ -1553,16 +1760,17 @@ diff --git a/test/memory_policy/CMakeLists.txt b/test/memory_policy/CMakeLists.t
  target_compile_definitions(JpegDecoderPolicyTest PRIVATE ARDUINO_ARCH_ESP32=1 CROSSINK_MEMORY_TEST=1)
  target_link_libraries(JpegDecoderPolicyTest PRIVATE crosspoint_test_common GTest::gtest_main)
 diff --git a/test/memory_policy/jpeg_decoder_stubs/GfxRenderer.h b/test/memory_policy/jpeg_decoder_stubs/GfxRenderer.h
+index cba5b3f2e6c3309d63950a48086ebe3715fe6d64..cf7a54c9578e26625e4cd78cf4967188f26ce9c9 100644
 --- a/test/memory_policy/jpeg_decoder_stubs/GfxRenderer.h
 +++ b/test/memory_policy/jpeg_decoder_stubs/GfxRenderer.h
-@@ -17,6 +17,8 @@
+@@ -17,6 +17,8 @@ class GfxRenderer {
    int getWriteOriginY() const { return 0; }
    int getWriteRows() const { return height; }
    RenderMode getRenderMode() const { return BW; }
 +  bool grayPlanesAreAbsolute() const { return false; }
 +  void screenToPanel(int x, int y, int& panelX, int& panelY) const { panelX = x; panelY = y; }
    Orientation getOrientation() const { return LandscapeCounterClockwise; }
-
+ 
   private:
 diff --git a/test/reader_drawer_model/ReaderDrawerModelTest.cpp b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
 index 1637cf1ce3e06455a40a71a03652bb86c136dabf..221b84ef21e121f6a9e72c1e52478f54ee545e45 100644
@@ -1575,12 +1783,12 @@ index 1637cf1ce3e06455a40a71a03652bb86c136dabf..221b84ef21e121f6a9e72c1e52478f54
 +  for (size_t i = 0; i < layout.count; ++i) {
 +    EXPECT_NE(layout.items[i], ReaderDrawerCatalogItem::InvertImages);
 +  }
-
+ 
    const auto& minimalMore = minimal[static_cast<size_t>(ReaderDrawerTab::More)];
    EXPECT_EQ(minimalMore.count, 3);
 @@ -142,14 +145,15 @@ TEST(ReaderDrawerModel, CatalogOrderAndConditionalRowsMatchTouchDesign) {
    EXPECT_EQ(more.items[5], ReaderDrawerCatalogItem::AutoPageTurn);
-
+ 
    const auto& location = complete[static_cast<size_t>(ReaderDrawerTab::Location)];
 -  EXPECT_EQ(location.count, 7);
 +  EXPECT_EQ(location.count, 8);
@@ -1594,12 +1802,12 @@ index 1637cf1ce3e06455a40a71a03652bb86c136dabf..221b84ef21e121f6a9e72c1e52478f54
 +  EXPECT_EQ(location.items[5], ReaderDrawerCatalogItem::ReadestSync);
 +  EXPECT_EQ(location.items[6], ReaderDrawerCatalogItem::Screenshot);
 +  EXPECT_EQ(location.items[7], ReaderDrawerCatalogItem::DisplayQr);
-
+ 
    const auto& settings = complete[static_cast<size_t>(ReaderDrawerTab::Settings)];
    EXPECT_EQ(settings.count, 11);
 @@ -188,19 +192,21 @@ TEST(ReaderDrawerModel, ButtonDevicesRestoreStatsAndTransfersInTheirTabs) {
    EXPECT_EQ(more.items[3], ReaderDrawerCatalogItem::ReadingStats);
-
+ 
    const auto& location = catalog[static_cast<size_t>(ReaderDrawerTab::Location)];
 -  EXPECT_EQ(location.count, 7);
 -  EXPECT_EQ(location.items[2], ReaderDrawerCatalogItem::SyncProgress);
@@ -1614,7 +1822,7 @@ index 1637cf1ce3e06455a40a71a03652bb86c136dabf..221b84ef21e121f6a9e72c1e52478f54
 +  EXPECT_EQ(location.items[5], ReaderDrawerCatalogItem::SendNearbyBook);
 +  EXPECT_EQ(location.items[6], ReaderDrawerCatalogItem::Screenshot);
 +  EXPECT_EQ(location.items[7], ReaderDrawerCatalogItem::DisplayQr);
-
+ 
    available.hasBookmarks = true;
    available.hasClippings = true;
    const ReaderDrawerCatalog fullCatalog = makeReaderDrawerCatalog(available);
@@ -1625,86 +1833,5 @@ index 1637cf1ce3e06455a40a71a03652bb86c136dabf..221b84ef21e121f6a9e72c1e52478f54
 +  EXPECT_EQ(fullLocation.items[5], ReaderDrawerCatalogItem::ReadestSync);
 +  EXPECT_EQ(fullLocation.items[6], ReaderDrawerCatalogItem::SyncProgress);
  }
-
+ 
  TEST(ReaderDrawerModel, ChangeMaskSeparatesPreviewRelayoutAndOrientation) {
-diff --git a/src/activities/ScreenTransitionRefresh.h b/src/activities/ScreenTransitionRefresh.h
-index efee36e11b664431bed0cc87565a7ea17debd10a..9f6f8a3252077b8f27ea89ff8a84eabcfadace90 100644
---- a/src/activities/ScreenTransitionRefresh.h
-+++ b/src/activities/ScreenTransitionRefresh.h
-@@ -1,24 +1,15 @@
- #pragma once
-
- #include <HalDisplay.h>
--#include <HalGPIO.h>
-
- #include <cstdint>
-
--// Network workflows replace large parts of the screen as their state changes.
--// X4-class panels use a single-pass clean refresh for those transitions;
--// repeated renders within the same state (progress, signal strength, selection)
--// remain fast.
-+// Ordinary navigation must not insert a black/white cleaning pulse. The panel
-+// driver still handles its required boot/wake baseline; explicit cleaning and
-+// the reader's configured refresh cadence remain separate.
- class ScreenTransitionRefresh {
-  public:
--  HalDisplay::RefreshMode modeFor(const uint8_t screenState) {
--    const bool screenChanged = !hasRendered_ || screenState != lastScreenState_;
--    lastScreenState_ = screenState;
--    hasRendered_ = true;
--    return screenChanged && !gpio.deviceIsX3() ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
-+  HalDisplay::RefreshMode modeFor(const uint8_t /*screenState*/) {
-+    return HalDisplay::FAST_REFRESH;
-   }
--
-- private:
--  uint8_t lastScreenState_ = 0;
--  bool hasRendered_ = false;
- };
-diff --git a/docs/file-formats.md b/docs/file-formats.md
-index 38c7341f4f2bffc752dfc0d9bfefd6a22a3623c0..ec4f77be0638480dd0333dc32d4dceafdb58e094 100644
---- a/docs/file-formats.md
-+++ b/docs/file-formats.md
-@@ -378,7 +378,7 @@ if (parsedSize != fileSize) {
-
- ## `reader_settings.bin`
-
--### Version 10
-+### Version 11
-
- Each EPUB cache directory may contain `reader_settings.bin`. Missing files mean
- the book uses global Reader settings and the default auto-page-turn interval.
-@@ -396,7 +396,10 @@ point sizes, version 7 appends the dictionary font's selected point size, and
- version 8 splits the screen margin into vertical and horizontal values. Version
- 9 removes the obsolete per-book Dark Mode byte: Dark Mode is now a global
- display setting. Version 10 appends a field mask so a book overrides only the
--reader settings that differ from its current global defaults. Version 2-9
-+reader settings that differ from its current global defaults. Version 11 adds
-+three optional per-book overrides for image contrast, white-background
-+transparency, and monochrome rendering. Older books inherit their defaults.
-+Version 2-9
- records with the custom-settings flag keep their full snapshot as an override
- when migrated; they cannot distinguish past manual edits from automatic ones.
- The file can preserve an auto-page-turn interval without forcing custom
-@@ -409,7 +412,7 @@ fallback successfully opens a difficult book.
-
- ```c++
- struct ReaderSettingsBin {
--    u8 version; // 10
-+    u8 version; // 11
-     u8 flags;   // bit 0 = at least one custom reader field, bit 1 = custom auto-page-turn interval, bit 2 = render mode override, bit 3 = dictionary font override, bit 4 = Safe Mode override
-     u16 autoPageTurnSeconds;
-     u8 renderMode; // 0 = CrossInk Default, 1 = Balanced, 2 = Light
-@@ -436,6 +439,11 @@ struct ReaderSettingsBin {
-     char sdFontFamilyName[64];
-     char dictionarySdFontFamilyName[64]; // meaningful only when flag bit 3 is set
-     u8 dictionaryFontPointSize; // 0 = follow reader size
--    u32 readerSettingsOverrideMask; // bits 0-17 correspond to snapshot fields above, excluding snapshotRenderMode; bit 18 = sdFontFamilyName
-+    u32 readerSettingsOverrideMask; // field-override bits
-+    u8 textWeight;
-+    u8 invertImagesDark;
-+    u8 imageContrast; // 0-200, neutral is 100
-+    u8 transparentImageBackground;
-+    u8 monochromeImages;
- };
- ```

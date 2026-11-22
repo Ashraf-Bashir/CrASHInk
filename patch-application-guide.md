@@ -29,12 +29,13 @@ Make changes in the owning patch. Shared source files can appear in several patc
 | `0005-clippings.patch` | Clipping storage, highlight rendering, editing, and color |
 | `0006-readest.patch` | Readest sync and destination preview |
 | `0007-chapter-index.patch` | Collapsible EPUB chapter index |
-| `0008-book-images.patch` | EPUB image contrast, grayscale, and refresh |
+| `0008-book-images.patch` | EPUB image contrast, photo-only grayscale refresh, and recovery |
 | `0009-frontlight-and-borders.patch` | Frontlight and light-leak borders |
 | `0010-library-and-home.patch` | Library, home navigation, covers, and book actions |
 | `0011-power-and-sleep.patch` | Power management, auto-sleep, and sleep images |
 | `0012-sd-firmware-updates.patch` | Firmware picker and SD installs |
-| `0013-workflowy.patch` | Workflowy export and integration |
-| `0014-background-work.patch` | Background book preparation, Library indexing, and Workflowy display |
+| `0013-workflowy.patch` | Workflowy export, outline, editor, and action menus |
+| `0014-background-work.patch` | Background book preparation, Library indexing, and Workflowy display and idle/sleep handling |
+| `0015-epub-styling.patch` | EPUB semantics and formatting with publisher layout disabled |
 
 The SDK series owns the display driver changes for grayscale and the SecureNet HTTPS hostname handling.

@@ -2,6 +2,24 @@
 
 ### Fixed
 
+- Workflowy closes after five minutes without input and closes before the device sleeps.
+
+- Workflowy groups insertion actions under Add, distinguishes expandable menu rows, and returns to the parent after completing a zoomed note. Pending saves stay visible while paging.
+
+- Workflowy task editing and lists support rich text and highlights.
+
+- Workflowy task editing shows the same tag palette as task creation. Both editors can insert a Workflowy date tag.
+
+- EPUBs preserve superscripts, subscripts, text direction, compact lists and quotes, and bounded preformatted whitespace with Embedded Style off.
+
+- EPUB photos are kept during queued page turns, and a failed photo window no longer skips later photos.
+
+- EPUB pages show text first, then paint grayscale photos in their own partial refresh windows.
+
+- EPUB text retains stylesheet-defined bold, italics, and underline when Embedded Style is off.
+
+- Recognize more EPUB stylesheet selectors so publisher-defined italics and other formatting can appear in the reader.
+
 - Book images show their actual BW rendition before grayscale, including cached images. Regional grayscale updates each image independently, preserving intervening text; a failed refinement keeps the BW image without repainting the page. Removed blank loading previews and automatic clean-base activations from the image path; explicit screen refresh remains available.
 
 - Inline highlight adjustment maps exact visible lines when intervening chapter text prevents a whole-page match, and handles imported punctuation differences. Unsafe mappings open the text editor instead of an empty handle view; failed saves keep the unsaved draft and handles visible for retry.
