@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- Receive updates connects the X4 Pro to Wi-Fi on demand, verifies signed firmware sent from Android, and switches Wi-Fi off before installing automatically.
+
 ### Changed
 
 - Workflowy compact calendar rows hide tags between the time and task title.

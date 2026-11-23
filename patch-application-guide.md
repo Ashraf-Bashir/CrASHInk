@@ -37,5 +37,6 @@ Make changes in the owning patch. Shared source files can appear in several patc
 | `0013-workflowy.patch` | Workflowy export, outline, editor, and action menus |
 | `0014-background-work.patch` | Background book preparation, Library indexing, and Workflowy display and idle/sleep handling |
 | `0015-epub-styling.patch` | EPUB semantics and formatting with publisher layout disabled |
+| `0016-wifi-firmware-updater.patch` | Paired Android firmware installation over Wi-Fi |
 
 The SDK series owns the display driver changes for grayscale and the SecureNet HTTPS hostname handling.

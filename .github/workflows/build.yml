@@ -11,12 +11,17 @@ on:
           - ubuntu-22.04
           - ubuntu-24.04
 
+permissions:
+  contents: read
+
 jobs:
   build:
     # Both choices are standard GitHub-hosted runners; no paid runner is used.
     runs-on: ${{ inputs.runner || 'ubuntu-22.04' }}
     env:
       PLATFORMIO_BUILD_CACHE_DIR: ${{ github.workspace }}/.pio-build-cache
+    outputs:
+      firmware-artifact: ${{ steps.raw.outputs.artifact-id }}
     steps:
       - name: Checkout patches
         uses: actions/checkout@v4
@@ -102,10 +107,68 @@ jobs:
           cp .pio/build/x4-pro/firmware.bin "../builds/crASHink-${VERSION}.${STAMP}-x4pro.bin"
           ls -lh ../builds/
 
-      - name: Upload binary
+      - name: Upload regular firmware
+        id: raw
         uses: actions/upload-artifact@v7
         with:
           path: builds/crASHink-*.bin
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+  sign-wifi-firmware:
+    name: Sign Wi-Fi firmware
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.firmware-artifact }}
+          path: builds
+      - name: Sign and verify firmware
+        env:
+          CRASHINK_WIFI_SIGNING_KEY: ${{ secrets.CRASHINK_WIFI_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CRASHINK_WIFI_SIGNING_KEY" || { echo 'Missing CRASHINK_WIFI_SIGNING_KEY'; exit 1; }
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$CRASHINK_WIFI_SIGNING_KEY" > "$key"
+          unset CRASHINK_WIFI_SIGNING_KEY
+
+          sed -n '/^+constexpr char SIGNING_PUBLIC_KEY/,/^+)pem";/p' patches/0016-wifi-firmware-updater.patch |
+            sed -e '1s/.*R"pem(//' -e '1!s/^+//' -e '$d' > builds/receiver-public.pem
+          openssl pkey -in "$key" -pubout | cmp - builds/receiver-public.pem
+
+          shopt -s nullglob
+          images=(builds/crASHink-*-x4pro.bin)
+          test "${#images[@]}" -eq 1
+          raw=${images[0]}
+          signed="${raw%-x4pro.bin}-wifi-x4pro.bin"
+          python3 tools/android-updater/sign-firmware.py "$raw" "$signed" --key "$key"
+          python3 - "$raw" "$signed" <<'PYVERIFY'
+          from pathlib import Path
+          import sys
+
+          raw = Path(sys.argv[1]).read_bytes()
+          signed = Path(sys.argv[2]).read_bytes()
+          marker = b"CRASHOTA1"
+          signature = signed[len(raw):-len(marker)]
+          if not signed.startswith(raw) or not signed.endswith(marker) or len(signature) != 256:
+              raise SystemExit("Signed bundle does not contain the exact raw firmware and signature")
+          Path("builds/firmware.sig").write_bytes(signature)
+          PYVERIFY
+          openssl dgst -sha256 -verify builds/receiver-public.pem -signature builds/firmware.sig "$raw"
+      - name: Upload signed Wi-Fi firmware
+        uses: actions/upload-artifact@v7
+        with:
+          path: builds/crASHink-*-wifi-x4pro.bin
           archive: false
           if-no-files-found: error
           retention-days: 30

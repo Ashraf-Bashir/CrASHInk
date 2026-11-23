@@ -1,0 +1,469 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 925fda481f32911fb00db7287f22d6e101b46f5c..7c872c8a240023cb2b6f354b4be9fd04249be643 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -873,6 +873,10 @@ STR_EPUB_LAYOUT_MEMORY_READING_AIDS_HINT_GUIDE: "Try again with Guide Dots off."
+ STR_EPUB_FALLBACK_FONT_TITLE: "Chapter using built-in font"
+ STR_EPUB_FALLBACK_FONT_BODY: "Available memory was too low to lay out this chapter with the SD-card font, so it was loaded with the built-in font."
+ STR_SD_FIRMWARE_UPDATE: "SD Card Firmware Update"
++STR_RECEIVE_UPDATES: "Receive updates"
++STR_RECEIVE_UPDATES_WAITING: "Tap Update in the Android app"
++STR_RECEIVE_UPDATES_WINDOW: "Listening for five minutes"
++STR_RECEIVE_UPDATES_UNAVAILABLE: "Could not start Wi-Fi update receiver"
+ STR_SELECT_FIRMWARE_FILE: "Select firmware file (.bin)"
+ STR_NO_BIN_FILES: "No .bin files found"
+ STR_VALIDATING_FIRMWARE: "Validating firmware..."
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index a6fda313a83e7b6e753f9581dd747651a97d1a7c..50b637bb752358c592ad6be71edec9c45fa7585b 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1052,6 +1052,9 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
++#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
++  systemSettings.push_back(SettingInfo::Action(StrId::STR_RECEIVE_UPDATES, SettingAction::ReceiveFirmwareUpdate));
++#endif
+   return systemSettings;
+ }
+ 
+diff --git a/src/activities/settings/ReceiveFirmwareActivity.cpp b/src/activities/settings/ReceiveFirmwareActivity.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e414502a0b2be
+--- /dev/null
++++ b/src/activities/settings/ReceiveFirmwareActivity.cpp
+@@ -0,0 +1,133 @@
++#include "ReceiveFirmwareActivity.h"
++
++#include <Arduino.h>
++#include <GfxRenderer.h>
++#include <I18n.h>
++#include <WiFi.h>
++
++#include "MappedInputManager.h"
++#include "activities/network/WifiSelectionActivity.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++#include "network/WifiFirmwareUpdate.h"
++
++namespace {
++constexpr uint32_t LISTEN_TIMEOUT_MS = 5 * 60 * 1000;
++}
++
++void ReceiveFirmwareActivity::onEnter() {
++  Activity::onEnter();
++  if (WiFi.status() == WL_CONNECTED && (WiFi.getMode() & WIFI_STA)) {
++    onConnected();
++    return;
++  }
++
++  ownsWifi = true;
++  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
++                         [this](const ActivityResult& result) {
++                           if (result.isCancelled) finish();
++                           else onConnected();
++                         });
++}
++
++void ReceiveFirmwareActivity::onConnected() {
++  const bool listening = wifi_firmware_update::start();
++  snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
++  {
++    RenderLock lock(*this);
++    state = listening ? State::Waiting : State::Unavailable;
++  }
++  startedAt = millis();
++  requestUpdate();
++}
++
++void ReceiveFirmwareActivity::onExit() {
++  wifi_firmware_update::stop();
++  if (ownsWifi && WiFi.getMode() != WIFI_OFF) {
++    WiFi.disconnect(false);
++    WiFi.mode(WIFI_OFF);
++  }
++  Activity::onExit();
++}
++
++void ReceiveFirmwareActivity::loop() {
++  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
++      mappedInput.wasPressed(MappedInputManager::Button::Back)) {
++    finish();
++    return;
++  }
++  if (state != State::Waiting) return;
++  if (millis() - startedAt >= LISTEN_TIMEOUT_MS || WiFi.status() != WL_CONNECTED) {
++    finish();
++    return;
++  }
++  if (!wifi_firmware_update::poll()) return;
++  delay(250);
++  wifi_firmware_update::stopListening();
++  WiFi.disconnect(false);
++  WiFi.mode(WIFI_OFF);
++  install();
++}
++
++void ReceiveFirmwareActivity::install() {
++  {
++    RenderLock lock(*this);
++    state = State::Installing;
++  }
++  requestUpdateAndWait();
++  const auto updateProgress = +[](size_t written, size_t total, void* context) {
++    auto* activity = static_cast<ReceiveFirmwareActivity*>(context);
++    const auto percent = static_cast<unsigned int>(written * 100 / total);
++    const auto previous = activity->progress.load();
++    if (percent == 100 || percent >= previous + 5) {
++      activity->progress.store(percent);
++      activity->requestUpdate(true);
++    }
++  };
++  if (!wifi_firmware_update::installReceived(updateProgress, this)) {
++    wifi_firmware_update::stop();
++    {
++      RenderLock lock(*this);
++      state = State::Failed;
++    }
++    requestUpdate();
++    return;
++  }
++  delay(350);
++  ESP.restart();
++}
++
++void ReceiveFirmwareActivity::render(RenderLock&&) {
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const Rect header{0, metrics.topPadding, renderer.getScreenWidth(),
++                    TouchHeaderBackButton::height(metrics, mappedInput)};
++  renderer.clearScreen();
++  TouchHeaderBackButton::draw(renderer, header, tr(STR_RECEIVE_UPDATES), false);
++  const auto y = renderer.getScreenHeight() / 2;
++  switch (state) {
++    case State::Connecting:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_CONNECTING));
++      break;
++    case State::Waiting:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_WAITING));
++      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
++                                tr(STR_RECEIVE_UPDATES_WINDOW));
++      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 4, address);
++      break;
++    case State::Installing:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
++      GUI.drawProgressBar(renderer,
++                          Rect{metrics.contentSidePadding, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
++                               renderer.getScreenWidth() - metrics.contentSidePadding * 2, metrics.progressBarHeight},
++                          static_cast<int>(progress.load()), 100);
++      break;
++    case State::Failed:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_WRITE_FAILED));
++      break;
++    case State::Unavailable:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_UNAVAILABLE));
++      break;
++  }
++  renderer.displayBuffer();
++}
+diff --git a/src/activities/settings/ReceiveFirmwareActivity.h b/src/activities/settings/ReceiveFirmwareActivity.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7312d0365772f7410338ecdf1902a37303b9657
+--- /dev/null
++++ b/src/activities/settings/ReceiveFirmwareActivity.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <atomic>
++
++#include "activities/Activity.h"
++
++class ReceiveFirmwareActivity final : public Activity {
++ public:
++  ReceiveFirmwareActivity(GfxRenderer& renderer, MappedInputManager& input)
++      : Activity("ReceiveFirmware", renderer, input) {}
++
++  void onEnter() override;
++  void onExit() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++  bool preventAutoSleep() override { return true; }
++
++ private:
++  enum class State { Connecting, Waiting, Installing, Failed, Unavailable };
++  State state = State::Connecting;
++  bool ownsWifi = false;
++  uint32_t startedAt = 0;
++  std::atomic<unsigned int> progress{0};
++  char address[16]{};
++
++  void onConnected();
++  void install();
++};
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 0d88e55becfb9f13c3b423bd17bddb0d204d694a..0c6511408ec8e3f8b66f16957194706c350c7793 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -38,6 +38,7 @@
+ #include "readest/ReadestStore.h"
+ #include "SdCardFontSystem.h"
+ #include "SdFirmwareUpdateActivity.h"
++#include "ReceiveFirmwareActivity.h"
+ #include "SettingsList.h"
+ #include "SilentRestart.h"
+ #include "StatusBarSettingsActivity.h"
+@@ -1234,6 +1235,9 @@ void SettingsActivity::toggleCurrentSetting() {
+       case SettingAction::SdFirmwareUpdate:
+         startActivityForResult(std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInput), resultHandler);
+         break;
++      case SettingAction::ReceiveFirmwareUpdate:
++        startActivityForResult(std::make_unique<ReceiveFirmwareActivity>(renderer, mappedInput), resultHandler);
++        break;
+       case SettingAction::DownloadFonts:
+         silentRestartToManageFonts();
+         break;
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 95e56f56c1a3c532f50f95a59346b99b6762dadc..832d04bde3c2b91e5879823ccf7ba803e83b96b1 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -50,6 +50,7 @@ enum class SettingAction {
+   ClearCache,
+   CheckForUpdates,
+   SdFirmwareUpdate,
++  ReceiveFirmwareUpdate,
+   Language,
+   KeyboardLayouts,
+   DownloadFonts,
+diff --git a/src/network/WifiFirmwareUpdate.cpp b/src/network/WifiFirmwareUpdate.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..75447bdf06ce6585997220c3fa1fcc5034fc0a57
+--- /dev/null
++++ b/src/network/WifiFirmwareUpdate.cpp
+@@ -0,0 +1,209 @@
++#include "WifiFirmwareUpdate.h"
++
++#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
++#include <Arduino.h>
++#include <HalStorage.h>
++#include <WebServer.h>
++#include <WiFi.h>
++#include <esp_ota_ops.h>
++#include <mbedtls/sha256.h>
++#include <mbedtls/pk.h>
++
++#include <array>
++#include <memory>
++#include <new>
++
++#include "FirmwareFlasher.h"
++
++namespace {
++constexpr char IMAGE_PATH[] = "/.crashink-ota-staging.bin";
++constexpr uint16_t PORT = 8081;
++constexpr char DIGEST_HEADER[] = "X-Crashink-SHA256";
++constexpr char SIGNATURE_HEADER[] = "X-Crashink-Signature";
++constexpr char SIGNING_PUBLIC_KEY[] = R"pem(-----BEGIN PUBLIC KEY-----
++MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvkvq+2wEci6kZ5V418RR
++s68kaEGwVVKcXKAT8fH8nioBruh+YuvL3c7y8shz2547JLuVCXBPfyGk0ec639oa
++F8cBTg4av8b8V2uoeWc3ELkZlEUSaogEeJZFXhsN3jYWctrCtL+dbea1lxFAAbXZ
++r56EKCaojlEN9SV8T8k6XDIbRKv56FM8UrIFQY4PUAHxCIB7W3jnviAtz5CDCNUn
++zQNWLqmapMdYtZPp85wSMLX6taBqv8aBBceIZGqG16QDpRme+3MO+2rNU3EpPSCu
+++bV0rIPjzxsV4khvyfa+vQufcjRBq4GX/qx0c/Hv9qxsYdsB9egnyhwcz7oweMr/
++swIDAQAB
++-----END PUBLIC KEY-----
++)pem";
++constexpr char HEX_DIGITS[] = "0123456789abcdef";
++
++std::unique_ptr<WebServer> server;
++std::array<uint8_t, 32> expectedDigest{};
++HalFile staging;
++mbedtls_sha256_context hash;
++size_t imageSize = 0;
++int errorCode = 400;
++bool authorized = false;
++bool ready = false;
++bool ownsStaging = false;
++bool accepted = false;
++
++template <size_t N>
++bool decodeHex(const char* hex, size_t length, std::array<uint8_t, N>& result) {
++  if (length != 2 * N) return false;
++  for (size_t i = 0; i < N; ++i) {
++    const char* hi = strchr(HEX_DIGITS, hex[2 * i]);
++    const char* lo = strchr(HEX_DIGITS, hex[2 * i + 1]);
++    if (!hi || !lo || !*hi || !*lo) return false;
++    result[i] = static_cast<uint8_t>((hi - HEX_DIGITS) * 16 + lo - HEX_DIGITS);
++  }
++  return true;
++}
++
++bool equalDigest(const std::array<uint8_t, 32>& a, const std::array<uint8_t, 32>& b) {
++  unsigned difference = 0;
++  for (size_t i = 0; i < a.size(); ++i) difference |= a[i] ^ b[i];
++  return difference == 0;
++}
++
++void clearStaging() {
++  if (staging) staging.close();
++  if (ownsStaging) Storage.remove(IMAGE_PATH);
++  ownsStaging = false;
++  ready = false;
++}
++
++bool verifySignature() {
++  const auto header = server->header(SIGNATURE_HEADER);
++  std::array<uint8_t, 256> signature{};
++  if (!decodeHex(header.c_str(), header.length(), signature)) return false;
++  mbedtls_pk_context publicKey;
++  mbedtls_pk_init(&publicKey);
++  const bool valid = mbedtls_pk_parse_public_key(&publicKey,
++      reinterpret_cast<const uint8_t*>(SIGNING_PUBLIC_KEY), sizeof(SIGNING_PUBLIC_KEY)) == 0 &&
++      mbedtls_pk_verify(&publicKey, MBEDTLS_MD_SHA256, expectedDigest.data(), expectedDigest.size(),
++                       signature.data(), signature.size()) == 0;
++  mbedtls_pk_free(&publicKey);
++  return valid;
++}
++
++void receiveImage() {
++  const auto& raw = server->raw();
++  switch (raw.status) {
++    case RAW_START: {
++      clearStaging();
++      errorCode = 400;
++      authorized = false;
++      const int length = server->clientContentLength();
++      const auto* partition = esp_ota_get_next_update_partition(nullptr);
++      if (!partition || length < 24 || static_cast<size_t>(length) > partition->size) {
++        errorCode = 413;
++        return;
++      }
++      imageSize = length;
++      const auto digest = server->header(DIGEST_HEADER);
++      if (!decodeHex(digest.c_str(), digest.length(), expectedDigest)) return;
++      if (!verifySignature()) {
++        errorCode = 403;
++        return;
++      }
++      authorized = true;
++      Storage.remove(IMAGE_PATH);
++      if (!Storage.openFileForWrite("OTA", IMAGE_PATH, staging)) {
++        errorCode = 507;
++        authorized = false;
++        return;
++      }
++      ownsStaging = true;
++      mbedtls_sha256_init(&hash);
++      mbedtls_sha256_starts(&hash, 0);
++      break;
++    }
++    case RAW_WRITE:
++      if (authorized && staging) {
++        if (staging.write(raw.buf, raw.currentSize) != raw.currentSize) {
++          errorCode = 507;
++          clearStaging();
++        } else {
++          mbedtls_sha256_update(&hash, raw.buf, raw.currentSize);
++        }
++      }
++      break;
++    case RAW_END:
++    case RAW_ABORTED:
++      if (authorized) {
++        std::array<uint8_t, 32> actual{};
++        mbedtls_sha256_finish(&hash, actual.data());
++        mbedtls_sha256_free(&hash);
++        authorized = false;
++        if (raw.status == RAW_END && staging && raw.totalSize == imageSize &&
++            equalDigest(actual, expectedDigest) && staging.sync()) {
++          staging.close();
++          ready = true;
++        } else {
++          if (errorCode != 507) errorCode = 422;
++          clearStaging();
++        }
++      }
++      break;
++  }
++}
++
++void closeListener() {
++  if (!server) return;
++  server.reset();
++}
++
++void install() {
++  if (!ready) {
++    server->send(errorCode, "text/plain", "Firmware rejected before flashing");
++    return;
++  }
++  const auto* partition = esp_ota_get_next_update_partition(nullptr);
++  auto result = firmware_flash::Result::OPEN_FAIL;
++  if (partition && Storage.openFileForRead("OTA", IMAGE_PATH, staging)) {
++    result = firmware_flash::validateOpenImageFile(staging, partition->size);
++  }
++  if (result != firmware_flash::Result::OK) {
++    clearStaging();
++    server->send(422, "text/plain", firmware_flash::resultName(result));
++    return;
++  }
++  accepted = true;
++  server->send(200, "text/plain", "received\n");
++}
++}  // namespace
++
++bool wifi_firmware_update::start() {
++  if (WiFi.status() != WL_CONNECTED) return false;
++  server.reset(new (std::nothrow) WebServer(PORT));
++  if (!server) return false;
++  const char* headers[]{DIGEST_HEADER, SIGNATURE_HEADER};
++  server->collectHeaders(headers, 2);
++  server->on("/ota/status", HTTP_GET, [] { server->send(200, "text/plain", "crashink-receive-v3"); });
++  server->on("/ota/install", HTTP_POST, install, receiveImage);
++  server->begin();
++  return true;
++}
++
++void wifi_firmware_update::stop() {
++  closeListener();
++  clearStaging();
++  accepted = false;
++}
++
++bool wifi_firmware_update::poll() {
++  if (server) server->handleClient();
++  return accepted;
++}
++
++bool wifi_firmware_update::installReceived(Progress progress, void* context) {
++  if (!accepted || !staging || WiFi.getMode() != WIFI_OFF) return false;
++  const auto result = firmware_flash::flashValidatedFile(staging, progress, context);
++  stop();
++  return result == firmware_flash::Result::OK;
++}
++
++void wifi_firmware_update::stopListening() { closeListener(); }
++#else
++bool wifi_firmware_update::start() { return false; }
++void wifi_firmware_update::stop() {}
++bool wifi_firmware_update::poll() { return false; }
++bool wifi_firmware_update::installReceived(Progress, void*) { return false; }
++void wifi_firmware_update::stopListening() {}
++#endif
+diff --git a/src/network/WifiFirmwareUpdate.h b/src/network/WifiFirmwareUpdate.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f99ad6b0426915127d6d2f6d84dd062e955b1e2
+--- /dev/null
++++ b/src/network/WifiFirmwareUpdate.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include <cstddef>
++
++namespace wifi_firmware_update {
++using Progress = void (*)(size_t written, size_t total, void* context);
++bool start();
++void stop();
++void stopListening();
++bool poll();
++bool installReceived(Progress progress, void* context);
++}
