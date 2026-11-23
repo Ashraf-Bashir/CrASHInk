@@ -7287,10 +7287,10 @@ index 0000000000000000000000000000000000000000..be85ab98da0c693c07c446bd60bc8bcc
 +inline constexpr freeink::Icon workflowyActionAddIcon{24,24,12,workflowyActionAddBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..71bfba9622a42daef1aa143a12a3500a07075d16
+index 0000000000000000000000000000000000000000..a1f78fa20cef79f52dd2a69d4f1ccfc391ab27d9
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,283 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -7513,9 +7513,26 @@ index 0000000000000000000000000000000000000000..71bfba9622a42daef1aa143a12a3500a
 +  }
 +};
 +
++// Hide the leading tags immediately after the time in compact rows.
++inline size_t compactTaskBodyStart(std::string_view text, size_t timeEnd) {
++  size_t end = timeEnd;
++  size_t next = end;
++  while (next < text.size() && (text[next] == ' ' || text[next] == '\t')) ++next;
++  while (next + 1 < text.size() && (text[next] == '#' || text[next] == '@') &&
++         tagCharacter(text[next + 1])) {
++    end = next + 2;
++    while (end < text.size() && tagCharacter(text[end])) ++end;
++    next = end;
++    while (next < text.size() && (text[next] == ' ' || text[next] == '\t')) ++next;
++  }
++  return end;
++}
++
 +inline std::string compactTaskText(std::string text) {
-+  if (const auto time = parseTimeRange(text))
-+    text.replace(time->begin, time->finish - time->begin, compactScheduleRange(time->start, time->end));
++  if (const auto time = parseTimeRange(text)) {
++    const auto bodyStart = compactTaskBodyStart(text, time->finish);
++    text.replace(time->begin, bodyStart - time->begin, compactScheduleRange(time->start, time->end));
++  }
 +  return text;
 +}
 +inline size_t compactTaskOriginalOffset(std::string_view body, size_t offset) {
@@ -7523,7 +7540,7 @@ index 0000000000000000000000000000000000000000..71bfba9622a42daef1aa143a12a3500a
 +  if (!time || offset <= time->begin) return offset;
 +  const auto compact = compactScheduleRange(time->start, time->end);
 +  if (offset >= time->begin + compact.size())
-+    return offset - compact.size() + time->finish - time->begin;
++    return offset - compact.size() + compactTaskBodyStart(body, time->finish) - time->begin;
 +  // A tap within abbreviated time opens the corresponding original clock field.
 +  return time->begin;
 +}
@@ -8202,10 +8219,10 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b9dee4d39f3819b833d736f825ba02a04df1dc77
+index 0000000000000000000000000000000000000000..58c24df55c717b51bd452d2a0ad62590fa90c673
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,140 @@
 +#include "WorkflowySchedule.h"
 +#include "WorkflowyOutlineLayout.h"
 +#include "WorkflowySettings.h"
@@ -8262,6 +8279,11 @@ index 0000000000000000000000000000000000000000..b9dee4d39f3819b833d736f825ba02a0
 +  assert(TaskTextProjection("Task #health @INSIDE").text(true).empty());
 +  assert(TaskTextProjection("  #health @INSIDE Task #career ").text(true)=="#health @INSIDE");
 +  assert(TaskTextProjection("  #health @INSIDE Task #career ",false).text(false)=="Task #career");
++  const std::string taggedTask = "8:15am - 9:30am #operational @work Task #later";
++  const auto compactTagged = compactTaskText(taggedTask);
++  assert(compactTagged == "8¼–9½ Task #later");
++  assert(compactTaskOriginalOffset(taggedTask, compactTagged.find("Task")) == taggedTask.find("Task"));
++  assert(compactTaskText("#operational Task") == "#operational Task");
 +  assert(compactTaskText("8:15am - 9:30am Task")=="8¼–9½ Task");
 +  assert(compactTaskText("8:45pm - 12am Task")=="20¾–24 Task");
 +  assert(compactScheduleClock(0)=="0" && compactScheduleClock(480)=="8");

@@ -1,11 +1,15 @@
 diff --git a/docs/file-formats.md b/docs/file-formats.md
-index a2382a134ac864e96d524a4c1f8ba550c8274a26..3289b4be15eff089f0111e6443bc80ca365d083d 100644
+index a2382a134ac864e96d524a4c1f8ba550c8274a26..82ae7e1d3b5939c1343c064583b0cbcd38a9b294 100644
 --- a/docs/file-formats.md
 +++ b/docs/file-formats.md
-@@ -556,6 +556,18 @@ Binary layout:
+@@ -556,6 +556,22 @@ Binary layout:
  
  ## `section.bin`
  
++### Version 87
++
++List markers stay on the first text line when a list item wraps its opening paragraph in divs. Nested table-of-contents entries within a spine item no longer force a new page. Full and partial section caches rebuild.
++
 +### Version 86
 +
 +Compact lists, quotes, and preserved line breaks change pagination. Full and partial section caches rebuild. The CSS cache stores the whitespace mode in the existing property flags.
@@ -75,10 +79,10 @@ index e593a2875babe767d664c302a0edd4081368c870..fa27226c5a79df7b8c7237b53fb9ecdc
    mix(spec.focusReadingEnabled);
    mix(spec.guideReadingEnabled);
 diff --git a/lib/Epub/Epub/Section.cpp b/lib/Epub/Epub/Section.cpp
-index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b8592889dd2c5fa 100644
+index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..823b04a04a169b6cf83ff83a0666f6f4b1a9ffb9 100644
 --- a/lib/Epub/Epub/Section.cpp
 +++ b/lib/Epub/Epub/Section.cpp
-@@ -33,16 +33,24 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
+@@ -33,16 +33,52 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
  // v81: HTML and body text indents now inherit into descendant blocks.
  // v82: Scalable headings and blocks serialize point size and line height.
  // v83: Nested blocks inherit bold and italic styles, changing glyphs and wrapping.
@@ -86,12 +90,40 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
 +// v84: Contextual CSS selectors can change glyph styles and page layout.
 +// v85: Preserve stylesheet emphasis without publisher layout and record stylesheet use.
 +// v86: Compact paragraph semantics and preformatted lines change page layout.
-+constexpr uint8_t SECTION_FILE_VERSION = 86;
++// v87: Wrapped list items and nested TOC entries change page layout.
++constexpr uint8_t SECTION_FILE_VERSION = 87;
  // Suspended incremental build: valid pages plus LUTs and a parse-watermark trailer.
  // Change this with layout or payload changes so stale partial pages cannot resume
  // under a different layout contract.
 -constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xC4;
-+constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xC7;
++constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xC8;
++struct SpineTocAnchors {
++  std::vector<std::string> chapters;
++  std::vector<std::string> sections;
++};
++
++SpineTocAnchors collectSpineTocAnchors(const Epub& epub, int spineIndex, bool preview) {
++  SpineTocAnchors anchors;
++  const int first = preview ? -1 : epub.getTocIndexForSpineIndex(spineIndex);
++  if (first < 0) return anchors;
++
++  int shallowest = 256;
++  for (int i = first; i < epub.getTocItemsCount(); ++i) {
++    auto entry = epub.getTocItem(i);
++    if (entry.spineIndex != spineIndex) break;
++    if (entry.level < shallowest) {
++      for (auto& chapter : anchors.chapters) anchors.sections.push_back(std::move(chapter));
++      anchors.chapters.clear();
++      shallowest = entry.level;
++    }
++    if (!entry.anchor.empty()) {
++      auto& targets = entry.level == shallowest ? anchors.chapters : anchors.sections;
++      targets.push_back(std::move(entry.anchor));
++    }
++  }
++  return anchors;
++}
++
  constexpr uint32_t HEADER_SIZE =
      sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(bool) +
 -    sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) + sizeof(uint8_t) +
@@ -106,7 +138,7 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
  constexpr size_t SECTION_HTML_STREAM_CHUNK_SIZE = 8192;
  constexpr size_t LOW_MEMORY_SECTION_HTML_STREAM_CHUNK_SIZE = 1024;
  
-@@ -208,7 +216,7 @@ bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
+@@ -208,7 +244,7 @@ bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
                                     sizeof(spec.lineCompression) + sizeof(spec.extraParagraphSpacing) +
                                     sizeof(spec.forceParagraphIndents) + sizeof(spec.paragraphAlignment) +
                                     sizeof(spec.viewportWidth) + sizeof(spec.viewportHeight) +
@@ -115,7 +147,7 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
                                     sizeof(spec.imageRendering) + sizeof(spec.focusReadingEnabled) +
                                     sizeof(spec.guideReadingEnabled) + sizeof(spec.wordSpacing) + sizeof(uint8_t) +
                                     sizeof(pageCount) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) +
-@@ -223,7 +231,7 @@ bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
+@@ -223,7 +259,7 @@ bool Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
           serialization::tryWritePod(file, spec.viewportWidth) &&
           serialization::tryWritePod(file, spec.viewportHeight) &&
           serialization::tryWritePod(file, spec.hyphenationEnabled) &&
@@ -124,7 +156,7 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
           serialization::tryWritePod(file, spec.imageRendering) &&
           serialization::tryWritePod(file, spec.focusReadingEnabled) &&
           serialization::tryWritePod(file, spec.guideReadingEnabled) &&
-@@ -287,7 +295,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
+@@ -287,7 +323,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
      bool fileForceParagraphIndents;
      uint8_t fileParagraphAlignment;
      bool fileHyphenationEnabled;
@@ -133,7 +165,7 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
      uint8_t fileImageRendering;
      bool fileFocusReadingEnabled;
      bool fileGuideReadingEnabled;
-@@ -299,7 +307,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
+@@ -299,7 +335,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
          !serialization::tryReadPod(file, fileParagraphAlignment) ||
          !serialization::tryReadPod(file, fileViewportWidth) || !serialization::tryReadPod(file, fileViewportHeight) ||
          !serialization::tryReadPod(file, fileHyphenationEnabled) ||
@@ -142,7 +174,7 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
          !serialization::tryReadPod(file, fileFocusReadingEnabled) ||
          !serialization::tryReadPod(file, fileGuideReadingEnabled) ||
          !serialization::tryReadPod(file, fileWordSpacing) || !serialization::tryReadPod(file, fileRenderMode)) {
-@@ -313,7 +321,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
+@@ -313,7 +349,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
          spec.extraParagraphSpacing != fileExtraParagraphSpacing ||
          spec.forceParagraphIndents != fileForceParagraphIndents || spec.paragraphAlignment != fileParagraphAlignment ||
          spec.viewportWidth != fileViewportWidth || spec.viewportHeight != fileViewportHeight ||
@@ -151,7 +183,7 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
          spec.imageRendering != fileImageRendering || spec.focusReadingEnabled != fileFocusReadingEnabled ||
          spec.guideReadingEnabled != fileGuideReadingEnabled || spec.wordSpacing != fileWordSpacing ||
          static_cast<uint8_t>(spec.renderMode) != fileRenderMode) {
-@@ -565,7 +573,7 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
+@@ -565,7 +601,7 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
    std::string imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
  
    CssParser* cssParser = nullptr;
@@ -160,7 +192,39 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
      cssParser = epub->getCssParser();
      if (cssParser) {
        const auto cssHeapBefore = MemoryBudget::snapshot();
-@@ -895,7 +903,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
+@@ -583,18 +619,7 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
+     }
+   }
+ 
+-  // Collect TOC anchors for this spine so the parser can insert page breaks at chapter boundaries
+-  std::vector<std::string> tocAnchors;
+-  const int startTocIndex = buildOptions.isPreview() ? -1 : epub->getTocIndexForSpineIndex(spineIndex);
+-  if (startTocIndex >= 0) {
+-    for (int i = startTocIndex; i < epub->getTocItemsCount(); i++) {
+-      auto entry = epub->getTocItem(i);
+-      if (entry.spineIndex != spineIndex) break;
+-      if (!entry.anchor.empty()) {
+-        tocAnchors.push_back(std::move(entry.anchor));
+-      }
+-    }
+-  }
++  auto tocAnchors = collectSpineTocAnchors(*epub, spineIndex, buildOptions.isPreview());
+ 
+   ChapterHtmlSlimParser visitor(
+       *epub, parsePath, renderer, fontId, lineCompression, extraParagraphSpacing, forceParagraphIndents,
+@@ -630,9 +655,9 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
+         }
+         pageIndex.appendPrepared({fileOffset, paragraphIndex, listItemIndex, visibleTextOffset});
+       },
+-      embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors), popupFn, cssParser, renderMode,
++      embeddedStyle, contentBase, imageBasePath, imageRendering, std::move(tocAnchors.chapters), popupFn, cssParser, renderMode,
+       buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{}, buildOptions.previewMaxPages,
+-      buildOptions.referenceUnitsAreCharacters);
++      buildOptions.referenceUnitsAreCharacters, std::move(tocAnchors.sections));
+   Hyphenator::setPreferredLanguage(epub->getLanguage());
+   bool cancelled = false;
+   bool success = false;
+@@ -895,7 +920,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
    ctx->contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
    ctx->imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
  
@@ -169,6 +233,37 @@ index cdaecebf3c97a7a988e4fc9e3d8b575ec49aa4fb..36dc4e737953d04c0d4b397d9b859288
      ctx->cssParser = epub->getCssParser();
      if (ctx->cssParser) {
        const auto cssHeapBefore = MemoryBudget::snapshot();
+@@ -913,17 +938,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
+     }
+   }
+ 
+-  std::vector<std::string> tocAnchors;
+-  const int startTocIndex = buildOptions.isPreview() ? -1 : epub->getTocIndexForSpineIndex(spineIndex);
+-  if (startTocIndex >= 0) {
+-    for (int i = startTocIndex; i < epub->getTocItemsCount(); i++) {
+-      auto entry = epub->getTocItem(i);
+-      if (entry.spineIndex != spineIndex) break;
+-      if (!entry.anchor.empty()) {
+-        tocAnchors.push_back(std::move(entry.anchor));
+-      }
+-    }
+-  }
++  auto tocAnchors = collectSpineTocAnchors(*epub, spineIndex, buildOptions.isPreview());
+ 
+   BuildContext* ctxPtr = ctx.get();
+   ctx->parser = makeUniqueNoThrow<ChapterHtmlSlimParser>(
+@@ -955,9 +970,9 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const SectionBuildOptions
+         }
+         ctxPtr->pageIndex.appendPrepared({fileOffset, paragraphIndex, listItemIndex, visibleTextOffset});
+       },
+-      embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, imageRendering, std::move(tocAnchors), popupFn,
++      embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, imageRendering, std::move(tocAnchors.chapters), popupFn,
+       ctxPtr->cssParser, renderMode, buildOptions.isPreview() ? std::string(buildOptions.previewAnchor) : std::string{},
+-      buildOptions.previewMaxPages, false);
++      buildOptions.previewMaxPages, false, std::move(tocAnchors.sections));
+   if (!ctx->parser) {
+     LOG_ERR("SCT", "Failed to allocate section parser");
+     lastLayoutAbortedForLowMemory_ = true;
 diff --git a/lib/Epub/Epub/css/CssParser.cpp b/lib/Epub/Epub/css/CssParser.cpp
 index d0b5265f7a8739e4480d1b129faddddbde78ba9c..3982b9413ca2085db669148e2550b047ee603e4c 100644
 --- a/lib/Epub/Epub/css/CssParser.cpp
@@ -587,7 +682,7 @@ index 0d88df8e7c72f6a1d22f3a3e428c3225b92baceb..b39adcaca5e1a5b017b7ae4897afb8ba
    }
  };
 diff --git a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
-index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d162ab318 100644
+index cd5e188c0ac1e037bcb033bde559b7780a7e3180..94bfcfb9aad3ebad341cfbb13ecf9cb6fc07cf8a 100644
 --- a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
 +++ b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
 @@ -74,7 +74,7 @@ constexpr uint32_t MIN_FREE_HEAP_FOR_RICH_TABLE = 96U * 1024U;
@@ -653,7 +748,15 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      if (entry.hasSmallCaps) {
        effectiveSmallCaps = entry.smallCaps;
      }
-@@ -913,11 +930,12 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
+@@ -863,6 +880,7 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
+     return;
+   }
+ 
++  pendingListMarkerDepth = -1;
+   nextWordContinues = false;  // New block = new paragraph, no continuation
+   pendingInlinePadding = 0;
+   partWordInlinePadding = 0;
+@@ -913,11 +931,12 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
    wordsExtractedInBlock = 0;
  }
  
@@ -668,7 +771,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
  }
  
  void ChapterHtmlSlimParser::finalizeCurrentTableCell() {
-@@ -1859,6 +1877,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -1859,6 +1878,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
    // storing an ancestor/id beyond the current element start.
    std::string_view classAttr;
    std::string_view styleAttr;
@@ -677,7 +780,28 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
    const char* dirAttr = nullptr;
    if (atts != nullptr) {
      for (int i = 0; atts[i]; i += 2) {
-@@ -1913,17 +1933,44 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -1876,7 +1897,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+         const char* idValue = attrValue;
+         const bool isTocAnchor =
+             std::find(self->tocAnchors.begin(), self->tocAnchors.end(), idValue) != self->tocAnchors.end();
+-        if (isTocAnchor || (!isNonNavigableInlineElement(name) && self->anchorData.size() < MAX_ANCHORS_PER_CHAPTER)) {
++        const bool isTocSectionAnchor =
++            std::find(self->tocSectionAnchors.begin(), self->tocSectionAnchors.end(), idValue) !=
++            self->tocSectionAnchors.end();
++        if (isTocAnchor || isTocSectionAnchor || (!isNonNavigableInlineElement(name) && self->anchorData.size() < MAX_ANCHORS_PER_CHAPTER)) {
+           // Flush displaced block anchors before overwriting. Keep dense inline <a id>
+           // runs coalesced so converter-generated anchors do not churn heap in link-heavy chapters.
+           const bool previousAnchorShouldBeRecorded = !self->pendingAnchorFromInlineA;
+@@ -1884,7 +1908,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+             self->flushPendingAnchor();
+           }
+           self->pendingAnchorId = idValue;
+-          self->pendingAnchorFromInlineA = !isTocAnchor && strcmp(name, "a") == 0;
++          self->pendingAnchorFromInlineA = !isTocAnchor && !isTocSectionAnchor && strcmp(name, "a") == 0;
+ 
+           // A chapter's TOC target is sometimes an empty inline <a id> tucked *inside* an
+           // already-open heading, ahead of the chapter-number/ornament/title runs
+@@ -1913,17 +1937,44 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
    // before tag-specific branches emit any content or metadata.
    CssStyle cssStyle;
    if (self->cssParser) {
@@ -724,7 +848,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
    if (dirAttr && dirAttr[0] != '\0') {
      if (strcasecmp(dirAttr, "rtl") == 0) {
        cssStyle.direction = CssTextDirection::Rtl;
-@@ -2117,7 +2164,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2117,7 +2168,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
      self->tableDepth += 1;
      self->tableRowIndex = 0;
      self->tableColIndex = 0;
@@ -733,7 +857,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      self->depth += 1;
      return;
    }
-@@ -2134,7 +2181,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2134,7 +2185,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
      } else if (self->currentTableBuffer) {
        self->currentTableBuffer->rows.push_back({});
      }
@@ -742,7 +866,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      self->depth += 1;
      return;
    }
-@@ -2226,7 +2273,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2226,7 +2277,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        self->startNewTextBlock(tableCellBlockStyle);
      }
  
@@ -751,7 +875,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      self->depth += 1;
      return;
    }
-@@ -2245,7 +2292,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2245,7 +2296,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        self->pushBlockFontStyle(cssStyle);
        self->updateEffectiveInlineStyle();
      }
@@ -760,7 +884,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      self->depth += 1;
      return;
    }
-@@ -2278,7 +2325,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2278,7 +2329,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        self->compactTableUnsupported = true;
        self->currentCompactTable->markUnsupported();
      }
@@ -769,7 +893,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      self->depth += 1;
      return;
    }
-@@ -2320,10 +2367,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2320,10 +2371,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        // Skip hidden images and retain explicit block placement in all render modes.
        bool displayBlockImage = false;
        bool displayInlineImage = false;
@@ -783,7 +907,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
          if (!styleAttr.empty()) {
            imgDisplayStyle.applyOver(CssParser::parseInlineStyle(styleAttr));
          }
-@@ -2417,11 +2464,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2417,11 +2468,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                  int displayHeight = 0;
                  const float emSize = static_cast<float>(self->renderer.getFontAscenderSize(self->fontId));
                  CssStyle imgStyle;
@@ -798,7 +922,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
                                   : CssStyle{};
                    // Merge inline style (e.g. style="height: 2em") so it overrides stylesheet rules
                    if (!styleAttr.empty()) {
-@@ -2550,7 +2597,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2550,7 +2601,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                    const bool flushImageLine = self->pendingInlineImages.size() >= MAX_PENDING_INLINE_IMAGES;
                    self->flushLongTextRunIfNeeded(flushImageLine, flushImageLine);
                    if (self->lowMemoryAbort) return;
@@ -807,7 +931,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
                    self->depth += 1;
                    return;
                  }
-@@ -2644,7 +2691,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2644,7 +2695,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                    self->currentTextBlock->setBlockStyle(afterImageStyle);
                  }
  
@@ -816,7 +940,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
                  self->depth += 1;
                  return;
                } else {
-@@ -2671,7 +2718,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2671,7 +2722,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                                      .getCombinedBlockStyle(centeredBlockStyle, BlockStyle::CombineAxis::Horizontal)
                                      .withoutBottom());
          self->italicUntilDepth = std::min(self->italicUntilDepth, self->depth);
@@ -825,7 +949,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
          self->depth += 1;
          self->characterData(userData, alt.c_str(), alt.length());
          self->skipDescendantsOfCurrentElement();
-@@ -2759,7 +2806,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2759,7 +2810,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        }
        applyDirectionToEntry(entry, cssStyle);
        applySmallCapsToEntry(entry, cssStyle);
@@ -833,7 +957,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
        if (self->inlineStyleCount_ < MAX_INLINE_STYLE_DEPTH) {
          self->inlineStyleBuf_[self->inlineStyleCount_++] = entry;
        } else {
-@@ -2768,7 +2814,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2768,7 +2818,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        self->updateEffectiveInlineStyle();
  
        // Skip CSS resolution — we already handled styling for this <a> tag
@@ -842,7 +966,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
        self->depth += 1;
        return;
      }
-@@ -2802,6 +2848,21 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2802,6 +2852,21 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
    if (!self->embeddedStyle || self->isLightMode()) {
      stripPublisherSpacing(userAlignmentBlockStyle);
    }
@@ -864,7 +988,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
  
    // <html> and <body> are transparent to the block layout stack, but CSS
    // text-indent is inherited by descendant paragraphs. Preserve that value on
-@@ -2837,7 +2898,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2837,7 +2902,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        stripPublisherSpacing(hrBlockStyle);
      }
      self->emitHorizontalRule(hrBlockStyle);
@@ -873,7 +997,23 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      self->depth += 1;
      return;
    }
-@@ -3137,7 +3198,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -2925,10 +2990,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+       } else {
+         LOG_ERR("EHP", "block style stack overflow (block)");
+       }
+-      // Common EPUB shape: <li><p>text</p></li>. Keep the first paragraph in the marker block
+-      // so the auto bullet does not become its own orphaned paragraph.
+-      const bool reuseListMarkerBlock = strcmp(name, "p") == 0 && self->pendingListMarkerDepth >= 0 &&
+-                                        self->depth == self->pendingListMarkerDepth + 1 && self->currentTextBlock &&
++      // Publishers can wrap the first paragraph in one or more divs.
++      // Keep the marker with the first text block through those wrappers.
++      const bool reuseListMarkerBlock = (strcmp(name, "p") == 0 || strcmp(name, "div") == 0) &&
++                                        self->pendingListMarkerDepth >= 0 &&
++                                        self->depth > self->pendingListMarkerDepth && self->currentTextBlock &&
+                                         self->currentTextBlock->size() == 1;
+       if (reuseListMarkerBlock) {
+         const auto mergedStyle = self->currentTextBlock->getBlockStyle().getCombinedBlockStyle(
+@@ -3137,7 +3203,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
      // Handle span and other inline elements for CSS styling
      if (cssStyle.hasFontWeight() || cssStyle.hasFontStyle() || cssStyle.hasTextDecoration() ||
          cssStyle.hasBackgroundBlack() || cssStyle.hasVerticalAlign() || cssStyle.hasDirection() ||
@@ -882,7 +1022,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
        // Flush buffer before style change so preceding text gets current style
        if (self->partWordBufferIndex > 0) {
          self->flushPartWordBuffer();
-@@ -3166,7 +3227,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -3166,7 +3232,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
        applyDirectionToEntry(entry, cssStyle);
        entry.setsParagraphDirection = strcmp(name, "html") == 0 || strcmp(name, "body") == 0;
        applySmallCapsToEntry(entry, cssStyle);
@@ -890,7 +1030,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
        if (self->inlineStyleCount_ < MAX_INLINE_STYLE_DEPTH) {
          self->inlineStyleBuf_[self->inlineStyleCount_++] = entry;
        } else {
-@@ -3181,7 +3241,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
+@@ -3181,7 +3246,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
    }
  
    // Unprocessed tag, just increasing depth and continue forward
@@ -899,7 +1039,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
    self->depth += 1;
  }
  
-@@ -3259,6 +3319,40 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
+@@ -3259,6 +3324,40 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
        const uint32_t codepoint = utf8NextCodepoint(&codepointPtr);
        codepointReferenceOffset = self->consumeReferenceCodepoint(codepoint);
      }
@@ -940,7 +1080,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
      if (isWhitespace(s[i])) {
        // Currently looking at whitespace, if there's anything in the partWordBuffer, flush it
        if (self->partWordBufferIndex > 0) {
-@@ -4193,7 +4287,7 @@ int ChapterHtmlSlimParser::effectiveLineHeight() const {
+@@ -4193,7 +4292,7 @@ int ChapterHtmlSlimParser::effectiveLineHeight() const {
    return std::max(1, static_cast<int>(renderer.getLineHeight(currentTextFontId()) * lineCompression + 0.5f));
  }
  
@@ -949,7 +1089,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
    if (shouldAbortForLowMemory("page layout")) {
      return;
    }
-@@ -4261,7 +4355,7 @@ void ChapterHtmlSlimParser::makePages() {
+@@ -4261,7 +4360,7 @@ void ChapterHtmlSlimParser::makePages() {
    }
  
    // Extra paragraph spacing if enabled (default behavior)
@@ -959,7 +1099,7 @@ index cd5e188c0ac1e037bcb033bde559b7780a7e3180..2e010ca99b2561ce5dd2e35e7d36fb8d
    }
  
 diff --git a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h
-index 8b28a2e00438778663a34a2d4ee525602aac283e..02fb23eab24ec24d605c7898ecd1e8ecc3075bb6 100644
+index 8b28a2e00438778663a34a2d4ee525602aac283e..aba4362cae4aa67e2f2b3a98e4bdc394c91d71fe 100644
 --- a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h
 +++ b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h
 @@ -147,6 +147,8 @@ class ChapterHtmlSlimParser {
@@ -981,7 +1121,17 @@ index 8b28a2e00438778663a34a2d4ee525602aac283e..02fb23eab24ec24d605c7898ecd1e8ec
  
    struct BufferedTableCell {
      std::unique_ptr<ParsedText> text;
-@@ -275,7 +280,7 @@ class ChapterHtmlSlimParser {
+@@ -234,7 +239,8 @@ class ChapterHtmlSlimParser {
+   std::vector<std::pair<std::string, uint16_t>> anchorData;
+   std::string pendingAnchorId;  // deferred until after previous text block is flushed
+   bool pendingAnchorFromInlineA = false;
+-  std::vector<std::string> tocAnchors;  // the list of anchors that are TOC chapter boundaries
++  std::vector<std::string> tocAnchors;  // TOC chapter boundaries
++  std::vector<std::string> tocSectionAnchors;  // Nested TOC targets within the same spine item
+   uint16_t xpathParagraphIndex = 0;
+   uint16_t xpathListItemIndex = 0;
+   uint16_t currentTextBlockParagraphIndex = 0;
+@@ -275,7 +281,7 @@ class ChapterHtmlSlimParser {
    void markCurrentPageFromCurrentElement();
    void setCurrentPageVisibleOffset(uint32_t offset, uint32_t referenceOffset = UINT32_MAX);
    void completeCurrentPage();
@@ -990,7 +1140,7 @@ index 8b28a2e00438778663a34a2d4ee525602aac283e..02fb23eab24ec24d605c7898ecd1e8ec
    int effectiveLineHeight() const;
    bool isPreviewBuild() const { return !previewAnchor.empty() && previewMaxPages > 0; }
    bool isScanningForPreviewAnchor() const { return isPreviewBuild() && !previewAnchorFound; }
-@@ -287,7 +292,7 @@ class ChapterHtmlSlimParser {
+@@ -287,7 +293,7 @@ class ChapterHtmlSlimParser {
    bool flattensTables() const { return renderMode != EpubRenderMode::CrossInkDefault; }
    bool isLightMode() const { return renderMode == EpubRenderMode::Light; }
    bool honorsPublisherDecorations() const { return renderMode != EpubRenderMode::Light; }
@@ -999,6 +1149,26 @@ index 8b28a2e00438778663a34a2d4ee525602aac283e..02fb23eab24ec24d605c7898ecd1e8ec
    void pushBlockFontStyle(const CssStyle& cssStyle);
    static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
    static void applySmallCapsToEntry(StyleStackEntry& entry, const CssStyle& css);
+@@ -328,7 +334,8 @@ class ChapterHtmlSlimParser {
+       const uint8_t imageRendering = 0, std::vector<std::string> tocAnchors = {},
+       const std::function<void()>& popupFn = nullptr, CssParser* cssParser = nullptr,
+       const EpubRenderMode renderMode = EpubRenderMode::CrossInkDefault, std::string previewAnchor = {},
+-      const uint16_t previewMaxPages = 0, const bool trackReferenceCharacters = false)
++      const uint16_t previewMaxPages = 0, const bool trackReferenceCharacters = false,
++      std::vector<std::string> tocSectionAnchors = {})
+ 
+       : epub(&epub),
+         filepath(filepath),
+@@ -357,7 +364,8 @@ class ChapterHtmlSlimParser {
+         renderMode(renderMode),
+         previewAnchor(std::move(previewAnchor)),
+         previewMaxPages(previewMaxPages),
+-        tocAnchors(std::move(tocAnchors)) {}
++        tocAnchors(std::move(tocAnchors)),
++        tocSectionAnchors(std::move(tocSectionAnchors)) {}
+ 
+   ~ChapterHtmlSlimParser();
+   uint32_t getVisibleTextLength() const { return visibleTextOffset; }
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
 index f87e40bcd38d02979219e0fafa43d1386e56af89..c8e7ad8a3ec33810fdca60dc31131ac281e94aff 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
@@ -1076,7 +1246,7 @@ index 3149756ccca38dfffec18c99ec4a077815fba4eb..74b384ce29dc6ead7a74298d015f815b
    if (loaded) epub->ensureOptimizerImageIndex();
    if (loaded) {
 diff --git a/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp b/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp
-index 78c3d6b40d1b1a187cbaa76c09844d3a97c9b923..ccde3a00887f3d985e3c8841568a9b0804bffd04 100644
+index 78c3d6b40d1b1a187cbaa76c09844d3a97c9b923..41c12164825d651622ae5fe83501cfa90d7d8c66 100644
 --- a/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp
 +++ b/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp
 @@ -111,6 +111,24 @@ TEST_F(ChapterHtmlSlimParserTest, NestedBlocksOverrideAndRestoreInheritedBoldAnd
@@ -1104,6 +1274,44 @@ index 78c3d6b40d1b1a187cbaa76c09844d3a97c9b923..ccde3a00887f3d985e3c8841568a9b08
  TEST_F(ChapterHtmlSlimParserTest, NestedHeadingAndListPreserveBlockFontInheritance) {
    const XML_Char* attributes[] = {"style", "font-style: italic", nullptr};
    ChapterHtmlSlimParser::startElement(&parser, "blockquote", attributes);
+@@ -556,6 +574,37 @@ TEST_F(ChapterHtmlSlimParserTest, HiddenIdsDoNotBecomeAnchorsOrTocPageBreaks) {
+   }
+ }
+ 
++TEST_F(ChapterHtmlSlimParserTest, RecordsNestedTocTargetsWithoutBreakingThePage) {
++  parser.tocSectionAnchors.push_back("subsection");
++  parser.currentPage = std::make_unique<Page>();
++  parser.currentPage->elements.push_back(std::make_unique<PageHorizontalRule>(10, 1, 0, 0));
++  const XML_Char* attributes[] = {"id", "subsection", nullptr};
++  ChapterHtmlSlimParser::startElement(&parser, "span", attributes);
++  ChapterHtmlSlimParser::endElement(&parser, "span");
++  parser.flushPendingAnchor();
++
++  ASSERT_EQ(parser.anchorData.size(), 1u);
++  EXPECT_EQ(parser.completedPageCount, 0);
++}
++
++TEST_F(ChapterHtmlSlimParserTest, KeepsListMarkerWithTextThroughNestedDivs) {
++  ChapterHtmlSlimParser::startElement(&parser, "ul", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "li", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "div", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "div", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "p", nullptr);
++  ChapterHtmlSlimParser::characterData(&parser, "First item", 10);
++  parser.flushPartWordBuffer();
++
++  ASSERT_EQ(parser.currentTextBlock->size(), 3u);
++  EXPECT_EQ(parser.currentTextBlock->words[0], "•");
++  EXPECT_EQ(parser.currentTextBlock->words[1], "First");
++
++  ChapterHtmlSlimParser::endElement(&parser, "p");
++  ChapterHtmlSlimParser::startElement(&parser, "p", nullptr);
++  EXPECT_TRUE(parser.currentTextBlock->isEmpty());
++}
++
+ TEST_F(ChapterHtmlSlimParserTest, NumbersOrderedListsAndRestartsNestedCounters) {
+   ChapterHtmlSlimParser::startElement(&parser, "ol", nullptr);
+   ChapterHtmlSlimParser::startElement(&parser, "li", nullptr);
 diff --git a/test/memory_policy/CssArenaBackingTest.cpp b/test/memory_policy/CssArenaBackingTest.cpp
 index 76ebee13d4f31c5c34de76d1a6781f13c760c406..7b99c34ff0e4bfa4e5d976b89cbeede457a439bc 100644
 --- a/test/memory_policy/CssArenaBackingTest.cpp
@@ -1139,7 +1347,7 @@ index 76ebee13d4f31c5c34de76d1a6781f13c760c406..7b99c34ff0e4bfa4e5d976b89cbeede4
 +  }
 +}
 diff --git a/test/section_persistence/SectionPersistenceTest.cpp b/test/section_persistence/SectionPersistenceTest.cpp
-index 1fca4fee1429abe985520faba7f780ceb512b1c5..ce1bfe9d97ac571d6558f1cf520c097307fb601b 100644
+index 1fca4fee1429abe985520faba7f780ceb512b1c5..05502f8796aba44ba1d94d3be2314e81b1de493d 100644
 --- a/test/section_persistence/SectionPersistenceTest.cpp
 +++ b/test/section_persistence/SectionPersistenceTest.cpp
 @@ -20,10 +20,10 @@
@@ -1150,10 +1358,10 @@ index 1fca4fee1429abe985520faba7f780ceb512b1c5..ce1bfe9d97ac571d6558f1cf520c0973
 -constexpr uint8_t kPartialVersion = 0xC4;
 -constexpr uint8_t kPreviousFullVersion = 82;
 -constexpr uint8_t kPreviousPartialVersion = 0xC3;
-+constexpr uint8_t kFullVersion = 86;
-+constexpr uint8_t kPartialVersion = 0xC7;
-+constexpr uint8_t kPreviousFullVersion = 85;
-+constexpr uint8_t kPreviousPartialVersion = 0xC6;
++constexpr uint8_t kFullVersion = 87;
++constexpr uint8_t kPartialVersion = 0xC8;
++constexpr uint8_t kPreviousFullVersion = 86;
++constexpr uint8_t kPreviousPartialVersion = 0xC7;
  constexpr uint8_t kOlderFullVersion = 79;
  constexpr uint8_t kOlderPartialVersion = 0xF4;
  constexpr uint8_t kEarlierFullVersion = 78;

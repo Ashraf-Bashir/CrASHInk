@@ -1,6 +1,12 @@
 ## [Unreleased]
 
+### Changed
+
+- Workflowy compact calendar rows hide tags between the time and task title.
+
 ### Fixed
+
+- EPUB list markers stay with wrapped opening paragraphs, and nested chapter sections can continue on the same page.
 
 - Workflowy closes after five minutes without input and closes before the device sleeps.
 
