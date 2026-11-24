@@ -1347,9 +1347,16 @@ diff --git a/src/activities/Activity.h b/src/activities/Activity.h
 
    virtual void render(RenderLock&&) {}
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index 82fe5758e9b40d881fad8498be18dc53b3f175d0..4eb2a9ee7b7de542661ffcacb17122dbec15c218 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -28,7 +28,6 @@
+@@ -1,4 +1,5 @@
+ #include <WiFi.h>
++#include "home/AppLauncherActivity.h"
+ #include "ActivityManager.h"
+
+ #if CROSSINK_SCALABLE_FONTS
+@@ -29,7 +30,6 @@
  #include "home/AlertActivity.h"
  #include "home/CrashActivity.h"
  #include "home/FileBrowserActivity.h"
@@ -1357,7 +1364,7 @@ diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager
  #include "home/RecentBookProgress.h"
  #include "library/LibraryActivity.h"
  #include "network/CrossPointWebServerActivity.h"
-@@ -939,15 +938,6 @@
+@@ -951,15 +951,6 @@ void ActivityManager::goToNearbyStatsSync() {
  }
 
  void ActivityManager::goToSettings(const bool dismissOnUpSwipe) {
@@ -1373,7 +1380,7 @@ diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager
    replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput, dismissOnUpSwipe));
  }
 
-@@ -1019,6 +1009,8 @@
+@@ -1031,6 +1022,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
  }
 
  void ActivityManager::goToSleep(bool fromTimeout) {
@@ -1382,7 +1389,7 @@ diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager
    const bool canSnapshotOverlay = currentActivity && currentActivity->canSnapshotForSleepOverlay();
    const GfxRenderer::Orientation sleepPopupOrientation = renderer.getOrientation();
    std::string currentBookPath = getCurrentBookPath();
-@@ -1055,31 +1047,17 @@
+@@ -1067,31 +1060,19 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
  }
 
  void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::RefreshMode initialRefreshMode) {
@@ -1408,24 +1415,25 @@ diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager
 -    } else if (activityName == "Settings") {
 -      initialMenuItem = HomeMenuItem::SETTINGS_MENU;
 -    }
--  }
--  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem, initialRefreshMode,
--                                                 std::move(initialBookPath)));
 +  // "Readest Auto-Sync" on closing a book: remember it, sync once Home is up.
 +  const std::string closingBook = currentActivity && currentActivity->isEpubReaderActivity()
 +                                      ? currentActivity->getCurrentBookPath()
 +                                      : std::string();
 +  (void)initialMenuItem;
 +  (void)initialRefreshMode;
-+  goToLibrary();
++  auto home = makeUniqueNoThrow<AppLauncherActivity>(renderer, mappedInput);
++  if (!home) { LOG_ERR("ACT", "Cannot allocate app launcher"); return; }
++  replaceActivity(std::move(home));
 +  if (shouldReadestAutoSync(closingBook)) {
 +    loop();  // finish leaving the reader first so its position is saved
 +    silentRestartToReadestAutoSync(ReadestAutoSync::Close, closingBook);
-+  }
+   }
+-  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem, initialRefreshMode,
+-                                                 std::move(initialBookPath)));
  }
  void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
-@@ -1112,7 +1090,7 @@
+@@ -1124,7 +1105,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
 
  bool ActivityManager::blocksGlobalInput() const { return currentActivity && currentActivity->blocksGlobalInput(); }
 
@@ -1525,9 +1533,10 @@ diff --git a/src/activities/home/BookActions.h b/src/activities/home/BookActions
 
  }  // namespace BookActions
 diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+index adc3331a03b2d7fb907d34ca5e7cde56363cda45..aedd327e5fb1b3357654d8068dee31d7b7624a37 100644
 --- a/src/activities/home/FileBrowserActivity.cpp
 +++ b/src/activities/home/FileBrowserActivity.cpp
-@@ -555,6 +555,8 @@
+@@ -555,6 +555,8 @@ void FileBrowserActivity::showDirectoryActionMenu(const std::string& entry, bool
                               case FileBrowserAction::ReadingStats:
                               case FileBrowserAction::DeleteStats:
                               case FileBrowserAction::ToggleCompleted:
@@ -1536,7 +1545,7 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
                               case FileBrowserAction::RemoveFromRecents:
                               case FileBrowserAction::PinFavorite:
                               case FileBrowserAction::UnpinFavorite:
-@@ -844,6 +846,8 @@
+@@ -844,6 +846,8 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
              return;
            case FileBrowserAction::SetSleepFolder:
            case FileBrowserAction::ClearSleepFolder:
@@ -1545,7 +1554,16 @@ diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/F
            case FileBrowserAction::RemoveFromRecents:
            case FileBrowserAction::ViewBookmarks:
            case FileBrowserAction::ViewClippings:
-@@ -1477,7 +1481,7 @@
+@@ -1464,7 +1468,7 @@ void FileBrowserActivity::render(RenderLock&&) {
+   const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+   if (mappedInput.hasTouchHardware()) {
+     const int rightReserve = mode == Mode::Books ? TouchHeaderBackButton::layout(header).iconRect.width + 8 : 0;
+-    TouchHeaderBackButton::draw(renderer, uiTarget, header, folderName.c_str(), false, rightReserve);
++    TouchHeaderBackButton::draw(renderer, uiTarget, header, folderName.c_str(), false, rightReserve, nullptr, TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, true, mode == Mode::Books && basepath == "/");
+   } else {
+     GUI.drawHeader(renderer, header, folderName.c_str());
+   }
+@@ -1477,7 +1481,7 @@ void FileBrowserActivity::render(RenderLock&&) {
    uiReady = true;
 
    const size_t visibleEntries = entryCount();
@@ -2159,7 +2177,7 @@ diff --git a/src/activities/home/SavedItemsHomeActivity.cpp b/src/activities/hom
    renderer.displayBuffer();
  }
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4dba651e82 100644
+index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a70acbf01 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
 @@ -6,57 +6,66 @@
@@ -2926,7 +2944,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    });
    requestUpdate();
  }
-@@ -664,39 +753,39 @@ void LibraryActivity::openSearch() {
+@@ -664,39 +753,34 @@ void LibraryActivity::openSearch() {
  }
 
  void LibraryActivity::refreshLibrary() {
@@ -2972,21 +2990,19 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
 -    descending = !descending;
 -    SETTINGS.librarySortDescending = descending;
 -    if (!SETTINGS.saveToFile()) LOG_ERR("LIB", "Cannot save Library sort direction");
-+  if (control == NAV_FIRST && !query.empty()) {
-+    query.clear();
-     applyFilter();
+-    applyFilter();
 -    topIndex = 0;
 -    if (gridEnabled()) resetViewport();
-+    resetViewport();
-     requestUpdate();
-   }
+-    requestUpdate();
+-  }
++  if (control == NAV_FIRST) { activityManager.goHome(); return; }
 +  if (control == NAV_FIRST + 1) activityManager.goToFileTransfer();
 +  if (control == NAV_FIRST + 2) activityManager.goToFileBrowser();
 +  if (control == NAV_FIRST + 3) activityManager.goToSettings();
  }
 
  void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-@@ -704,15 +793,18 @@ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+@@ -704,15 +788,18 @@ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
    if (event.value < 0 || event.value >= self->rowCount()) return;
    self->selection = event.value + CONTROL_COUNT;
    self->showSelection = false;
@@ -3008,7 +3024,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    self->showSelection = false;
    self->activateControl(event.value);
  }
-@@ -751,32 +843,73 @@ void LibraryActivity::latchInput() {
+@@ -751,32 +838,73 @@ void LibraryActivity::latchInput() {
    int x = 0;
    int y = 0;
    if (mappedInput.wasScreenTouchDown(x, y)) {
@@ -3094,7 +3110,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    }
    if (released) touchTracking = false;
    switch (swipe) {
-@@ -805,10 +938,10 @@ void LibraryActivity::latchInput() {
+@@ -805,10 +933,10 @@ void LibraryActivity::latchInput() {
      ignoreBackRelease = false;
    }
    if (mappedInput.hasTouchHardware()) {
@@ -3109,7 +3125,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    } else {
      if (mappedInput.wasReleased(MappedInputManager::Button::Left)) queueInput(Type::LeftRelease);
      if (mappedInput.wasReleased(MappedInputManager::Button::Right)) queueInput(Type::RightRelease);
-@@ -848,26 +981,63 @@ void LibraryActivity::loop() {
+@@ -848,26 +976,63 @@ void LibraryActivity::loop() {
      handleInput(input);
      return;
    }
@@ -3183,7 +3199,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
        showBookActionMenu(selection - CONTROL_COUNT, ignoreConfirmRelease);
      else
        activateControl(selection);
-@@ -892,19 +1062,30 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -892,19 +1057,30 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      pendingInput.clear();
      if (selection < CONTROL_COUNT)
        activateControl(selection);
@@ -3219,7 +3235,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
      return;
    }
    const auto swipe = input.type == Type::SwipeUp      ? MappedInputManager::SwipeDir::Up
-@@ -915,26 +1096,11 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -915,26 +1091,11 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down ||
        (gridEnabled() &&
         (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Right))) {
@@ -3248,7 +3264,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
      if (input.type == Type::LeftRelease) {
        pendingInput.clear();
        openSortPicker();
-@@ -942,7 +1108,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -942,7 +1103,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      }
      if (input.type == Type::RightRelease) {
        pendingInput.clear();
@@ -3257,7 +3273,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
        return;
      }
    }
-@@ -950,21 +1116,23 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -950,21 +1111,23 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    const auto move = [this](const int next) {
      if (!showSelection) {
        showSelection = true;
@@ -3284,7 +3300,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
      } else if (selection >= CONTROL_COUNT) {
        listNav.selected = selection - CONTROL_COUNT;
        listNav.top = topIndex;
-@@ -976,7 +1144,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -976,7 +1139,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    if (mappedInput.hasTouchHardware()) {
      if (input.type == Type::Next) move(ButtonNavigator::nextIndex(selection, count));
      if (input.type == Type::Previous) move(ButtonNavigator::previousIndex(selection, count));
@@ -3293,7 +3309,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
      if (input.type == Type::NextPage) move(ButtonNavigator::nextPageIndex(selection, count, page));
      if (input.type == Type::PreviousPage) move(ButtonNavigator::previousPageIndex(selection, count, page));
    } else if (rowCount() > 0) {
-@@ -985,19 +1153,40 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -985,19 +1148,40 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      const auto moveBook = [&](const int next) { move(CONTROL_COUNT + next); };
      if (input.type == Type::Next) moveBook(ButtonNavigator::nextIndex(row, bookCount));
      if (input.type == Type::Previous) moveBook(ButtonNavigator::previousIndex(row, bookCount));
@@ -3336,7 +3352,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
      item.label = tr(STR_LIBRARY_UNAVAILABLE);
      item.enabled = false;
      return;
-@@ -1030,6 +1219,8 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem&
+@@ -1030,6 +1214,8 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem&
    }
    item.icon = listIconFor(UITheme::getFileIcon(self->rowScratch.path), 32);
    item.actionValue = static_cast<int16_t>(row);
@@ -3345,7 +3361,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    if (!SETTINGS.libraryListExpanded) return;
    if (self->sort == Sort::DateAdded) {
      const uint16_t date = self->dateGroupForRow(row);
-@@ -1105,68 +1296,59 @@ uint32_t LibraryActivity::groupForRow(const int row) {
+@@ -1105,68 +1291,59 @@ uint32_t LibraryActivity::groupForRow(const int row) {
    return library::foldedGroupInitial(key);
  }
 
@@ -3410,8 +3426,8 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
 +                                                static_cast<int16_t>(bottomControls + bounds[2]),
                                                  static_cast<int16_t>(bounds[3])});
 +  if (touch && !selectingBooks) {
-+    static constexpr const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32,
-+                                                   &icon_folder_32, &icon_lyra_settings_32};
++    static constexpr const freeink::Icon* icons[] = {&icon_home_32, &icon_lyra_transfer_32,
++                                                   &icon_folder_32, &icon_cog_32};
 +    const int width = renderer.getScreenWidth() - bounds[1] - bounds[3];
 +    const int y = renderer.getScreenHeight() - bounds[2] - NAV_HEIGHT;
 +    const auto ink = fui::Paint::solid(fui::Color::Black);
@@ -3455,7 +3471,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
      fui::ButtonProps action;
      action.action = ACTION_CONTROL;
      action.inputMask = fui::InputTouch;
-@@ -1176,26 +1358,35 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1176,26 +1353,35 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
      action.value = 0;
      action.state = showSelection && selection == 0 ? fui::StateSelected : fui::StateNormal;
      screen.button(action,
@@ -3502,7 +3518,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    const int16_t statusPadding = static_cast<int16_t>(metrics.contentSidePadding);
    const fui::Insets statusInsets{0, statusPadding, 0, statusPadding};
    if (scanFailed || index.ranksDegraded() || filterFailed) {
-@@ -1207,16 +1398,33 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1207,16 +1393,33 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
                                 : tr(STR_LIBRARY_UNSORTED),
                    screen.theme().smallText);
    }
@@ -3540,7 +3556,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
          message = tr(STR_LIBRARY_NO_RESULTS);
        else if (sort == Sort::RecentlyRead)
          message = tr(STR_NO_RECENT_BOOKS);
-@@ -1252,162 +1460,187 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1252,162 +1455,187 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
  }
 
  void LibraryActivity::buildGrid(UiApp::ScreenType& screen) {
@@ -3865,7 +3881,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
  }
 
  void LibraryActivity::render(RenderLock&&) {
-@@ -1417,42 +1650,135 @@ void LibraryActivity::render(RenderLock&&) {
+@@ -1417,42 +1645,135 @@ void LibraryActivity::render(RenderLock&&) {
      drawScanScreen(tr(STR_LIBRARY_SCANNING));
      return;
    }
@@ -4020,7 +4036,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
  void LibraryActivity::promptDeleteBook(const RecentBook& book) {
    const std::string path = book.path;
    auto handler = [this, path](const ActivityResult& res) {
-@@ -1470,7 +1796,11 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
+@@ -1470,7 +1791,11 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
      // The card changed, so a cancelled scan must not keep showing this book.
      scanCancelledThisVisit = false;
      RECENT_BOOKS.removeByPath(path);
@@ -4033,7 +4049,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
    };
 
    const std::string heading = tr(STR_DELETE) + std::string("? ");
-@@ -1500,135 +1830,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+@@ -1500,135 +1825,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
                                      [&book](const RecentBook& recent) { return recent.path == book.path; });
    std::vector<FileBrowserActionActivity::MenuItem> items =
        BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/isRecent);
@@ -4356,6 +4372,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..b8e804184f9a40eaf879be4aaf8b0a4d
 +      });
  }
 diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
+index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767dd6c61d0 100644
 --- a/src/activities/library/LibraryActivity.h
 +++ b/src/activities/library/LibraryActivity.h
 @@ -3,15 +3,21 @@
@@ -4380,7 +4397,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
  #include "util/ButtonNavigator.h"
 
  class LibraryActivity final : public Activity {
-@@ -19,6 +25,14 @@
+@@ -19,6 +25,14 @@ class LibraryActivity final : public Activity {
    LibraryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
    void onEnter() override;
    void onExit() override;
@@ -4390,12 +4407,12 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
 +    coverWorker.start();
 +    requestUpdate();
 +  }
-+  bool isHomeActivity() const override { return true; }
++  bool isHomeActivity() const override { return false; }
 +  bool allowGlobalHomeSwipeGesture() const override { return false; }
    void loop() override;
    void render(RenderLock&&) override;
    bool blocksGlobalInput() const override { return actionPopup.isActive(); }
-@@ -41,7 +55,7 @@
+@@ -41,7 +55,7 @@ class LibraryActivity final : public Activity {
   private:
    enum class Sort : uint8_t { DateAdded, Title, AuthorLast, AuthorFirst, RecentlyRead, Series, Genre };
    // Touch header controls precede the book rows; button-only navigation visits books directly.
@@ -4404,7 +4421,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    using UiApp = freeink::ui::FreeInkApp<32, 4>;
    freeink::ui::GfxRendererTarget uiTarget;
    UiApp app;
-@@ -49,18 +63,42 @@
+@@ -49,18 +63,42 @@ class LibraryActivity final : public Activity {
    freeink::ui::ListNav listNav;
    OptionPopup actionPopup;
    library::LibraryIndexFile index;
@@ -4449,7 +4466,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    bool uiReady = false;
    bool initialScanPending = false;
    bool confirmLongPressCaptured = false;
-@@ -96,6 +134,15 @@
+@@ -96,6 +134,15 @@ class LibraryActivity final : public Activity {
    library::SortOrder filterOrder = library::SortOrder::TitleAsc;
    uint16_t filterSourceCount = 0;
    uint16_t filteredCount = 0;
@@ -4465,7 +4482,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    // Indices into the bounded recent-books history, independent of the Library index.
    uint16_t recentRows[RecentBooksStore::MAX_RECENT_BOOKS]{};
    size_t recentCount = 0;
-@@ -118,10 +165,8 @@
+@@ -118,10 +165,8 @@ class LibraryActivity final : public Activity {
    void buildGrid(UiApp::ScreenType& screen);
    void loadGridPageCovers();
    bool loadGridCover(int row);
@@ -4477,7 +4494,7 @@ diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/L
    library::SortOrder indexOrder() const;
    int rowCount() const;
    uint16_t ordinalForRow(int row);
-@@ -130,28 +175,34 @@
+@@ -130,28 +175,34 @@ class LibraryActivity final : public Activity {
    uint32_t groupForRow(int row);
    uint16_t dateGroupForRow(int row);
    bool metadataGroupForRow(int row, std::string& out);
@@ -5165,9 +5182,10 @@ diff --git a/src/activities/settings/ClearCacheActivity.cpp b/src/activities/set
    auto root = Storage.open("/.crosspoint");
    if (!root || !root.isDirectory()) {
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 9608eb3a090c28523adb30cfc6079c79371d5fbe..7c136bf08af00197829157f11070285201795f04 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
-@@ -846,12 +846,7 @@
+@@ -846,12 +846,7 @@ void SettingsActivity::finishToParent() {
  }
 
  void SettingsActivity::applyUiSettingChange(uint8_t CrossPointSettings::* valuePtr) {
@@ -5181,7 +5199,7 @@ diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/setti
      return;
    }
 
-@@ -860,9 +855,6 @@
+@@ -860,9 +855,6 @@ void SettingsActivity::applyUiSettingChange(uint8_t CrossPointSettings::* valueP
    // release it before requestUpdate() triggers the next repaint.
    {
      RenderLock lock(*this);
@@ -5191,10 +5209,20 @@ diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/setti
      const auto spec = uiScaleSpec();
      uiTarget.setFont(fui::GfxRendererTarget::FONT_SMALL, spec.smallFontId);
      uiTarget.setFont(fui::GfxRendererTarget::FONT_BODY, spec.bodyFontId);
+@@ -1685,7 +1677,7 @@ void SettingsActivity::render(RenderLock&&) {
+   const char* title = isFileBrowserView() ? tr(STR_FILE_BROWSER_SETTINGS) : tr(STR_SETTINGS_TITLE);
+
+   if (mappedInput.hasTouchHardware()) {
+-    TouchHeaderBackButton::drawCompact(renderer, title, false, false);
++    TouchHeaderBackButton::drawCompact(renderer, title, false, false, TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, !isFileBrowserView() && activeSubmenu == SettingAction::None);
+   } else {
+     CompactHeader::drawTitle(renderer, title);
+   }
 diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
+index 4dc102627252ce345f2e3c9c0e8de209c193fb02..92c84a5a344093684755795ce8aebf98d348b5b8 100644
 --- a/src/activities/util/FrontlightPanelActivity.cpp
 +++ b/src/activities/util/FrontlightPanelActivity.cpp
-@@ -272,7 +272,8 @@
+@@ -272,7 +272,8 @@ void FrontlightPanelActivity::closeSyncDialog() {
  }
 
  void FrontlightPanelActivity::activateQuickAction(const int index) {
@@ -5204,7 +5232,7 @@ diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/ut
    if (index == 0 && !context.showReadingStatsAction) return;
    drawerState.selectedAction = static_cast<int8_t>(index);
    switch (index) {
-@@ -481,14 +482,18 @@
+@@ -481,14 +482,18 @@ void FrontlightPanelActivity::buildPanelScreen(UiApp::ScreenType& screen) {
    simulatorActionBarTop = actionBar.y;
  #endif
    const bool showStats = context.showReadingStatsAction;
@@ -5225,15 +5253,6 @@ diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/ut
      const int16_t x = static_cast<int16_t>(actionBar.x + slotIndex * slotWidth);
      const int16_t width = slotIndex == slotCount - 1 ? static_cast<int16_t>(actionBar.right() - x) : slotWidth;
      const fui::Rect slot{x, actionBar.y, width, actionBar.height};
-@@ -597,7 +602,7 @@
-     uiTarget.bitmap(fui::Rect{static_cast<int16_t>(button.x + (button.width - HEADER_ICON_SIZE) / 2),
-                               static_cast<int16_t>(headerBottom - HEADER_CONTENT_BOTTOM_GAP - HEADER_ICON_SIZE),
-                               HEADER_ICON_SIZE, HEADER_ICON_SIZE},
--                    fui::bitmapFromIcon(icon_home_24), fui::BitmapMode::Center);
-+                    fui::bitmapFromIcon(icon_landmark_24), fui::BitmapMode::Center);
-   }
- }
-
 diff --git a/src/components/BookCoverCache.cpp b/src/components/BookCoverCache.cpp
 new file mode 100644
 --- /dev/null
@@ -7628,3 +7647,190 @@ diff --git a/src/components/themes/minimal/MinimalTheme.cpp b/src/components/the
  }
 
  void MinimalTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
+diff --git a/src/activities/home/AppLauncherActivity.cpp b/src/activities/home/AppLauncherActivity.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e962ec7f6b416df463826e8d2b6eb13ff0b0ac2
+--- /dev/null
++++ b/src/activities/home/AppLauncherActivity.cpp
+@@ -0,0 +1,73 @@
++#include "AppLauncherActivity.h"
++#include <I18n.h>
++#include <Memory.h>
++#include <algorithm>
++#include "components/UITheme.h"
++#include "components/icons/listIcons.h"
++#include "fontIds.h"
++
++namespace {
++constexpr int AppCount = 4;
++}
++Rect AppLauncherActivity::tile(int index) const {
++  int top, right, bottom, left;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  const int columns = renderer.getScreenWidth() > renderer.getScreenHeight() ? 3 : 2;
++  const int rows = (AppCount + columns - 1) / columns;
++  const int startY = top + 82;
++  const int width = renderer.getScreenWidth() - left - right;
++  const int height = std::max(1, renderer.getScreenHeight() - bottom - startY - 12);
++  const int x = left + (index % columns) * width / columns;
++  const int y = startY + (index / columns) * height / rows;
++  return Rect{x, y, width / columns, height / rows};
++}
++void AppLauncherActivity::open(int index) {
++  if (index == 0) activityManager.goToLibrary();
++  if (index == 1) activityManager.goToFileTransfer();
++  if (index == 2) activityManager.goToFileBrowser();
++  if (index == 3) activityManager.goToSettings();
++
++}
++void AppLauncherActivity::loop() {
++  using Button = MappedInputManager::Button;
++  if (mappedInput.wasReleased(Button::Left)) { selected = (selected + AppCount - 1) % AppCount; requestUpdate(); }
++  if (mappedInput.wasReleased(Button::Right)) { selected = (selected + 1) % AppCount; requestUpdate(); }
++  if (mappedInput.wasReleased(Button::Confirm)) { open(selected); return; }
++  if (mappedInput.wasSwipe() != MappedInputManager::SwipeDir::None) return;
++  int x, y;
++  if (!mappedInput.wasScreenTapped(x, y)) return;
++  for (int i = 0; i < AppCount; ++i) {
++    const auto r = tile(i);
++    if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) { open(i); return; }
++  }
++}
++void AppLauncherActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  int top, right, bottom, left;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  GUI.drawDisplayStatusBar(renderer, top);
++  renderer.drawCenteredText(UI_12_FONT_ID, top + 43, "crASHink", true, EpdFontFamily::BOLD);
++  static const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32, &icon_folder_32, &icon_cog_32,
++  };
++  const char* labels[] = {tr(STR_LIBRARY), tr(STR_FILE_TRANSFER), tr(STR_BROWSE), tr(STR_SETTINGS_SHORT),
++  };
++  for (int i = 0; i < AppCount; ++i) {
++    const auto r = tile(i);
++    const auto& icon = *icons[i];
++    const int scale = std::max(1, std::min(3, std::min((r.width - 34) / 32, (r.height - 54) / 32)));
++    const int x = r.x + (r.width - icon.w * scale) / 2;
++    const int y = r.y + std::max(12, (r.height - icon.h * scale - 32) / 2);
++    // Scale the existing mask assets directly; no decoded image/cache allocation.
++    for (int row = 0; row < icon.h; ++row)
++      for (int col = 0; col < icon.w; ++col)
++        if (!(icon.bits[row * ((icon.w + 7) / 8) + col / 8] & (0x80 >> (col & 7))))
++          renderer.fillRect(x + col * scale, y + row * scale, scale, scale, true);
++    const int textWidth = r.width - 16;
++    const auto label = renderer.truncatedText(UI_12_FONT_ID, labels[i], textWidth);
++    renderer.drawText(UI_12_FONT_ID, r.x + (r.width - renderer.getTextWidth(UI_12_FONT_ID, label.c_str())) / 2,
++                      y + icon.h * scale + 14, label.c_str());
++    if (!mappedInput.hasTouchHardware() && i == selected)
++      renderer.drawRoundedRect(r.x + 8, r.y + 8, r.width - 16, r.height - 16, 2, 12, true);
++  }
++  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++}
+diff --git a/src/activities/home/AppLauncherActivity.h b/src/activities/home/AppLauncherActivity.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb8775f0d2e0e6eafee1c257de2f53a046a5c4b2
+--- /dev/null
++++ b/src/activities/home/AppLauncherActivity.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include "activities/Activity.h"
++
++struct Rect;
++
++class AppLauncherActivity final : public Activity {
++ public:
++  AppLauncherActivity(GfxRenderer& renderer, MappedInputManager& input) : Activity("Home", renderer, input) {}
++  bool isHomeActivity() const override { return true; }
++  void loop() override;
++  void render(RenderLock&&) override;
++ private:
++  int selected = 0;
++  Rect tile(int index) const;
++  void open(int index);
++};
+diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
+index 21c82a09db0aece69e36623e91958534d1fd42b9..0640d5ee2215aae946962a1bc81c1b8aababaac5 100644
+--- a/src/activities/network/CrossPointWebServerActivity.cpp
++++ b/src/activities/network/CrossPointWebServerActivity.cpp
+@@ -496,7 +496,7 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
+ void CrossPointWebServerActivity::renderHeader() const {
+   const char* title = isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER);
+   if (mappedInput.hasTouchHardware()) {
+-    TouchHeaderBackButton::drawCompact(renderer, title);
++    TouchHeaderBackButton::drawCompact(renderer, title, false, false, TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, returnBookPath.empty());
+   } else {
+     CompactHeader::drawTitle(renderer, title);
+   }
+diff --git a/src/components/HomeNavigationIcon.h b/src/components/HomeNavigationIcon.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0466c9bc392fe1e1bd941971694d15ddfc359cb3
+--- /dev/null
++++ b/src/components/HomeNavigationIcon.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include <GfxRenderer.h>
++#include "components/icons/listIcons.h"
++inline void drawHomeNavigationIcon(const GfxRenderer& renderer, int centerX, int centerY) {
++  renderer.drawIcon(icon_home_32.bits, centerX - 16, centerY - 16, 32);
++}
+diff --git a/src/components/TouchHeaderBackButton.cpp b/src/components/TouchHeaderBackButton.cpp
+index 91fb8c92296a4bd7cdf46b1f9994a78fdd41dd06..ad5a2a583c88f101cafe701fc3ab68ddcfccfd6e 100644
+--- a/src/components/TouchHeaderBackButton.cpp
++++ b/src/components/TouchHeaderBackButton.cpp
+@@ -78,14 +78,14 @@ bool wasTapped(const MappedInputManager& input, const GfxRenderer& renderer) {
+ }
+
+ void draw(GfxRenderer& renderer, const Rect& header, const char* title, const bool readerContext,
+-          const int rightReserve, const char* subtitle, const int verticalOffset, const bool showStatus) {
++          const int rightReserve, const char* subtitle, const int verticalOffset, const bool showStatus, const bool home) {
+   auto target = makeUiTarget(renderer);
+-  draw(renderer, target, header, title, readerContext, rightReserve, subtitle, verticalOffset, showStatus);
++  draw(renderer, target, header, title, readerContext, rightReserve, subtitle, verticalOffset, showStatus, home);
+ }
+
+ void draw(GfxRenderer& renderer, fui::GfxRendererTarget& target, const Rect& header, const char* title,
+           const bool readerContext, const int rightReserve, const char* subtitle, const int verticalOffset,
+-          const bool showStatus) {
++          const bool showStatus, const bool home) {
+   Layout back = layout(header);
+   const int offset = effectiveVerticalOffset(back, header, verticalOffset);
+   back.iconRect.y += offset;
+@@ -105,16 +105,16 @@ void draw(GfxRenderer& renderer, fui::GfxRendererTarget& target, const Rect& hea
+   const int iconX = back.iconRect.x + (back.iconRect.width - ICON_SIZE) / 2;
+   const int iconY = back.iconRect.y + (back.iconRect.height - ICON_SIZE) / 2;
+   target.bitmap(fui::Rect{static_cast<int16_t>(iconX), static_cast<int16_t>(iconY), ICON_SIZE, ICON_SIZE},
+-                fui::bitmapFromIcon(icon_back_32), fui::BitmapMode::Center);
++                fui::bitmapFromIcon(home ? icon_home_32 : icon_back_32), fui::BitmapMode::Center);
+ }
+
+ void drawCompact(GfxRenderer& renderer, const char* title, const bool readerContext, const bool showDate,
+-                 const int verticalOffset) {
++                 const int verticalOffset, const bool home) {
+   const auto& metrics = UITheme::getInstance().getMetrics();
+   const Rect header = compactHeaderRect(renderer);
+   const int rightReserve =
+       metrics.batteryWidth + 2 * metrics.headerSidePadding + (showDate ? headerDateReservedWidth(renderer) : 0);
+-  draw(renderer, header, title, readerContext, rightReserve, nullptr, verticalOffset);
++  draw(renderer, header, title, readerContext, rightReserve, nullptr, verticalOffset, true, home);
+   if (showDate) {
+     const Layout back = layout(header);
+     const int offset = effectiveVerticalOffset(back, header, verticalOffset);
+diff --git a/src/components/TouchHeaderBackButton.h b/src/components/TouchHeaderBackButton.h
+index b1faac6901c42e3538d88cec3c39e9e8fc3da6ad..b568e9f96fe3a93d5b18c475d0ec1d9e9ccf6668 100644
+--- a/src/components/TouchHeaderBackButton.h
++++ b/src/components/TouchHeaderBackButton.h
+@@ -26,11 +26,11 @@ Rect compactHeaderRect(const GfxRenderer& renderer);
+ bool wasTapped(const MappedInputManager& input, const Rect& header);
+ bool wasTapped(const MappedInputManager& input, const GfxRenderer& renderer);
+ void draw(GfxRenderer& renderer, const Rect& header, const char* title, bool readerContext, int rightReserve = 0,
+-          const char* subtitle = nullptr, int verticalOffset = TITLE_VERTICAL_OFFSET, bool showStatus = true);
++          const char* subtitle = nullptr, int verticalOffset = TITLE_VERTICAL_OFFSET, bool showStatus = true, bool home = false);
+ void draw(GfxRenderer& renderer, freeink::ui::GfxRendererTarget& target, const Rect& header, const char* title,
+           bool readerContext, int rightReserve = 0, const char* subtitle = nullptr,
+-          int verticalOffset = TITLE_VERTICAL_OFFSET, bool showStatus = true);
++          int verticalOffset = TITLE_VERTICAL_OFFSET, bool showStatus = true, bool home = false);
+ void drawCompact(GfxRenderer& renderer, const char* title, bool readerContext = false, bool showDate = false,
+-                 int verticalOffset = TITLE_VERTICAL_OFFSET);
++                 int verticalOffset = TITLE_VERTICAL_OFFSET, bool home = false);
+
+ }  // namespace TouchHeaderBackButton

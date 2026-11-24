@@ -12,10 +12,10 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
  
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a6af292478e11d385b42e6c43786a5b840ea21d..925fda481f32911fb00db7287f22d6e101b46f5c 100644
+index 3a6af292478e11d385b42e6c43786a5b840ea21d..29f82df76db15e2f58f8ca1980cacf2965dd097b 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -611,6 +611,24 @@ STR_DELETE_CACHE: "Delete Book Cache"
+@@ -611,6 +611,27 @@ STR_DELETE_CACHE: "Delete Book Cache"
  STR_SAVE_CLIPPING: "Create Clipping"
  STR_VIEW_CLIPPINGS: "View Clippings"
  STR_CLIPPINGS: "Clippings"
@@ -34,13 +34,16 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..925fda481f32911fb00db7287f22d6e1
 +STR_WORKFLOWY_SEND_FAILED: "Workflowy could not save this item"
 +STR_WORKFLOWY_SENDING: "Sending to Workflowy"
 +STR_WORKFLOWY_SENT: "Sent"
-+STR_WORKFLOWY_ALREADY_SENT: "Already sent"
++STR_WORKFLOWY_SHARING: "Sending to Workflowy…"
++STR_WORKFLOWY_SHARE_SENT: "Sent to Workflowy"
++STR_WORKFLOWY_SAVED_LOCALLY: "Saved locally · will retry on next Share"
++STR_WORKFLOWY_ALREADY_SENT: "Already sent to Workflowy"
 +STR_WORKFLOWY_RECEIPT_FAILED: "Sent, but could not save receipt"
 +STR_WORKFLOWY_CLOCK_FAILED: "Could not set time for secure connection"
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1080,3 +1098,67 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1080,3 +1101,67 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -197,10 +200,10 @@ index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index ac3bc1d0f5791e55b5e36ac6dbca219ecb352b0b..aa5017216ef6a136a72431c3da1126155e25af35 100644
+index 4eb2a9ee7b7de542661ffcacb17122dbec15c218..0699f2c18306748e787b82e1eb44a4eb6672b01e 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -39,10 +39,12 @@
+@@ -41,10 +41,12 @@
  #include "reader/BookStatsTracking.h"
  #include "reader/GlobalReadingStats.h"
  #include "reader/ReaderActivity.h"
@@ -212,12 +215,28 @@ index ac3bc1d0f5791e55b5e36ac6dbca219ecb352b0b..aa5017216ef6a136a72431c3da112615
 +#include "util/OptionSelectionActivity.h"
  #include "util/SwipeAdjustment.h"
  #include "util/TwoFingerSwipe.h"
- 
-@@ -586,6 +588,13 @@ void ActivityManager::loop() {
+
+@@ -595,6 +597,29 @@ void ActivityManager::loop() {
      mappedInput.setPowerAsConfirmInReaderMode(false);
    }
- 
+
 +  if (pendingAction == PendingAction::None) {
++    if (workflowyNoticeVisible && millis() - workflowyNoticeShownAt >= 1000u) {
++      workflowyNoticeVisible = false;
++      requestUpdate();
++    }
++    // This is feedback, not an activity: no delay, modal dialog or input grab.
++    // Only the small popup backdrop is borrowed; the reader keeps running.
++    if (currentActivity && !RenderLock::peek()) {
++      RenderLock lock(RenderLock::Mode::Try);
++      if (lock.ownsLock()) {
++        if (const auto message = workflowy::takeShareNotice()) {
++          GUI.drawPopup(renderer, I18n::getInstance().get(*message), true);
++          workflowyNoticeShownAt = millis();
++          workflowyNoticeVisible = true;
++        }
++      }
++    }
 +    if (const auto error = workflowy::takeShareError()) {
 +      pushActivity(std::make_unique<OptionSelectionActivity>(
 +          renderer, mappedInput, "WorkflowyShareError", *error, std::vector<std::string>{tr(STR_OK)}, 0, false, true));
@@ -227,15 +246,15 @@ index ac3bc1d0f5791e55b5e36ac6dbca219ecb352b0b..aa5017216ef6a136a72431c3da112615
    while (pendingAction != PendingAction::None) {
      if (pendingAction == PendingAction::Pop) {
        RenderLock lock;
-@@ -1086,7 +1095,9 @@ void ActivityManager::popActivity() {
+@@ -1097,7 +1122,9 @@ void ActivityManager::popActivity() {
    pendingAction = PendingAction::Pop;
  }
- 
+
 -bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
 +bool ActivityManager::preventAutoSleep() const {
 +  return workflowy::shareInProgress() || (currentActivity && currentActivity->preventAutoSleep());
 +}
- 
+
  bool ActivityManager::requiresExclusiveStorageLoop() const {
    return currentActivity && currentActivity->requiresExclusiveStorageLoop();
 diff --git a/src/activities/ActivityResult.h b/src/activities/ActivityResult.h
@@ -268,7 +287,7 @@ index c8632d51a6c0eea1826a12e30bcdc227c0437854..8d9cfcd5f30a4e9e7254e437587e06c9
                   FileBrowserActionResult, FilePathResult, WordResult, ReadingStatsResult, ClippingResult,
                   TtfRenderOptionsResult, DictionaryClippingRequest, ClippingJumpResult, HighlightPageAction, FrontlightPanelResult>;
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index a53cced410b6bc88ecbfdb0fb30d4f8053f8dd68..4439cd35a622ab376505aee62dc8bafd256a4f67 100644
+index 480832df63a053d8d26498697ac12a1ef261e2ce..bea317f59ee3f962a6a2a545d7bd072b4292f674 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
 @@ -25,6 +25,10 @@
@@ -296,20 +315,20 @@ index a53cced410b6bc88ecbfdb0fb30d4f8053f8dd68..4439cd35a622ab376505aee62dc8bafd
  constexpr int BATCH_CANCEL_CONTROL = NAV_FIRST + NAV_COUNT;
  constexpr int BATCH_APPLY_CONTROL = BATCH_CANCEL_CONTROL + 1;
  int gridColumns() { return CoverGridLayout::Columns; }
-@@ -789,6 +798,12 @@ void LibraryActivity::activateControl(const int control) {
+@@ -784,6 +793,12 @@ void LibraryActivity::activateControl(const int control) {
    if (control == NAV_FIRST + 1) activityManager.goToFileTransfer();
    if (control == NAV_FIRST + 2) activityManager.goToFileBrowser();
    if (control == NAV_FIRST + 3) activityManager.goToSettings();
 +#ifndef SIMULATOR
 +  if (control == NAV_FIRST + 4)
-+    startActivityForResult(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput, true), {});
++    activityManager.replaceActivity(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput, true));
 +  if (control == NAV_FIRST + 5)
-+    startActivityForResult(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput), {});
++    activityManager.replaceActivity(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput));
 +#endif
  }
- 
+
  void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-@@ -1085,7 +1100,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -1080,7 +1095,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      } else if (!mappedInput.hasTouchHardware()) {
        static constexpr StrId choices[] = {StrId::STR_LIBRARY, StrId::STR_FILE_TRANSFER, StrId::STR_BROWSE,
                                            StrId::STR_SETTINGS_SHORT};
@@ -318,12 +337,12 @@ index a53cced410b6bc88ecbfdb0fb30d4f8053f8dd68..4439cd35a622ab376505aee62dc8bafd
                         [this](int selected) { activateControl(NAV_FIRST + selected); });
        requestUpdate();
      }
-@@ -1312,7 +1327,11 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1307,7 +1322,11 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
                                                  static_cast<int16_t>(bounds[3])});
    if (touch && !selectingBooks) {
-     static constexpr const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32,
--                                                   &icon_folder_32, &icon_lyra_settings_32};
-+                                                   &icon_folder_32, &icon_lyra_settings_32,
+     static constexpr const freeink::Icon* icons[] = {&icon_home_32, &icon_lyra_transfer_32,
+-                                                   &icon_folder_32, &icon_cog_32};
++                                                   &icon_folder_32, &icon_cog_32,
 +#ifndef SIMULATOR
 +                                                   &workflowyCalendarIcon, &workflowyIcon,
 +#endif
@@ -332,13 +351,21 @@ index a53cced410b6bc88ecbfdb0fb30d4f8053f8dd68..4439cd35a622ab376505aee62dc8bafd
      const int y = renderer.getScreenHeight() - bounds[2] - NAV_HEIGHT;
      const auto ink = fui::Paint::solid(fui::Color::Black);
 diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
-index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..a9dff5c0c6aa777667942e72d8f499ef4c3d1a04 100644
+index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..2a4d7ade7aa93e12683105c9904d8f2622a9fd25 100644
 --- a/src/activities/reader/EpubReaderClippingListActivity.cpp
 +++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
-@@ -38,6 +38,15 @@ Rect clippingHeaderRect(const Rect& safe, const ThemeMetrics& metrics, const Map
+@@ -11,6 +11,7 @@
+ #include "MappedInputManager.h"
+ #include "HighlightEditActivity.h"
+ #include "WorkflowyShareActivity.h"
++#include "workflowy/WorkflowyIcon.h"
+ #include "ClippingListPaging.h"
+ #include "components/DisclosureIcon.h"
+ #include "ReaderUtils.h"
+@@ -38,6 +39,15 @@ Rect clippingHeaderRect(const Rect& safe, const ThemeMetrics& metrics, const Map
    return Rect{safe.x, safe.y + metrics.topPadding, safe.width, TouchHeaderBackButton::height(metrics, mappedInput)};
  }
- 
+
 +Rect colorFilterButton(const Rect& header) {
 +  return Rect{header.x + header.width - 92, header.y + header.height - 42, 88, 40};
 +}
@@ -351,16 +378,30 @@ index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..a9dff5c0c6aa777667942e72d8f499ef
  Rect touchDetailOpenButtonRect(const Rect& safe, const ThemeMetrics& metrics) {
    const int sidePadding = std::min(metrics.contentSidePadding, std::max(0, safe.width / 2 - 1));
    return Rect{safe.x + sidePadding, safe.y + safe.height - metrics.verticalSpacing - TOUCH_DETAIL_BUTTON_HEIGHT,
-@@ -448,8 +457,7 @@ void EpubReaderClippingListActivity::loop() {
+@@ -448,8 +458,8 @@ void EpubReaderClippingListActivity::loop() {
    if (!detailMode && filteredCount > 0 &&
        (mappedInput.wasTapInRect(share.x, share.y, share.width, share.height) ||
         (!mappedInput.hasTouchHardware() && mappedInput.wasReleased(MappedInputManager::Button::Right)))) {
 -    startActivityForResult(std::make_unique<WorkflowyShareActivity>(renderer, mappedInput, SIZE_MAX, colorFilter),
 -                           [](const ActivityResult&) {});
 +    workflowy::shareClippings(SIZE_MAX, colorFilter);
++    finish();
      return;
    }
    const auto filter = colorFilterButton(header);
+@@ -806,9 +816,9 @@ void EpubReaderClippingListActivity::render(RenderLock&&) {
+       const auto share = shareClippingsButton(header);
+       const int x = share.x + share.width / 2, y = share.y + share.height / 2;
+       renderer.drawRoundedRect(share.x, share.y, share.width, share.height, 1, 5, true);
+-      renderer.drawLine(x - 8, y + 8, x + 8, y - 8, 2, true);
+-      renderer.drawLine(x, y - 8, x + 8, y - 8, 2, true);
+-      renderer.drawLine(x + 8, y - 8, x + 8, y, 2, true);
++      for (int row = 0; row < 32; ++row)
++        for (int col = 0; col < 32; ++col)
++          if (!(workflowyBits[row * 4 + col / 8] & (0x80 >> (col & 7)))) renderer.drawPixel(x - 16 + col, y - 16 + row, true);
+     }
+     const auto filter = colorFilterButton(header);
+     renderer.drawRoundedRect(filter.x, filter.y, filter.width, filter.height, colorFilter ? 2 : 1, 5, true);
 diff --git a/src/activities/reader/HighlightEditActivity.cpp b/src/activities/reader/HighlightEditActivity.cpp
 index 01464c836ce33b553ec56865b26d96604cd526d4..a07dda907741c186c1cb44e3764ad97a1cb91efe 100644
 --- a/src/activities/reader/HighlightEditActivity.cpp
@@ -409,10 +450,33 @@ index 01464c836ce33b553ec56865b26d96604cd526d4..a07dda907741c186c1cb44e3764ad97a
    renderer.drawLine(close.x + close.width - 14, close.y + 14, close.x + 14, close.y + close.height - 14, 2, true);
    const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
 diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
-index 34e9d1d552236d3e553525141de3e0804f0cb9e5..f9815c73dc2e5b4c3a17309d9d95dcf20b6b8e98 100644
+index 1b38d1497e5b7166b2613b6bb11348b92d5ddfc9..d3160c524b61f771e58160fa724d03f74a182e84 100644
 --- a/src/activities/reader/OnPageHighlightActivity.cpp
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -427,11 +427,8 @@ void OnPageHighlightActivity::loop() {
+@@ -16,6 +16,7 @@
+ #include "PageWordGeometry.h"
+ #include "ReaderUtils.h"
+ #include "WorkflowyShareActivity.h"
++#include "workflowy/WorkflowyIcon.h"
+ #include "clippings/SelectionRibbon.h"
+ #include "fontIds.h"
+
+@@ -61,9 +62,11 @@ void toolbarIcon(const GfxRenderer& renderer, const HighlightToolbar::Bounds& bu
+     line(10, 10, 10, 18);
+     line(14, 10, 14, 18);
+   } else if (action == HighlightToolbar::Action::Share) {
+-    line(5, 19, 20, 4);
+-    line(11, 4, 20, 4);
+-    line(20, 4, 20, 13);
++    const int originX = button.x + (button.width - 32) / 2;
++    const int originY = button.y + (button.height - 32) / 2;
++    for (int row = 0; row < 32; ++row)
++      for (int col = 0; col < 32; ++col)
++        if (!(workflowyBits[row * 4 + col / 8] & (0x80 >> (col & 7)))) renderer.drawPixel(originX + col, originY + row, true);
+   } else {
+     line(3, 21, 5, 14);
+     line(5, 14, 17, 2);
+@@ -435,11 +438,8 @@ void OnPageHighlightActivity::loop() {
            break;
          }
          case HighlightToolbar::Action::Share:
@@ -428,10 +492,10 @@ index 34e9d1d552236d3e553525141de3e0804f0cb9e5..f9815c73dc2e5b4c3a17309d9d95dcf2
            returnAction(true);
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c75d6ac86
+index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f693ae1bb9
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,489 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -441,6 +505,9 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +#include <WiFi.h>
 +#include <esp_crt_bundle.h>
 +#include <esp_http_client.h>
++#include <esp_heap_caps.h>
++#include <esp_random.h>
++#include <Memory.h>
 +#include <freertos/task.h>
 +
 +#include <algorithm>
@@ -452,9 +519,11 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +#include <vector>
 +
 +#include "ClippingStore.h"
++#include "activities/RenderLock.h"
 +#include "WifiCredentialStore.h"
 +#include "network/WifiUtils.h"
 +#include "workflowy/WorkflowySettings.h"
++#include "workflowy/WorkflowyBookGroup.h"
 +
 +namespace workflowy {
 +std::string readSetting(const char* path, size_t limit) {
@@ -495,9 +564,12 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +constexpr char API_URL[] = "https://workflowy.com/api/v1/nodes";
 +constexpr char DEFAULT_DESTINATION[] = "3dbd4508b236";
 +constexpr char DEST_FILE[] = "/.crashink/workflowy.destination";
-+constexpr char SHARE_FILE[] = "/.crashink/.workflowy/share.tmp";
++constexpr char OUTBOX[] = "/.crashink/.workflowy/.outbox";
++std::atomic<uint32_t> shareGeneration{0};
++uint32_t workerStartedAt = 0;
 +constexpr size_t DEST_MAX = 128;
 +std::atomic<bool> sending{false};
++std::atomic<int> notice{-1};
 +std::atomic<StrId> error{StrId::STR_WORKFLOWY_SENT};
 +
 +std::string oneLine(std::string value) {
@@ -518,12 +590,23 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +  return hash;
 +}
 +
++struct ShareJsonAllocator final : ArduinoJson::Allocator {
++      void* allocate(size_t size) override { return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
++      void deallocate(void* p) override { heap_caps_free(p); }
++      void* reallocate(void* p, size_t size) override { return heap_caps_realloc(p, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
++};
++
 +struct ShareJob {
 +  std::string key;
-+  std::string receiptPath;
++  std::string receiptPath, spoolPath;
++  uint32_t dataOffset = 0;
++  uint64_t accountHash = 0;
++  bool checkRemoteQuote = false;
++  std::string destination, bookTitle, bookAuthor, bookParent;
 +  bool ownsWifi = false;
 +
 +  bool connect() {
++    if (millis() - workerStartedAt >= 180000u) return false;
 +    if (hasActiveStationWifiConnection()) return true;
 +    const auto networks = WIFI_STORE.getCredentialSummaries();
 +    if (networks.empty() || WiFi.getMode() != WIFI_OFF) return false;
@@ -532,12 +615,13 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +    if (!WiFi.mode(WIFI_STA)) return false;
 +    WiFi.setAutoReconnect(false);
 +    const auto trySaved = [](const std::string& ssid) {
++      if (millis() - workerStartedAt >= 180000u) return false;
 +      const auto saved = WIFI_STORE.findCredential(ssid);
 +      if (!saved) return false;
 +      WiFi.disconnect(false, false);
 +      WiFi.begin(saved->ssid.c_str(), saved->password.empty() ? nullptr : saved->password.c_str());
 +      const auto started = millis();
-+      while (!hasActiveStationWifiConnection() && millis() - started < 6500) delay(50);
++      while (!hasActiveStationWifiConnection() && millis() - started < 6500 && millis() - workerStartedAt < 180000u) delay(50);
 +      return hasActiveStationWifiConnection();
 +    };
 +    const auto last = WIFI_STORE.getLastConnectedSsid();
@@ -555,68 +639,195 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +    return std::any_of(visible.begin(), visible.end(), trySaved);
 +  }
 +
-+  StrId send() {
-+    if (!connect()) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
-+    if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) {
-+      return StrId::STR_WORKFLOWY_CLOCK_FAILED;
-+    }
++  static constexpr const char* RESPONSE_FILE = "/.crashink/.workflowy/share-response.tmp";
++  int request(const std::string& url, bool post, const std::string& body, bool capture) {
++    FsFile response;
++    if (capture && !Storage.openFileForWrite("WF", RESPONSE_FILE, response)) return -3;
++    struct Sink { FsFile* file; size_t size = 0; bool failed = false; } sink{capture ? &response : nullptr};
 +    const auto auth = "Bearer " + key;
-+    size_t offset = 0;
-+    while (true) {
-+      FsFile spool;
-+      if (!Storage.openFileForRead("WF", SHARE_FILE, spool)) return StrId::STR_WORKFLOWY_READ_FAILED;
-+      if (offset == spool.size()) return StrId::STR_WORKFLOWY_SENT;
-+      uint32_t length = 0;
-+      uint64_t receipt = 0;
-+      if (!spool.seek(offset) || spool.read(&receipt, sizeof(receipt)) != sizeof(receipt) ||
-+          spool.read(&length, sizeof(length)) != sizeof(length) || !length || length > spool.size() - spool.position()) {
-+        return StrId::STR_WORKFLOWY_READ_FAILED;
++    esp_http_client_config_t config{};
++    config.url = url.c_str(); config.method = post ? HTTP_METHOD_POST : HTTP_METHOD_GET;
++    config.crt_bundle_attach = esp_crt_bundle_attach; config.user_agent = "CrASHInk/Workflowy";
++    config.timeout_ms = 12000; config.disable_auto_redirect = true; config.max_authorization_retries = -1;
++    config.user_data = &sink;
++    config.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
++      auto& sink = *static_cast<Sink*>(event->user_data);
++      if (event->event_id != HTTP_EVENT_ON_DATA || !sink.file) return ESP_OK;
++      if (event->data_len < 0 || sink.size + event->data_len > 512u * 1024u ||
++          sink.file->write(static_cast<const uint8_t*>(event->data), event->data_len) != static_cast<size_t>(event->data_len)) {
++        sink.failed = true; return ESP_FAIL;
 +      }
++      sink.size += event->data_len; return ESP_OK;
++    };
++    const auto client = esp_http_client_init(&config);
++    if (!client) return -1;
++    auto result = esp_http_client_set_header(client, "Authorization", auth.c_str());
++    if (post && result == ESP_OK) result = esp_http_client_set_header(client, "Content-Type", "application/json");
++    if (post && result == ESP_OK) result = esp_http_client_set_post_field(client, body.data(), body.size());
++    if (result == ESP_OK) result = esp_http_client_perform(client);
++    const int status = esp_http_client_get_status_code(client);
++    esp_http_client_cleanup(client);
++    const bool saved = !capture || response.sync();
++    response.close();
++    if (sink.failed || !saved || (capture && result != ESP_OK)) return -3;
++    return status > 0 ? status : -1;
++  }
++  StrId resolveBook() {
++    std::string encoded; encoded.reserve(destination.size() * 3);
++    constexpr char hex[] = "0123456789ABCDEF";
++    for (unsigned char ch : destination) {
++      if (std::isalnum(ch) || ch == '-' || ch == '_') encoded += ch;
++      else { encoded += '%'; encoded += hex[ch >> 4]; encoded += hex[ch & 15]; }
++    }
++    int status = request(std::string(API_URL) + "?parent_id=" + encoded, false, {}, true);
++    const auto failure = [](int status) {
++      return status == 401 || status == 403 ? StrId::STR_WORKFLOWY_AUTH_FAILED
++                : status <= 0 ? StrId::STR_WORKFLOWY_NETWORK_FAILED : StrId::STR_WORKFLOWY_SEND_FAILED;
++    };
++    if (status != 200) return failure(status);
++    // Response bytes stay on SD; only filtered child IDs/names use PSRAM.
++    ShareJsonAllocator allocator;
++    JsonDocument nodes(&allocator), filter;
++    filter["nodes"][0]["id"] = true; filter["nodes"][0]["name"] = true;
++    FsFile response;
++    if (!Storage.openFileForRead("WF", RESPONSE_FILE, response)) return StrId::STR_WORKFLOWY_READ_FAILED;
++    const auto invalid = deserializeJson(nodes, response, DeserializationOption::Filter(filter));
++    response.close();
++    if (invalid || !nodes["nodes"].is<JsonArray>()) return StrId::STR_WORKFLOWY_READ_FAILED;
++    bookParent = workflowy::findBookGroup(nodes["nodes"].as<JsonArrayConst>(), bookTitle, bookAuthor);
++    nodes.clear();
++    if (!bookParent.empty()) return StrId::STR_WORKFLOWY_SENT;
++    JsonDocument create;
++    create["parent_id"] = destination;
++    create["name"] = oneLine(workflowy::bookGroupLabel(bookTitle, bookAuthor));
++    create["position"] = "bottom";
++    std::string body;
++    if (!serializeJson(create, body) || create.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++    status = request(API_URL, true, body, true);
++    if (status < 200 || status >= 300) return failure(status);
++    JsonDocument result;
++    if (!Storage.openFileForRead("WF", RESPONSE_FILE, response)) return StrId::STR_WORKFLOWY_READ_FAILED;
++    const auto error = deserializeJson(result, response);
++    response.close();
++    bookParent = result["item_id"] | "";
++    return !error && workflowy::bookNodeId(bookParent) ? StrId::STR_WORKFLOWY_SENT : StrId::STR_WORKFLOWY_READ_FAILED;
++  }
++
++  int receiptSeen(uint64_t target) {
++    if (!Storage.exists(receiptPath.c_str())) return 0;
++    FsFile file;
++    if (!Storage.openFileForRead("WF", receiptPath.c_str(), file)) return -1;
++    uint64_t value;
++    while (file.read(&value, sizeof(value)) == sizeof(value)) if (value == target) return 1;
++    return 0;
++  }
++  bool saveReceipt(uint64_t receipt) {
++    FsFile file = Storage.open(receiptPath.c_str(), O_WRONLY | O_CREAT);
++    return file && file.seek(file.size() / sizeof(receipt) * sizeof(receipt)) &&
++           file.write(&receipt, sizeof(receipt)) == sizeof(receipt) && file.sync();
++  }
++  bool load(const std::string& path) {
++    spoolPath = path;
++    FsFile file;
++    if (!Storage.openFileForRead("WF", path.c_str(), file)) return false;
++    uint32_t bytes = 0;
++    if (file.read(&bytes, sizeof(bytes)) != sizeof(bytes) || !bytes || bytes > 4096 || bytes > file.size() - sizeof(bytes)) return false;
++    std::string header(bytes, '\0');
++    if (file.read(header.data(), bytes) != static_cast<int>(bytes)) return false;
++    JsonDocument metadata;
++    if (deserializeJson(metadata, header) || metadata["version"].as<int>() != 1) return false;
++    destination = metadata["destination"] | ""; bookTitle = metadata["title"] | ""; bookAuthor = metadata["author"] | "";
++    accountHash = metadata["account"].as<uint64_t>();
++    const char* id = metadata["receipt"] | "";
++    if (std::strlen(id) != 16 || std::string_view(id).find_first_not_of("0123456789abcdef") != std::string_view::npos || destination.empty() || bookTitle.empty()) return false;
++    receiptPath = std::string("/.crashink/.workflowy/") + id + ".sent";
++    dataOffset = sizeof(bytes) + bytes;
++    key = workflowy::readSetting(workflowy::KEY_FILE, workflowy::KEY_MAX);
++    checkRemoteQuote = Storage.exists((spoolPath + ".started").c_str());
++    return true;
++  }
++  StrId send() {
++    if (key.empty() || (accountHash && accountHash != receiptHash(key))) return StrId::STR_WORKFLOWY_AUTH_FAILED;
++    size_t offset = dataOffset;
++    bool connected = false, sentAny = false;
++    while (true) {
++      if (millis() - workerStartedAt >= 180000u) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
++      FsFile spool;
++      if (!Storage.openFileForRead("WF", spoolPath.c_str(), spool)) return StrId::STR_WORKFLOWY_READ_FAILED;
++      if (offset == spool.size()) return sentAny ? StrId::STR_WORKFLOWY_SENT : StrId::STR_WORKFLOWY_ALREADY_SENT;
++      uint32_t length = 0; uint64_t receipt = 0;
++      if (!spool.seek(offset) || spool.read(&receipt, sizeof(receipt)) != sizeof(receipt) ||
++          spool.read(&length, sizeof(length)) != sizeof(length) || !length || length > 256u * 1024u || length > spool.size() - spool.position()) return StrId::STR_WORKFLOWY_READ_FAILED;
 +      std::string body(length, '\0');
 +      if (spool.read(body.data(), length) != static_cast<int>(length)) return StrId::STR_WORKFLOWY_READ_FAILED;
-+      offset = spool.position();
-+      spool.close();
-+
-+      esp_http_client_config_t config{};
-+      config.url = API_URL;
-+      config.method = HTTP_METHOD_POST;
-+      config.crt_bundle_attach = esp_crt_bundle_attach;
-+      config.user_agent = "CrASHInk/Workflowy";
-+      config.timeout_ms = 12000;
-+      config.disable_auto_redirect = true;
-+      config.max_authorization_retries = -1;
-+      const auto client = esp_http_client_init(&config);
-+      if (!client) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
-+      auto result = esp_http_client_set_header(client, "Authorization", auth.c_str());
-+      if (result == ESP_OK) result = esp_http_client_set_header(client, "Content-Type", "application/json");
-+      if (result == ESP_OK) result = esp_http_client_set_post_field(client, body.data(), body.size());
-+      if (result == ESP_OK) result = esp_http_client_perform(client);
-+      const int status = esp_http_client_get_status_code(client);
-+      esp_http_client_cleanup(client);
++      offset = spool.position(); spool.close();
++      const int recorded = receiptSeen(receipt);
++      if (recorded < 0) return StrId::STR_WORKFLOWY_READ_FAILED;
++      if (recorded) continue;
++      if (!connected) {
++        if (!connect()) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
++        if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) return StrId::STR_WORKFLOWY_CLOCK_FAILED;
++        const auto grouped = resolveBook(); Storage.remove(RESPONSE_FILE);
++        if (grouped != StrId::STR_WORKFLOWY_SENT) return grouped;
++        connected = true;
++      }
++      JsonDocument quote;
++      if (deserializeJson(quote, body)) return StrId::STR_WORKFLOWY_READ_FAILED;
++      quote["parent_id"] = bookParent;
++      if (checkRemoteQuote) {
++        // A previous POST may have reached Workflowy before its response was lost.
++        // Compare actual child text before retrying that first unacknowledged quote.
++        const int listed = request(std::string(API_URL) + "?parent_id=" + bookParent, false, {}, true);
++        if (listed != 200) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
++        FsFile response;
++        ShareJsonAllocator allocator;
++        JsonDocument children(&allocator), filter;
++        filter["nodes"][0]["name"] = true;
++        if (!Storage.openFileForRead("WF", RESPONSE_FILE, response) ||
++            deserializeJson(children, response, DeserializationOption::Filter(filter)) || !children["nodes"].is<JsonArray>()) return StrId::STR_WORKFLOWY_READ_FAILED;
++        response.close(); Storage.remove(RESPONSE_FILE);
++        bool exists = false;
++        for (JsonObjectConst child : children["nodes"].as<JsonArrayConst>())
++          if (workflowy::bookGroupKey(child["name"] | "") == workflowy::bookGroupKey(quote["name"] | "")) { exists = true; break; }
++        checkRemoteQuote = false;
++        if (exists) { if (!saveReceipt(receipt)) return StrId::STR_WORKFLOWY_RECEIPT_FAILED; sentAny = true; continue; }
++      }
++      {
++        FsFile marker = Storage.open((spoolPath + ".started").c_str(), O_WRONLY | O_CREAT | O_TRUNC);
++        const uint8_t value = 1;
++        if (!marker || marker.write(&value, 1) != 1 || !marker.sync()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++      }
++      body.clear();
++      if (!serializeJson(quote, body) || quote.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++      const int status = request(API_URL, true, body, false);
 +      if (status == 401 || status == 403) return StrId::STR_WORKFLOWY_AUTH_FAILED;
-+      if (status < 200 || status >= 300) {
-+        LOG_ERR("WF", "Share failed: transport=%s HTTP=%d", esp_err_to_name(result), status);
-+        return status <= 0 ? StrId::STR_WORKFLOWY_NETWORK_FAILED : StrId::STR_WORKFLOWY_SEND_FAILED;
-+      }
-+
-+      FsFile receipts = Storage.open(receiptPath.c_str(), O_WRONLY | O_CREAT);
-+      if (!receipts || !receipts.seek(receipts.size() / sizeof(receipt) * sizeof(receipt)) ||
-+          receipts.write(&receipt, sizeof(receipt)) != sizeof(receipt) || !receipts.sync()) {
-+        return StrId::STR_WORKFLOWY_RECEIPT_FAILED;
-+      }
-+      // A successful status acknowledges creation. Never repost on a lost or truncated response.
++      if (status < 200 || status >= 300) return status <= 0 ? StrId::STR_WORKFLOWY_NETWORK_FAILED : StrId::STR_WORKFLOWY_SEND_FAILED;
++      if (!saveReceipt(receipt)) return StrId::STR_WORKFLOWY_RECEIPT_FAILED;
++      sentAny = true;
 +    }
 +  }
++
 +};
 +
 +void finishShare(const StrId result) {
-+  Storage.remove(SHARE_FILE);
-+  error.store(result);
-+  sending.store(false);
++  const bool ok = result == StrId::STR_WORKFLOWY_SENT || result == StrId::STR_WORKFLOWY_ALREADY_SENT;
++  if (!ok) error.store(result);
++  notice.store(ok ? static_cast<int>(result == StrId::STR_WORKFLOWY_SENT ? StrId::STR_WORKFLOWY_SHARE_SENT
++                                                                     : StrId::STR_WORKFLOWY_ALREADY_SENT) : -1);
 +}
 +
 +StrId stageShare(ShareJob& job, const size_t index, const int colorFilter, bool& hasItems) {
 +  const auto destination = workflowy::readSetting(DEST_FILE, DEST_MAX);
++  job.destination = destination.empty() ? DEFAULT_DESTINATION : destination;
++  job.bookTitle = CLIPPINGS.getBookTitle();
++  job.bookAuthor = CLIPPINGS.getBookAuthor();
++  if (job.bookTitle.empty()) {
++    job.bookTitle = CLIPPINGS.getBookFilePath();
++    const auto slash = job.bookTitle.find_last_of('/');
++    if (slash != std::string::npos) job.bookTitle.erase(0, slash + 1);
++    const auto dot = job.bookTitle.rfind('.');
++    if (dot != std::string::npos) job.bookTitle.resize(dot);
++  }
 +  char path[64];
 +  snprintf(path, sizeof(path), "/.crashink/.workflowy/%016llx.sent",
 +           static_cast<unsigned long long>(receiptHash(CLIPPINGS.getBookFilePath())));
@@ -624,16 +835,24 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +  Storage.mkdir("/.crashink");
 +  Storage.mkdir("/.crashink/.workflowy");
 +
-+  std::vector<uint64_t> receipts;
-+  if (Storage.exists(path)) {
-+    FsFile existing;
-+    if (!Storage.openFileForRead("WF", path, existing)) return StrId::STR_WORKFLOWY_READ_FAILED;
-+    uint64_t receipt;
-+    while (existing.read(&receipt, sizeof(receipt)) == sizeof(receipt)) receipts.push_back(receipt);
-+    std::sort(receipts.begin(), receipts.end());
-+  }
-+  FsFile spool = Storage.open(SHARE_FILE, O_WRONLY | O_CREAT | O_TRUNC);
++  Storage.mkdir(OUTBOX);
++  char pending[128];
++  snprintf(pending, sizeof(pending), "%s/%010lu-%010lu-%08lx.job", OUTBOX,
++           static_cast<unsigned long>(std::time(nullptr)), static_cast<unsigned long>(millis()),
++           static_cast<unsigned long>(esp_random()));
++  job.spoolPath = pending;
++  const auto temporary = job.spoolPath + ".tmp";
++  FsFile spool = Storage.open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
 +  if (!spool) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++  JsonDocument metadata;
++  metadata["version"] = 1; metadata["destination"] = job.destination; metadata["title"] = job.bookTitle;
++  metadata["author"] = job.bookAuthor; metadata["account"] = job.key.empty() ? 0 : receiptHash(job.key);
++  metadata["receipt"] = std::string(path).substr(std::string(path).find_last_of('/') + 1, 16);
++  std::string header;
++  serializeJson(metadata, header);
++  const uint32_t headerLength = header.size();
++  if (!headerLength || headerLength > 4096 || spool.write(&headerLength, sizeof(headerLength)) != sizeof(headerLength) ||
++      spool.write(header.data(), header.size()) != header.size()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
 +  const size_t end = index == SIZE_MAX ? CLIPPINGS.clippingCount() : index + 1;
 +  const auto keyHash = receiptHash(job.key);
 +  for (size_t current = index == SIZE_MAX ? 0 : index; current < end; ++current) {
@@ -645,11 +864,7 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +    }
 +    CLIPPINGS.readChapterTitle(current, chapter);
 +    std::string citation;
-+    for (const auto* part : {&CLIPPINGS.getBookTitle(), &CLIPPINGS.getBookAuthor(), static_cast<const std::string*>(&chapter)}) {
-+      if (part->empty()) continue;
-+      if (!citation.empty()) citation += " — ";
-+      citation += oneLine(*part);
-+    }
++    citation = oneLine(chapter);
 +    auto name = oneLine(quote);
 +    if (!citation.empty()) name += "\n\n📖 " + citation;
 +    if (!note.empty()) name += "\n\n📝 " + oneLine(note);
@@ -659,11 +874,11 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +    request["position"] = "bottom";
 +    std::string body;
 +    if (!serializeJson(request, body) || request.overflowed()) return StrId::STR_WORKFLOWY_SEND_FAILED;
-+    auto receipt = receiptHash(body, keyHash);
++    auto receipt = receiptHash("book-group-v1:" + job.bookTitle + "\n" + job.bookAuthor, keyHash);
++    receipt = receiptHash(body, receipt);
 +    receipt = (receipt ^ clipping->spineIndex) * 1099511628211ULL;
 +    receipt = (receipt ^ clipping->startPage) * 1099511628211ULL;
 +    receipt = (receipt ^ clipping->startWordIndex) * 1099511628211ULL;
-+    if (std::binary_search(receipts.begin(), receipts.end(), receipt)) continue;
 +    const auto length = static_cast<uint32_t>(body.size());
 +    if (spool.write(&receipt, sizeof(receipt)) != sizeof(receipt) ||
 +        spool.write(&length, sizeof(length)) != sizeof(length) ||
@@ -672,35 +887,89 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +    }
 +    hasItems = true;
 +  }
-+  return spool.sync() ? StrId::STR_WORKFLOWY_SENT : StrId::STR_WORKFLOWY_SAVE_FAILED;
++  const bool saved = spool.sync();
++  spool.close();
++  if (!saved || !Storage.rename(temporary.c_str(), job.spoolPath.c_str())) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++  return StrId::STR_WORKFLOWY_SENT;
 +}
 +}  // namespace
 +
++std::string oldestShare() {
++  HalFile folder = Storage.open(OUTBOX);
++  if (!folder || !folder.isDirectory()) return {};
++  std::string oldest;
++  while (true) {
++    HalFile entry = folder.openNextFile();
++    if (!entry) break;
++    char name[128]{};
++    entry.getName(name, sizeof(name));
++    const bool regular = !entry.isDirectory(); entry.close();
++    const std::string candidate(name);
++    if (regular && candidate.ends_with(".job") && (oldest.empty() || candidate < oldest)) oldest = candidate;
++  }
++  return oldest.empty() ? std::string{} : std::string(OUTBOX) + "/" + oldest;
++}
++
 +void workflowy::shareClippings(const size_t index, const int colorFilter) {
-+  if (sending.exchange(true)) return;
-+  auto job = std::make_unique<ShareJob>();
++  auto job = makeUniqueNoThrow<ShareJob>();
++  if (!job) { LOG_ERR("WF", "Cannot allocate share job"); finishShare(StrId::STR_WORKFLOWY_SAVE_FAILED); return; }
 +  job->key = readSetting(KEY_FILE, KEY_MAX);
-+  if (job->key.empty()) return finishShare(StrId::STR_WORKFLOWY_AUTH_FAILED);
 +  bool hasItems = false;
-+  const auto result = stageShare(*job, index, colorFilter, hasItems);
-+  if (result != StrId::STR_WORKFLOWY_SENT || !hasItems) return finishShare(result);
-+  auto* context = job.release();
-+  const auto sendTask = [](void* context) {
-+    StrId result;
-+    {
-+      const std::unique_ptr<ShareJob> job(static_cast<ShareJob*>(context));
-+      result = job->send();
-+      if (job->ownsWifi) {
-+        WiFi.disconnect(false, false);
-+        WiFi.mode(WIFI_OFF);
++  StrId result;
++  {
++    RenderLock lock; // serialize ClippingStore's single-reader SD handle with the clipping list render
++    result = stageShare(*job, index, colorFilter, hasItems);
++  }
++  if (result != StrId::STR_WORKFLOWY_SENT) { finishShare(result); return; }
++  if (!hasItems) { Storage.remove(job->spoolPath.c_str()); finishShare(StrId::STR_WORKFLOWY_ALREADY_SENT); return; }
++  shareGeneration.fetch_add(1);
++  notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SHARING));
++  if (sending.exchange(true)) return; // already running: it will also drain this new disk job
++  const auto sendTask = [](void*) {
++    workerStartedAt = millis();
++    bool ownsWifi = false;
++    const auto releaseWorker = [&](uint32_t generation) {
++      // Finish network cleanup before another Share can start a replacement worker.
++      if (ownsWifi) { WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); ownsWifi = false; }
++      sending.store(false);
++      if (shareGeneration.load() != generation && !sending.exchange(true)) { workerStartedAt = millis(); return true; }
++      return false;
++    };
++    while (true) {
++      const auto generation = shareGeneration.load();
++      const auto path = oldestShare();
++      if (path.empty()) {
++        if (releaseWorker(generation)) continue;
++        break;
 +      }
++      auto job = makeUniqueNoThrow<ShareJob>();
++      if (!job) { LOG_ERR("WF", "Cannot allocate outbox reader"); notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY)); if (releaseWorker(generation)) continue; break; }
++      if (!job->load(path)) {
++        LOG_ERR("WF", "Invalid outbox item retained for recovery");
++        Storage.rename(path.c_str(), (path + ".bad").c_str());
++        notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY));
++        if (releaseWorker(generation)) continue; break;
++      }
++      const auto result = job->send(); ownsWifi |= job->ownsWifi;
++      Storage.remove(ShareJob::RESPONSE_FILE);
++      if (result != StrId::STR_WORKFLOWY_SENT && result != StrId::STR_WORKFLOWY_ALREADY_SENT) {
++        LOG_ERR("WF", "Share pending locally (reason %d)", static_cast<int>(result));
++        notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY));
++        if (releaseWorker(generation)) continue; break;
++      }
++      if (!Storage.remove(path.c_str())) {
++        LOG_ERR("WF", "Cannot remove acknowledged outbox item; receipts prevent resending");
++        notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY)); if (releaseWorker(generation)) continue; break;
++      }
++      Storage.remove((path + ".started").c_str());
++      finishShare(result);
 +    }
-+    finishShare(result);
++    if (ownsWifi) { WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); }
 +    vTaskDelete(nullptr);
 +  };
-+  if (xTaskCreate(sendTask, "wf-share", 8192, context, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
-+    delete context;
-+    finishShare(StrId::STR_WORKFLOWY_SEND_FAILED);
++  if (xTaskCreate(sendTask, "wf-share", 12288, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
++    sending.store(false);
++    notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY));
 +  }
 +}
 +
@@ -711,12 +980,17 @@ index 0000000000000000000000000000000000000000..e609315b8f0111ffcb085fecf6a0674c
 +  if (result == StrId::STR_WORKFLOWY_SENT) return std::nullopt;
 +  return result;
 +}
++
++std::optional<StrId> workflowy::takeShareNotice() {
++  const int value = notice.exchange(-1);
++  return value < 0 ? std::nullopt : std::optional<StrId>(static_cast<StrId>(value));
++}
 diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ffc991db741a2782c4fccf0a1a381611a0ab0daf
+index 0000000000000000000000000000000000000000..fec871e5858d2cbc818e42513eaba211b9489438
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.h
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +#pragma once
 +
 +#include <I18n.h>
@@ -729,6 +1003,7 @@ index 0000000000000000000000000000000000000000..ffc991db741a2782c4fccf0a1a381611
 +void shareClippings(size_t index, int colorFilter = 0);
 +bool shareInProgress();
 +std::optional<StrId> takeShareError();
++std::optional<StrId> takeShareNotice();
 +}
 diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
 index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9c8928a7b 100644
@@ -1504,10 +1779,11 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8622118d11545568b8b62c78b932f7a5f5f68c7
+index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c018787d61
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5269 @@
+@@ -0,0 +1,5277 @@
++#include "components/HomeNavigationIcon.h"
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -5295,6 +5571,7 @@ index 0000000000000000000000000000000000000000..c8622118d11545568b8b62c78b932f7a
 +    char text[64]{};
 +    switch (config.slots[i]) {
 +      case ReaderStatusBarItem::Clock:
++        if (WiFi.getMode() != WIFI_OFF) widths[i] += 24;
 +        if (halClock.isAvailable()) halClock.formatTime(text, sizeof(text), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1);
 +        break;
 +      case ReaderStatusBarItem::Date:
@@ -5644,9 +5921,12 @@ index 0000000000000000000000000000000000000000..c8622118d11545568b8b62c78b932f7a
 +    const int iconY = bounds.footer + 23;
 +    const auto iconX = [&](TodoControl control) { return bounds.x + (2 * static_cast<int>(control) + 1) * bounds.width / (2 * FOOTER_CONTROLS); };
 +    int x = iconX(TodoControl::Back);
++    if (viewStack.empty()) drawHomeNavigationIcon(renderer, x, iconY);
++    else {
 +    renderer.drawLine(x - 9, iconY, x + 9, iconY, ICON_STROKE, true);
 +    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, ICON_STROKE, true);
 +    renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, ICON_STROKE, true);
++    }
 +    const int viewX = iconX(TodoControl::ShowDone);
 +    const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
 +    const int eyeY[] = {iconY, iconY - 4, iconY - 6, iconY - 4, iconY, iconY + 4, iconY + 6, iconY + 4};
@@ -6691,9 +6971,12 @@ index 0000000000000000000000000000000000000000..c8622118d11545568b8b62c78b932f7a
 +  renderer.drawLine(bounds.x, bounds.footer, right, bounds.footer);
 +  const auto slot = [&](CalendarControl control) { return bounds.x + (2 * static_cast<int>(control) + 1) * bounds.width / 14; };
 +  const int y = bounds.footer + 23;
++  if (calendarReturnHome) drawHomeNavigationIcon(renderer, slot(CalendarControl::Back), y);
++  else {
 +  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) + 8, y, 3, true);
 +  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y - 6, 3, true);
 +  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y + 6, 3, true);
++  }
 +  const auto label = calendarSchedule ? tr(STR_WORKFLOWY_SCHEDULE_VIEW) : calendarWeek ? tr(STR_WORKFLOWY_WEEK) : tr(STR_WORKFLOWY_DAY);
 +  const auto mode = renderer.truncatedText(SMALL_FONT_ID, label, bounds.width / 7 - 8);
 +  renderer.drawText(SMALL_FONT_ID, slot(CalendarControl::View) - renderer.getTextWidth(SMALL_FONT_ID, mode.c_str()) / 2, y - 9,
@@ -8000,12 +8283,12 @@ index 0000000000000000000000000000000000000000..2cbebac96602cba8ee3aef9c6b37e74a
 +
 +}  // namespace workflowy
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
-index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..b56581603573131fa86dfdd003ed5be6f90af21a 100644
+index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..782f40804ceb2dda60c60e210cf3c100b8c6a033 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -130,3 +130,9 @@ add_subdirectory(image_refresh_regions)
+@@ -130,3 +130,11 @@ add_subdirectory(image_refresh_regions)
  add_subdirectory(library_thumbnails)
- 
+
  add_subdirectory(end_of_book_dismiss)
 +
 +add_subdirectory(workflowy_schedule)
@@ -8013,6 +8296,8 @@ index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..b56581603573131fa86dfdd003ed5be6
 +add_subdirectory(workflowy_bulk)
 +
 +add_subdirectory(workflowy_ui)
++
++add_subdirectory(workflowy_share)
 diff --git a/test/workflowy_bulk/CMakeLists.txt b/test/workflowy_bulk/CMakeLists.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..f4fced0bb7f826e1b19ca9b9119b64c3967618b4
@@ -8615,3 +8900,443 @@ index 0000000000000000000000000000000000000000..4f3f7a70e57cd3bf2dc26291d46a6b00
 +  busy.viewStack={1};busy.paintedArrows={{"root",60,100}};
 +  assert(busy.tapArrow(460,80) && busy.zoomOut==1);
 +}
+diff --git a/src/activities/ActivityManager.h b/src/activities/ActivityManager.h
+index cd12ef5a1845e02ec9644f71f82f67d7a51b5bbd..e78665f5724005aa8aef5488ceb39f918d71c0f3 100644
+--- a/src/activities/ActivityManager.h
++++ b/src/activities/ActivityManager.h
+@@ -85,6 +85,8 @@ class ActivityManager {
+   std::unique_ptr<Activity> pendingActivity;
+   enum class PendingAction { None, Push, Pop, Replace };
+   PendingAction pendingAction = PendingAction::None;
++  bool workflowyNoticeVisible = false;
++  uint32_t workflowyNoticeShownAt = 0;
+   // Set when an overlay is closed specifically to hand control back to the
+   // reader's menu. It must wait until the reader is current again.
+   int16_t pendingReaderMenuAction = -1;
+diff --git a/src/activities/home/AppLauncherActivity.cpp b/src/activities/home/AppLauncherActivity.cpp
+index 1e962ec7f6b416df463826e8d2b6eb13ff0b0ac2..42b8bdcc9b698813314f4f8f52bb50acbfc76915 100644
+--- a/src/activities/home/AppLauncherActivity.cpp
++++ b/src/activities/home/AppLauncherActivity.cpp
+@@ -5,9 +5,17 @@
+ #include "components/UITheme.h"
+ #include "components/icons/listIcons.h"
+ #include "fontIds.h"
++#ifndef SIMULATOR
++#include "activities/workflowy/WorkflowyDailyActivity.h"
++#include "workflowy/WorkflowyIcon.h"
++#endif
+
+ namespace {
++#ifdef SIMULATOR
+ constexpr int AppCount = 4;
++#else
++constexpr int AppCount = 6;
++#endif
+ }
+ Rect AppLauncherActivity::tile(int index) const {
+   int top, right, bottom, left;
+@@ -26,7 +34,13 @@ void AppLauncherActivity::open(int index) {
+   if (index == 1) activityManager.goToFileTransfer();
+   if (index == 2) activityManager.goToFileBrowser();
+   if (index == 3) activityManager.goToSettings();
+-
++#ifndef SIMULATOR
++  if (index >= 4) {
++    auto app = makeUniqueNoThrow<WorkflowyDailyActivity>(renderer, mappedInput, index == 4);
++    if (!app) { LOG_ERR("HOME", "Cannot allocate Workflowy"); return; }
++    startActivityForResult(std::move(app), {});
++  }
++#endif
+ }
+ void AppLauncherActivity::loop() {
+   using Button = MappedInputManager::Button;
+@@ -48,8 +62,14 @@ void AppLauncherActivity::render(RenderLock&&) {
+   GUI.drawDisplayStatusBar(renderer, top);
+   renderer.drawCenteredText(UI_12_FONT_ID, top + 43, "crASHink", true, EpdFontFamily::BOLD);
+   static const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32, &icon_folder_32, &icon_cog_32,
++#ifndef SIMULATOR
++    &workflowyCalendarIcon, &workflowyIcon,
++#endif
+   };
+   const char* labels[] = {tr(STR_LIBRARY), tr(STR_FILE_TRANSFER), tr(STR_BROWSE), tr(STR_SETTINGS_SHORT),
++#ifndef SIMULATOR
++    tr(STR_WORKFLOWY_CALENDAR_VIEW), tr(STR_WORKFLOWY),
++#endif
+   };
+   for (int i = 0; i < AppCount; ++i) {
+     const auto r = tile(i);
+diff --git a/src/workflowy/WorkflowyBookGroup.h b/src/workflowy/WorkflowyBookGroup.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..15cb2453a521305bac06db1eae8f2ee649b75538
+--- /dev/null
++++ b/src/workflowy/WorkflowyBookGroup.h
+@@ -0,0 +1,58 @@
++#pragma once
++#include <ArduinoJson.h>
++#include <algorithm>
++#include <cctype>
++#include <string>
++#include <string_view>
++#include <utility>
++
++namespace workflowy {
++inline bool bookNodeId(std::string_view id) {
++  return !id.empty() && id.size() <= 64 && id.find_first_not_of("0123456789abcdefABCDEF-") == std::string_view::npos;
++}
++inline std::string bookGroupLabel(const std::string& title, const std::string& author) {
++  return std::string("📘 ") + title + (author.empty() ? "" : " — " + author);
++}
++inline std::string bookGroupKey(std::string_view text) {
++  std::string clean; clean.reserve(text.size());
++  bool tag = false, escaped = false;
++  for (const unsigned char ch : text) {
++    if (escaped) { clean += ch; escaped = false; continue; }
++    if (ch == '\\') { escaped = true; continue; }
++    if (ch == '<') { tag = true; continue; }
++    if (tag) { if (ch == '>') tag = false; continue; }
++    if (ch < 128 && std::isspace(ch)) {
++      if (!clean.empty() && clean.back() != ' ') clean += ' ';
++    } else clean += ch < 128 ? static_cast<char>(std::tolower(ch)) : static_cast<char>(ch);
++  }
++  for (const auto& entity : {std::pair{"&amp;", "&"}, {"&quot;", "\""}, {"&#39;", "'"}, {"&nbsp;", " "}, {"&lt;", "<"}, {"&gt;", ">"}}) {
++    size_t pos = 0;
++    while ((pos = clean.find(entity.first, pos)) != std::string::npos) {
++      clean.replace(pos, std::char_traits<char>::length(entity.first), entity.second);
++      pos += std::char_traits<char>::length(entity.second);
++    }
++  }
++  while (!clean.empty() && clean.back() == ' ') clean.pop_back();
++  for (const auto icon : {"📘", "📖", "📚", "📕", "📗", "📙"}) {
++    if (clean.starts_with(icon)) { clean.erase(0, std::char_traits<char>::length(icon)); break; }
++  }
++  if (clean.starts_with("\xef\xb8\x8f")) clean.erase(0, 3);
++  while (!clean.empty() && clean.front() == ' ') clean.erase(0, 1);
++  return clean;
++}
++// Prefer title + author. A pre-existing title-only parent is reused as a fallback.
++// Only direct children are inspected; quotes elsewhere in the account are untouched.
++inline std::string findBookGroup(JsonArrayConst nodes, const std::string& title, const std::string& author) {
++  const auto titleKey = bookGroupKey(title);
++  const auto exactKey = bookGroupKey(title + (author.empty() ? "" : " — " + author));
++  std::string fallback;
++  for (JsonObjectConst node : nodes) {
++    const char* id = node["id"] | "";
++    if (!bookNodeId(id)) continue;
++    const auto key = bookGroupKey(node["name"] | "");
++    if (key == exactKey) return id;
++    if (key == titleKey && fallback.empty()) fallback = id;
++  }
++  return fallback;
++}
++}
+diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
+index da3cae2241a70bc9183ab3a96ba3b0cf556dbc5a..48be9f02b19c07e05adb078be8f84f859713684b 100644
+--- a/test/highlight_word_edit/CMakeLists.txt
++++ b/test/highlight_word_edit/CMakeLists.txt
+@@ -154,3 +154,5 @@ target_include_directories(onpage_highlight_mapping_test PRIVATE ${CMAKE_CURRENT
+ target_compile_definitions(onpage_highlight_mapping_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
+ target_compile_options(onpage_highlight_mapping_test PRIVATE -UNDEBUG)
+ add_test(NAME onpage_highlight_mapping COMMAND onpage_highlight_mapping_test)
++
++target_include_directories(onpage_highlight_render_test PRIVATE ${REPO_ROOT}/freeink-sdk/libs/assets/Icons/include)
+diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word_edit/OnPageRenderTest.cpp
+index be03c32c1a3fe6e37f002a8d9b7a6ce21b6e5e1f..76c8e06c92f2bcc73e06f475696eb1acb94da95d 100644
+--- a/test/highlight_word_edit/OnPageRenderTest.cpp
++++ b/test/highlight_word_edit/OnPageRenderTest.cpp
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <vector>
+ #include "activities/reader/HighlightToolbar.h"
++#include "workflowy/WorkflowyIcon.h"
+ #include "activities/reader/HighlightWordSlices.h"
+ #include "activities/reader/SelectionGap.h"
+ #include "clippings/SelectionRibbon.h"
+@@ -18,6 +19,8 @@ constexpr int UI_10_FONT_ID=0,SMALL_FONT_ID=0;
+ #define tr(...) ""
+ struct {int invertImagesDark=0;int screenInverted=0;int getReaderFontId() const {return 0;}int textWeightOffset() const {return 0;}} SETTINGS;
+ struct RenderLock {};
++struct TestClip { int color=0; };
++struct {TestClip clip;const TestClip* clippingAt(size_t) const {return &clip;}} CLIPPINGS;
+ struct Scope {void endScanAndPrewarm() {}};
+ struct Cache {Scope createPrewarmScope() {return {};}};
+ struct GfxRenderer {
+@@ -61,7 +64,7 @@ class OnPageHighlightActivity {
+  struct Word {Rect rect;uint32_t start,end;bool rtl=false;uint16_t row=0;};
+  GfxRenderer renderer;std::unique_ptr<Page> page=std::make_unique<Page>();
+  Word words[4]={{{20,80,40,20},0,4},{{80,80,40,20},5,9},{{20,120,40,20},10,14},{{80,120,40,20},15,19}};
+- size_t wordCount=4;int left=0,top=0;
++ size_t wordCount=4,index=0;int left=0,top=0;
+  bool ready=true,failed=false,dragFrameReady=false,closeAfterAdjustment=false;
+  int firstAnchorY=0,lastAnchorY=0;
+  Rect firstHandle{},lastHandle{};HighlightToolbar::Layout toolbar{};
+@@ -76,6 +79,14 @@ class OnPageHighlightActivity {
+ };
+ #include "OnPageRender.inc"
+ int main() {
++ for (int shade = 0; shade < 3; ++shade) {
++   GfxRenderer plain, selected;
++   const HighlightToolbar::Bounds cell{0,0,68,58};
++   toolbarIcon(plain, cell, static_cast<HighlightToolbar::Action>(shade), -1);
++   toolbarIcon(selected, cell, static_cast<HighlightToolbar::Action>(shade), shade);
++   assert(plain.pixels != selected.pixels);
++ }
++
+  const auto rtlGap=SelectionGap::between({80,20,40,20},{20,20,40,20});
+  assert(rtlGap.x==60 && rtlGap.width==20);
+  assert(SelectionGap::between({20,20,40,20},{20,50,40,20}).width==0);
+diff --git a/test/workflowy_share/CMakeLists.txt b/test/workflowy_share/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c5638a9e6e8335ebc40fd82c48fccbdfd5b5761
+--- /dev/null
++++ b/test/workflowy_share/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_executable(workflowy_share_test WorkflowyShareTest.cpp ${REPO_ROOT}/src/activities/reader/WorkflowyShareActivity.cpp)
++target_include_directories(workflowy_share_test PRIVATE stubs ${REPO_ROOT}/src)
++target_link_libraries(workflowy_share_test PRIVATE ArduinoJson)
++target_compile_options(workflowy_share_test PRIVATE -UNDEBUG)
++add_test(NAME workflowy_share COMMAND workflowy_share_test)
+diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..63c05fd1e65ab80674221974b856f536cc8ba198
+--- /dev/null
++++ b/test/workflowy_share/WorkflowyShareTest.cpp
+@@ -0,0 +1,21 @@
++#include "Harness.h"
++#include "activities/reader/WorkflowyShareActivity.h"
++#include "workflowy/WorkflowySettings.h"
++#include "workflowy/WorkflowyBookGroup.h"
++int jobs(){int n=0;for(auto& f:std::filesystem::recursive_directory_iterator(sdRoot))if(f.path().extension()==".job")++n;return n;}
++int main(){
++ sdRoot=(std::filesystem::temp_directory_path()/"crashink-workflowy-share-test").string();std::filesystem::remove_all(sdRoot);std::filesystem::create_directories(sdRoot);
++ assert(workflowy::writeSetting(workflowy::KEY_FILE,"test-key"));
++ workflowy::shareClippings(0);assert(workflowy::shareInProgress());assert(httpCalls==0&&jobs()==1);for(auto& f:std::filesystem::recursive_directory_iterator(sdRoot))if(f.path().extension()==".job"){std::ifstream in(f.path(),std::ios::binary);std::string data((std::istreambuf_iterator<char>(in)),{});assert(data.find("test-key")==std::string::npos);}runWorker();assert(!workflowy::shareInProgress()&&jobs()==1&&remote.empty());assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_SAVED_LOCALLY);assert(!workflowy::takeShareError());
++ // Change foreground book: queued text and metadata must survive independently.
++ CLIPPINGS.title="Second Book";CLIPPINGS.path="/second.epub";CLIPPINGS.quote="Second quote";online=true;
++ workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(jobs()==0&&remote.size()==4);assert(remote[0].name=="📘 Book — Author");assert(remote[1].parent==remote[0].id);assert(remote[2].name=="📘 Second Book — Author");assert(remote[3].parent==remote[2].id);assert(!WiFi.connected);
++ const auto count=remote.size();workflowy::shareClippings(0);runWorker();assert(remote.size()==count&&jobs()==0);assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_ALREADY_SENT);
++ // Two taps while worker is running publish both durable records.
++ CLIPPINGS.quote="Third quote";workflowy::shareClippings(0);CLIPPINGS.quote="Fourth quote";workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(remote.size()==count+2&&jobs()==0);
++ // Ambiguous POST: server accepted it but response was lost. Retry must not duplicate.
++ CLIPPINGS.quote="Fifth quote";loseQuoteResponse=true;workflowy::shareClippings(0);runWorker();assert(jobs()==1);auto accepted=remote.size();workflowy::shareClippings(0);runWorker();assert(jobs()==0&&remote.size()==accepted);
++ JsonDocument nodes;assert(!deserializeJson(nodes,R"({"nodes":[{"id":"abc123","name":"📖 Existing"},{"id":"def456","name":"<b>Existing — Author</b>"}]})"));assert(workflowy::findBookGroup(nodes["nodes"].as<JsonArrayConst>(),"Existing","Author")=="def456");
++ assert(workflowy::bookGroupKey("📘 <b>R&amp;D</b> — Author")==workflowy::bookGroupKey("R&D — Author"));
++ assert(!workflowy::takeShareError());std::filesystem::remove_all(sdRoot);std::cout<<"Workflowy durable share tests passed\n";
++}
+diff --git a/test/workflowy_share/stubs/ClippingStore.h b/test/workflowy_share/stubs/ClippingStore.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/ClippingStore.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/HalClock.h b/test/workflowy_share/stubs/HalClock.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/HalClock.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/HalStorage.h b/test/workflowy_share/stubs/HalStorage.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/HalStorage.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/Harness.h b/test/workflowy_share/stubs/Harness.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf73c6e62294f8da05f672f3054fabfce98ca367
+--- /dev/null
++++ b/test/workflowy_share/stubs/Harness.h
+@@ -0,0 +1,92 @@
++#pragma once
++#include <ArduinoJson.h>
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <cstring>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++#include <iostream>
++enum class StrId {STR_WORKFLOWY_ALREADY_SENT,STR_WORKFLOWY_AUTH_FAILED,STR_WORKFLOWY_CLOCK_FAILED,STR_WORKFLOWY_NETWORK_FAILED,STR_WORKFLOWY_READ_FAILED,STR_WORKFLOWY_RECEIPT_FAILED,STR_WORKFLOWY_SAVED_LOCALLY,STR_WORKFLOWY_SAVE_FAILED,STR_WORKFLOWY_SEND_FAILED,STR_WORKFLOWY_SENT,STR_WORKFLOWY_SHARE_SENT,STR_WORKFLOWY_SHARING};
++inline uint32_t tick=1; inline uint32_t millis(){return tick;} inline void delay(int ms){tick+=ms;}
++#define LOG_ERR(...) ((void)0)
++#define LOG_INF(...) ((void)0)
++constexpr int O_WRONLY=1,O_CREAT=2,O_TRUNC=4;
++inline std::string sdRoot;
++struct FsFile {
++ std::shared_ptr<std::fstream> file; std::string path; std::vector<std::string> entries; size_t entry=0; bool directory=false;
++ explicit operator bool()const{return directory || (file && file->is_open());}
++ int read(void* data,size_t n){if(!file)return -1;file->read((char*)data,n);return file->gcount();}
++ int read(){unsigned char ch;return read(&ch,1)==1?ch:-1;}
++ size_t readBytes(char* data,size_t n){return std::max(0,read(data,n));}
++ size_t write(const void* data,size_t n){if(!file)return 0;file->write((const char*)data,n);return *file?n:0;}
++ bool seek(size_t n){if(!file)return false;file->clear();file->seekg(n);file->seekp(n);return bool(*file);}
++ size_t size()const{std::error_code e;return std::filesystem::file_size(path,e);}
++ size_t position(){return file?static_cast<size_t>(file->tellg()):0;}
++ bool sync(){if(!file)return false;file->flush();return bool(*file);}
++ void close(){if(file&&file->is_open())file->close();directory=false;}
++ bool isDirectory()const{return directory;}
++ FsFile openNextFile();
++ void getName(char* out,size_t n){auto name=std::filesystem::path(path).filename().string();std::snprintf(out,n,"%s",name.c_str());}
++};
++struct Store {
++ std::string real(const char* p){return sdRoot+p;}
++ bool exists(const char* p){return std::filesystem::exists(real(p));}
++ bool mkdir(const char* p){return std::filesystem::create_directories(real(p)) || exists(p);}
++ bool remove(const char* p){return std::filesystem::remove(real(p));}
++ bool rename(const char* p,const char* q){std::error_code e;std::filesystem::rename(real(p),real(q),e);return !e;}
++ FsFile open(const char* p,int mode=0){FsFile f;f.path=real(p);if(std::filesystem::is_directory(f.path)){f.directory=true;for(auto& e:std::filesystem::directory_iterator(f.path))f.entries.push_back(e.path().string());return f;}
++ if((mode&O_CREAT)&&!exists(p)){std::ofstream created(f.path);}
++ auto flags=std::ios::binary | std::ios::in; if(mode&O_WRONLY)flags|=std::ios::out;if(mode&O_TRUNC)flags|=std::ios::trunc;
++ f.file=std::make_shared<std::fstream>(f.path,flags);return f;}
++ bool openFileForRead(const char*,const char* p,FsFile& f){f=open(p);return bool(f);}
++ bool openFileForWrite(const char*,const char* p,FsFile& f){f=open(p,O_WRONLY|O_CREAT|O_TRUNC);return bool(f);}
++};
++inline Store Storage; using HalFile=FsFile;
++inline FsFile FsFile::openNextFile(){if(entry>=entries.size())return {};return Storage.open(entries[entry++].substr(sdRoot.size()).c_str());}
++inline void (*pendingTask)(void*)=nullptr; inline void* pendingContext=nullptr;
++constexpr int pdPASS=1,tskIDLE_PRIORITY=0;
++inline int xTaskCreate(void(*f)(void*),const char*,int,void* data,int,void*){assert(!pendingTask);pendingTask=f;pendingContext=data;return pdPASS;}
++inline void vTaskDelete(void*){}
++inline void runWorker(){auto fn=pendingTask;auto data=pendingContext;pendingTask=nullptr;assert(fn);fn(data);}
++inline uint32_t esp_random(){static uint32_t n=1;return n++;}
++constexpr int WIFI_OFF=0,WIFI_STA=1; inline bool online=false;
++struct Wifi {int modeValue=0;bool connected=false;
++ int getMode(){return modeValue;}bool mode(int m){modeValue=m;if(!m)connected=false;return true;}
++ void disconnect(bool,bool=false){connected=false;}void persistent(bool){}void setAutoReconnect(bool){}
++ void begin(const char*,const char*){connected=online;}int scanNetworks(){return 0;}void scanDelete(){}std::string SSID(int){return {};}
++}; inline Wifi WiFi;
++inline bool hasActiveStationWifiConnection(){return WiFi.connected;}
++struct Credential {std::string ssid="saved",password="password";};
++struct Credentials {std::vector<int> getCredentialSummaries(){return {1};}std::optional<Credential> findCredential(const std::string&){return Credential{};}std::string getLastConnectedSsid(){return "saved";}bool hasSavedCredential(const std::string&){return true;}};inline Credentials WIFI_STORE;
++struct Clock {bool syncSystemTimeFromNTP(){return true;}};inline Clock halClock;
++struct RenderLock {};
++template<class T>std::unique_ptr<T> makeUniqueNoThrow(){return std::make_unique<T>();}
++constexpr int MALLOC_CAP_SPIRAM=1,MALLOC_CAP_8BIT=2;
++inline void* heap_caps_malloc(size_t n,int){return std::malloc(n);}inline void heap_caps_free(void* p){std::free(p);}inline void* heap_caps_realloc(void* p,size_t n,int){return std::realloc(p,n);}
++struct Clipping {int spineIndex=0,startPage=0,startWordIndex=0,color=0;};
++struct Clippings {std::string title="Book",author="Author",path="/book.epub",quote="First quote";Clipping clip;
++ std::string getBookTitle(){return title;}std::string getBookAuthor(){return author;}std::string getBookFilePath(){return path;}
++ size_t clippingCount(){return 1;}const Clipping* clippingAt(size_t i){return i==0?&clip:nullptr;}
++ bool readClippingNote(size_t,std::string& s){s.clear();return true;}bool readClippingText(size_t,std::string& s){s=quote;return true;}bool readChapterTitle(size_t,std::string& s){s="Chapter";return true;}
++};inline Clippings CLIPPINGS;
++using esp_err_t=int;constexpr int ESP_OK=0,ESP_FAIL=-1,HTTP_METHOD_POST=1,HTTP_METHOD_GET=0,HTTP_EVENT_ON_DATA=1;
++struct esp_http_client_event_t {int event_id;void* user_data;void* data;int data_len;};
++inline int esp_crt_bundle_attach(void*){return 0;}
++struct esp_http_client_config_t {const char* url=nullptr;int method=0;int(*crt_bundle_attach)(void*)=nullptr;const char* user_agent=nullptr;int timeout_ms=0;bool disable_auto_redirect=false;int max_authorization_retries=0;void* user_data=nullptr;esp_err_t(*event_handler)(esp_http_client_event_t*)=nullptr;};
++struct Http {esp_http_client_config_t c;std::string url,body;int status=200;};
++inline Http* esp_http_client_init(const esp_http_client_config_t* c){return new Http{*c,c->url,{}};}
++inline int esp_http_client_set_header(Http*,const char*,const char*){return ESP_OK;}
++inline int esp_http_client_set_post_field(Http* h,const char* data,size_t n){h->body.assign(data,n);return ESP_OK;}
++struct Remote {std::string id,parent,name;};inline std::vector<Remote> remote;inline int httpCalls=0;inline bool loseQuoteResponse=false;
++inline int esp_http_client_perform(Http* h){++httpCalls;if(!online){h->status=0;return ESP_FAIL;}JsonDocument doc;std::string response;
++ if(h->c.method==HTTP_METHOD_GET){auto parent=h->url.substr(h->url.find("parent_id=")+10);auto a=doc["nodes"].to<JsonArray>();for(auto& n:remote)if(n.parent==parent){auto o=a.add<JsonObject>();o["id"]=n.id;o["name"]=n.name;}}
++ else {JsonDocument body;assert(!deserializeJson(body,h->body));char id[48];std::snprintf(id,sizeof(id),"aaaaaaaa-aaaa-aaaa-aaaa-%012zu",remote.size()+1);remote.push_back({id,body["parent_id"]|"",body["name"]|""});doc["item_id"]=id;
++ if(loseQuoteResponse&&remote.back().name.find("quote")!=std::string::npos){loseQuoteResponse=false;h->status=0;return ESP_FAIL;}}
++ serializeJson(doc,response);esp_http_client_event_t e{HTTP_EVENT_ON_DATA,h->c.user_data,response.data(),static_cast<int>(response.size())};return h->c.event_handler(&e);}
++inline int esp_http_client_get_status_code(Http* h){return h->status;}inline void esp_http_client_cleanup(Http* h){delete h;}
+diff --git a/test/workflowy_share/stubs/I18n.h b/test/workflowy_share/stubs/I18n.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/I18n.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/Logging.h b/test/workflowy_share/stubs/Logging.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/Logging.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/Memory.h b/test/workflowy_share/stubs/Memory.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/Memory.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/WiFi.h b/test/workflowy_share/stubs/WiFi.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/WiFi.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/WifiCredentialStore.h b/test/workflowy_share/stubs/WifiCredentialStore.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/WifiCredentialStore.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/activities/RenderLock.h b/test/workflowy_share/stubs/activities/RenderLock.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/activities/RenderLock.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/esp_crt_bundle.h b/test/workflowy_share/stubs/esp_crt_bundle.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/esp_crt_bundle.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/esp_heap_caps.h b/test/workflowy_share/stubs/esp_heap_caps.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/esp_heap_caps.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/esp_http_client.h b/test/workflowy_share/stubs/esp_http_client.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/esp_http_client.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/esp_random.h b/test/workflowy_share/stubs/esp_random.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/esp_random.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/freertos/task.h b/test/workflowy_share/stubs/freertos/task.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/freertos/task.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/workflowy_share/stubs/network/WifiUtils.h b/test/workflowy_share/stubs/network/WifiUtils.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/workflowy_share/stubs/network/WifiUtils.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"

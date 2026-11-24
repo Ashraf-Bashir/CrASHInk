@@ -2232,9 +2232,10 @@ new file mode 100644
 +};
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..e82a90aa6fa45f60629dfcd9b6da521e899ef94e
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
-@@ -0,0 +1,1263 @@
+@@ -0,0 +1,1300 @@
 +#include "ReadestSyncActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -2281,6 +2282,7 @@ new file mode 100644
 +#include "readest/ReadestPositionPolicy.h"
 +#include "readest/ReadestPositionResolver.h"
 +#include "readest/ReadestStore.h"
++#include "readest/ReadestHighlightColor.h"
 +
 +namespace {
 +// Readest renders custom hex colors; this grey is also what Readest's own
@@ -2718,6 +2720,7 @@ new file mode 100644
 +}
 +
 +bool ReadestSyncActivity::locatePulledText(const ReadestNote& note, PulledText& out) {
++  out.color = readest::highlightShade(note.color, SETTINGS.highlightColor);
 +  // Find Readest's text in the device copy, starting at the same relative
 +  // spot of the book as in Readest's copy and widening to the whole book.
 +  float hint = -1.0f;
@@ -2751,7 +2754,7 @@ new file mode 100644
 +  const auto addResult =
 +      CLIPPINGS.addClipping(static_cast<uint16_t>(pulled.spine), page, page, VIRTUAL_PAGE_COUNT, 0, 0,
 +                            countWords(pulled.text), chapterTitle.c_str(), UINT16_MAX, pulled.text, UINT16_MAX, 0, nullptr,
-+                            static_cast<ClippingColor>(SETTINGS.highlightColor));
++                            static_cast<ClippingColor>(pulled.color));
 +  if (addResult == ClippingStore::AddResult::SaveFailed) {
 +    fail(tr(STR_READEST_SAVE_FAILED));
 +    return false;
@@ -2828,6 +2831,7 @@ new file mode 100644
 +  };
 +
 +  std::vector<bool> remoteHandled(remote.size(), false);
++  std::vector<std::pair<size_t, uint8_t>> toRecolor;
 +  std::vector<size_t> toPull;       // remote notes to add on the device
 +  std::vector<size_t> toTombstone;  // remote notes to delete in Readest
 +  struct Replacement {
@@ -2866,6 +2870,17 @@ new file mode 100644
 +      continue;
 +    }
 +    local[static_cast<size_t>(li)].claimed = true;
++    const auto* clip = CLIPPINGS.clippingAt(static_cast<size_t>(li));
++    const auto shade = static_cast<uint8_t>(clip->color);
++    if ((link.color <= 2 && shade != link.color) || remote[r].color == HIGHLIGHT_COLOR) {
++      toRecolor.emplace_back(r, shade); // local edit or legacy grey migration
++      link.color = shade;
++    } else {
++      link.color = readest::highlightShade(remote[r].color, shade);
++      if (link.color != shade && !CLIPPINGS.setColor(static_cast<size_t>(li), static_cast<ClippingColor>(link.color))) {
++        fail(tr(STR_READEST_SAVE_FAILED)); return false;
++      }
++    }
 +    // One-time repair: clippings pulled by builds before v3 may contain text
 +    // the reader never shows (hidden page numbers), so its highlighter missed
 +    // parts of them. Re-extract and replace only when the text changes.
@@ -2893,7 +2908,9 @@ new file mode 100644
 +        continue;  // the device clipping stays unclaimed and is pushed again
 +      }
 +      local[static_cast<size_t>(li)].claimed = true;
-+      nextLinks.push_back({remote[r].id, remoteKeys[r], remoteKeys[r]});
++      const auto shade = readest::highlightShade(remote[r].color, static_cast<uint8_t>(CLIPPINGS.clippingAt(li)->color));
++      if (!CLIPPINGS.setColor(li, static_cast<ClippingColor>(shade))) { fail(tr(STR_READEST_SAVE_FAILED)); return false; }
++      nextLinks.push_back({remote[r].id, remoteKeys[r], remoteKeys[r], shade});
 +      continue;
 +    }
 +    toPull.push_back(r);
@@ -2916,7 +2933,8 @@ new file mode 100644
 +    const int li = claimLocal(pulledText.keyHash);
 +    if (li >= 0) {
 +      local[static_cast<size_t>(li)].claimed = true;
-+      nextLinks.push_back({remote[r].id, remoteKeys[r], pulledText.keyHash});
++      if (!CLIPPINGS.setColor(li, static_cast<ClippingColor>(pulledText.color))) { fail(tr(STR_READEST_SAVE_FAILED)); return false; }
++      nextLinks.push_back({remote[r].id, remoteKeys[r], pulledText.keyHash, pulledText.color});
 +      continue;
 +    }
 +    pendingPulls.push_back({r, std::move(pulledText)});
@@ -2984,7 +3002,7 @@ new file mode 100644
 +        break;
 +      }
 +    }
-+    nextLinks.push_back({id, local[i].keyHash, local[i].keyHash});
++    nextLinks.push_back({id, local[i].keyHash, local[i].keyHash, static_cast<uint8_t>(clipping->color)});
 +    if (reused) continue;
 +
 +    JsonObject note = notes.add<JsonObject>();
@@ -2998,7 +3016,7 @@ new file mode 100644
 +    note["text"] = text;
 +    note["note"] = "";
 +    note["style"] = "highlight";
-+    note["color"] = HIGHLIGHT_COLOR;
++    note["color"] = readest::highlightColor(static_cast<uint8_t>(clipping->color));
 +    if (nowMs > 0) note["createdAt"] = nowMs;
 +    // Deliberately ancient: Readest's last-writer-wins then never lets a
 +    // re-push overwrite (or resurrect) a highlight edited/deleted in Readest.
@@ -3006,6 +3024,21 @@ new file mode 100644
 +    note["updatedAt"] = 1;
 +    batchCount++;
 +    counts.pushed++;
++    if ((batchCount >= PUSH_BATCH || measureJson(batch) >= PUSH_BATCH_BYTES) && !flush()) return false;
++  }
++
++  // Color-only edits retain the original note identity, text and location.
++  if (nowMs > 0) for (const auto& change : toRecolor) {
++    const auto& original = remote[change.first];
++    JsonObject note = notes.add<JsonObject>();
++    note["bookHash"] = book.hash;
++    if (!book.metaHash.empty()) note["metaHash"] = book.metaHash;
++    note["id"] = original.id; note["type"] = "annotation";
++    note["cfi"] = original.cfi; note["xpointer0"] = original.xpointer0; note["xpointer1"] = original.xpointer1;
++    note["text"] = original.text; note["note"] = original.note;
++    note["style"] = "highlight"; note["color"] = readest::highlightColor(change.second);
++    note["updatedAt"] = nowMs;
++    ++batchCount;
 +    if ((batchCount >= PUSH_BATCH || measureJson(batch) >= PUSH_BATCH_BYTES) && !flush()) return false;
 +  }
 +
@@ -3064,7 +3097,7 @@ new file mode 100644
 +  // 6. Repaired clippings go back with the corrected text.
 +  for (const auto& replacement : replacements) {
 +    if (addPulledClipping(replacement.pulled)) {
-+      nextLinks.push_back({remote[replacement.remote].id, remoteKeys[replacement.remote], replacement.pulled.keyHash});
++      nextLinks.push_back({remote[replacement.remote].id, remoteKeys[replacement.remote], replacement.pulled.keyHash, replacement.pulled.color});
 +    } else if (state == FAILED) {
 +      return false;
 +    }
@@ -3080,7 +3113,7 @@ new file mode 100644
 +        counts.pulled++;
 +        addedKeys.push_back(key);
 +      }
-+      nextLinks.push_back({remote[pending.remote].id, remoteKeys[pending.remote], key});
++      nextLinks.push_back({remote[pending.remote].id, remoteKeys[pending.remote], key, pending.pulled.color});
 +    } else if (state == FAILED) {
 +      return false;
 +    } else {
@@ -3088,6 +3121,11 @@ new file mode 100644
 +    }
 +  }
 +
++  if (!nowMs) for (const auto& change : toRecolor)
++    for (auto& link : nextLinks) if (link.id == remote[change.first].id) {
++      link.color = 255;
++      for (const auto& previous : links) if (previous.id == link.id) { link.color = previous.color; break; }
++    }
 +  ReadestLinks::save(localHash, nextLinks);
 +  return true;
 +}
@@ -3500,9 +3538,10 @@ new file mode 100644
 +}
 diff --git a/src/activities/reader/ReadestSyncActivity.h b/src/activities/reader/ReadestSyncActivity.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..e8d4bc9c2bef6bb846d93c7fdf52303459fcac31
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.h
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,141 @@
 +#pragma once
 +#include <Epub.h>
 +
@@ -3631,6 +3670,7 @@ new file mode 100644
 +    XPathTextLocation location;
 +    std::string text;
 +    std::string keyHash;
++    uint8_t color = 0;
 +  };
 +  bool locatePulledText(const ReadestNote& note, PulledText& out);
 +  // Adds a pulled clipping; false if not added (fail() already called when
@@ -4429,9 +4469,10 @@ diff --git a/src/main.cpp b/src/main.cpp
          if (fontsActivity) {
 diff --git a/src/readest/ReadestBookMap.cpp b/src/readest/ReadestBookMap.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..3a46addbc32ed682343c2977597e6c476ce2fee0
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.cpp
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,174 @@
 +#include "ReadestBookMap.h"
 +
 +#include <ArduinoJson.h>
@@ -4581,6 +4622,7 @@ new file mode 100644
 +    } else {
 +      link.keyHash = pair.value()["r"] | "";
 +      link.localHash = pair.value()["l"] | "";
++      link.color = pair.value()["c"] | 255;
 +    }
 +    out.push_back(std::move(link));
 +  }
@@ -4596,6 +4638,7 @@ new file mode 100644
 +    JsonObject entry = ids[link.id].to<JsonObject>();
 +    entry["r"] = link.keyHash;
 +    entry["l"] = link.localHash;
++    entry["c"] = link.color;
 +  }
 +  if (!PersistableStoreBase::writeDocToFile(linksPath(localHash).c_str(), doc)) {
 +    LOG_ERR("RDS", "Failed to save Readest highlight links");
@@ -4606,12 +4649,14 @@ new file mode 100644
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestBookMap.h b/src/readest/ReadestBookMap.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..a2ee89c4d4aeea893fb28e41f9cc4ede46f8b3db
 --- /dev/null
 +++ b/src/readest/ReadestBookMap.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,62 @@
 +#pragma once
 +
 +#include <string>
++#include <cstdint>
 +#include <vector>
 +
 +#include "ReadestClient.h"
@@ -4660,20 +4705,22 @@ new file mode 100644
 +  std::string id;
 +  std::string keyHash;    // fingerprint of Readest's text for the highlight
 +  std::string localHash;  // fingerprint of the device clipping's text
++  uint8_t color = 255;    // last synchronized local shade; 255 = older link
 +};
 +// Bumped when fingerprints change: 2 = accents/ligatures folded, 3 = separate
 +// Readest/device fingerprints (their wording may differ, e.g. hidden page
 +// numbers that only Readest's text contains).
-+constexpr int KEY_VERSION = 3;
++constexpr int KEY_VERSION = 4; // v4 also tracks color-only changes
 +// `version` receives the fingerprint version the links were saved with.
 +bool load(const std::string& localHash, std::vector<Link>& out, int& version);
 +bool save(const std::string& localHash, const std::vector<Link>& links);
 +}  // namespace ReadestLinks
 diff --git a/src/readest/ReadestClient.cpp b/src/readest/ReadestClient.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..b5f462074c27597091f90a98073fc514a658e222
 --- /dev/null
 +++ b/src/readest/ReadestClient.cpp
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,660 @@
 +#include "ReadestClient.h"
 +
 +#include <ArduinoJson.h>
@@ -5268,6 +5315,8 @@ new file mode 100644
 +  noteFilter["type"] = true;
 +  noteFilter["cfi"] = true;
 +  noteFilter["xpointer0"] = true;
++  noteFilter["xpointer1"] = true;
++  noteFilter["note"] = true;
 +  noteFilter["text"] = true;
 +  noteFilter["color"] = true;
 +  noteFilter["deleted_at"] = true;
@@ -5300,6 +5349,8 @@ new file mode 100644
 +    item.id = note["id"] | "";
 +    item.cfi = note["cfi"] | "";
 +    item.xpointer0 = note["xpointer0"] | "";
++    item.xpointer1 = note["xpointer1"] | "";
++    item.note = note["note"] | "";
 +    item.text = text;
 +    item.color = note["color"] | "";
 +    item.deleted = !note["deleted_at"].isNull();
@@ -5332,9 +5383,10 @@ new file mode 100644
 +}
 diff --git a/src/readest/ReadestClient.h b/src/readest/ReadestClient.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..bd002bf492d6187687784b0252461ac4ac7a2e69
 --- /dev/null
 +++ b/src/readest/ReadestClient.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,114 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -5362,6 +5414,8 @@ new file mode 100644
 +  std::string xpointer0;
 +  std::string text;
 +  std::string color;
++  std::string xpointer1;
++  std::string note;
 +  bool deleted = false;  // tombstone: deleted in Readest
 +};
 +
@@ -6096,6 +6150,7 @@ diff --git a/test/clip_word_store/ClipWordStoreTest.cpp b/test/clip_word_store/C
 +}
 diff --git a/test/readest_highlight_safety/CMakeLists.txt b/test/readest_highlight_safety/CMakeLists.txt
 new file mode 100644
+index 0000000000000000000000000000000000000000..664035f27b688790f3f36878e595a3701d4246d9
 --- /dev/null
 +++ b/test/readest_highlight_safety/CMakeLists.txt
 @@ -0,0 +1,10 @@
@@ -6106,14 +6161,15 @@ new file mode 100644
 +    ${REPO_ROOT}/src/activities/reader/ReadestSyncActivity.cpp ${SYNC_INC}
 +  DEPENDS ${REPO_ROOT}/src/activities/reader/ReadestSyncActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractSync.py VERBATIM)
 +add_executable(readest_highlight_safety_test ReadestHighlightSafetyTest.cpp ${SYNC_INC})
-+target_include_directories(readest_highlight_safety_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_include_directories(readest_highlight_safety_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src/readest)
 +target_compile_options(readest_highlight_safety_test PRIVATE -UNDEBUG)
 +add_test(NAME readest_highlight_safety COMMAND readest_highlight_safety_test)
 diff --git a/test/readest_highlight_safety/ExtractSync.py b/test/readest_highlight_safety/ExtractSync.py
 new file mode 100644
+index 0000000000000000000000000000000000000000..b89737bc4a3cf81f2a0cd6a4eff18f3220fb4feb
 --- /dev/null
 +++ b/test/readest_highlight_safety/ExtractSync.py
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,15 @@
 +from pathlib import Path
 +import sys
 +source = Path(sys.argv[1]).read_text()
@@ -6123,6 +6179,7 @@ new file mode 100644
 +  removed.clear(); claimed.clear();
 +  for (const auto& clip : local) { removed.push_back(clip.remove); claimed.push_back(clip.claimed); }
 +  keptLinks = nextLinks;
++  recolors = toRecolor.size();
 +  tombstones = toTombstone.size();
 +  pulls = toPull.size();
 +  return true;
@@ -6130,30 +6187,35 @@ new file mode 100644
 +''')
 diff --git a/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..ce832f412c050e249c00ceb914d396fd7c677671
 --- /dev/null
 +++ b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,120 @@
++#include "ReadestHighlightColor.h"
 +#include <cassert>
 +#include <cstdint>
 +#include <iostream>
 +#include <string>
 +#include <vector>
 +constexpr uint16_t VIRTUAL_PAGE_COUNT = 1000;
-+enum StringId { STR_READEST_PULLING, STR_READEST_READ_CLIPPINGS_FAILED };
++enum StringId { STR_READEST_PULLING, STR_READEST_READ_CLIPPINGS_FAILED, STR_READEST_SAVE_FAILED };
 +const char* tr(StringId) { return "status"; }
 +struct ReadestBook {};
 +struct HighlightCounts {};
 +struct ReadestNote {
 +  std::string id, text;
 +  bool deleted = false;
++  std::string color = "yellow";
 +};
 +struct PulledText {
 +  std::string keyHash;
++  uint8_t color=0;
 +};
 +namespace ReadestLinks {
 +constexpr int KEY_VERSION = 3;
 +struct Link {
 +  std::string id, keyHash, localHash;
++  uint8_t color=255;
 +};
 +std::vector<Link> fixture;
 +bool load(const std::string&, std::vector<Link>& out, int& version) {
@@ -6162,7 +6224,10 @@ new file mode 100644
 +  return true;
 +}
 +}  // namespace ReadestLinks
++enum class ClippingColor {LightGrey,DarkGrey,Solid};
++constexpr const char* HIGHLIGHT_COLOR="#9e9e9e";
 +struct Clipping {
++  ClippingColor color=ClippingColor::LightGrey;
 +  uint32_t layoutSignature = 0;
 +  uint16_t pageCount = 1000;
 +};
@@ -6170,6 +6235,7 @@ new file mode 100644
 +  std::vector<std::string> texts;
 +  bool readFails = false;
 +  Clipping clip;
++  bool setColor(size_t,ClippingColor color) {clip.color=color;return true;}
 +  size_t clippingCount() const { return texts.size(); }
 +  const Clipping* clippingAt(size_t) const { return &clip; }
 +  bool readClippingText(size_t i, std::string& out) const {
@@ -6195,7 +6261,7 @@ new file mode 100644
 +  bool failed = false;
 +  std::vector<bool> removed, claimed;
 +  std::vector<ReadestLinks::Link> keptLinks;
-+  size_t tombstones = 0, pulls = 0;
++  size_t tombstones = 0, pulls = 0, recolors = 0;
 +  void setStatus(const char*) {}
 +  void fail(const char*) { failed = true; }
 +  bool locatePulledText(const ReadestNote&, PulledText&) { return false; }
@@ -6230,6 +6296,18 @@ new file mode 100644
 +  ReadestSyncActivity edited;
 +  edited.client.notes = {{"i", "updated intro", false}, {"1", "chapter1", false}, {"2", "chapter2", false}};
 +  assert(edited.syncHighlights(book, counts) && edited.removed[0] && edited.pulls == 1);
++  CLIPPINGS.texts = {"intro"};
++  CLIPPINGS.clip.color = ClippingColor::Solid;
++  ReadestLinks::fixture = {{"i", "intro", "intro", 0}};
++  ReadestSyncActivity localColor;
++  localColor.client.notes = {{"i", "intro", false, "yellow"}};
++  assert(localColor.syncHighlights(book, counts) && localColor.recolors == 1);
++  assert(localColor.keptLinks[0].color == 2);
++  CLIPPINGS.clip.color = ClippingColor::LightGrey;
++  ReadestSyncActivity remoteColor;
++  remoteColor.client.notes = {{"i", "intro", false, "red"}};
++  assert(remoteColor.syncHighlights(book, counts) && remoteColor.recolors == 0);
++  assert(CLIPPINGS.clip.color == ClippingColor::DarkGrey && remoteColor.keptLinks[0].color == 1);
 +  std::cout << "Partial/empty remote responses preserve earlier chapters; explicit tombstones apply; local read "
 +               "failures stop sync\n";
 +}
@@ -6273,9 +6351,11 @@ new file mode 100644
 +Path(sys.argv[2]).write_text(s)
 diff --git a/test/readest_http/ReadestHttpTest.cpp b/test/readest_http/ReadestHttpTest.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..7db4f9fcba97276390513483fd593edfd9bb082a
 --- /dev/null
 +++ b/test/readest_http/ReadestHttpTest.cpp
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,192 @@
++#include "ReadestHighlightColor.h"
 +#include <SecureHttpClient.h>
 +
 +#include <cassert>
@@ -6310,6 +6390,13 @@ new file mode 100644
 +}
 +void done() { assert(replies.empty()); }
 +int main() {
++  assert(std::string(readest::highlightColor(0)) == "yellow");
++  assert(std::string(readest::highlightColor(1)) == "red");
++  assert(std::string(readest::highlightColor(2)) == "blue");
++  for (uint8_t shade = 0; shade < 3; ++shade)
++    assert(readest::highlightShade(readest::highlightColor(shade), 0) == shade);
++  assert(readest::highlightShade("unknown", 1) == 1);
++
 +  ReadestBook book;
 +  book.hash = "book";
 +  {
@@ -6429,11 +6516,12 @@ new file mode 100644
 +    replies = {
 +        {200, token},
 +        {200,
-+         R"({"notes":[{"id":"n1","type":"annotation","text":"hello world","xpointer0":"/p[1]","color":"yellow","deleted_at":null}]})"}};
++         R"({"notes":[{"id":"n1","type":"annotation","text":"hello world","xpointer0":"/p[1]","xpointer1":"/p[2]","note":"Keep this annotation","color":"yellow","deleted_at":null}]})"}};
 +    ReadestClient c;
 +    std::vector<ReadestNote> notes;
 +    assert(c.pullNotes(book, notes) == ReadestClient::OK);
 +    assert(notes.size() == 1 && notes[0].id == "n1" && notes[0].text == "hello world" && !notes[0].deleted);
++    assert(notes[0].xpointer1 == "/p[2]" && notes[0].note == "Keep this annotation" && notes[0].color == "yellow");
 +    done();
 +  }
 +  {
@@ -6912,3 +7000,25 @@ new file mode 100644
 +  int64_t utcNowMs() const { return now; }
 +};
 +inline HalClock halClock;
+diff --git a/src/readest/ReadestHighlightColor.h b/src/readest/ReadestHighlightColor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b6e43ed45f73bbcee3401408815c475c3b93fa9
+--- /dev/null
++++ b/src/readest/ReadestHighlightColor.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <cstdint>
++#include <string_view>
++
++// Local shades ordered light, medium, darkest. Use Readest's named colors.
++namespace readest {
++inline const char* highlightColor(uint8_t shade) {
++  return shade == 2 ? "blue" : shade == 1 ? "red" : "yellow";
++}
++inline uint8_t highlightShade(std::string_view color, uint8_t fallback) {
++  if (color == "blue" || color == "#2196f3") return 2;
++  if (color == "red" || color == "#f44336") return 1;
++  if (color == "yellow" || color == "#ffeb3b") return 0;
++  return fallback;
++}
++}  // namespace readest

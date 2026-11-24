@@ -2,6 +2,11 @@
 
 ### Added
 
+- Home is an app launcher with large Library, File Transfer, Files, Settings, Calendar, and Workflowy icons. Settings uses a gear, and returns to the launcher use a Home icon; contextual returns retain a Back arrow.
+- The shared status bar shows Wi-Fi beside the clock for as long as the radio is enabled, across reader and app screens.
+- Highlight color choices mark the selected shade with a checkmark. Readest maps light to yellow, medium to red, and darkest to blue, including color-only edits and incoming highlights.
+- Quote sharing uses the Workflowy logo, closes the sharing controls, and displays a brief confirmation while reading continues. Quotes are grouped under “📘 Book title — Author”; offline shares remain on SD and retry with the next Share, with receipts protecting against duplicates.
+
 - File Transfer includes Wi-Fi firmware update with a download-arrow icon and a short same-network explanation, opening the existing signed update receiver.
 
 - Receive updates connects the X4 Pro to Wi-Fi on demand, verifies signed firmware sent from Android, and switches Wi-Fi off before installing automatically.
@@ -11,6 +16,9 @@
 - Workflowy compact calendar rows hide tags between the time and task title.
 
 ### Fixed
+
+- Returning from file transfer automatically reconciles the Library without a Refresh tap. The previous disk catalog and complete membership remain usable while the worker reuses unchanged metadata and prepares the replacement view; old filter saves cannot overwrite new membership. Cover work remains page-prioritized after handoff.
+- Library updating shows a numeric percentage and a proportional top bar based on a counted file pass and processed view rows. Loading feedback also appears for ordinary partial cached filters, rather than silently showing only the first nine results.
 
 - Explicit Library Refresh always walks the SD card, bypasses saved membership results, and checks that each result still exists. Stale title/0% placeholders are cleared before loading; book actions also invalidate old view membership. A compact top progress strip shows scanning book counts and measured filtering progress, then disappears.
 
