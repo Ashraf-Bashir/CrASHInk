@@ -1,11 +1,13 @@
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 925fda481f32911fb00db7287f22d6e101b46f5c..7c872c8a240023cb2b6f354b4be9fd04249be643 100644
+index 925fda481f32911fb00db7287f22d6e101b46f5c..e643c74327d285e1f576c892f4ec78d06f4fc200 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -873,6 +873,10 @@ STR_EPUB_LAYOUT_MEMORY_READING_AIDS_HINT_GUIDE: "Try again with Guide Dots off."
+@@ -873,6 +873,12 @@ STR_EPUB_LAYOUT_MEMORY_READING_AIDS_HINT_GUIDE: "Try again with Guide Dots off."
  STR_EPUB_FALLBACK_FONT_TITLE: "Chapter using built-in font"
  STR_EPUB_FALLBACK_FONT_BODY: "Available memory was too low to lay out this chapter with the SD-card font, so it was loaded with the built-in font."
  STR_SD_FIRMWARE_UPDATE: "SD Card Firmware Update"
++STR_WIFI_FIRMWARE_UPDATE: "Wi-Fi firmware update"
++STR_WIFI_FIRMWARE_UPDATE_DESC: "Install a signed update from your phone using CrASHInk Updater. Use the same Wi-Fi."
 +STR_RECEIVE_UPDATES: "Receive updates"
 +STR_RECEIVE_UPDATES_WAITING: "Tap Update in the Android app"
 +STR_RECEIVE_UPDATES_WINDOW: "Listening for five minutes"
@@ -467,3 +469,98 @@ index 0000000000000000000000000000000000000000..7f99ad6b0426915127d6d2f6d84dd062
 +bool poll();
 +bool installReceived(Progress progress, void* context);
 +}
+diff --git a/src/activities/network/NetworkModeSelectionActivity.cpp b/src/activities/network/NetworkModeSelectionActivity.cpp
+index c11a5c1208bb5f4784b0560d5583e408bcdc57f5..c4b73416a1debaca942ae1bdb007998406782e21 100644
+--- a/src/activities/network/NetworkModeSelectionActivity.cpp
++++ b/src/activities/network/NetworkModeSelectionActivity.cpp
+@@ -2,6 +2,9 @@
+
+ #include <GfxRenderer.h>
+ #include <I18n.h>
++#include <Memory.h>
++#include <Logging.h>
++#include "activities/settings/ReceiveFirmwareActivity.h"
+
+ #include "CrossPointSettings.h"
+ #include "MappedInputManager.h"
+@@ -19,33 +22,33 @@ constexpr fui::ActionId ACTION_ROW = 1;
+
+ #if CROSSINK_APP_CAP_USB_DRIVE
+ constexpr NetworkMode menuModes[] = {NetworkMode::JOIN_NETWORK,        NetworkMode::CONNECT_CALIBRE,
+-                                     NetworkMode::CREATE_HOTSPOT,      NetworkMode::USB_DRIVE,
++                                     NetworkMode::CREATE_HOTSPOT,      NetworkMode::USB_DRIVE, NetworkMode::WIFI_FIRMWARE_UPDATE,
+                                      NetworkMode::NEARBY_BOOK_RECEIVE, NetworkMode::NEARBY_STATS_SYNC};
+ constexpr StrId menuItems[] = {StrId::STR_JOIN_NETWORK, StrId::STR_CALIBRE_WIRELESS,    StrId::STR_CREATE_HOTSPOT,
+-                               StrId::STR_USB_DRIVE,    StrId::STR_RECEIVE_NEARBY_BOOK, StrId::STR_NEARBY_STATS_SYNC};
++                               StrId::STR_USB_DRIVE, StrId::STR_WIFI_FIRMWARE_UPDATE, StrId::STR_RECEIVE_NEARBY_BOOK, StrId::STR_NEARBY_STATS_SYNC};
+ constexpr StrId menuDescs[] = {StrId::STR_JOIN_DESC,
+                                StrId::STR_CALIBRE_DESC,
+                                StrId::STR_HOTSPOT_DESC,
+-                               StrId::STR_USB_DRIVE_DESC,
++                               StrId::STR_USB_DRIVE_DESC, StrId::STR_WIFI_FIRMWARE_UPDATE_DESC,
+                                StrId::STR_RECEIVE_NEARBY_BOOK_DESC,
+                                StrId::STR_NEARBY_STATS_SYNC_DESC};
+ constexpr UIIcon menuIcons[] = {UIIcon::Wifi,     UIIcon::Library,  UIIcon::Hotspot,
+-                                UIIcon::Transfer, UIIcon::Transfer, UIIcon::Transfer};
++                                UIIcon::Transfer, UIIcon::Transfer, UIIcon::Transfer, UIIcon::Transfer};
+ #else
+ constexpr NetworkMode menuModes[] = {NetworkMode::JOIN_NETWORK, NetworkMode::CONNECT_CALIBRE,
+-                                     NetworkMode::CREATE_HOTSPOT, NetworkMode::NEARBY_BOOK_RECEIVE,
++                                     NetworkMode::CREATE_HOTSPOT, NetworkMode::WIFI_FIRMWARE_UPDATE, NetworkMode::NEARBY_BOOK_RECEIVE,
+                                      NetworkMode::NEARBY_STATS_SYNC};
+-constexpr StrId menuItems[] = {StrId::STR_JOIN_NETWORK, StrId::STR_CALIBRE_WIRELESS, StrId::STR_CREATE_HOTSPOT,
++constexpr StrId menuItems[] = {StrId::STR_JOIN_NETWORK, StrId::STR_CALIBRE_WIRELESS, StrId::STR_CREATE_HOTSPOT, StrId::STR_WIFI_FIRMWARE_UPDATE,
+                                StrId::STR_RECEIVE_NEARBY_BOOK, StrId::STR_NEARBY_STATS_SYNC};
+-constexpr StrId menuDescs[] = {StrId::STR_JOIN_DESC, StrId::STR_CALIBRE_DESC, StrId::STR_HOTSPOT_DESC,
++constexpr StrId menuDescs[] = {StrId::STR_JOIN_DESC, StrId::STR_CALIBRE_DESC, StrId::STR_HOTSPOT_DESC, StrId::STR_WIFI_FIRMWARE_UPDATE_DESC,
+                                StrId::STR_RECEIVE_NEARBY_BOOK_DESC, StrId::STR_NEARBY_STATS_SYNC_DESC};
+-constexpr UIIcon menuIcons[] = {UIIcon::Wifi, UIIcon::Library, UIIcon::Hotspot, UIIcon::Transfer, UIIcon::Transfer};
++constexpr UIIcon menuIcons[] = {UIIcon::Wifi, UIIcon::Library, UIIcon::Hotspot, UIIcon::Transfer, UIIcon::Transfer, UIIcon::Transfer};
+ #endif
+
+ constexpr int ALL_MENU_ITEM_COUNT = sizeof(menuModes) / sizeof(menuModes[0]);
+ int menuItemCount() { return ALL_MENU_ITEM_COUNT - (SETTINGS.shouldTrackReadingStats() ? 0 : 1); }
+ int listItemCount() { return menuItemCount() + 1; }
+-constexpr int NEARBY_SECTION_INDEX = CROSSINK_APP_CAP_USB_DRIVE ? 4 : 3;
++constexpr int NEARBY_SECTION_INDEX = CROSSINK_APP_CAP_USB_DRIVE ? 5 : 4;
+
+ int listIndexForMenuIndex(const int menuIndex) { return menuIndex < NEARBY_SECTION_INDEX ? menuIndex : menuIndex + 1; }
+ }  // namespace
+@@ -190,7 +193,9 @@ void NetworkModeSelectionActivity::buildListScreen(UiApp::ScreenType& screen) {
+     fui::ListItem item;
+     item.label = I18N.get(menuItems[i]);
+     item.subtitle = I18N.get(menuDescs[i]);
+-    if (menuModes[i] == NetworkMode::USB_DRIVE) {
++    if (menuModes[i] == NetworkMode::WIFI_FIRMWARE_UPDATE) {
++      item.icon = fui::bitmapFromIcon(icon_arrow_down_32);
++    } else if (menuModes[i] == NetworkMode::USB_DRIVE) {
+       item.icon = fui::bitmapFromIcon(icon_usb_32);
+     } else if (menuModes[i] == NetworkMode::NEARBY_BOOK_RECEIVE) {
+       item.icon = fui::bitmapFromIcon(icon_chevrons_left_right_ellipsis_32);
+@@ -259,6 +264,12 @@ void NetworkModeSelectionActivity::render(RenderLock&&) {
+ }
+
+ void NetworkModeSelectionActivity::onModeSelected(NetworkMode mode) {
++  if (mode == NetworkMode::WIFI_FIRMWARE_UPDATE) {
++    auto receiver = makeUniqueNoThrow<ReceiveFirmwareActivity>(renderer, mappedInput);
++    if (!receiver) { LOG_ERR("NET", "Cannot allocate Wi-Fi firmware receiver"); return; }
++    startActivityForResult(std::move(receiver), [this](const ActivityResult&) { requestUpdate(); });
++    return;
++  }
+   setResult(NetworkModeResult{mode});
+   finish();
+ }
+diff --git a/src/activities/network/NetworkModeSelectionActivity.h b/src/activities/network/NetworkModeSelectionActivity.h
+index 65fcaad725587f5b3a32190b5da238f55fd4062d..138d2753c2526d8b3bf80c79a5e262c50a7cc5d3 100644
+--- a/src/activities/network/NetworkModeSelectionActivity.h
++++ b/src/activities/network/NetworkModeSelectionActivity.h
+@@ -13,7 +13,8 @@ enum class NetworkMode {
+   CREATE_HOTSPOT,
+   USB_DRIVE,
+   NEARBY_BOOK_RECEIVE,
+-  NEARBY_STATS_SYNC
++  NEARBY_STATS_SYNC,
++  WIFI_FIRMWARE_UPDATE
+ };
+
+ /**

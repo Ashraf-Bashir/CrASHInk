@@ -2,6 +2,8 @@
 
 ### Added
 
+- File Transfer includes Wi-Fi firmware update with a download-arrow icon and a short same-network explanation, opening the existing signed update receiver.
+
 - Receive updates connects the X4 Pro to Wi-Fi on demand, verifies signed firmware sent from Android, and switches Wi-Fi off before installing automatically.
 
 ### Changed
@@ -9,6 +11,8 @@
 - Workflowy compact calendar rows hide tags between the time and task title.
 
 ### Fixed
+
+- Explicit Library Refresh always walks the SD card, bypasses saved membership results, and checks that each result still exists. Stale title/0% placeholders are cleared before loading; book actions also invalidate old view membership. A compact top progress strip shows scanning book counts and measured filtering progress, then disappears.
 
 - Library Refresh reconciles the SD catalog in both Currently reading and Latest added. Refreshes requested during an active scan are coalesced into one follow-up scan instead of being lost. Successful refresh handoff invalidates stale saved view results, including unchanged-catalog progress filters; opening a book is no longer needed to force this invalidation.
 
