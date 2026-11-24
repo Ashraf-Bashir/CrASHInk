@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- Main app screens use the bottom ribbon for Home navigation; redundant top-left Home/Back icons and their invisible touch targets are removed. Nested settings and contextual pickers keep Back.
+
 - The File Transfer menu now includes the shared bottom app ribbon, with menu rows kept above it and File Transfer marked as selected.
 
 - Workflowy quote sharing displays one immediate “Queued for Workflowy” confirmation before Wi-Fi starts, with no duplicate completion toast. Offline quotes remain safely queued.
