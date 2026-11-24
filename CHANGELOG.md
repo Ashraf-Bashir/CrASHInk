@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- Library Refresh reconciles the SD catalog in both Currently reading and Latest added. Refreshes requested during an active scan are coalesced into one follow-up scan instead of being lost. Successful refresh handoff invalidates stale saved view results, including unchanged-catalog progress filters; opening a book is no longer needed to force this invalidation.
+
 - EPUB list markers stay with wrapped opening paragraphs, and nested chapter sections can continue on the same page.
 
 - Workflowy closes after five minutes without input and closes before the device sleeps.
