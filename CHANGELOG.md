@@ -17,6 +17,12 @@
 
 ### Fixed
 
+- Home requests its first paint immediately and sets portrait orientation, instead of leaving a boot, Calendar, Browse, or Settings frame visible over an invisible launcher. Fresh touch-down and first-paint guards prevent carried-over releases from opening apps.
+- Launcher icons are rendered from SVG at native 80-pixel resolution. The layout is Library / Workflowy, Calendar / Browse, File Transfer / Settings, without a title at the top. Left/Right selects a tile and the capacitive Home key opens it once.
+- All six app views share the same bottom navigation ribbon. Workflowy and Calendar keep their action controls above it; Browse's Home control returns directly to the launcher. Home symbols use logical bitmap coordinates so they remain upright.
+- Workflowy releases unused reader fonts before starting network work. The launcher queues at most one app launch while switching screens.
+- The firmware receiver shows a live five-minute countdown using differential refreshes. The boot droplet has gentle curved eyes and a smile.
+
 - Returning from file transfer automatically reconciles the Library without a Refresh tap. The previous disk catalog and complete membership remain usable while the worker reuses unchanged metadata and prepares the replacement view; old filter saves cannot overwrite new membership. Cover work remains page-prioritized after handoff.
 - Library updating shows a numeric percentage and a proportional top bar based on a counted file pass and processed view rows. Loading feedback also appears for ordinary partial cached filters, rather than silently showing only the first nine results.
 

@@ -1335,9 +1335,18 @@ diff --git a/src/SettingsList.h b/src/SettingsList.h
      addDisplaySetting(StrId::STR_SWAP_LIBRARY_FILE_BROWSER);
    }
 diff --git a/src/activities/Activity.h b/src/activities/Activity.h
+index e3a6fd75be5ead4f8888b740c6c0bc20c0d73d02..50bcff28d4a54ef784d0cedcaa69350dc66ff4eb 100644
 --- a/src/activities/Activity.h
 +++ b/src/activities/Activity.h
-@@ -39,6 +39,8 @@
+@@ -13,6 +13,7 @@
+ #include "GfxRenderer.h"
+ #include "MappedInputManager.h"
+ #include "RenderLock.h"
++#include "components/AppNavigation.h"
+ #include "util/QuickLockTrigger.h"
+ #include "util/ScreenshotInfo.h"
+
+@@ -39,6 +40,8 @@ class Activity {
    virtual ~Activity() = default;
    virtual void onEnter();
    virtual void onExit();
@@ -1346,8 +1355,16 @@ diff --git a/src/activities/Activity.h b/src/activities/Activity.h
    virtual void loop() {}
 
    virtual void render(RenderLock&&) {}
+@@ -75,6 +78,7 @@ class Activity {
+   // activity owning the open book should be the Home/Reader unwind target.
+   virtual bool isBookReaderActivity() const { return false; }
+   virtual bool isHomeActivity() const { return false; }
++  virtual AppNavigation::View appNavigationView() const { return AppNavigation::View::None; }
+   // The open book uses its vertical swipe actions across the entire page;
+   // dialogs and lists retain their normal edge or scroll gestures.
+   virtual bool usesFullScreenReaderVerticalSwipes() const { return false; }
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index 82fe5758e9b40d881fad8498be18dc53b3f175d0..4eb2a9ee7b7de542661ffcacb17122dbec15c218 100644
+index 82fe5758e9b40d881fad8498be18dc53b3f175d0..9fcb52021064e6faf44885756fc4137d8b2330c3 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
 @@ -1,4 +1,5 @@
@@ -1364,7 +1381,19 @@ index 82fe5758e9b40d881fad8498be18dc53b3f175d0..4eb2a9ee7b7de542661ffcacb17122db
  #include "home/RecentBookProgress.h"
  #include "library/LibraryActivity.h"
  #include "network/CrossPointWebServerActivity.h"
-@@ -951,15 +951,6 @@ void ActivityManager::goToNearbyStatsSync() {
+@@ -534,7 +534,10 @@ void ActivityManager::loop() {
+     finishLiveLightSwipe(twoFingerLightSwipe, *this);
+ #endif
+
+-  if (currentActivity) {
++  const bool appNavigationHandled = currentActivity && pendingAction == PendingAction::None &&
++      AppNavigation::handleInput(renderer, mappedInput, currentActivity->appNavigationView());
++
++  if (currentActivity && !appNavigationHandled) {
+     mappedInput.setPowerAsConfirmInReaderMode(currentActivity->allowPowerAsConfirmInReaderMode());
+
+     if (currentActivity->blocksGlobalInput()) {
+@@ -951,15 +954,6 @@ void ActivityManager::goToNearbyStatsSync() {
  }
 
  void ActivityManager::goToSettings(const bool dismissOnUpSwipe) {
@@ -1380,7 +1409,7 @@ index 82fe5758e9b40d881fad8498be18dc53b3f175d0..4eb2a9ee7b7de542661ffcacb17122db
    replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput, dismissOnUpSwipe));
  }
 
-@@ -1031,6 +1022,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
+@@ -1031,6 +1025,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
  }
 
  void ActivityManager::goToSleep(bool fromTimeout) {
@@ -1389,7 +1418,7 @@ index 82fe5758e9b40d881fad8498be18dc53b3f175d0..4eb2a9ee7b7de542661ffcacb17122db
    const bool canSnapshotOverlay = currentActivity && currentActivity->canSnapshotForSleepOverlay();
    const GfxRenderer::Orientation sleepPopupOrientation = renderer.getOrientation();
    std::string currentBookPath = getCurrentBookPath();
-@@ -1067,31 +1060,19 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
+@@ -1067,31 +1063,19 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
  }
 
  void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::RefreshMode initialRefreshMode) {
@@ -1433,7 +1462,7 @@ index 82fe5758e9b40d881fad8498be18dc53b3f175d0..4eb2a9ee7b7de542661ffcacb17122db
  }
  void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
-@@ -1124,7 +1105,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
+@@ -1124,7 +1108,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
 
  bool ActivityManager::blocksGlobalInput() const { return currentActivity && currentActivity->blocksGlobalInput(); }
 
@@ -1533,7 +1562,7 @@ diff --git a/src/activities/home/BookActions.h b/src/activities/home/BookActions
 
  }  // namespace BookActions
 diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
-index adc3331a03b2d7fb907d34ca5e7cde56363cda45..aedd327e5fb1b3357654d8068dee31d7b7624a37 100644
+index adc3331a03b2d7fb907d34ca5e7cde56363cda45..884da22cee286996352115332cc1c388a88935c2 100644
 --- a/src/activities/home/FileBrowserActivity.cpp
 +++ b/src/activities/home/FileBrowserActivity.cpp
 @@ -555,6 +555,8 @@ void FileBrowserActivity::showDirectoryActionMenu(const std::string& entry, bool
@@ -1554,16 +1583,35 @@ index adc3331a03b2d7fb907d34ca5e7cde56363cda45..aedd327e5fb1b3357654d8068dee31d7
            case FileBrowserAction::RemoveFromRecents:
            case FileBrowserAction::ViewBookmarks:
            case FileBrowserAction::ViewClippings:
-@@ -1464,7 +1468,7 @@ void FileBrowserActivity::render(RenderLock&&) {
+@@ -1055,7 +1059,8 @@ void FileBrowserActivity::activateSelected() {
+
+ void FileBrowserActivity::loop() {
+   if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
+-    navigateBack();
++    if (mode == Mode::Books) activityManager.goHome();
++    else navigateBack();
+     return;
+   }
+   if (pendingCompletedFeedback) {
+@@ -1299,7 +1304,7 @@ void FileBrowserActivity::buildListScreen(UiApp::ScreenType& screen) {
+   // Content below the GUI.drawHeader band, above the button hints.
+   screen.setContentMargin(
+       fui::Insets{static_cast<int16_t>(metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput)), 0,
+-                  static_cast<int16_t>(metrics.buttonHintsHeight), 0});
++                  static_cast<int16_t>(appNavigationView() == AppNavigation::View::None ? metrics.buttonHintsHeight : std::max<int>(metrics.buttonHintsHeight, AppNavigation::Height)), 0});
+
+   if (mode == Mode::Books && mappedInput.hasTouchHardware()) {
+     const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+@@ -1464,7 +1469,7 @@ void FileBrowserActivity::render(RenderLock&&) {
    const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
    if (mappedInput.hasTouchHardware()) {
      const int rightReserve = mode == Mode::Books ? TouchHeaderBackButton::layout(header).iconRect.width + 8 : 0;
 -    TouchHeaderBackButton::draw(renderer, uiTarget, header, folderName.c_str(), false, rightReserve);
-+    TouchHeaderBackButton::draw(renderer, uiTarget, header, folderName.c_str(), false, rightReserve, nullptr, TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, true, mode == Mode::Books && basepath == "/");
++    TouchHeaderBackButton::draw(renderer, uiTarget, header, folderName.c_str(), false, rightReserve, nullptr, TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, true, mode == Mode::Books);
    } else {
      GUI.drawHeader(renderer, header, folderName.c_str());
    }
-@@ -1477,7 +1481,7 @@ void FileBrowserActivity::render(RenderLock&&) {
+@@ -1477,7 +1482,7 @@ void FileBrowserActivity::render(RenderLock&&) {
    uiReady = true;
 
    const size_t visibleEntries = entryCount();
@@ -1572,6 +1620,24 @@ index adc3331a03b2d7fb907d34ca5e7cde56363cda45..aedd327e5fb1b3357654d8068dee31d7
                                                                    : mappedInput.withBackArrow(tr(STR_BACK)))
                                             : mappedInput.withBackArrow(tr(STR_BACK));
    // In PickFirmware mode, Confirm on a .bin returns the path to the caller (not "open"); show
+@@ -1488,7 +1493,8 @@ void FileBrowserActivity::render(RenderLock&&) {
+   const auto labels = mappedInput.mapLabels(
+       backLabel, confirmLabel, visibleEntries == 0 || mode == Mode::PickDirectory ? "" : tr(STR_DIR_UP),
+       mode == Mode::PickDirectory ? tr(STR_SELECT) : (visibleEntries == 0 ? "" : tr(STR_DIR_DOWN)));
+-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++  if (appNavigationView() == AppNavigation::View::None)
++    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+   if (!mappedInput.hasTouch() && mode == Mode::Books && basepath == "/") {
+     const int pathLineHeight = renderer.getLineHeight(SMALL_FONT_ID);
+@@ -1507,6 +1513,7 @@ void FileBrowserActivity::render(RenderLock&&) {
+     GUI.drawPopup(renderer, completedFeedbackIsFinished ? tr(STR_MARKED_FINISHED) : tr(STR_MARKED_UNFINISHED));
+   }
+
++  AppNavigation::draw(renderer, appNavigationView());
+   renderer.displayBuffer();
+ }
+
 diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
 --- a/src/activities/home/HomeActivity.cpp
 +++ b/src/activities/home/HomeActivity.cpp
@@ -2177,10 +2243,10 @@ diff --git a/src/activities/home/SavedItemsHomeActivity.cpp b/src/activities/hom
    renderer.displayBuffer();
  }
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a70acbf01 100644
+index f281d57307c42e6f65b042d78bdd488ca2b94297..7f46711b5a449978e6abe9a8fc94f564ff55b3f5 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
-@@ -6,57 +6,66 @@
+@@ -6,57 +6,63 @@
  #include <Epub.h>
  #include <FsHelpers.h>
  #include <HalStorage.h>
@@ -2252,17 +2318,14 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
 -  return (SETTINGS.libraryShowEpub ? library::FileEpub : 0) | (SETTINGS.libraryShowXtc ? library::FileXtc : 0) |
 -         (SETTINGS.libraryShowTxt ? library::FileTxt : 0) | (SETTINGS.libraryShowMarkdown ? library::FileMarkdown : 0);
 -}
-+constexpr int NAV_HEIGHT = 48;
-+constexpr int NAV_FIRST = 10;
-+constexpr int NAV_COUNT = 4;
-+constexpr int BATCH_CANCEL_CONTROL = NAV_FIRST + NAV_COUNT;
++constexpr int BATCH_CANCEL_CONTROL = 10;
 +constexpr int BATCH_APPLY_CONTROL = BATCH_CANCEL_CONTROL + 1;
 +int gridColumns() { return CoverGridLayout::Columns; }
 +int gridPageSize() { return 9; }
 
  const RecentBook* recentBookForPath(const std::string& path) {
    const auto& books = RECENT_BOOKS.getBooks();
-@@ -65,16 +74,6 @@ const RecentBook* recentBookForPath(const std::string& path) {
+@@ -65,16 +71,6 @@ const RecentBook* recentBookForPath(const std::string& path) {
    return it == books.end() ? nullptr : &*it;
  }
 
@@ -2279,7 +2342,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
  int headerControlRightInset() {
    const auto& metrics = UITheme::getInstance().getMetrics();
    // Inline battery themes need a separate lane for the options button.
-@@ -85,13 +84,16 @@ int headerControlRightInset() {
+@@ -85,13 +81,16 @@ int headerControlRightInset() {
  LibraryActivity::LibraryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
      : Activity("Library", renderer, mappedInput),
        uiTarget(makeUiTarget(renderer)),
@@ -2297,7 +2360,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    {
      RenderLock lock;
      Activity::onEnter();
-@@ -99,23 +101,23 @@ void LibraryActivity::onEnter() {
+@@ -99,23 +98,23 @@ void LibraryActivity::onEnter() {
      // The activity can be constructed while a landscape reader is still active.
      // Refresh FreeInkUI's captured screen size and safe area after rotating.
      app.setDevice(uiTarget.deviceContext());
@@ -2329,7 +2392,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    }
 
    // Paint the scan message before the main task starts reading the card.
-@@ -133,17 +135,28 @@ void LibraryActivity::onEnter() {
+@@ -133,17 +132,28 @@ void LibraryActivity::onEnter() {
      ignoreConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
      requestUpdate();
    }
@@ -2358,7 +2421,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    if (sort == Sort::RecentlyRead) {
      index.close();
      scanFailed = false;
-@@ -160,9 +173,9 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+@@ -160,9 +170,9 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
      applyFilter();
      return;
    }
@@ -2371,7 +2434,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
        index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0)) {
      rebuildIndex(showScanning);
      return;
-@@ -172,13 +185,12 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+@@ -172,13 +182,12 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
    applyFilter();
  }
 
@@ -2391,7 +2454,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    uiReady = false;
    index.close();
    if (showScanning) drawScanScreen(tr(STR_LIBRARY_SCANNING));
-@@ -189,7 +201,8 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
+@@ -189,7 +198,8 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
    callbacks.progress = &LibraryActivity::onScanProgress;
    scanCancelledThisVisit = false;
    scanBackHeldAtStart = mappedInput.isPressed(MappedInputManager::Button::Back);
@@ -2401,7 +2464,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    scanFailureText = stats.failure == library::BuildFailure::Cancelled      ? StrId::STR_LIBRARY_SCAN_CANCELLED
                      : stats.failure == library::BuildFailure::TooManyBooks ? StrId::STR_LIBRARY_TOO_MANY_BOOKS
                                                                             : StrId::STR_LIBRARY_SCAN_FAILED;
-@@ -213,7 +226,15 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
+@@ -213,7 +223,15 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
        }
      }
    }
@@ -2417,7 +2480,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    return !scanFailed;
  }
 
-@@ -285,24 +306,64 @@ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book)
+@@ -285,24 +303,64 @@ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book)
 
  void LibraryActivity::resolveRecents() {
    recentCount = 0;
@@ -2496,7 +2559,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    }
  }
 
-@@ -326,65 +387,19 @@ library::SortOrder LibraryActivity::indexOrder() const {
+@@ -326,65 +384,19 @@ library::SortOrder LibraryActivity::indexOrder() const {
    return library::SortOrder::RecentDesc;
  }
 
@@ -2567,7 +2630,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
  }
 
  // Position in filterOrder of the row-th match: find its block by the running
-@@ -393,7 +408,8 @@ uint16_t LibraryActivity::filteredSourceRow(const uint16_t row) const {
+@@ -393,7 +405,8 @@ uint16_t LibraryActivity::filteredSourceRow(const uint16_t row) const {
    // Sized when the filter ran: the index may be closed (count 0) while a row
    // is still drawn before the activity swaps out.
    if (!filterBits || !filterRanks || row >= filteredCount || filterSourceCount == 0) return UINT16_MAX;
@@ -2577,7 +2640,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    const uint16_t* ranks = filterRanks.get();
    uint16_t block = static_cast<uint16_t>(std::upper_bound(ranks, ranks + blocks, row) - ranks - 1);
    uint16_t seen = filterRanks[block];
-@@ -426,7 +442,80 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
+@@ -426,7 +439,80 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
    return true;
  }
 
@@ -2658,7 +2721,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    filteredCount = 0;
    filterFailed = false;
    filterBits.reset();
-@@ -436,7 +525,7 @@ void LibraryActivity::applyFilter() {
+@@ -436,7 +522,7 @@ void LibraryActivity::applyFilter() {
      resolveRecents();
      return;
    }
@@ -2667,7 +2730,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    const uint16_t sourceCount = index.bookCount();
    filterOrder = indexOrder();
    filterSourceCount = sourceCount;
-@@ -449,26 +538,45 @@ void LibraryActivity::applyFilter() {
+@@ -449,26 +535,45 @@ void LibraryActivity::applyFilter() {
      filterFailed = true;
      return;
    }
@@ -2733,7 +2796,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    const auto readIndexedPath = [&](const library::ClixRecord& record) {
      if (!folderOffsets) {
        folderOffsets = makeUniqueNoThrow<uint32_t[]>(library::LibraryIndexFile::FOLDER_CHECKPOINT_COUNT);
-@@ -483,8 +591,9 @@ void LibraryActivity::applyFilter() {
+@@ -483,8 +588,9 @@ void LibraryActivity::applyFilter() {
      }
      return true;
    };
@@ -2745,7 +2808,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      if (row % FILTER_BLOCK_ROWS == 0) filterRanks[row / FILTER_BLOCK_ROWS] = filteredCount;
      const uint16_t ordinal = index.ordinalForRow(filterOrder, row);
      library::ClixRecord record{};
-@@ -494,7 +603,7 @@ void LibraryActivity::applyFilter() {
+@@ -494,7 +600,7 @@ void LibraryActivity::applyFilter() {
        filteredCount = 0;
        break;
      }
@@ -2754,7 +2817,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      if (!needle.empty() && !index.readDisplayText(record, title, author)) {
        LOG_ERR("LIB", "Cannot read Library search text");
        filterFailed = true;
-@@ -510,53 +619,55 @@ void LibraryActivity::applyFilter() {
+@@ -510,53 +616,55 @@ void LibraryActivity::applyFilter() {
      // Only matching books need their completion state read from the SD card.
      if (!needle.empty() && !library::matchesQuery(folded, needle)) continue;
      if (SETTINGS.libraryHideFinishedBooks) {
@@ -2836,7 +2899,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
  }
 
  void LibraryActivity::reloadAfterBookAction() {
-@@ -566,11 +677,12 @@ void LibraryActivity::reloadAfterBookAction() {
+@@ -566,11 +674,12 @@ void LibraryActivity::reloadAfterBookAction() {
    listNav.top = topIndex;
    listNav.follow(rowCount());
    topIndex = listNav.top;
@@ -2852,7 +2915,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    requestUpdate();
  }
 
-@@ -579,6 +691,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
+@@ -579,6 +688,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
      LOG_ERR("LIB", "Cannot allocate Library dialog");
      return;
    }
@@ -2860,7 +2923,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    pendingInput.clear();
    touchTracking = false;
    app.clearTapFlash();
-@@ -588,6 +701,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
+@@ -588,6 +698,7 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
      confirmLongPressCaptured = false;
      uiReady = false;
      handler(result);
@@ -2868,7 +2931,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      requestUpdate();
    });
  }
-@@ -596,57 +710,32 @@ void LibraryActivity::openBook(const int row) {
+@@ -596,57 +707,32 @@ void LibraryActivity::openBook(const int row) {
    RecentBook book;
    if (!readBook(row, book)) return;
    app.clearTapFlash();
@@ -2944,7 +3007,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    });
    requestUpdate();
  }
-@@ -664,39 +753,34 @@ void LibraryActivity::openSearch() {
+@@ -664,39 +750,30 @@ void LibraryActivity::openSearch() {
  }
 
  void LibraryActivity::refreshLibrary() {
@@ -2995,14 +3058,10 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
 -    if (gridEnabled()) resetViewport();
 -    requestUpdate();
 -  }
-+  if (control == NAV_FIRST) { activityManager.goHome(); return; }
-+  if (control == NAV_FIRST + 1) activityManager.goToFileTransfer();
-+  if (control == NAV_FIRST + 2) activityManager.goToFileBrowser();
-+  if (control == NAV_FIRST + 3) activityManager.goToSettings();
  }
 
  void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-@@ -704,15 +788,18 @@ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+@@ -704,15 +781,18 @@ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
    if (event.value < 0 || event.value >= self->rowCount()) return;
    self->selection = event.value + CONTROL_COUNT;
    self->showSelection = false;
@@ -3024,7 +3083,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    self->showSelection = false;
    self->activateControl(event.value);
  }
-@@ -751,32 +838,73 @@ void LibraryActivity::latchInput() {
+@@ -751,32 +831,73 @@ void LibraryActivity::latchInput() {
    int x = 0;
    int y = 0;
    if (mappedInput.wasScreenTouchDown(x, y)) {
@@ -3110,7 +3169,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    }
    if (released) touchTracking = false;
    switch (swipe) {
-@@ -805,10 +933,10 @@ void LibraryActivity::latchInput() {
+@@ -805,10 +926,10 @@ void LibraryActivity::latchInput() {
      ignoreBackRelease = false;
    }
    if (mappedInput.hasTouchHardware()) {
@@ -3125,7 +3184,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    } else {
      if (mappedInput.wasReleased(MappedInputManager::Button::Left)) queueInput(Type::LeftRelease);
      if (mappedInput.wasReleased(MappedInputManager::Button::Right)) queueInput(Type::RightRelease);
-@@ -848,26 +976,63 @@ void LibraryActivity::loop() {
+@@ -848,26 +969,63 @@ void LibraryActivity::loop() {
      handleInput(input);
      return;
    }
@@ -3199,7 +3258,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
        showBookActionMenu(selection - CONTROL_COUNT, ignoreConfirmRelease);
      else
        activateControl(selection);
-@@ -892,19 +1057,30 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -892,19 +1050,30 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      pendingInput.clear();
      if (selection < CONTROL_COUNT)
        activateControl(selection);
@@ -3235,7 +3294,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      return;
    }
    const auto swipe = input.type == Type::SwipeUp      ? MappedInputManager::SwipeDir::Up
-@@ -915,26 +1091,11 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -915,26 +1084,11 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down ||
        (gridEnabled() &&
         (swipe == MappedInputManager::SwipeDir::Left || swipe == MappedInputManager::SwipeDir::Right))) {
@@ -3264,7 +3323,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      if (input.type == Type::LeftRelease) {
        pendingInput.clear();
        openSortPicker();
-@@ -942,7 +1103,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -942,7 +1096,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      }
      if (input.type == Type::RightRelease) {
        pendingInput.clear();
@@ -3273,7 +3332,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
        return;
      }
    }
-@@ -950,21 +1111,23 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -950,21 +1104,23 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    const auto move = [this](const int next) {
      if (!showSelection) {
        showSelection = true;
@@ -3300,7 +3359,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      } else if (selection >= CONTROL_COUNT) {
        listNav.selected = selection - CONTROL_COUNT;
        listNav.top = topIndex;
-@@ -976,7 +1139,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -976,7 +1132,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    if (mappedInput.hasTouchHardware()) {
      if (input.type == Type::Next) move(ButtonNavigator::nextIndex(selection, count));
      if (input.type == Type::Previous) move(ButtonNavigator::previousIndex(selection, count));
@@ -3309,7 +3368,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      if (input.type == Type::NextPage) move(ButtonNavigator::nextPageIndex(selection, count, page));
      if (input.type == Type::PreviousPage) move(ButtonNavigator::previousPageIndex(selection, count, page));
    } else if (rowCount() > 0) {
-@@ -985,19 +1148,40 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -985,19 +1141,40 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      const auto moveBook = [&](const int next) { move(CONTROL_COUNT + next); };
      if (input.type == Type::Next) moveBook(ButtonNavigator::nextIndex(row, bookCount));
      if (input.type == Type::Previous) moveBook(ButtonNavigator::previousIndex(row, bookCount));
@@ -3352,7 +3411,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      item.label = tr(STR_LIBRARY_UNAVAILABLE);
      item.enabled = false;
      return;
-@@ -1030,6 +1214,8 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem&
+@@ -1030,6 +1207,8 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem&
    }
    item.icon = listIconFor(UITheme::getFileIcon(self->rowScratch.path), 32);
    item.actionValue = static_cast<int16_t>(row);
@@ -3361,7 +3420,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    if (!SETTINGS.libraryListExpanded) return;
    if (self->sort == Sort::DateAdded) {
      const uint16_t date = self->dateGroupForRow(row);
-@@ -1105,68 +1291,59 @@ uint32_t LibraryActivity::groupForRow(const int row) {
+@@ -1105,68 +1284,38 @@ uint32_t LibraryActivity::groupForRow(const int row) {
    return library::foldedGroupInitial(key);
  }
 
@@ -3420,32 +3479,11 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
        static_cast<int16_t>(metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput));
 -  const int buttonHintsHeight = mappedInput.hasTouchHardware() ? 0 : metrics.buttonHintsHeight;
 +  const bool touch = mappedInput.hasTouchHardware();
-+  const int bottomControls = touch ? NAV_HEIGHT : metrics.buttonHintsHeight;
++  const int bottomControls = touch ? AppNavigation::Height : metrics.buttonHintsHeight;
    screen.setContentMarginFromScreen(fui::Insets{headerBottom, static_cast<int16_t>(bounds[1]),
 -                                                static_cast<int16_t>(FOOTER_HEIGHT + buttonHintsHeight + bounds[2]),
 +                                                static_cast<int16_t>(bottomControls + bounds[2]),
                                                  static_cast<int16_t>(bounds[3])});
-+  if (touch && !selectingBooks) {
-+    static constexpr const freeink::Icon* icons[] = {&icon_home_32, &icon_lyra_transfer_32,
-+                                                   &icon_folder_32, &icon_cog_32};
-+    const int width = renderer.getScreenWidth() - bounds[1] - bounds[3];
-+    const int y = renderer.getScreenHeight() - bounds[2] - NAV_HEIGHT;
-+    const auto ink = fui::Paint::solid(fui::Color::Black);
-+    uiTarget.fill(fui::Rect{static_cast<int16_t>(bounds[3]), static_cast<int16_t>(y),
-+                            static_cast<int16_t>(width), 1}, ink);
-+    fui::ButtonProps action;
-+    action.action = ACTION_CONTROL;
-+    action.inputMask = fui::InputTouch;
-+    action.styles = fui::plainStyles();
-+    for (int i = 0; i < NAV_COUNT; ++i) {
-+      const int x = bounds[3] + i * width / NAV_COUNT;
-+      const int next = bounds[3] + (i + 1) * width / NAV_COUNT;
-+      action.icon = fui::bitmapFromIcon(*icons[i]);
-+      action.value = NAV_FIRST + i;
-+      screen.button(action, fui::Rect{static_cast<int16_t>(x), static_cast<int16_t>(y + 1),
-+                                     static_cast<int16_t>(next - x), NAV_HEIGHT - 1});
-+    }
-+  }
    // Every header icon owns a 44px touch box, with 10px of clearance.
    const int16_t controlSize = HEADER_CONTROL_SIZE;
    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
@@ -3471,7 +3509,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
      fui::ButtonProps action;
      action.action = ACTION_CONTROL;
      action.inputMask = fui::InputTouch;
-@@ -1176,26 +1353,35 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1176,26 +1325,35 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
      action.value = 0;
      action.state = showSelection && selection == 0 ? fui::StateSelected : fui::StateNormal;
      screen.button(action,
@@ -3518,7 +3556,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    const int16_t statusPadding = static_cast<int16_t>(metrics.contentSidePadding);
    const fui::Insets statusInsets{0, statusPadding, 0, statusPadding};
    if (scanFailed || index.ranksDegraded() || filterFailed) {
-@@ -1207,16 +1393,33 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1207,16 +1365,33 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
                                 : tr(STR_LIBRARY_UNSORTED),
                    screen.theme().smallText);
    }
@@ -3556,7 +3594,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
          message = tr(STR_LIBRARY_NO_RESULTS);
        else if (sort == Sort::RecentlyRead)
          message = tr(STR_NO_RECENT_BOOKS);
-@@ -1252,162 +1455,187 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1252,162 +1427,187 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
  }
 
  void LibraryActivity::buildGrid(UiApp::ScreenType& screen) {
@@ -3881,7 +3919,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
  }
 
  void LibraryActivity::render(RenderLock&&) {
-@@ -1417,42 +1645,135 @@ void LibraryActivity::render(RenderLock&&) {
+@@ -1417,42 +1617,136 @@ void LibraryActivity::render(RenderLock&&) {
      drawScanScreen(tr(STR_LIBRARY_SCANNING));
      return;
    }
@@ -3947,6 +3985,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
 -                                (FOOTER_HEIGHT + renderer.getLineHeight(SMALL_FONT_ID)) / 2,
 -                            footer);
    if (pendingCacheDeletedFeedback) GUI.drawPopup(renderer, tr(STR_BOOK_CACHE_DELETED));
++  AppNavigation::draw(renderer, appNavigationView());
    renderer.displayBuffer();
  }
 
@@ -4036,7 +4075,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
  void LibraryActivity::promptDeleteBook(const RecentBook& book) {
    const std::string path = book.path;
    auto handler = [this, path](const ActivityResult& res) {
-@@ -1470,7 +1791,11 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
+@@ -1470,7 +1764,11 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
      // The card changed, so a cancelled scan must not keep showing this book.
      scanCancelledThisVisit = false;
      RECENT_BOOKS.removeByPath(path);
@@ -4049,7 +4088,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
    };
 
    const std::string heading = tr(STR_DELETE) + std::string("? ");
-@@ -1500,135 +1825,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+@@ -1500,135 +1798,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
                                      [&book](const RecentBook& recent) { return recent.path == book.path; });
    std::vector<FileBrowserActionActivity::MenuItem> items =
        BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/isRecent);
@@ -4372,7 +4411,7 @@ index f281d57307c42e6f65b042d78bdd488ca2b94297..e5265d9a6cf7a0cff9a3ad137995926a
 +      });
  }
 diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
-index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767dd6c61d0 100644
+index 97f455067396602b944aa98958f588f7a5d50cd6..0e0d71f29725a1c41836e9b22e349aed7151c26e 100644
 --- a/src/activities/library/LibraryActivity.h
 +++ b/src/activities/library/LibraryActivity.h
 @@ -3,15 +3,21 @@
@@ -4397,7 +4436,7 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767
  #include "util/ButtonNavigator.h"
 
  class LibraryActivity final : public Activity {
-@@ -19,6 +25,14 @@ class LibraryActivity final : public Activity {
+@@ -19,8 +25,17 @@ class LibraryActivity final : public Activity {
    LibraryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
    void onEnter() override;
    void onExit() override;
@@ -4411,8 +4450,11 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767
 +  bool allowGlobalHomeSwipeGesture() const override { return false; }
    void loop() override;
    void render(RenderLock&&) override;
++  AppNavigation::View appNavigationView() const override { return AppNavigation::View::Library; }
    bool blocksGlobalInput() const override { return actionPopup.isActive(); }
-@@ -41,7 +55,7 @@ class LibraryActivity final : public Activity {
+
+ #ifdef SIMULATOR
+@@ -41,7 +56,7 @@ class LibraryActivity final : public Activity {
   private:
    enum class Sort : uint8_t { DateAdded, Title, AuthorLast, AuthorFirst, RecentlyRead, Series, Genre };
    // Touch header controls precede the book rows; button-only navigation visits books directly.
@@ -4421,7 +4463,7 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767
    using UiApp = freeink::ui::FreeInkApp<32, 4>;
    freeink::ui::GfxRendererTarget uiTarget;
    UiApp app;
-@@ -49,18 +63,42 @@ class LibraryActivity final : public Activity {
+@@ -49,18 +64,42 @@ class LibraryActivity final : public Activity {
    freeink::ui::ListNav listNav;
    OptionPopup actionPopup;
    library::LibraryIndexFile index;
@@ -4466,7 +4508,7 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767
    bool uiReady = false;
    bool initialScanPending = false;
    bool confirmLongPressCaptured = false;
-@@ -96,6 +134,15 @@ class LibraryActivity final : public Activity {
+@@ -96,6 +135,15 @@ class LibraryActivity final : public Activity {
    library::SortOrder filterOrder = library::SortOrder::TitleAsc;
    uint16_t filterSourceCount = 0;
    uint16_t filteredCount = 0;
@@ -4482,7 +4524,7 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767
    // Indices into the bounded recent-books history, independent of the Library index.
    uint16_t recentRows[RecentBooksStore::MAX_RECENT_BOOKS]{};
    size_t recentCount = 0;
-@@ -118,10 +165,8 @@ class LibraryActivity final : public Activity {
+@@ -118,10 +166,8 @@ class LibraryActivity final : public Activity {
    void buildGrid(UiApp::ScreenType& screen);
    void loadGridPageCovers();
    bool loadGridCover(int row);
@@ -4494,7 +4536,7 @@ index 97f455067396602b944aa98958f588f7a5d50cd6..22344ae6cf9e810c00181df327125767
    library::SortOrder indexOrder() const;
    int rowCount() const;
    uint16_t ordinalForRow(int row);
-@@ -130,28 +175,34 @@ class LibraryActivity final : public Activity {
+@@ -130,28 +176,34 @@ class LibraryActivity final : public Activity {
    uint32_t groupForRow(int row);
    uint16_t dateGroupForRow(int row);
    bool metadataGroupForRow(int row, std::string& out);
@@ -5182,7 +5224,7 @@ diff --git a/src/activities/settings/ClearCacheActivity.cpp b/src/activities/set
    auto root = Storage.open("/.crosspoint");
    if (!root || !root.isDirectory()) {
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
-index 9608eb3a090c28523adb30cfc6079c79371d5fbe..7c136bf08af00197829157f11070285201795f04 100644
+index 9608eb3a090c28523adb30cfc6079c79371d5fbe..4ef0c1da34de569b0b16f38582dcc36bfc6616cc 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
 @@ -846,12 +846,7 @@ void SettingsActivity::finishToParent() {
@@ -5209,6 +5251,15 @@ index 9608eb3a090c28523adb30cfc6079c79371d5fbe..7c136bf08af00197829157f110702852
      const auto spec = uiScaleSpec();
      uiTarget.setFont(fui::GfxRendererTarget::FONT_SMALL, spec.smallFontId);
      uiTarget.setFont(fui::GfxRendererTarget::FONT_BODY, spec.bodyFontId);
+@@ -1472,7 +1464,7 @@ void SettingsActivity::buildSettingsScreen(UiApp::ScreenType& screen) {
+   // tab's top rule with the header's final underline pixel.
+   const int tabTop = std::max<int>(safe.y, CompactHeader::headerBottomY(metrics) - 1);
+   screen.setContentMargin(
+-      fui::Insets{static_cast<int16_t>(tabTop - safe.y), 0, static_cast<int16_t>(metrics.buttonHintsHeight), 0});
++      fui::Insets{static_cast<int16_t>(tabTop - safe.y), 0, static_cast<int16_t>(appNavigationView() == AppNavigation::View::None ? metrics.buttonHintsHeight : std::max<int>(metrics.buttonHintsHeight, AppNavigation::Height)), 0});
+
+   if (isFileBrowserView()) {
+     const int16_t listInset = static_cast<int16_t>(metrics.listInset);
 @@ -1685,7 +1677,7 @@ void SettingsActivity::render(RenderLock&&) {
    const char* title = isFileBrowserView() ? tr(STR_FILE_BROWSER_SETTINGS) : tr(STR_SETTINGS_TITLE);
 
@@ -5218,6 +5269,18 @@ index 9608eb3a090c28523adb30cfc6079c79371d5fbe..7c136bf08af00197829157f110702852
    } else {
      CompactHeader::drawTitle(renderer, title);
    }
+@@ -1730,8 +1722,10 @@ void SettingsActivity::render(RenderLock&&) {
+   const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), confirmLabel,
+                                             (horizontalFront ? tr(STR_DIR_LEFT) : tr(STR_DIR_UP)),
+                                             (horizontalFront ? tr(STR_DIR_RIGHT) : tr(STR_DIR_DOWN)));
+-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++  if (appNavigationView() == AppNavigation::View::None)
++    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+
+   // Always use standard refresh for settings screen
++  AppNavigation::draw(renderer, appNavigationView());
+   renderer.displayBuffer();
+ }
 diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
 index 4dc102627252ce345f2e3c9c0e8de209c193fb02..92c84a5a344093684755795ce8aebf98d348b5b8 100644
 --- a/src/activities/util/FrontlightPanelActivity.cpp
@@ -5888,14 +5951,16 @@ diff --git a/src/util/BookMoveUtils.cpp b/src/util/BookMoveUtils.cpp
    bool ok = true;
 
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index afe274ae416daee520c45dd99bb30686ea64a58c..7c52c4215646c88e48911f5ecf8ff6152ab09345 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -126,3 +126,7 @@
+@@ -126,3 +126,8 @@ add_subdirectory(readest_source_position)
  add_subdirectory(clipping_list_visibility)
 
  add_subdirectory(image_refresh_regions)
 +
 +add_subdirectory(library_thumbnails)
++add_subdirectory(app_launcher)
 +
 +add_subdirectory(end_of_book_dismiss)
 diff --git a/test/end_of_book_dismiss/CMakeLists.txt b/test/end_of_book_dismiss/CMakeLists.txt
@@ -7649,51 +7714,66 @@ diff --git a/src/components/themes/minimal/MinimalTheme.cpp b/src/components/the
  void MinimalTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
 diff --git a/src/activities/home/AppLauncherActivity.cpp b/src/activities/home/AppLauncherActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e962ec7f6b416df463826e8d2b6eb13ff0b0ac2
+index 0000000000000000000000000000000000000000..afbca3fa4a0a38be514e9280784eb8e4c628c88f
 --- /dev/null
 +++ b/src/activities/home/AppLauncherActivity.cpp
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,82 @@
 +#include "AppLauncherActivity.h"
 +#include <I18n.h>
-+#include <Memory.h>
 +#include <algorithm>
 +#include "components/UITheme.h"
-+#include "components/icons/listIcons.h"
 +#include "fontIds.h"
 +
-+namespace {
-+constexpr int AppCount = 4;
++void AppLauncherActivity::onEnter() {
++  Activity::onEnter();
++  { RenderLock lock; renderer.setOrientation(GfxRenderer::Orientation::Portrait); }
++  mappedInput.suppressCurrentTouchContact();
++  mappedInput.suppressNextBackRelease();
++  mappedInput.clearDeferredHomeGesture();
++  painted.store(false); pressed = -1; launching = false;
++  requestUpdate(); // Navigation must never leave the outgoing screen visible.
 +}
 +Rect AppLauncherActivity::tile(int index) const {
 +  int top, right, bottom, left;
 +  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+  const int columns = renderer.getScreenWidth() > renderer.getScreenHeight() ? 3 : 2;
-+  const int rows = (AppCount + columns - 1) / columns;
-+  const int startY = top + 82;
++  constexpr int columns = 2, rows = 3;
++  const int startY = top + UITheme::getStatusBarHeight() + 20;
 +  const int width = renderer.getScreenWidth() - left - right;
 +  const int height = std::max(1, renderer.getScreenHeight() - bottom - startY - 12);
-+  const int x = left + (index % columns) * width / columns;
-+  const int y = startY + (index / columns) * height / rows;
-+  return Rect{x, y, width / columns, height / rows};
++  return Rect{left + index % columns * width / columns, startY + index / columns * height / rows,
++              width / columns, height / rows};
 +}
 +void AppLauncherActivity::open(int index) {
-+  if (index == 0) activityManager.goToLibrary();
-+  if (index == 1) activityManager.goToFileTransfer();
-+  if (index == 2) activityManager.goToFileBrowser();
-+  if (index == 3) activityManager.goToSettings();
-+
++  if (!painted.load() || launching) return;
++  launching = true; pressed = -1;
++  mappedInput.suppressCurrentTouchContact();
++  AppNavigation::open(static_cast<AppNavigation::View>(index), renderer, mappedInput);
 +}
 +void AppLauncherActivity::loop() {
++  if (!painted.load()) { mappedInput.clearDeferredHomeGesture(); return; }
++  if (launching) return;
 +  using Button = MappedInputManager::Button;
-+  if (mappedInput.wasReleased(Button::Left)) { selected = (selected + AppCount - 1) % AppCount; requestUpdate(); }
-+  if (mappedInput.wasReleased(Button::Right)) { selected = (selected + 1) % AppCount; requestUpdate(); }
-+  if (mappedInput.wasReleased(Button::Confirm)) { open(selected); return; }
-+  if (mappedInput.wasSwipe() != MappedInputManager::SwipeDir::None) return;
-+  int x, y;
-+  if (!mappedInput.wasScreenTapped(x, y)) return;
-+  for (int i = 0; i < AppCount; ++i) {
-+    const auto r = tile(i);
-+    if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) { open(i); return; }
++  if (mappedInput.wasReleased(Button::Left) || mappedInput.wasReleased(Button::Up)) {
++    selected = (selected + AppNavigation::Count - 1) % AppNavigation::Count; requestUpdate();
++  }
++  if (mappedInput.wasReleased(Button::Right) || mappedInput.wasReleased(Button::Down)) {
++    selected = (selected + 1) % AppNavigation::Count; requestUpdate();
++  }
++  if (mappedInput.wasReleased(Button::Confirm) || mappedInput.wasHomeGesture()) { open(selected); return; }
++  int x = 0, y = 0;
++  const auto at = [&](int x, int y) {
++    for (int i = 0; i < AppNavigation::Count; ++i) {
++      const auto r = tile(i);
++      if (x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height) return i;
++    }
++    return -1;
++  };
++  if (mappedInput.wasScreenTouchDown(x, y)) { pressed = at(x, y); touchX = x; touchY = y; moved = false; }
++  if (mappedInput.isScreenTouchHeld(x, y) && (std::abs(x - touchX) > 14 || std::abs(y - touchY) > 14)) moved = true;
++  if (mappedInput.wasSwipe() != MappedInputManager::SwipeDir::None) { pressed = -1; moved = true; return; }
++  if (mappedInput.wasScreenTapped(x, y)) {
++    const int candidate = pressed; pressed = -1;
++    if (!moved && candidate >= 0 && candidate == at(x, y)) open(candidate);
 +  }
 +}
 +void AppLauncherActivity::render(RenderLock&&) {
@@ -7701,39 +7781,34 @@ index 0000000000000000000000000000000000000000..1e962ec7f6b416df463826e8d2b6eb13
 +  int top, right, bottom, left;
 +  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
 +  GUI.drawDisplayStatusBar(renderer, top);
-+  renderer.drawCenteredText(UI_12_FONT_ID, top + 43, "crASHink", true, EpdFontFamily::BOLD);
-+  static const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32, &icon_folder_32, &icon_cog_32,
-+  };
-+  const char* labels[] = {tr(STR_LIBRARY), tr(STR_FILE_TRANSFER), tr(STR_BROWSE), tr(STR_SETTINGS_SHORT),
-+  };
-+  for (int i = 0; i < AppCount; ++i) {
++  const char* labels[] = {tr(STR_LIBRARY), tr(STR_WORKFLOWY), tr(STR_WORKFLOWY_CALENDAR_VIEW),
++                          tr(STR_BROWSE), tr(STR_FILE_TRANSFER), tr(STR_SETTINGS_SHORT)};
++  for (int i = 0; i < AppNavigation::Count; ++i) {
 +    const auto r = tile(i);
-+    const auto& icon = *icons[i];
-+    const int scale = std::max(1, std::min(3, std::min((r.width - 34) / 32, (r.height - 54) / 32)));
-+    const int x = r.x + (r.width - icon.w * scale) / 2;
-+    const int y = r.y + std::max(12, (r.height - icon.h * scale - 32) / 2);
-+    // Scale the existing mask assets directly; no decoded image/cache allocation.
-+    for (int row = 0; row < icon.h; ++row)
-+      for (int col = 0; col < icon.w; ++col)
-+        if (!(icon.bits[row * ((icon.w + 7) / 8) + col / 8] & (0x80 >> (col & 7))))
-+          renderer.fillRect(x + col * scale, y + row * scale, scale, scale, true);
-+    const int textWidth = r.width - 16;
-+    const auto label = renderer.truncatedText(UI_12_FONT_ID, labels[i], textWidth);
-+    renderer.drawText(UI_12_FONT_ID, r.x + (r.width - renderer.getTextWidth(UI_12_FONT_ID, label.c_str())) / 2,
-+                      y + icon.h * scale + 14, label.c_str());
-+    if (!mappedInput.hasTouchHardware() && i == selected)
-+      renderer.drawRoundedRect(r.x + 8, r.y + 8, r.width - 16, r.height - 16, 2, 12, true);
++    const int side = std::min(112, std::min(r.width - 24, r.height - 48));
++    const int x = r.x + (r.width - side) / 2;
++    const int y = r.y + (r.height - side - 36) / 2;
++    const bool focused = i == selected;
++    renderer.drawRoundedRect(x, y, side, side, focused ? 3 : 1, 22, true);
++    AppNavigation::drawMask(renderer, AppNavigation::icon(static_cast<AppNavigation::View>(i), true),
++                            x + (side - 80) / 2, y + (side - 80) / 2);
++    const auto label = renderer.truncatedText(UI_12_FONT_ID, labels[i], r.width - 12);
++    const int textX = r.x + (r.width - renderer.getTextWidth(UI_12_FONT_ID, label.c_str())) / 2;
++    renderer.drawText(UI_12_FONT_ID, textX, y + side + 12, label.c_str(), true,
++                      focused ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR);
 +  }
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++  painted.store(true);
 +}
 diff --git a/src/activities/home/AppLauncherActivity.h b/src/activities/home/AppLauncherActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..cb8775f0d2e0e6eafee1c257de2f53a046a5c4b2
+index 0000000000000000000000000000000000000000..85c2a5049a687e37eeb50fe901c8a6840bbe570c
 --- /dev/null
 +++ b/src/activities/home/AppLauncherActivity.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,21 @@
 +#pragma once
 +#include "activities/Activity.h"
++#include <atomic>
 +
 +struct Rect;
 +
@@ -7741,18 +7816,30 @@ index 0000000000000000000000000000000000000000..cb8775f0d2e0e6eafee1c257de2f53a0
 + public:
 +  AppLauncherActivity(GfxRenderer& renderer, MappedInputManager& input) : Activity("Home", renderer, input) {}
 +  bool isHomeActivity() const override { return true; }
++  void onEnter() override;
 +  void loop() override;
 +  void render(RenderLock&&) override;
 + private:
 +  int selected = 0;
++  int pressed = -1, touchX = 0, touchY = 0;
++  bool moved = false, launching = false;
++  std::atomic<bool> painted{false};
 +  Rect tile(int index) const;
 +  void open(int index);
 +};
 diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
-index 21c82a09db0aece69e36623e91958534d1fd42b9..0640d5ee2215aae946962a1bc81c1b8aababaac5 100644
+index 21c82a09db0aece69e36623e91958534d1fd42b9..1d9f59aa659c39b899beacce55293aacc1e950e0 100644
 --- a/src/activities/network/CrossPointWebServerActivity.cpp
 +++ b/src/activities/network/CrossPointWebServerActivity.cpp
-@@ -496,7 +496,7 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
+@@ -489,6 +489,7 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
+       const auto top = (pageHeight - height) / 2;
+       renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_STARTING_HOTSPOT));
+     }
++    AppNavigation::draw(renderer, appNavigationView());
+     renderer.displayBuffer(screenTransitionRefresh.modeFor(static_cast<uint8_t>(state)));
+   }
+ }
+@@ -496,7 +497,7 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
  void CrossPointWebServerActivity::renderHeader() const {
    const char* title = isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER);
    if (mappedInput.hasTouchHardware()) {
@@ -7763,15 +7850,15 @@ index 21c82a09db0aece69e36623e91958534d1fd42b9..0640d5ee2215aae946962a1bc81c1b8a
    }
 diff --git a/src/components/HomeNavigationIcon.h b/src/components/HomeNavigationIcon.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0466c9bc392fe1e1bd941971694d15ddfc359cb3
+index 0000000000000000000000000000000000000000..555b3423f271548b94799f3a6cad0bb115ed8ef3
 --- /dev/null
 +++ b/src/components/HomeNavigationIcon.h
 @@ -0,0 +1,6 @@
 +#pragma once
-+#include <GfxRenderer.h>
++#include "components/AppNavigation.h"
 +#include "components/icons/listIcons.h"
 +inline void drawHomeNavigationIcon(const GfxRenderer& renderer, int centerX, int centerY) {
-+  renderer.drawIcon(icon_home_32.bits, centerX - 16, centerY - 16, 32);
++  AppNavigation::drawMask(renderer, icon_home_32, centerX - 16, centerY - 16);
 +}
 diff --git a/src/components/TouchHeaderBackButton.cpp b/src/components/TouchHeaderBackButton.cpp
 index 91fb8c92296a4bd7cdf46b1f9994a78fdd41dd06..ad5a2a583c88f101cafe701fc3ab68ddcfccfd6e 100644
@@ -7834,3 +7921,904 @@ index b1faac6901c42e3538d88cec3c39e9e8fc3da6ad..b568e9f96fe3a93d5b18c475d0ec1d9e
 +                 int verticalOffset = TITLE_VERTICAL_OFFSET, bool home = false);
 
  }  // namespace TouchHeaderBackButton
+diff --git a/assets/launcher/LUCIDE-LICENSE b/assets/launcher/LUCIDE-LICENSE
+new file mode 100644
+index 0000000000000000000000000000000000000000..718bb3f0e44153809972abed31839375804bf652
+--- /dev/null
++++ b/assets/launcher/LUCIDE-LICENSE
+@@ -0,0 +1,43 @@
++ISC License
++
++Copyright (c) 2026 Lucide Icons and Contributors
++
++Permission to use, copy, modify, and/or distribute this software for any
++purpose with or without fee is hereby granted, provided that the above
++copyright notice and this permission notice appear in all copies.
++
++THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++---
++
++The following Lucide icons are derived from the Feather project:
++
++airplay, alert-circle, alert-octagon, alert-triangle, aperture, arrow-down-circle, arrow-down-left, arrow-down-right, arrow-down, arrow-left-circle, arrow-left, arrow-right-circle, arrow-right, arrow-up-circle, arrow-up-left, arrow-up-right, arrow-up, at-sign, calendar, cast, check, chevron-down, chevron-left, chevron-right, chevron-up, chevrons-down, chevrons-left, chevrons-right, chevrons-up, circle, clipboard, clock, code, columns, command, compass, corner-down-left, corner-down-right, corner-left-down, corner-left-up, corner-right-down, corner-right-up, corner-up-left, corner-up-right, crosshair, database, divide-circle, divide-square, dollar-sign, download, external-link, feather, frown, hash, headphones, help-circle, info, italic, key, layout, life-buoy, link-2, link, loader, lock, log-in, log-out, maximize, meh, minimize, minimize-2, minus-circle, minus-square, minus, monitor, moon, more-horizontal, more-vertical, move, music, navigation-2, navigation, octagon, pause-circle, percent, plus-circle, plus-square, plus, power, radio, rss, search, server, share, shopping-bag, sidebar, smartphone, smile, square, table-2, tablet, target, terminal, trash-2, trash, triangle, tv, type, upload, x-circle, x-octagon, x-square, x, zoom-in, zoom-out
++
++The MIT License (MIT) (for the icons listed above)
++
++Copyright (c) 2013-present Cole Bemis
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/assets/launcher/README.md b/assets/launcher/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e0a9df3d731ffc33e14d9ba47aac1bb54f0d4a9
+--- /dev/null
++++ b/assets/launcher/README.md
+@@ -0,0 +1,5 @@
++Launcher icons are rendered directly from SVG at 80 and 32 pixels; never enlarged from the small masks.
++
++Library, Browse, Transfer, Settings and Calendar: Lucide, ISC license, revision 8827e55d935a100445f3faf776bb50d5b9a945bb, https://github.com/lucide-icons/lucide.
++Workflowy: a vector reconstruction of the existing Workflowy outline mark used by this firmware (nested bullets).
++Regenerate with `python3 scripts/generate_launcher_icons.py` (Pillow and resvg-py).
+diff --git a/assets/launcher/browse.svg b/assets/launcher/browse.svg
+new file mode 100644
+index 0000000000000000000000000000000000000000..b01f60fcb51848a9b3a7380d4566c4de7534745c
+--- /dev/null
++++ b/assets/launcher/browse.svg
+@@ -0,0 +1,13 @@
++<svg
++  xmlns="http://www.w3.org/2000/svg"
++  width="24"
++  height="24"
++  viewBox="0 0 24 24"
++  fill="none"
++  stroke="currentColor"
++  stroke-width="2"
++  stroke-linecap="round"
++  stroke-linejoin="round"
++>
++  <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
++</svg>
+diff --git a/assets/launcher/calendar.svg b/assets/launcher/calendar.svg
+new file mode 100644
+index 0000000000000000000000000000000000000000..78c5420d4c5020d7db7f223495a88ea21fd2562d
+--- /dev/null
++++ b/assets/launcher/calendar.svg
+@@ -0,0 +1,22 @@
++<svg
++  xmlns="http://www.w3.org/2000/svg"
++  width="24"
++  height="24"
++  viewBox="0 0 24 24"
++  fill="none"
++  stroke="currentColor"
++  stroke-width="2"
++  stroke-linecap="round"
++  stroke-linejoin="round"
++>
++  <path d="M8 2v3" />
++  <path d="M16 2v3" />
++  <rect x="3" y="3" width="18" height="18" rx="2" />
++  <path d="M3 9h18" />
++  <path d="M8 13h.01" />
++  <path d="M12 13h.01" />
++  <path d="M16 13h.01" />
++  <path d="M8 17h.01" />
++  <path d="M12 17h.01" />
++  <path d="M16 17h.01" />
++</svg>
+diff --git a/assets/launcher/library.svg b/assets/launcher/library.svg
+new file mode 100644
+index 0000000000000000000000000000000000000000..5375b947ab375fed3bfaceef892db2b0e566f460
+--- /dev/null
++++ b/assets/launcher/library.svg
+@@ -0,0 +1,15 @@
++<svg
++  xmlns="http://www.w3.org/2000/svg"
++  width="24"
++  height="24"
++  viewBox="0 0 24 24"
++  fill="none"
++  stroke="currentColor"
++  stroke-width="2"
++  stroke-linecap="round"
++  stroke-linejoin="round"
++>
++  <rect width="8" height="18" x="3" y="3" rx="1" />
++  <path d="M7 3v18" />
++  <path d="M20.4 18.9c.2.5-.1 1.1-.6 1.3l-1.9.7c-.5.2-1.1-.1-1.3-.6L11.1 5.1c-.2-.5.1-1.1.6-1.3l1.9-.7c.5-.2 1.1.1 1.3.6Z" />
++</svg>
+diff --git a/assets/launcher/settings.svg b/assets/launcher/settings.svg
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c6263af909841a3911f41a385021778eacba736
+--- /dev/null
++++ b/assets/launcher/settings.svg
+@@ -0,0 +1,14 @@
++<svg
++  xmlns="http://www.w3.org/2000/svg"
++  width="24"
++  height="24"
++  viewBox="0 0 24 24"
++  fill="none"
++  stroke="currentColor"
++  stroke-width="2"
++  stroke-linecap="round"
++  stroke-linejoin="round"
++>
++  <path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" />
++  <circle cx="12" cy="12" r="3" />
++</svg>
+diff --git a/assets/launcher/transfer.svg b/assets/launcher/transfer.svg
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d919e72c62c2140f1100e277bec85391b8431c
+--- /dev/null
++++ b/assets/launcher/transfer.svg
+@@ -0,0 +1,16 @@
++<svg
++  xmlns="http://www.w3.org/2000/svg"
++  width="24"
++  height="24"
++  viewBox="0 0 24 24"
++  fill="none"
++  stroke="currentColor"
++  stroke-width="2"
++  stroke-linecap="round"
++  stroke-linejoin="round"
++>
++  <path d="m3 16 4 4 4-4" />
++  <path d="M7 20V4" />
++  <path d="m21 8-4-4-4 4" />
++  <path d="M17 4v16" />
++</svg>
+diff --git a/assets/launcher/workflowy.svg b/assets/launcher/workflowy.svg
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a9c6f4121d7b032f9f8fa1669f34b515585d197
+--- /dev/null
++++ b/assets/launcher/workflowy.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round"><circle cx="4" cy="5" r="1.3" fill="black" stroke="none"/><path d="M8 5h12"/><circle cx="8" cy="12" r="1.3" fill="black" stroke="none"/><path d="M12 12h8"/><circle cx="4" cy="19" r="1.3" fill="black" stroke="none"/><path d="M8 19h12"/></svg>
+\ No newline at end of file
+diff --git a/scripts/generate_launcher_icons.py b/scripts/generate_launcher_icons.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f6bd61d1e6ec81d887e4cc197f072b29813cd50
+--- /dev/null
++++ b/scripts/generate_launcher_icons.py
+@@ -0,0 +1,27 @@
++"""Render launcher SVGs at native screen sizes. Requires pillow and resvg-py."""
++from pathlib import Path
++import io
++import resvg_py
++from PIL import Image
++
++root = Path(__file__).resolve().parents[1]
++out = ['#pragma once', '#include <Icon.h>', '// Generated from assets/launcher/*.svg; do not edit.']
++for name in ['library', 'workflowy', 'calendar', 'browse', 'transfer', 'settings']:
++    for size in [32, 80]:
++        png = resvg_py.svg_to_bytes(svg_path=str(root / 'assets/launcher' / (name + '.svg')), width=size, height=size)
++        image = Image.open(io.BytesIO(png)).convert('RGBA')
++        white = Image.new('RGBA', image.size, 'white'); white.alpha_composite(image)
++        pixels = white.convert('L').load(); data = []; ys = []
++        for y in range(size):
++            for xb in range(0, size, 8):
++                byte = 255
++                for b in range(8):
++                    if xb + b < size and pixels[xb + b, y] < 150:
++                        byte &= ~(128 >> b); ys.append(y)
++                data.append(byte)
++        ident = f'launcher_{name}_{size}'
++        out.append(f'inline constexpr uint8_t {ident}_bits[] = {{')
++        for i in range(0, len(data), 16): out.append('  ' + ', '.join(f'0x{v:02x}' for v in data[i:i+16]) + ',')
++        out.append('};')
++        out.append(f'inline constexpr freeink::Icon {ident}{{{size}, {size}, {round(sum(ys)/len(ys))}, {ident}_bits}};')
++(root / 'src/components/icons/launcherIcons.h').write_text('\n'.join(out) + '\n')
+diff --git a/src/activities/home/FileBrowserActivity.h b/src/activities/home/FileBrowserActivity.h
+index b9a88567bb71fc9d728bcb7db667baeb1b8b5a7f..8c73ec8d2adda29b710364f1557d305a16588b92 100644
+--- a/src/activities/home/FileBrowserActivity.h
++++ b/src/activities/home/FileBrowserActivity.h
+@@ -113,4 +113,5 @@ class FileBrowserActivity final : public Activity {
+   void onExit() override;
+   void loop() override;
+   void render(RenderLock&&) override;
++  AppNavigation::View appNavigationView() const override { return mode == Mode::Books ? AppNavigation::View::Browse : AppNavigation::View::None; }
+ };
+diff --git a/src/activities/network/CrossPointWebServerActivity.h b/src/activities/network/CrossPointWebServerActivity.h
+index 9bd6211e0ec534fcf1279288f334087c8436031e..98f78cb51330c447452ec7fe4c0b5a74e7817fd1 100644
+--- a/src/activities/network/CrossPointWebServerActivity.h
++++ b/src/activities/network/CrossPointWebServerActivity.h
+@@ -88,6 +88,7 @@ class CrossPointWebServerActivity final : public Activity {
+   void onExit() override;
+   void loop() override;
+   void render(RenderLock&&) override;
++  AppNavigation::View appNavigationView() const override { return returnBookPath.empty() ? AppNavigation::View::Transfer : AppNavigation::View::None; }
+   bool skipLoopDelay() override { return webServer && webServer->isRunning(); }
+   bool preventAutoSleep() override { return webServer && webServer->isRunning(); }
+ };
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 95e56f56c1a3c532f50f95a59346b99b6762dadc..0f80145e091775ffcbbec2dd1ed1aa7e2ee4be9f 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -345,4 +345,5 @@ class SettingsActivity final : public Activity {
+   void onExit() override;
+   void loop() override;
+   void render(RenderLock&&) override;
++  AppNavigation::View appNavigationView() const override { return returnToParentOnClose ? AppNavigation::View::None : AppNavigation::View::Settings; }
+ };
+diff --git a/src/components/AppNavigation.cpp b/src/components/AppNavigation.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f699f6d4d271aa8be64e4633b838c5a7e0a26994
+--- /dev/null
++++ b/src/components/AppNavigation.cpp
+@@ -0,0 +1,57 @@
++#include "AppNavigation.h"
++#include <GfxRenderer.h>
++#include <Memory.h>
++#include "MappedInputManager.h"
++#include "activities/ActivityManager.h"
++#include "components/icons/launcherIcons.h"
++namespace AppNavigation {
++const freeink::Icon& icon(View view, bool large) {
++  static constexpr const freeink::Icon* small[] = {&launcher_library_32, &launcher_workflowy_32, &launcher_calendar_32,
++    &launcher_browse_32, &launcher_transfer_32, &launcher_settings_32};
++  static constexpr const freeink::Icon* big[] = {&launcher_library_80, &launcher_workflowy_80, &launcher_calendar_80,
++    &launcher_browse_80, &launcher_transfer_80, &launcher_settings_80};
++  const auto index = static_cast<unsigned>(view);
++  return *(large ? big : small)[index < Count ? index : 0];
++}
++void drawMask(const GfxRenderer& renderer, const freeink::Icon& bitmap, int x, int y) {
++  // Icon masks are logical rows; legacy drawIcon expects pre-rotated panel bytes.
++  const int stride = (bitmap.w + 7) / 8;
++  for (int row = 0; row < bitmap.h; ++row)
++    for (int col = 0; col < bitmap.w; ++col)
++      if (!(bitmap.bits[row * stride + col / 8] & (0x80 >> (col & 7)))) renderer.drawPixel(x + col, y + row, true);
++}
++void draw(const GfxRenderer& renderer, View view) {
++  if (view == View::None) return;
++  int top, right, bottom, left;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  const int width = renderer.getScreenWidth() - right - left;
++  const int y = renderer.getScreenHeight() - bottom - Height;
++  renderer.fillRect(left, y, width, Height, false);
++  renderer.drawLine(left, y, left + width - 1, y, 1, true);
++  for (int i = 0; i < Count; ++i) {
++    const int center = left + (2 * i + 1) * width / (2 * Count);
++    drawMask(renderer, icon(static_cast<View>(i)), center - 16, y + 9);
++    if (i == static_cast<int>(view)) renderer.fillRect(center - 11, y + Height - 6, 22, 3, true);
++  }
++}
++void open(View view, GfxRenderer& renderer, MappedInputManager& input) {
++  switch (view) {
++    case View::Library: activityManager.goToLibrary(); break;
++    case View::Browse: activityManager.goToFileBrowser(); break;
++    case View::Transfer: activityManager.goToFileTransfer(); break;
++    case View::Settings: activityManager.goToSettings(); break;
++    default: break;
++  }
++}
++bool handleInput(GfxRenderer& renderer, MappedInputManager& input, View current) {
++  if (current == View::None || input.wasSwipe() != MappedInputManager::SwipeDir::None) return false;
++  int x, y, top, right, bottom, left;
++  if (!input.wasScreenTapped(x, y)) return false;
++  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++  const int width = renderer.getScreenWidth() - right - left;
++  if (width <= 0 || x < left || x >= left + width || y < renderer.getScreenHeight() - bottom - Height || y >= renderer.getScreenHeight() - bottom) return false;
++  const auto view = static_cast<View>((x - left) * Count / width);
++  if (view != current) open(view, renderer, input);
++  return true;
++}
++}
+diff --git a/src/components/AppNavigation.h b/src/components/AppNavigation.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9839e1a5b66c090a5e1ea20dfdc203201671a6fc
+--- /dev/null
++++ b/src/components/AppNavigation.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <cstdint>
++class GfxRenderer;
++class MappedInputManager;
++namespace freeink {struct Icon;}
++namespace AppNavigation {
++enum class View : uint8_t {Library, Workflowy, Calendar, Browse, Transfer, Settings, None = 255};
++constexpr int Height = 54;
++constexpr int Count = 6;
++const freeink::Icon& icon(View view, bool large = false);
++void drawMask(const GfxRenderer& renderer, const freeink::Icon& icon, int x, int y);
++void draw(const GfxRenderer& renderer, View view);
++bool handleInput(GfxRenderer& renderer, MappedInputManager& input, View current);
++void open(View view, GfxRenderer& renderer, MappedInputManager& input);
++}
+diff --git a/src/components/icons/launcherIcons.h b/src/components/icons/launcherIcons.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..46e450b8a0f02a7656e14e72c2314b08dc198e7c
+--- /dev/null
++++ b/src/components/icons/launcherIcons.h
+@@ -0,0 +1,387 @@
++#pragma once
++#include <Icon.h>
++// Generated from assets/launcher/*.svg; do not edit.
++inline constexpr uint8_t launcher_library_32_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xbf, 0xff, 0xff, 0xe0, 0x00, 0x07, 0xff,
++  0xe0, 0x00, 0x07, 0xff, 0xe3, 0x18, 0x03, 0xff, 0xe7, 0x18, 0xe3, 0xff, 0xe7, 0x18, 0x63, 0xff,
++  0xe7, 0x18, 0x71, 0xff, 0xe7, 0x18, 0x71, 0xff, 0xe7, 0x18, 0x31, 0xff, 0xe7, 0x18, 0x38, 0xff,
++  0xe7, 0x18, 0x38, 0xff, 0xe7, 0x18, 0x18, 0xff, 0xe7, 0x18, 0x1c, 0x7f, 0xe7, 0x18, 0x1c, 0x7f,
++  0xe7, 0x18, 0x8e, 0x3f, 0xe7, 0x18, 0x8e, 0x3f, 0xe7, 0x18, 0xc6, 0x3f, 0xe7, 0x18, 0xc7, 0x1f,
++  0xe7, 0x18, 0xc7, 0x1f, 0xe7, 0x18, 0xe3, 0x1f, 0xe7, 0x18, 0xe3, 0x8f, 0xe7, 0x18, 0xe3, 0x8f,
++  0xe7, 0x18, 0xf1, 0x8f, 0xe7, 0x18, 0xf1, 0xc7, 0xe3, 0x18, 0xf0, 0x07, 0xe0, 0x00, 0xf8, 0x0f,
++  0xe0, 0x01, 0xfc, 0x3f, 0xff, 0xbf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_library_32{32, 32, 16, launcher_library_32_bits};
++inline constexpr uint8_t launcher_library_80_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x07, 0xe0, 0x7f, 0xff, 0xff, 0xff,
++  0xff, 0x80, 0x00, 0x00, 0x03, 0x00, 0x1f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x0f, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xfe, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff,
++  0xff, 0xff, 0xfe, 0x03, 0xf0, 0x1f, 0x80, 0x00, 0x03, 0xff, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0x0e, 0x03, 0xff, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x7e, 0x03, 0xff, 0xff, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0x01, 0xff, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x7f,
++  0x01, 0xff, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x7f, 0x00, 0xff, 0xff, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0x80, 0x3f, 0x80, 0xff, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x3f, 0x80, 0xff,
++  0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x3f, 0x80, 0x7f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0x1f, 0xc0, 0x7f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x1f, 0xc0, 0x7f, 0xff, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x1f, 0xc0, 0x3f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x0f,
++  0xe0, 0x3f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x0f, 0xe0, 0x3f, 0xff, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0x80, 0x0f, 0xf0, 0x1f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x07, 0xf0, 0x1f,
++  0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x07, 0xf0, 0x0f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0x03, 0xf8, 0x0f, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x03, 0xf8, 0x0f, 0xff, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x03, 0xf8, 0x07, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x01,
++  0xfc, 0x07, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x01, 0xfc, 0x07, 0xff, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0x80, 0x01, 0xfc, 0x03, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x00, 0xfe, 0x03,
++  0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0x80, 0xfe, 0x03, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0x80, 0xff, 0x01, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xc0, 0x7f, 0x01, 0xff, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xc0, 0x7f, 0x01, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xc0,
++  0x7f, 0x80, 0xff, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xe0, 0x3f, 0x80, 0xff, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0x80, 0xe0, 0x3f, 0x80, 0x7f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xe0, 0x1f, 0xc0,
++  0x7f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xf0, 0x1f, 0xc0, 0x7f, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0xf0, 0x1f, 0xc0, 0x3f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xf0, 0x0f, 0xe0, 0x3f, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xf8, 0x0f, 0xe0, 0x3f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xf8,
++  0x0f, 0xe0, 0x1f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xf8, 0x07, 0xf0, 0x1f, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0x80, 0xfc, 0x07, 0xf0, 0x1f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xfc, 0x07, 0xf8,
++  0x0f, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xfe, 0x03, 0xf8, 0x0f, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0xfe, 0x03, 0xf8, 0x07, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xfe, 0x01, 0xfc, 0x07, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0x01, 0xfc, 0x07, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff,
++  0x01, 0xfc, 0x03, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0x00, 0xfe, 0x03, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0x80, 0xff, 0x80, 0xfe, 0x03, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0x80, 0xfe,
++  0x01, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0x80, 0x7f, 0x01, 0xff, 0xfe, 0x07, 0xf0, 0x1f,
++  0x80, 0xff, 0xc0, 0x7f, 0x01, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0xc0, 0x7f, 0x80, 0xff,
++  0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff, 0xe0, 0x3f, 0x00, 0xff, 0xfe, 0x07, 0xf0, 0x1f, 0x80, 0xff,
++  0xe0, 0x38, 0x01, 0xff, 0xfe, 0x03, 0xf0, 0x1f, 0x80, 0xff, 0xe0, 0x00, 0x01, 0xff, 0xfe, 0x00,
++  0x00, 0x00, 0x00, 0xff, 0xf0, 0x00, 0x01, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0xff, 0xf0, 0x00,
++  0x03, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x01, 0xff, 0xf8, 0x00, 0x07, 0xff, 0xff, 0x00, 0x00, 0x00,
++  0x01, 0xff, 0xf8, 0x00, 0x1f, 0xff, 0xff, 0x80, 0x00, 0x00, 0x03, 0xff, 0xfc, 0x00, 0x7f, 0xff,
++  0xff, 0xc0, 0x00, 0x00, 0x07, 0xff, 0xff, 0x03, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_library_80{80, 80, 40, launcher_library_80_bits};
++inline constexpr uint8_t launcher_workflowy_32_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xf1, 0xc0, 0x00, 0x1f, 0xf1, 0x80, 0x00, 0x0f, 0xf1, 0xc0, 0x00, 0x1f,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xcf, 0xff, 0xff, 0xff, 0x8e, 0x00, 0x0f,
++  0xff, 0x8e, 0x00, 0x0f, 0xff, 0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xf1, 0xc0, 0x00, 0x1f, 0xf1, 0x80, 0x00, 0x0f, 0xf1, 0xc0, 0x00, 0x1f, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_workflowy_32{32, 32, 16, launcher_workflowy_32_bits};
++inline constexpr uint8_t launcher_workflowy_80_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0x80,
++  0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff,
++  0xff, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0x80, 0x3f, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x03, 0xff, 0xff, 0x80, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xc0,
++  0x7f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xe1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xfc, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xfe, 0x01,
++  0xf8, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xff, 0xfc, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x03, 0xff,
++  0xff, 0xff, 0xfc, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xff, 0xfe, 0x01, 0xf8, 0x00,
++  0x00, 0x00, 0x07, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xfc, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff,
++  0xff, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe1,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xc0, 0x00, 0x00, 0x00, 0x00,
++  0x0f, 0xff, 0xff, 0x80, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0x80, 0x3f, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff,
++  0xff, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xc0, 0x7f, 0x80, 0x00, 0x00,
++  0x00, 0x00, 0x07, 0xff, 0xff, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf1,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_workflowy_80{80, 80, 40, launcher_workflowy_80_bits};
++inline constexpr uint8_t launcher_calendar_32_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xdf, 0xfb, 0xff, 0xff, 0x8f, 0xf1, 0xff, 0xf0, 0x00, 0x00, 0x0f,
++  0xe0, 0x00, 0x00, 0x07, 0xe3, 0x8f, 0xf1, 0xc7, 0xe7, 0x8f, 0xf1, 0xe7, 0xe7, 0xcf, 0xf3, 0xe7,
++  0xe7, 0xff, 0xff, 0xe7, 0xe7, 0xff, 0xff, 0xe7, 0xe3, 0xff, 0xff, 0xc7, 0xe0, 0x00, 0x00, 0x07,
++  0xe0, 0x00, 0x00, 0x07, 0xe3, 0xff, 0xff, 0xc7, 0xe7, 0xff, 0xff, 0xe7, 0xe7, 0xff, 0xff, 0xe7,
++  0xe7, 0xce, 0x73, 0xe7, 0xe7, 0x8e, 0x71, 0xe7, 0xe7, 0xde, 0x7b, 0xe7, 0xe7, 0xff, 0xff, 0xe7,
++  0xe7, 0xff, 0xff, 0xe7, 0xe7, 0xde, 0x7b, 0xe7, 0xe7, 0x8e, 0x71, 0xe7, 0xe7, 0xce, 0x73, 0xe7,
++  0xe7, 0xff, 0xff, 0xe7, 0xe7, 0xff, 0xff, 0xe7, 0xe3, 0xff, 0xff, 0xc7, 0xe0, 0x00, 0x00, 0x07,
++  0xf0, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_calendar_32{32, 32, 14, launcher_calendar_32_bits};
++inline constexpr uint8_t launcher_calendar_80_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0x8f, 0xff, 0xff, 0xf1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07, 0xff, 0xff, 0xe0, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xff, 0xff, 0xc0, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x03,
++  0xff, 0xff, 0xc0, 0x7f, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0xff,
++  0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x03, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0xff, 0xfe, 0x00, 0xfe, 0x03, 0xff, 0xff, 0xc0, 0x7f, 0x00, 0x7f, 0xfe, 0x03, 0xfe, 0x03,
++  0xff, 0xff, 0xc0, 0x7f, 0xc0, 0x7f, 0xfe, 0x03, 0xfe, 0x03, 0xff, 0xff, 0xc0, 0x7f, 0xc0, 0x7f,
++  0xfe, 0x07, 0xfe, 0x03, 0xff, 0xff, 0xc0, 0x7f, 0xe0, 0x7f, 0xfe, 0x07, 0xfe, 0x03, 0xff, 0xff,
++  0xc0, 0x7f, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x07, 0xff, 0xff, 0xc0, 0xff, 0xe0, 0x7f, 0xfe, 0x07,
++  0xff, 0x8f, 0xff, 0xff, 0xe1, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f,
++  0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x7f, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xfc, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f,
++  0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f,
++  0xfe, 0x07, 0xff, 0x87, 0xfc, 0x3f, 0xe1, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x03, 0xf8, 0x1f,
++  0xc0, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xfe, 0x03, 0xf8, 0x1f, 0xc0, 0x7f, 0xe0, 0x7f, 0xfe, 0x07,
++  0xfe, 0x03, 0xf8, 0x1f, 0xc0, 0x7f, 0xe0, 0x7f, 0xfe, 0x07, 0xfe, 0x03, 0xf8, 0x1f, 0xc0, 0x7f,
++  0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x07, 0xf8, 0x1f, 0xe0, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x8f,
++  0xfe, 0x7f, 0xf1, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f,
++  0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x8f, 0xfe, 0x7f, 0xf1, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x07,
++  0xf8, 0x1f, 0xe0, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xfe, 0x03, 0xf8, 0x1f, 0xc0, 0x7f, 0xe0, 0x7f,
++  0xfe, 0x07, 0xfe, 0x03, 0xf8, 0x1f, 0xc0, 0x7f, 0xe0, 0x7f, 0xfe, 0x07, 0xfe, 0x03, 0xf8, 0x1f,
++  0xc0, 0x7f, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0x03, 0xf8, 0x1f, 0xc0, 0xff, 0xe0, 0x7f, 0xfe, 0x07,
++  0xff, 0x87, 0xfc, 0x3f, 0xe1, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f, 0xfe, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x7f,
++  0xfe, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x7f, 0xff, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xc0, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff,
++  0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_calendar_80{80, 80, 37, launcher_calendar_80_bits};
++inline constexpr uint8_t launcher_browse_32_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x07, 0xff, 0xff,
++  0xc0, 0x03, 0xff, 0xff, 0x87, 0xe1, 0xff, 0xff, 0x8f, 0xf0, 0xff, 0xff, 0x8f, 0xf8, 0x00, 0x1f,
++  0x8f, 0xfc, 0x00, 0x0f, 0x8f, 0xff, 0xff, 0x0f, 0x8f, 0xff, 0xff, 0x8f, 0x8f, 0xff, 0xff, 0x8f,
++  0x8f, 0xc0, 0x00, 0x07, 0x8f, 0x80, 0x00, 0x03, 0x8f, 0x80, 0x00, 0x03, 0x8f, 0x1f, 0xff, 0xf1,
++  0x8f, 0x1f, 0xff, 0xf1, 0x8e, 0x3f, 0xff, 0xf1, 0x8e, 0x3f, 0xff, 0xe3, 0x8e, 0x7f, 0xff, 0xe3,
++  0x8f, 0xff, 0xff, 0xe3, 0x8f, 0xff, 0xff, 0xe7, 0x8f, 0xff, 0xff, 0xc7, 0x8f, 0xff, 0xff, 0xc7,
++  0x8f, 0xff, 0xff, 0xc7, 0x80, 0x00, 0x00, 0x0f, 0xc0, 0x00, 0x00, 0x0f, 0xe0, 0x00, 0x00, 0x1f,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_browse_32{32, 32, 16, launcher_browse_32_bits};
++inline constexpr uint8_t launcher_browse_80_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x7f, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00,
++  0x00, 0x00, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xf0, 0x07, 0xff, 0xe0, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xf8,
++  0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x3f, 0xff, 0xfc, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x3f, 0xff, 0xfc, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x3f, 0xff, 0xfe, 0x00, 0x00,
++  0x00, 0x00, 0xff, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xff, 0xe0, 0x3f,
++  0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x1f, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00,
++  0x0f, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xe0, 0x3f, 0xff, 0xff,
++  0xf0, 0x00, 0x00, 0x00, 0x07, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x07, 0xff,
++  0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xfe, 0x03, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xff, 0xe0, 0x3f,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
++  0x03, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x03, 0xff, 0xe0, 0x3f, 0xff, 0xf0,
++  0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xe0, 0x3f, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
++  0xe0, 0x3f, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xe0, 0x3f, 0xfe, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x3f, 0xe0, 0x3f, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0xe0, 0x3f,
++  0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xe0, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x0f, 0xe0, 0x3f, 0xf8, 0x07, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xe0, 0x3f, 0xf0, 0x0f,
++  0xff, 0xff, 0xff, 0xff, 0xf8, 0x07, 0xe0, 0x3f, 0xf0, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x07,
++  0xe0, 0x3f, 0xe0, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x07, 0xe0, 0x3f, 0xe0, 0x3f, 0xff, 0xff,
++  0xff, 0xff, 0xfc, 0x07, 0xe0, 0x3f, 0xc0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xe0, 0x3f,
++  0xc0, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xe0, 0x3f, 0x80, 0x7f, 0xff, 0xff, 0xff, 0xff,
++  0xf8, 0x0f, 0xe0, 0x3f, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xe0, 0x3f, 0x80, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xe0, 0x3f, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f,
++  0xe0, 0x3f, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xe0, 0x3f, 0xc3, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xf0, 0x1f, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x3f, 0xe0, 0x3f,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x3f, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x3f, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x3f, 0xe0, 0x3f, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f,
++  0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xc0, 0x7f, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0xff, 0xe0, 0x3f,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0xff, 0xe0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0x80, 0xff, 0xf0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xf0, 0x1f, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0x01, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff,
++  0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x03, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xfe, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x1f, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_browse_80{80, 80, 40, launcher_browse_80_bits};
++inline constexpr uint8_t launcher_transfer_32_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0x3f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0x7f, 0xff, 0x1f, 0xf0, 0x3f, 0xff, 0x1f, 0xe0, 0x1f,
++  0xff, 0x1f, 0xc0, 0x0f, 0xff, 0x1f, 0x88, 0x87, 0xff, 0x1f, 0x18, 0xc7, 0xff, 0x1f, 0x38, 0xe7,
++  0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff,
++  0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xf8, 0xff,
++  0xe7, 0x1c, 0xf8, 0xff, 0xe3, 0x18, 0xf8, 0xff, 0xe1, 0x11, 0xf8, 0xff, 0xf0, 0x03, 0xf8, 0xff,
++  0xf8, 0x07, 0xf8, 0xff, 0xfc, 0x0f, 0xf8, 0xff, 0xfe, 0x1f, 0xf8, 0xff, 0xff, 0x1f, 0xfc, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_transfer_32{32, 32, 16, launcher_transfer_32_bits};
++inline constexpr uint8_t launcher_transfer_80_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x7f, 0xff, 0xff, 0xfe, 0x1f, 0xff, 0xff, 0xff, 0xff,
++  0xf0, 0x3f, 0xff, 0xff, 0xfc, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x07,
++  0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf0, 0x03, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f,
++  0xff, 0xff, 0xe0, 0x01, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xc0, 0x00, 0xff, 0xff,
++  0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0x80, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff,
++  0x00, 0x00, 0x3f, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xfe, 0x00, 0x00, 0x1f, 0xff, 0xff, 0xff,
++  0xf0, 0x1f, 0xff, 0xfc, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xf8, 0x00, 0x00,
++  0x07, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xf0, 0x00, 0x00, 0x03, 0xff, 0xff, 0xff, 0xf0, 0x1f,
++  0xff, 0xe0, 0x08, 0x08, 0x01, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xc0, 0x18, 0x0c, 0x00, 0xff,
++  0xff, 0xff, 0xf0, 0x1f, 0xff, 0x80, 0x38, 0x0e, 0x00, 0x7f, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0x00,
++  0x78, 0x0f, 0x00, 0x7f, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0x00, 0xf8, 0x0f, 0x80, 0x7f, 0xff, 0xff,
++  0xf0, 0x1f, 0xff, 0x01, 0xf8, 0x0f, 0xc0, 0x7f, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0x03, 0xf8, 0x0f,
++  0xe0, 0x7f, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0x87, 0xf8, 0x0f, 0xf0, 0xff, 0xff, 0xff, 0xf0, 0x1f,
++  0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff,
++  0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff,
++  0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff,
++  0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f,
++  0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f,
++  0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff,
++  0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff,
++  0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff,
++  0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f,
++  0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f,
++  0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff,
++  0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xff, 0xff,
++  0xf8, 0x0f, 0xff, 0xff, 0xff, 0x0f, 0xf0, 0x1f, 0xe1, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xfe, 0x07,
++  0xf0, 0x1f, 0xc0, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xfe, 0x03, 0xf0, 0x1f, 0x80, 0xff, 0xf8, 0x0f,
++  0xff, 0xff, 0xfe, 0x01, 0xf0, 0x1f, 0x00, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xfe, 0x00, 0xf0, 0x1e,
++  0x00, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xfe, 0x00, 0x70, 0x1c, 0x01, 0xff, 0xf8, 0x0f, 0xff, 0xff,
++  0xff, 0x00, 0x30, 0x18, 0x03, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0x80, 0x10, 0x10, 0x07, 0xff,
++  0xf8, 0x0f, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x0f, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xe0,
++  0x00, 0x00, 0x1f, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x3f, 0xff, 0xf8, 0x0f,
++  0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x7f, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00,
++  0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x01, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff,
++  0xff, 0xff, 0x00, 0x03, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x80, 0x07, 0xff, 0xff,
++  0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x0f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff,
++  0xe0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x3f, 0xff, 0xff, 0xfc, 0x1f,
++  0xff, 0xff, 0xff, 0xff, 0xf8, 0x7f, 0xff, 0xff, 0xfe, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_transfer_80{80, 80, 39, launcher_transfer_80_bits};
++inline constexpr uint8_t launcher_settings_32_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x3f, 0xff, 0xff, 0xf8, 0x1f, 0xff, 0xff, 0xf0, 0x0f, 0xff,
++  0xff, 0xf1, 0x8f, 0xff, 0xff, 0xe3, 0xc7, 0xff, 0xfc, 0xe3, 0xc7, 0x3f, 0xf0, 0x03, 0xc0, 0x0f,
++  0xe0, 0x07, 0xe0, 0x07, 0xe3, 0x1f, 0xf8, 0xc7, 0xe3, 0xff, 0xff, 0xc7, 0xe3, 0xf8, 0x1f, 0xc7,
++  0xe3, 0xf0, 0x0f, 0xc7, 0xf1, 0xe0, 0x07, 0x8f, 0xf8, 0xe3, 0xc7, 0x1f, 0xf8, 0xe3, 0xc7, 0x1f,
++  0xf8, 0xe3, 0xc7, 0x1f, 0xf8, 0xe3, 0xc7, 0x1f, 0xe1, 0xe0, 0x07, 0x8f, 0xe3, 0xf0, 0x0f, 0xc7,
++  0xe3, 0xf8, 0x1f, 0xc7, 0xe3, 0xff, 0xff, 0xc7, 0xe3, 0x1f, 0xf8, 0xc7, 0xe0, 0x07, 0xe0, 0x07,
++  0xf0, 0x03, 0xc0, 0x0f, 0xfc, 0xe3, 0xc7, 0x3f, 0xff, 0xe3, 0xc7, 0xff, 0xff, 0xf1, 0x8f, 0xff,
++  0xff, 0xf0, 0x0f, 0xff, 0xff, 0xf8, 0x1f, 0xff, 0xff, 0xfc, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_settings_32{32, 32, 16, launcher_settings_32_bits};
++inline constexpr uint8_t launcher_settings_80_bits[] = {
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xfe, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x07, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00,
++  0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x03, 0xc0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xf8, 0x07, 0xe0, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xf0, 0x1f, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xf0, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0,
++  0x0f, 0xf0, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x1f, 0xf8, 0x0f, 0xff, 0xff, 0xff,
++  0xff, 0xfe, 0x07, 0xe0, 0x1f, 0xf8, 0x07, 0xe0, 0x7f, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x1f, 0xf8,
++  0x00, 0x00, 0x1f, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x3f, 0xfc, 0x00, 0x00, 0x07, 0xff, 0xff, 0xc0,
++  0x00, 0x00, 0x3f, 0xfc, 0x00, 0x00, 0x03, 0xff, 0xff, 0x80, 0x00, 0x00, 0x7f, 0xfe, 0x00, 0x00,
++  0x01, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x03,
++  0xff, 0xff, 0x80, 0x00, 0x00, 0xff, 0xff, 0x00, 0xf0, 0x0f, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0xff,
++  0xfe, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03,
++  0xff, 0xff, 0xe0, 0x07, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0x80, 0x01, 0xff, 0xff,
++  0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x01, 0xff, 0xfe,
++  0x00, 0x00, 0x7f, 0xff, 0x80, 0x7f, 0xff, 0x00, 0xff, 0xfc, 0x00, 0x00, 0x3f, 0xff, 0x00, 0xff,
++  0xff, 0x00, 0x7f, 0xf8, 0x00, 0x00, 0x1f, 0xfe, 0x00, 0xff, 0xff, 0x80, 0x3f, 0xf0, 0x00, 0x00,
++  0x0f, 0xfc, 0x01, 0xff, 0xff, 0xc0, 0x1f, 0xf0, 0x07, 0xe0, 0x0f, 0xf8, 0x03, 0xff, 0xff, 0xe0,
++  0x1f, 0xe0, 0x1f, 0xf8, 0x07, 0xf8, 0x07, 0xff, 0xff, 0xf0, 0x0f, 0xe0, 0x1f, 0xf8, 0x07, 0xf0,
++  0x0f, 0xff, 0xff, 0xf0, 0x0f, 0xe0, 0x3f, 0xfc, 0x07, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xe0,
++  0x3f, 0xfc, 0x07, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xe0, 0x3f, 0xfc, 0x07, 0xf0, 0x1f, 0xff,
++  0xff, 0xf8, 0x0f, 0xe0, 0x3f, 0xfc, 0x07, 0xf0, 0x1f, 0xff, 0xff, 0xf8, 0x0f, 0xe0, 0x3f, 0xfc,
++  0x07, 0xf0, 0x1f, 0xff, 0xff, 0xf0, 0x0f, 0xe0, 0x3f, 0xfc, 0x07, 0xf0, 0x0f, 0xff, 0xff, 0xf0,
++  0x0f, 0xe0, 0x1f, 0xf8, 0x07, 0xf0, 0x0f, 0xff, 0xff, 0xe0, 0x1f, 0xe0, 0x1f, 0xf8, 0x07, 0xf8,
++  0x07, 0xff, 0xff, 0xc0, 0x1f, 0xf0, 0x07, 0xe0, 0x0f, 0xf8, 0x03, 0xff, 0xff, 0x80, 0x3f, 0xf0,
++  0x00, 0x00, 0x0f, 0xfc, 0x01, 0xff, 0xff, 0x00, 0x7f, 0xf8, 0x00, 0x00, 0x1f, 0xfe, 0x00, 0xff,
++  0xff, 0x00, 0xff, 0xfc, 0x00, 0x00, 0x3f, 0xff, 0x00, 0xff, 0xfe, 0x01, 0xff, 0xfe, 0x00, 0x00,
++  0x7f, 0xff, 0x80, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03,
++  0xff, 0xff, 0x80, 0x01, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xe0, 0x07, 0xff, 0xff,
++  0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x03, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xc0, 0x7f, 0xfe, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x7f,
++  0xff, 0x00, 0xf0, 0x0f, 0xff, 0xff, 0xf0, 0x0f, 0x00, 0xff, 0xff, 0x00, 0x00, 0x01, 0xff, 0xff,
++  0x80, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0x80,
++  0x00, 0x00, 0x7f, 0xfe, 0x00, 0x00, 0x01, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x3f, 0xfc, 0x00, 0x00,
++  0x03, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x3f, 0xfc, 0x00, 0x00, 0x07, 0xff, 0xff, 0xf8, 0x00, 0x00,
++  0x1f, 0xf8, 0x00, 0x00, 0x1f, 0xff, 0xff, 0xfe, 0x07, 0xe0, 0x1f, 0xf8, 0x07, 0xe0, 0x7f, 0xff,
++  0xff, 0xff, 0xff, 0xf0, 0x1f, 0xf8, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x0f, 0xf0,
++  0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x0f, 0xf0, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xf8, 0x0f, 0xf0, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x07, 0xe0, 0x1f, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x03, 0xc0, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc,
++  0x00, 0x00, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xe0, 0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x7f, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++};
++inline constexpr freeink::Icon launcher_settings_80{80, 80, 40, launcher_settings_80_bits};
+diff --git a/test/app_launcher/CMakeLists.txt b/test/app_launcher/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d6859e9e3e090a95d1c2dd8641bef9f5d6ed175
+--- /dev/null
++++ b/test/app_launcher/CMakeLists.txt
+@@ -0,0 +1,4 @@
++add_executable(app_launcher_test LauncherTest.cpp ${REPO_ROOT}/src/activities/home/AppLauncherActivity.cpp ${REPO_ROOT}/src/components/AppNavigation.cpp)
++target_include_directories(app_launcher_test PRIVATE stubs ${REPO_ROOT}/src ${REPO_ROOT}/freeink-sdk/libs/assets/Icons/include)
++target_compile_options(app_launcher_test PRIVATE -UNDEBUG)
++add_test(NAME app_launcher COMMAND app_launcher_test)
+diff --git a/test/app_launcher/LauncherTest.cpp b/test/app_launcher/LauncherTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..33288a71d7ae08451c7d3bff5eb67e1becef2cd5
+--- /dev/null
++++ b/test/app_launcher/LauncherTest.cpp
+@@ -0,0 +1,21 @@
++#include "Harness.h"
++#include "activities/home/AppLauncherActivity.h"
++#include "components/CrASHinkLogo.h"
++void dump(const GfxRenderer& r,const char* path){std::ofstream f(path,std::ios::binary);f<<"P5\n"<<r.getScreenWidth()<<" "<<r.getScreenHeight()<<"\n255\n";f.write((const char*)r.pixels.data(),r.getScreenWidth()*r.getScreenHeight());}
++int main(){
++ GfxRenderer renderer;MappedInputManager input;
++ // A carried-over exit release must never select Calendar on the invisible Home.
++ input.tap=true;input.x=100;input.y=600;
++ AppLauncherActivity home(renderer,input);home.onEnter();assert(redraws==1&&renderer.orientation==GfxRenderer::Portrait);
++ home.loop();assert(activityManager.opened.empty());home.render(RenderLock{});assert(renderer.paints==1);
++ input.tap=true;home.loop();assert(activityManager.opened.empty());input.clear();
++ dump(renderer,"/tmp/crashink-launcher-native.pgm");std::ofstream labels("/tmp/crashink-launcher-labels.tsv");for(auto& l:renderer.labels)labels<<l.x<<"\t"<<l.y<<"\t"<<l.text<<"\n";labels.close();
++ // Right advances, Left reverses, Home selects the visible tile once.
++ input.release=int(MappedInputManager::Button::Right);home.loop();input.clear();input.home=true;home.loop();assert(activityManager.opened.back()==AppNavigation::View::Workflowy);
++ auto n=activityManager.opened.size();input.home=true;home.loop();assert(activityManager.opened.size()==n);
++ AppLauncherActivity next(renderer,input);input.clear();next.onEnter();next.render(RenderLock{});input.release=int(MappedInputManager::Button::Left);next.loop();input.clear();input.home=true;next.loop();assert(activityManager.opened.back()==AppNavigation::View::Settings);
++ // Bottom-right gear is fresh-touch activated; a swipe over it does not open it.
++ AppLauncherActivity touch(renderer,input);input.clear();touch.onEnter();touch.render(RenderLock{});input.x=360;input.y=650;input.down=true;touch.loop();input.clear();input.x=360;input.y=650;input.swipe=MappedInputManager::SwipeDir::Left;touch.loop();input.swipe=MappedInputManager::SwipeDir::None;input.tap=true;n=activityManager.opened.size();touch.loop();assert(activityManager.opened.size()==n);input.clear();input.x=360;input.y=650;input.down=true;touch.loop();input.down=false;input.tap=true;touch.loop();assert(activityManager.opened.back()==AppNavigation::View::Settings);
++ for(int view=0;view<6;++view){renderer.clearScreen();AppNavigation::draw(renderer,static_cast<AppNavigation::View>(view));input.clear();input.x=40;input.y=780;assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view))==false);input.tap=true;assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view)));}
++ renderer.clearScreen();drawCrASHinkLogo(renderer,180,300);dump(renderer,"/tmp/crashink-smile-native.pgm");
++}
+diff --git a/test/app_launcher/stubs/GfxRenderer.h b/test/app_launcher/stubs/GfxRenderer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/GfxRenderer.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/Harness.h b/test/app_launcher/stubs/Harness.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..019470f4f565668770e96ad0d97258e0b813c6bb
+--- /dev/null
++++ b/test/app_launcher/stubs/Harness.h
+@@ -0,0 +1,66 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cassert>
++#include <cstdint>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <vector>
++#include "components/AppNavigation.h"
++struct Rect {int x,y,width,height;explicit Rect(int x,int y,int w,int h):x(x),y(y),width(w),height(h){}};
++namespace HalDisplay {constexpr int FAST_REFRESH=0;}
++namespace EpdFontFamily {constexpr int BOLD=1,REGULAR=0;}
++constexpr int UI_12_FONT_ID=0;
++struct RenderLock {};
++struct GfxRenderer {
++ enum Orientation {Portrait,LandscapeClockwise};Orientation orientation=LandscapeClockwise;
++ mutable std::vector<uint8_t> pixels=std::vector<uint8_t>(480*800,255);
++ struct Label {int x,y;std::string text;};mutable std::vector<Label> labels;
++ int paints=0;
++ void setOrientation(Orientation o){orientation=o;}
++ int getScreenWidth()const{return orientation==Portrait?480:800;}int getScreenHeight()const{return orientation==Portrait?800:480;}
++ void getOrientedViewableTRBL(int* t,int* r,int* b,int* l)const{*t=*r=*b=*l=0;}
++ void clearScreen(){std::fill(pixels.begin(),pixels.end(),255);labels.clear();}
++ void drawPixel(int x,int y,bool black)const{if(x>=0&&x<getScreenWidth()&&y>=0&&y<getScreenHeight())pixels[y*getScreenWidth()+x]=black?0:255;}
++ void fillRect(int x,int y,int w,int h,bool black=true)const{for(int j=0;j<h;++j)for(int i=0;i<w;++i)drawPixel(x+i,y+j,black);}
++ void drawLine(int x,int y,int a,int b,int width=1,bool black=true)const {int n=std::max(std::abs(a-x),std::abs(b-y));for(int i=0;i<=n;++i)fillRect(x+(a-x)*i/std::max(1,n),y+(b-y)*i/std::max(1,n),width,width,black);}
++ void drawRoundedRect(int x,int y,int w,int h,int stroke,int radius,bool black)const {
++  for(int j=0;j<h;++j)for(int i=0;i<w;++i){int dx=std::max({radius-i,0,i-(w-1-radius)}),dy=std::max({radius-j,0,j-(h-1-radius)});if(dx*dx+dy*dy>radius*radius)continue;int ix=i-stroke,iy=j-stroke,iw=w-2*stroke,ih=h-2*stroke,rr=std::max(0,radius-stroke);int ax=std::max({rr-ix,0,ix-(iw-1-rr)}),ay=std::max({rr-iy,0,iy-(ih-1-rr)});if(ix<0||iy<0||ix>=iw||iy>=ih||ax*ax+ay*ay>rr*rr)drawPixel(x+i,y+j,black);}
++ }
++ int getTextWidth(int,const char* text)const{return std::string(text).size()*12;}
++ std::string truncatedText(int,const char* text,int)const{return text;}
++ void drawText(int,int x,int y,const char* text,bool=true,int=0)const{labels.push_back({x,y,text});}
++ void displayBuffer(int){++paints;}
++};
++struct MappedInputManager {
++ enum class Button {Left,Right,Up,Down,Confirm};enum class SwipeDir {None,Left,Right};
++ int release=-1,x=0,y=0;bool down=false,held=false,tap=false,home=false;SwipeDir swipe=SwipeDir::None;
++ bool wasReleased(Button b)const{return release==int(b);}bool wasHomeGesture(){bool h=home;home=false;return h;}
++ bool wasScreenTouchDown(int& a,int& b)const{a=x;b=y;return down;}bool isScreenTouchHeld(int& a,int& b)const{a=x;b=y;return held;}
++ bool wasScreenTapped(int& a,int& b)const{a=x;b=y;return tap;}SwipeDir wasSwipe()const{return swipe;}
++ void suppressCurrentTouchContact(){down=held=tap=false;}void suppressNextBackRelease(){}void clearDeferredHomeGesture(){home=false;}
++ void clear(){release=-1;down=held=tap=home=false;swipe=SwipeDir::None;}
++};
++inline int redraws=0;
++struct Activity {
++ GfxRenderer& renderer;MappedInputManager& mappedInput;
++ Activity(const char*,GfxRenderer& r,MappedInputManager& i):renderer(r),mappedInput(i){}virtual ~Activity()=default;
++ virtual bool isHomeActivity()const{return false;}virtual void onEnter(){}virtual void loop(){}virtual void render(RenderLock&&){}
++ void requestUpdate(){++redraws;}
++};
++struct FakeWorkflowy:Activity {bool calendar;FakeWorkflowy(GfxRenderer& r,MappedInputManager& i,bool c=false):Activity("WF",r,i),calendar(c){}};
++using WorkflowyDailyActivity=FakeWorkflowy;
++struct Manager {
++ std::vector<AppNavigation::View> opened;std::unique_ptr<Activity> pending;
++ void goToLibrary(){opened.push_back(AppNavigation::View::Library);}void goToFileBrowser(){opened.push_back(AppNavigation::View::Browse);}void goToFileTransfer(){opened.push_back(AppNavigation::View::Transfer);}void goToSettings(){opened.push_back(AppNavigation::View::Settings);}
++ void replaceActivity(std::unique_ptr<WorkflowyDailyActivity> p){opened.push_back(p->calendar?AppNavigation::View::Calendar:AppNavigation::View::Workflowy);pending=std::move(p);}
++};inline Manager activityManager;
++template<class T,class... Args>std::unique_ptr<T> makeUniqueNoThrow(Args&&... args){return std::make_unique<T>(std::forward<Args>(args)...);}
++#define LOG_ERR(...) ((void)0)
++namespace UITheme {inline int getStatusBarHeight(){return 24;}}
++struct Gui {void drawDisplayStatusBar(GfxRenderer&,int){}};inline Gui GUI;
++enum StrId {STR_LIBRARY,STR_WORKFLOWY,STR_WORKFLOWY_CALENDAR_VIEW,STR_BROWSE,STR_FILE_TRANSFER,STR_SETTINGS_SHORT};
++inline const char* tr(StrId id){constexpr const char* words[]={"Library","Workflowy","Calendar","Browse","File Transfer","Settings"};return words[id];}
+diff --git a/test/app_launcher/stubs/I18n.h b/test/app_launcher/stubs/I18n.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/I18n.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/MappedInputManager.h b/test/app_launcher/stubs/MappedInputManager.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/MappedInputManager.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/Memory.h b/test/app_launcher/stubs/Memory.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/Memory.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/activities/Activity.h b/test/app_launcher/stubs/activities/Activity.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/activities/Activity.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/activities/ActivityManager.h b/test/app_launcher/stubs/activities/ActivityManager.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/activities/ActivityManager.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/activities/workflowy/WorkflowyDailyActivity.h b/test/app_launcher/stubs/activities/workflowy/WorkflowyDailyActivity.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/activities/workflowy/WorkflowyDailyActivity.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/components/UITheme.h b/test/app_launcher/stubs/components/UITheme.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/components/UITheme.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"
+diff --git a/test/app_launcher/stubs/fontIds.h b/test/app_launcher/stubs/fontIds.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+--- /dev/null
++++ b/test/app_launcher/stubs/fontIds.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include "Harness.h"

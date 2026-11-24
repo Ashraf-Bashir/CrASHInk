@@ -286,70 +286,6 @@ index c8632d51a6c0eea1826a12e30bcdc227c0437854..8d9cfcd5f30a4e9e7254e437587e06c9
                   OptionSelectionResult, PageResult, NetworkModeResult, FootnoteResult, BookmarkResult,
                   FileBrowserActionResult, FilePathResult, WordResult, ReadingStatsResult, ClippingResult,
                   TtfRenderOptionsResult, DictionaryClippingRequest, ClippingJumpResult, HighlightPageAction, FrontlightPanelResult>;
-diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index 480832df63a053d8d26498697ac12a1ef261e2ce..bea317f59ee3f962a6a2a545d7bd072b4292f674 100644
---- a/src/activities/library/LibraryActivity.cpp
-+++ b/src/activities/library/LibraryActivity.cpp
-@@ -25,6 +25,10 @@
- #include "CrossPointState.h"
- #include "GlobalActions.h"
- #include "activities/ActivityManager.h"
-+#ifndef SIMULATOR
-+#include "activities/workflowy/WorkflowyDailyActivity.h"
-+#include "workflowy/WorkflowyIcon.h"
-+#endif
- #include "activities/home/BookActions.h"
- #include "activities/home/FileBrowserActionActivity.h"
- #include "activities/home/RecentBookProgress.h"
-@@ -61,7 +65,12 @@ constexpr int HEADER_CONTROL_SIZE = 44;
- constexpr int HEADER_CONTROL_GAP = 10;
- constexpr int NAV_HEIGHT = 48;
- constexpr int NAV_FIRST = 10;
--constexpr int NAV_COUNT = 4;
-+constexpr int NAV_COUNT =
-+#ifdef SIMULATOR
-+    4;
-+#else
-+    6;
-+#endif
- constexpr int BATCH_CANCEL_CONTROL = NAV_FIRST + NAV_COUNT;
- constexpr int BATCH_APPLY_CONTROL = BATCH_CANCEL_CONTROL + 1;
- int gridColumns() { return CoverGridLayout::Columns; }
-@@ -784,6 +793,12 @@ void LibraryActivity::activateControl(const int control) {
-   if (control == NAV_FIRST + 1) activityManager.goToFileTransfer();
-   if (control == NAV_FIRST + 2) activityManager.goToFileBrowser();
-   if (control == NAV_FIRST + 3) activityManager.goToSettings();
-+#ifndef SIMULATOR
-+  if (control == NAV_FIRST + 4)
-+    activityManager.replaceActivity(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput, true));
-+  if (control == NAV_FIRST + 5)
-+    activityManager.replaceActivity(std::make_unique<WorkflowyDailyActivity>(renderer, mappedInput));
-+#endif
- }
-
- void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-@@ -1080,7 +1095,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
-     } else if (!mappedInput.hasTouchHardware()) {
-       static constexpr StrId choices[] = {StrId::STR_LIBRARY, StrId::STR_FILE_TRANSFER, StrId::STR_BROWSE,
-                                           StrId::STR_SETTINGS_SHORT};
--      actionPopup.show(StrId::STR_LIBRARY, choices, NAV_COUNT, 0,
-+      actionPopup.show(StrId::STR_LIBRARY, choices, std::size(choices), 0,
-                        [this](int selected) { activateControl(NAV_FIRST + selected); });
-       requestUpdate();
-     }
-@@ -1307,7 +1322,11 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
-                                                 static_cast<int16_t>(bounds[3])});
-   if (touch && !selectingBooks) {
-     static constexpr const freeink::Icon* icons[] = {&icon_home_32, &icon_lyra_transfer_32,
--                                                   &icon_folder_32, &icon_cog_32};
-+                                                   &icon_folder_32, &icon_cog_32,
-+#ifndef SIMULATOR
-+                                                   &workflowyCalendarIcon, &workflowyIcon,
-+#endif
-+    };
-     const int width = renderer.getScreenWidth() - bounds[1] - bounds[3];
-     const int y = renderer.getScreenHeight() - bounds[2] - NAV_HEIGHT;
-     const auto ink = fui::Paint::solid(fui::Color::Black);
 diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
 index 3152388a62c72f430b7961f25aa7f8cc8f5abaa9..2a4d7ade7aa93e12683105c9904d8f2622a9fd25 100644
 --- a/src/activities/reader/EpubReaderClippingListActivity.cpp
@@ -1779,10 +1715,10 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c018787d61
+index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f042ba4750
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5277 @@
+@@ -0,0 +1,5284 @@
 +#include "components/HomeNavigationIcon.h"
 +#include "WorkflowyDailyActivity.h"
 +
@@ -1810,6 +1746,7 @@ index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c0
 +#include <ctime>
 +
 +#include "MappedInputManager.h"
++#include "SdCardFontSystem.h"
 +#include "StatusIconRow.h"
 +#include "components/HeaderDate.h"
 +#include "WifiCredentialStore.h"
@@ -2529,6 +2466,11 @@ index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c0
 +
 +void WorkflowyDailyActivity::onEnter() {
 +  Activity::onEnter();
++  {
++    RenderLock lock;
++    // Library/reader fonts are unused here; release them before TLS allocates.
++    sdFontSystem.releaseForNetwork(renderer);
++  }
 +  onUserInput();
 +  clearSessionCache();
 +  credential = workflowy::readSetting(workflowy::KEY_FILE, workflowy::KEY_MAX);
@@ -4336,7 +4278,7 @@ index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c0
 +  int top, right, bottom, left;
 +  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
 +  const int rowTop = top + CONTENT_TOP + (!zoomId.empty() && !selecting ? 30 : 0);
-+  const int footer = renderer.getScreenHeight() - bottom - 52;
++  const int footer = renderer.getScreenHeight() - bottom - 52 - AppNavigation::Height;
 +  const int pageLabel = std::max(32, renderer.getLineHeight(SMALL_FONT_ID) + 3);
 +  return {left + 8, top, renderer.getScreenWidth() - right - left - 16, rowTop, footer,
 +          footer - pageLabel, std::max(1, renderer.getLineHeight(wrapItems ? UI_12_FONT_ID : UI_10_FONT_ID))};
@@ -5597,6 +5539,7 @@ index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c0
 +}
 +
 +void WorkflowyDailyActivity::drawStatus(const Layout&, const size_t pending, const char* notice) {
++  AppNavigation::draw(renderer, appNavigationView());
 +  const bool error = isErrorNotice(message) || (!pending && !operationErrors.empty());
 +  if (!pending && !notice) return;
 +  char count[52];
@@ -7062,10 +7005,10 @@ index 0000000000000000000000000000000000000000..7df3b556b481920af8e98e524966c9c0
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..082a9843283df4024034481b432cfc8bd9bb46e7
+index 0000000000000000000000000000000000000000..f23acf6be1a16ed208cb801b31b07fdf2488e34a
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,353 @@
 +#pragma once
 +
 +#include <atomic>
@@ -7100,6 +7043,7 @@ index 0000000000000000000000000000000000000000..082a9843283df4024034481b432cfc8b
 +  void loop() override;
 +  void serviceBackgroundWork() override;
 +  void render(RenderLock&&) override;
++  AppNavigation::View appNavigationView() const override { return calendarVisible ? AppNavigation::View::Calendar : AppNavigation::View::Workflowy; }
 +  bool allowGlobalHomeSwipeGesture() const override { return false; }
 +  bool preventAutoSleep() override;
 +
@@ -8283,11 +8227,11 @@ index 0000000000000000000000000000000000000000..2cbebac96602cba8ee3aef9c6b37e74a
 +
 +}  // namespace workflowy
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
-index 13e5b9bc1c449d12a6a9b15aaf4f887e2cd97de5..782f40804ceb2dda60c60e210cf3c100b8c6a033 100644
+index 7c52c4215646c88e48911f5ecf8ff6152ab09345..214e10b187ead68b3abd3dd57f0e07b0313562f0 100644
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -130,3 +130,11 @@ add_subdirectory(image_refresh_regions)
- add_subdirectory(library_thumbnails)
+@@ -131,3 +131,11 @@ add_subdirectory(library_thumbnails)
+ add_subdirectory(app_launcher)
 
  add_subdirectory(end_of_book_dismiss)
 +
@@ -8670,13 +8614,15 @@ index 0000000000000000000000000000000000000000..21e6e830d87caa108b5a7288b1b2ebf9
 +add_test(NAME workflowy_ui COMMAND workflowy_ui_test)
 diff --git a/test/workflowy_ui/ExtractStatus.py b/test/workflowy_ui/ExtractStatus.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b66fa5bf1e405ee66e904165a9ca82813e18677b
+index 0000000000000000000000000000000000000000..bed4ade73d27017365e3492cb0740948bfadc67c
 --- /dev/null
 +++ b/test/workflowy_ui/ExtractStatus.py
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,28 @@
 +from pathlib import Path
 +import sys
 +source = Path(sys.argv[1]).read_text()
++# The shared ribbon is covered by app_launcher; isolate status text here.
++source = source.replace('  AppNavigation::draw(renderer, appNavigationView());\n', '')
 +start = source.index('void WorkflowyDailyActivity::drawStatus(')
 +end = source.index('void WorkflowyDailyActivity::render(', start)
 +error_start = source.index('bool isErrorNotice(')
@@ -8913,58 +8859,6 @@ index cd12ef5a1845e02ec9644f71f82f67d7a51b5bbd..e78665f5724005aa8aef5488ceb39f91
    // Set when an overlay is closed specifically to hand control back to the
    // reader's menu. It must wait until the reader is current again.
    int16_t pendingReaderMenuAction = -1;
-diff --git a/src/activities/home/AppLauncherActivity.cpp b/src/activities/home/AppLauncherActivity.cpp
-index 1e962ec7f6b416df463826e8d2b6eb13ff0b0ac2..42b8bdcc9b698813314f4f8f52bb50acbfc76915 100644
---- a/src/activities/home/AppLauncherActivity.cpp
-+++ b/src/activities/home/AppLauncherActivity.cpp
-@@ -5,9 +5,17 @@
- #include "components/UITheme.h"
- #include "components/icons/listIcons.h"
- #include "fontIds.h"
-+#ifndef SIMULATOR
-+#include "activities/workflowy/WorkflowyDailyActivity.h"
-+#include "workflowy/WorkflowyIcon.h"
-+#endif
-
- namespace {
-+#ifdef SIMULATOR
- constexpr int AppCount = 4;
-+#else
-+constexpr int AppCount = 6;
-+#endif
- }
- Rect AppLauncherActivity::tile(int index) const {
-   int top, right, bottom, left;
-@@ -26,7 +34,13 @@ void AppLauncherActivity::open(int index) {
-   if (index == 1) activityManager.goToFileTransfer();
-   if (index == 2) activityManager.goToFileBrowser();
-   if (index == 3) activityManager.goToSettings();
--
-+#ifndef SIMULATOR
-+  if (index >= 4) {
-+    auto app = makeUniqueNoThrow<WorkflowyDailyActivity>(renderer, mappedInput, index == 4);
-+    if (!app) { LOG_ERR("HOME", "Cannot allocate Workflowy"); return; }
-+    startActivityForResult(std::move(app), {});
-+  }
-+#endif
- }
- void AppLauncherActivity::loop() {
-   using Button = MappedInputManager::Button;
-@@ -48,8 +62,14 @@ void AppLauncherActivity::render(RenderLock&&) {
-   GUI.drawDisplayStatusBar(renderer, top);
-   renderer.drawCenteredText(UI_12_FONT_ID, top + 43, "crASHink", true, EpdFontFamily::BOLD);
-   static const freeink::Icon* icons[] = {&icon_landmark_32, &icon_lyra_transfer_32, &icon_folder_32, &icon_cog_32,
-+#ifndef SIMULATOR
-+    &workflowyCalendarIcon, &workflowyIcon,
-+#endif
-   };
-   const char* labels[] = {tr(STR_LIBRARY), tr(STR_FILE_TRANSFER), tr(STR_BROWSE), tr(STR_SETTINGS_SHORT),
-+#ifndef SIMULATOR
-+    tr(STR_WORKFLOWY_CALENDAR_VIEW), tr(STR_WORKFLOWY),
-+#endif
-   };
-   for (int i = 0; i < AppCount; ++i) {
-     const auto r = tile(i);
 diff --git a/src/workflowy/WorkflowyBookGroup.h b/src/workflowy/WorkflowyBookGroup.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..15cb2453a521305bac06db1eae8f2ee649b75538
@@ -9340,3 +9234,32 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 @@ -0,0 +1,2 @@
 +#pragma once
 +#include "Harness.h"
+diff --git a/src/components/AppNavigation.cpp b/src/components/AppNavigation.cpp
+index f699f6d4d271aa8be64e4633b838c5a7e0a26994..833cf751ed623639cd3e218c970f445b570e5e7d 100644
+--- a/src/components/AppNavigation.cpp
++++ b/src/components/AppNavigation.cpp
+@@ -4,6 +4,9 @@
+ #include "MappedInputManager.h"
+ #include "activities/ActivityManager.h"
+ #include "components/icons/launcherIcons.h"
++#ifndef SIMULATOR
++#include "activities/workflowy/WorkflowyDailyActivity.h"
++#endif
+ namespace AppNavigation {
+ const freeink::Icon& icon(View view, bool large) {
+   static constexpr const freeink::Icon* small[] = {&launcher_library_32, &launcher_workflowy_32, &launcher_calendar_32,
+@@ -40,6 +43,14 @@ void open(View view, GfxRenderer& renderer, MappedInputManager& input) {
+     case View::Browse: activityManager.goToFileBrowser(); break;
+     case View::Transfer: activityManager.goToFileTransfer(); break;
+     case View::Settings: activityManager.goToSettings(); break;
++#ifndef SIMULATOR
++    case View::Workflowy:
++    case View::Calendar: {
++      auto app = makeUniqueNoThrow<WorkflowyDailyActivity>(renderer, input, view == View::Calendar);
++      if (!app) { LOG_ERR("NAV", "Cannot allocate Workflowy"); break; }
++      activityManager.replaceActivity(std::move(app)); break;
++    }
++#endif
+     default: break;
+   }
+ }

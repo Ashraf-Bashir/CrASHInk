@@ -31,10 +31,10 @@ index a6fda313a83e7b6e753f9581dd747651a97d1a7c..50b637bb752358c592ad6be71edec9c4
  
 diff --git a/src/activities/settings/ReceiveFirmwareActivity.cpp b/src/activities/settings/ReceiveFirmwareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e414502a0b2be
+index 0000000000000000000000000000000000000000..cff5fb9badf0a02e3b2e3dec050485a47da12a89
 --- /dev/null
 +++ b/src/activities/settings/ReceiveFirmwareActivity.cpp
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,141 @@
 +#include "ReceiveFirmwareActivity.h"
 +
 +#include <Arduino.h>
@@ -50,7 +50,7 @@ index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e4145
 +#include "network/WifiFirmwareUpdate.h"
 +
 +namespace {
-+constexpr uint32_t LISTEN_TIMEOUT_MS = 5 * 60 * 1000;
++using wifi_firmware_update::LISTEN_TIMEOUT_MS;
 +}
 +
 +void ReceiveFirmwareActivity::onEnter() {
@@ -73,9 +73,10 @@ index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e4145
 +  snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
 +  {
 +    RenderLock lock(*this);
++    startedAt = millis();
++    remainingSeconds.store(LISTEN_TIMEOUT_MS / 1000);
 +    state = listening ? State::Waiting : State::Unavailable;
 +  }
-+  startedAt = millis();
 +  requestUpdate();
 +}
 +
@@ -99,6 +100,8 @@ index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e4145
 +    finish();
 +    return;
 +  }
++  const auto left = wifi_firmware_update::remainingListenSeconds(startedAt, millis());
++  if (remainingSeconds.exchange(left) != left) requestUpdate();
 +  if (!wifi_firmware_update::poll()) return;
 +  delay(250);
 +  wifi_firmware_update::stopListening();
@@ -146,12 +149,17 @@ index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e4145
 +    case State::Connecting:
 +      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_CONNECTING));
 +      break;
-+    case State::Waiting:
++    case State::Waiting: {
 +      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_WAITING));
 +      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
 +                                tr(STR_RECEIVE_UPDATES_WINDOW));
-+      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 4, address);
++      char countdown[12];
++      const auto seconds = remainingSeconds.load();
++      snprintf(countdown, sizeof(countdown), "%u:%02u", static_cast<unsigned>(seconds / 60), static_cast<unsigned>(seconds % 60));
++      renderer.drawCenteredText(UI_12_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 3, countdown, true, EpdFontFamily::BOLD);
++      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 5, address);
 +      break;
++    }
 +    case State::Installing:
 +      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
 +      GUI.drawProgressBar(renderer,
@@ -166,14 +174,14 @@ index 0000000000000000000000000000000000000000..e4b33e337133924f9e605096f16e4145
 +      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_UNAVAILABLE));
 +      break;
 +  }
-+  renderer.displayBuffer();
++  renderer.displayBuffer(state == State::Waiting ? HalDisplay::FAST_REFRESH : HalDisplay::HALF_REFRESH);
 +}
 diff --git a/src/activities/settings/ReceiveFirmwareActivity.h b/src/activities/settings/ReceiveFirmwareActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..a7312d0365772f7410338ecdf1902a37303b9657
+index 0000000000000000000000000000000000000000..de4d7bea9c0125df5e14fe151f8ca02d6fee7a36
 --- /dev/null
 +++ b/src/activities/settings/ReceiveFirmwareActivity.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,29 @@
 +#pragma once
 +
 +#include <atomic>
@@ -197,6 +205,7 @@ index 0000000000000000000000000000000000000000..a7312d0365772f7410338ecdf1902a37
 +  bool ownsWifi = false;
 +  uint32_t startedAt = 0;
 +  std::atomic<unsigned int> progress{0};
++  std::atomic<uint32_t> remainingSeconds{300};
 +  char address[16]{};
 +
 +  void onConnected();
@@ -453,15 +462,21 @@ index 0000000000000000000000000000000000000000..75447bdf06ce6585997220c3fa1fcc50
 +#endif
 diff --git a/src/network/WifiFirmwareUpdate.h b/src/network/WifiFirmwareUpdate.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f99ad6b0426915127d6d2f6d84dd062e955b1e2
+index 0000000000000000000000000000000000000000..66ae641e702aa45991ee9602bc88f2d5d593a176
 --- /dev/null
 +++ b/src/network/WifiFirmwareUpdate.h
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,18 @@
 +#pragma once
 +
 +#include <cstddef>
++#include <cstdint>
 +
 +namespace wifi_firmware_update {
++constexpr uint32_t LISTEN_TIMEOUT_MS = 5 * 60 * 1000;
++constexpr uint32_t remainingListenSeconds(uint32_t startedAt, uint32_t now) {
++  const uint32_t elapsed = now - startedAt;
++  return elapsed >= LISTEN_TIMEOUT_MS ? 0 : (LISTEN_TIMEOUT_MS - elapsed + 999) / 1000;
++}
 +using Progress = void (*)(size_t written, size_t total, void* context);
 +bool start();
 +void stop();
@@ -564,3 +579,44 @@ index 65fcaad725587f5b3a32190b5da238f55fd4062d..138d2753c2526d8b3bf80c79a5e262c5
  };
 
  /**
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 214e10b187ead68b3abd3dd57f0e07b0313562f0..5e81c1aded9bd585b22620abf08e1542b7782132 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -78,6 +78,7 @@ add_subdirectory(edge_slide)
+ add_subdirectory(option_popup)
+ add_subdirectory(sleep_wake_policy)
+ add_subdirectory(firmware_board_tag)
++add_subdirectory(wifi_firmware_timer)
+ add_subdirectory(ota_staging_guard)
+ add_subdirectory(font_cache_manager)
+ add_subdirectory(reader_drawer_model)
+diff --git a/test/wifi_firmware_timer/CMakeLists.txt b/test/wifi_firmware_timer/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8c109c8986061e35889649741d9013c684b9437
+--- /dev/null
++++ b/test/wifi_firmware_timer/CMakeLists.txt
+@@ -0,0 +1,4 @@
++add_executable(wifi_firmware_timer_test TimerTest.cpp)
++target_include_directories(wifi_firmware_timer_test PRIVATE ${REPO_ROOT}/src)
++target_compile_options(wifi_firmware_timer_test PRIVATE -UNDEBUG)
++add_test(NAME wifi_firmware_timer COMMAND wifi_firmware_timer_test)
+diff --git a/test/wifi_firmware_timer/TimerTest.cpp b/test/wifi_firmware_timer/TimerTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6287bc243f741d8cec70e6bc1977bce5e525c8df
+--- /dev/null
++++ b/test/wifi_firmware_timer/TimerTest.cpp
+@@ -0,0 +1,13 @@
++#include "network/WifiFirmwareUpdate.h"
++#include <cassert>
++#include <cstdint>
++int main() {
++ using wifi_firmware_update::remainingListenSeconds;
++ assert(remainingListenSeconds(100,100)==300);
++ assert(remainingListenSeconds(100,1099)==300);
++ assert(remainingListenSeconds(100,1100)==299);
++ assert(remainingListenSeconds(100,299100)==1);
++ assert(remainingListenSeconds(100,300100)==0);
++ assert(remainingListenSeconds(100,400100)==0);
++ assert(remainingListenSeconds(UINT32_MAX-499,500)==299);
++}
