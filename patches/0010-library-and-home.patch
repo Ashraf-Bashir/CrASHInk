@@ -8166,18 +8166,20 @@ index 95e56f56c1a3c532f50f95a59346b99b6762dadc..0f80145e091775ffcbbec2dd1ed1aa7e
  };
 diff --git a/src/components/AppNavigation.cpp b/src/components/AppNavigation.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f699f6d4d271aa8be64e4633b838c5a7e0a26994
+index 0000000000000000000000000000000000000000..87ea3c3e2bca4703b72dcad88b9d8402e5363b98
 --- /dev/null
 +++ b/src/components/AppNavigation.cpp
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,62 @@
 +#include "AppNavigation.h"
 +#include <GfxRenderer.h>
 +#include <Memory.h>
 +#include "MappedInputManager.h"
 +#include "activities/ActivityManager.h"
 +#include "components/icons/launcherIcons.h"
++#include "components/icons/listIcons.h"
 +namespace AppNavigation {
 +const freeink::Icon& icon(View view, bool large) {
++  if (view == View::Home) return icon_home_32;
 +  static constexpr const freeink::Icon* small[] = {&launcher_library_32, &launcher_workflowy_32, &launcher_calendar_32,
 +    &launcher_browse_32, &launcher_transfer_32, &launcher_settings_32};
 +  static constexpr const freeink::Icon* big[] = {&launcher_library_80, &launcher_workflowy_80, &launcher_calendar_80,
@@ -8200,14 +8202,16 @@ index 0000000000000000000000000000000000000000..f699f6d4d271aa8be64e4633b838c5a7
 +  const int y = renderer.getScreenHeight() - bottom - Height;
 +  renderer.fillRect(left, y, width, Height, false);
 +  renderer.drawLine(left, y, left + width - 1, y, 1, true);
-+  for (int i = 0; i < Count; ++i) {
-+    const int center = left + (2 * i + 1) * width / (2 * Count);
-+    drawMask(renderer, icon(static_cast<View>(i)), center - 16, y + 9);
-+    if (i == static_cast<int>(view)) renderer.fillRect(center - 11, y + Height - 6, 22, 3, true);
++  for (int i = 0; i < RibbonCount; ++i) {
++    const auto item = i == 0 ? View::Home : static_cast<View>(i - 1);
++    const int center = left + (2 * i + 1) * width / (2 * RibbonCount);
++    drawMask(renderer, icon(item), center - 16, y + 9);
++    if (item == view) renderer.fillRect(center - 11, y + Height - 6, 22, 3, true);
 +  }
 +}
 +void open(View view, GfxRenderer& renderer, MappedInputManager& input) {
 +  switch (view) {
++    case View::Home: activityManager.goHome(); break;
 +    case View::Library: activityManager.goToLibrary(); break;
 +    case View::Browse: activityManager.goToFileBrowser(); break;
 +    case View::Transfer: activityManager.goToFileTransfer(); break;
@@ -8222,26 +8226,28 @@ index 0000000000000000000000000000000000000000..f699f6d4d271aa8be64e4633b838c5a7
 +  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
 +  const int width = renderer.getScreenWidth() - right - left;
 +  if (width <= 0 || x < left || x >= left + width || y < renderer.getScreenHeight() - bottom - Height || y >= renderer.getScreenHeight() - bottom) return false;
-+  const auto view = static_cast<View>((x - left) * Count / width);
++  const int cell = (x - left) * RibbonCount / width;
++  const auto view = cell == 0 ? View::Home : static_cast<View>(cell - 1);
 +  if (view != current) open(view, renderer, input);
 +  return true;
 +}
 +}
 diff --git a/src/components/AppNavigation.h b/src/components/AppNavigation.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..9839e1a5b66c090a5e1ea20dfdc203201671a6fc
+index 0000000000000000000000000000000000000000..da1d7d8ae1165408811e3e53791d22f6cfdfa2fb
 --- /dev/null
 +++ b/src/components/AppNavigation.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +#pragma once
 +#include <cstdint>
 +class GfxRenderer;
 +class MappedInputManager;
 +namespace freeink {struct Icon;}
 +namespace AppNavigation {
-+enum class View : uint8_t {Library, Workflowy, Calendar, Browse, Transfer, Settings, None = 255};
++enum class View : uint8_t {Library, Workflowy, Calendar, Browse, Transfer, Settings, Home, None = 255};
 +constexpr int Height = 54;
 +constexpr int Count = 6;
++constexpr int RibbonCount = Count + 1;
 +const freeink::Icon& icon(View view, bool large = false);
 +void drawMask(const GfxRenderer& renderer, const freeink::Icon& icon, int x, int y);
 +void draw(const GfxRenderer& renderer, View view);
@@ -8653,10 +8659,10 @@ index 0000000000000000000000000000000000000000..7d6859e9e3e090a95d1c2dd8641bef9f
 +add_test(NAME app_launcher COMMAND app_launcher_test)
 diff --git a/test/app_launcher/LauncherTest.cpp b/test/app_launcher/LauncherTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..33288a71d7ae08451c7d3bff5eb67e1becef2cd5
+index 0000000000000000000000000000000000000000..5fdf6541b097af342feb887bf6dcb35b173c5354
 --- /dev/null
 +++ b/test/app_launcher/LauncherTest.cpp
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,23 @@
 +#include "Harness.h"
 +#include "activities/home/AppLauncherActivity.h"
 +#include "components/CrASHinkLogo.h"
@@ -8675,7 +8681,9 @@ index 0000000000000000000000000000000000000000..33288a71d7ae08451c7d3bff5eb67e1b
 + AppLauncherActivity next(renderer,input);input.clear();next.onEnter();next.render(RenderLock{});input.release=int(MappedInputManager::Button::Left);next.loop();input.clear();input.home=true;next.loop();assert(activityManager.opened.back()==AppNavigation::View::Settings);
 + // Bottom-right gear is fresh-touch activated; a swipe over it does not open it.
 + AppLauncherActivity touch(renderer,input);input.clear();touch.onEnter();touch.render(RenderLock{});input.x=360;input.y=650;input.down=true;touch.loop();input.clear();input.x=360;input.y=650;input.swipe=MappedInputManager::SwipeDir::Left;touch.loop();input.swipe=MappedInputManager::SwipeDir::None;input.tap=true;n=activityManager.opened.size();touch.loop();assert(activityManager.opened.size()==n);input.clear();input.x=360;input.y=650;input.down=true;touch.loop();input.down=false;input.tap=true;touch.loop();assert(activityManager.opened.back()==AppNavigation::View::Settings);
-+ for(int view=0;view<6;++view){renderer.clearScreen();AppNavigation::draw(renderer,static_cast<AppNavigation::View>(view));input.clear();input.x=40;input.y=780;assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view))==false);input.tap=true;assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view)));}
++ for(int view=0;view<6;++view){renderer.clearScreen();AppNavigation::draw(renderer,static_cast<AppNavigation::View>(view));input.clear();input.x=40;input.y=780;assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view))==false);input.tap=true;assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view)));assert(activityManager.opened.back()==AppNavigation::View::Home);
++  for(int cell=1;cell<AppNavigation::RibbonCount;++cell){input.clear();input.x=(2*cell+1)*480/(2*AppNavigation::RibbonCount);input.y=780;input.tap=true;auto before=activityManager.opened.size();assert(AppNavigation::handleInput(renderer,input,static_cast<AppNavigation::View>(view)));if(cell-1!=view)assert(activityManager.opened.back()==static_cast<AppNavigation::View>(cell-1));else assert(activityManager.opened.size()==before);}
++ }
 + renderer.clearScreen();drawCrASHinkLogo(renderer,180,300);dump(renderer,"/tmp/crashink-smile-native.pgm");
 +}
 diff --git a/test/app_launcher/stubs/GfxRenderer.h b/test/app_launcher/stubs/GfxRenderer.h
@@ -8688,10 +8696,10 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#include "Harness.h"
 diff --git a/test/app_launcher/stubs/Harness.h b/test/app_launcher/stubs/Harness.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..019470f4f565668770e96ad0d97258e0b813c6bb
+index 0000000000000000000000000000000000000000..b9117fbe7566832563de2b33063d603880b33efd
 --- /dev/null
 +++ b/test/app_launcher/stubs/Harness.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,67 @@
 +#pragma once
 +#include <algorithm>
 +#include <array>
@@ -8749,6 +8757,7 @@ index 0000000000000000000000000000000000000000..019470f4f565668770e96ad0d97258e0
 +using WorkflowyDailyActivity=FakeWorkflowy;
 +struct Manager {
 + std::vector<AppNavigation::View> opened;std::unique_ptr<Activity> pending;
++ void goHome(){opened.push_back(AppNavigation::View::Home);}
 + void goToLibrary(){opened.push_back(AppNavigation::View::Library);}void goToFileBrowser(){opened.push_back(AppNavigation::View::Browse);}void goToFileTransfer(){opened.push_back(AppNavigation::View::Transfer);}void goToSettings(){opened.push_back(AppNavigation::View::Settings);}
 + void replaceActivity(std::unique_ptr<WorkflowyDailyActivity> p){opened.push_back(p->calendar?AppNavigation::View::Calendar:AppNavigation::View::Workflowy);pending=std::move(p);}
 +};inline Manager activityManager;

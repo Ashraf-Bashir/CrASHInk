@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- The shared bottom ribbon starts with a Home icon that returns directly to the launcher from all six app views. The launcher retains six tiles and Settings stays at the right edge.
+
 - Home requests its first paint immediately and sets portrait orientation, instead of leaving a boot, Calendar, Browse, or Settings frame visible over an invisible launcher. Fresh touch-down and first-paint guards prevent carried-over releases from opening apps.
 - Launcher icons are rendered from SVG at native 80-pixel resolution. The layout is Library / Workflowy, Calendar / Browse, File Transfer / Settings, without a title at the top. Left/Right selects a tile and the capacitive Home key opens it once.
 - All six app views share the same bottom navigation ribbon. Workflowy and Calendar keep their action controls above it; Browse's Home control returns directly to the launcher. Home symbols use logical bitmap coordinates so they remain upright.
