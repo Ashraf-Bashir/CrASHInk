@@ -17,6 +17,12 @@
 
 ### Fixed
 
+- Workflowy quote sharing displays one immediate “Queued for Workflowy” confirmation before Wi-Fi starts, with no duplicate completion toast. Offline quotes remain safely queued.
+- Status bars keep one vertical position across apps; the Wi-Fi symbol stays within the bar. Launcher spacing is balanced, icons have consistent padding, and selected apps reverse colors in both themes.
+- Workflowy text editing includes up/down scrolling without closing the keyboard. Calendar uses its shorter name, and Home explicitly follows the configured auto-sleep timeout.
+
+- Workflowy and Calendar no longer duplicate Home in their action bars. Remaining actions fill the freed space; contextual Back stays available for parent items and Calendar opened from Workflowy.
+
 - The shared bottom ribbon starts with a Home icon that returns directly to the launcher from all six app views. The launcher retains six tiles and Settings stays at the right edge.
 
 - Home requests its first paint immediately and sets portrait orientation, instead of leaving a boot, Calendar, Browse, or Settings frame visible over an invisible launcher. Fresh touch-down and first-paint guards prevent carried-over releases from opening apps.

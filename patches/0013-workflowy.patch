@@ -12,7 +12,7 @@ index 09e958015c4e1779d646aed0829e43f1b5acfa75..5a34a97200bdc0d9b7490533c9103c00
  
  - Library and Home cover grids show saved reading percentages in high-contrast badges.
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index 3a6af292478e11d385b42e6c43786a5b840ea21d..29f82df76db15e2f58f8ca1980cacf2965dd097b 100644
+index 3a6af292478e11d385b42e6c43786a5b840ea21d..81a84e220207dd27844ad405e89dead882e74b54 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -611,6 +611,27 @@ STR_DELETE_CACHE: "Delete Book Cache"
@@ -34,7 +34,7 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..29f82df76db15e2f58f8ca1980cacf29
 +STR_WORKFLOWY_SEND_FAILED: "Workflowy could not save this item"
 +STR_WORKFLOWY_SENDING: "Sending to Workflowy"
 +STR_WORKFLOWY_SENT: "Sent"
-+STR_WORKFLOWY_SHARING: "Sending to Workflowy…"
++STR_WORKFLOWY_SHARING: "Queued for Workflowy"
 +STR_WORKFLOWY_SHARE_SENT: "Sent to Workflowy"
 +STR_WORKFLOWY_SAVED_LOCALLY: "Saved locally · will retry on next Share"
 +STR_WORKFLOWY_ALREADY_SENT: "Already sent to Workflowy"
@@ -106,7 +106,7 @@ index 3a6af292478e11d385b42e6c43786a5b840ea21d..29f82df76db15e2f58f8ca1980cacf29
 +STR_WORKFLOWY_END: "To"
 +STR_WORKFLOWY_DAY: "Day"
 +STR_WORKFLOWY_WEEK: "Week"
-+STR_WORKFLOWY_CALENDAR_VIEW: "Calendar view"
++STR_WORKFLOWY_CALENDAR_VIEW: "Calendar"
 +STR_WORKFLOWY_SCHEDULE_VIEW: "Schedule"
 +STR_WORKFLOWY_NEW_TASK: "New task"
 +
@@ -200,7 +200,7 @@ index e19b92125f2e8ef5569dcf09c048fe95e0e95f64..89292ee9976aaab27a6360d50c679882
    bool readClippingText(const Clipping& clipping, std::string& out) const;
    bool openTextReader(HalFile& reader) const;
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index 4eb2a9ee7b7de542661ffcacb17122dbec15c218..0699f2c18306748e787b82e1eb44a4eb6672b01e 100644
+index 9fcb52021064e6faf44885756fc4137d8b2330c3..46eaa6a737cca210b06ee56584d5a4a8e7214ded 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
 @@ -41,10 +41,12 @@
@@ -216,7 +216,7 @@ index 4eb2a9ee7b7de542661ffcacb17122dbec15c218..0699f2c18306748e787b82e1eb44a4eb
  #include "util/SwipeAdjustment.h"
  #include "util/TwoFingerSwipe.h"
 
-@@ -595,6 +597,29 @@ void ActivityManager::loop() {
+@@ -598,6 +600,17 @@ void ActivityManager::loop() {
      mappedInput.setPowerAsConfirmInReaderMode(false);
    }
 
@@ -224,18 +224,6 @@ index 4eb2a9ee7b7de542661ffcacb17122dbec15c218..0699f2c18306748e787b82e1eb44a4eb
 +    if (workflowyNoticeVisible && millis() - workflowyNoticeShownAt >= 1000u) {
 +      workflowyNoticeVisible = false;
 +      requestUpdate();
-+    }
-+    // This is feedback, not an activity: no delay, modal dialog or input grab.
-+    // Only the small popup backdrop is borrowed; the reader keeps running.
-+    if (currentActivity && !RenderLock::peek()) {
-+      RenderLock lock(RenderLock::Mode::Try);
-+      if (lock.ownsLock()) {
-+        if (const auto message = workflowy::takeShareNotice()) {
-+          GUI.drawPopup(renderer, I18n::getInstance().get(*message), true);
-+          workflowyNoticeShownAt = millis();
-+          workflowyNoticeVisible = true;
-+        }
-+      }
 +    }
 +    if (const auto error = workflowy::takeShareError()) {
 +      pushActivity(std::make_unique<OptionSelectionActivity>(
@@ -246,7 +234,34 @@ index 4eb2a9ee7b7de542661ffcacb17122dbec15c218..0699f2c18306748e787b82e1eb44a4eb
    while (pendingAction != PendingAction::None) {
      if (pendingAction == PendingAction::Pop) {
        RenderLock lock;
-@@ -1097,7 +1122,9 @@ void ActivityManager::popActivity() {
+@@ -735,6 +748,26 @@ void ActivityManager::loop() {
+     }
+   }
+
++  if (pendingAction == PendingAction::None && currentActivity && workflowy::shareNoticePending() && !RenderLock::peek()) {
++    // First close the sharing menu and paint the restored reader. Network
++    // startup is deferred until the one confirmation is physically visible.
++    bool backdropReady = true;
++    if (requestedUpdate.exchange(false) || restoredActivityNeedsRender.load())
++      backdropReady = requestUpdateAndWait() == RequestUpdateResult::Rendered;
++    if (!backdropReady) requestUpdate();
++    if (backdropReady) {
++      RenderLock lock(RenderLock::Mode::Try);
++      if (lock.ownsLock()) {
++        if (const auto message = workflowy::takeShareNotice()) {
++          GUI.drawPopup(renderer, I18n::getInstance().get(*message), true);
++          workflowyNoticeShownAt = millis();
++          workflowyNoticeVisible = true;
++        }
++      }
++    }
++  }
++  if (pendingAction == PendingAction::None && !workflowy::shareNoticePending()) workflowy::startQueuedShares();
++
+   if (APP_STATE.hasPendingAlert.load(std::memory_order_acquire) && pendingAction == PendingAction::None) {
+     APP_STATE.hasPendingAlert.store(false, std::memory_order_relaxed);
+     pushActivity(std::make_unique<AlertActivity>(renderer, mappedInput));
+@@ -1100,7 +1133,9 @@ void ActivityManager::popActivity() {
    pendingAction = PendingAction::Pop;
  }
 
@@ -428,10 +443,10 @@ index 1b38d1497e5b7166b2613b6bb11348b92d5ddfc9..d3160c524b61f771e58160fa724d03f7
            returnAction(true);
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f693ae1bb9
+index 0000000000000000000000000000000000000000..a1ff58f1d34cf726729a9bd2d04a4d2c0629ba3e
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,497 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -505,6 +520,7 @@ index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f6
 +uint32_t workerStartedAt = 0;
 +constexpr size_t DEST_MAX = 128;
 +std::atomic<bool> sending{false};
++std::atomic<bool> pendingKick{false};
 +std::atomic<int> notice{-1};
 +std::atomic<StrId> error{StrId::STR_WORKFLOWY_SENT};
 +
@@ -748,8 +764,9 @@ index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f6
 +void finishShare(const StrId result) {
 +  const bool ok = result == StrId::STR_WORKFLOWY_SENT || result == StrId::STR_WORKFLOWY_ALREADY_SENT;
 +  if (!ok) error.store(result);
-+  notice.store(ok ? static_cast<int>(result == StrId::STR_WORKFLOWY_SENT ? StrId::STR_WORKFLOWY_SHARE_SENT
-+                                                                     : StrId::STR_WORKFLOWY_ALREADY_SENT) : -1);
++  // Accepted shares are confirmed once, before Wi-Fi starts. A completion
++  // must not replay a second "Sent" toast over the reader. Failed transport
++  // remains durably queued; local staging errors still use takeShareError().
 +}
 +
 +StrId stageShare(ShareJob& job, const size_t index, const int colorFilter, bool& hasItems) {
@@ -860,7 +877,12 @@ index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f6
 +  if (!hasItems) { Storage.remove(job->spoolPath.c_str()); finishShare(StrId::STR_WORKFLOWY_ALREADY_SENT); return; }
 +  shareGeneration.fetch_add(1);
 +  notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SHARING));
-+  if (sending.exchange(true)) return; // already running: it will also drain this new disk job
++  pendingKick.store(true);
++}
++
++void workflowy::startQueuedShares() {
++  if (notice.load() >= 0) return; // the UI has not confirmed the enqueue yet
++  if (!pendingKick.exchange(false) || sending.exchange(true)) return;
 +  const auto sendTask = [](void*) {
 +    workerStartedAt = millis();
 +    bool ownsWifi = false;
@@ -879,23 +901,23 @@ index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f6
 +        break;
 +      }
 +      auto job = makeUniqueNoThrow<ShareJob>();
-+      if (!job) { LOG_ERR("WF", "Cannot allocate outbox reader"); notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY)); if (releaseWorker(generation)) continue; break; }
++      if (!job) { LOG_ERR("WF", "Cannot allocate outbox reader"); if (releaseWorker(generation)) continue; break; }
 +      if (!job->load(path)) {
 +        LOG_ERR("WF", "Invalid outbox item retained for recovery");
 +        Storage.rename(path.c_str(), (path + ".bad").c_str());
-+        notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY));
++
 +        if (releaseWorker(generation)) continue; break;
 +      }
 +      const auto result = job->send(); ownsWifi |= job->ownsWifi;
 +      Storage.remove(ShareJob::RESPONSE_FILE);
 +      if (result != StrId::STR_WORKFLOWY_SENT && result != StrId::STR_WORKFLOWY_ALREADY_SENT) {
 +        LOG_ERR("WF", "Share pending locally (reason %d)", static_cast<int>(result));
-+        notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY));
++
 +        if (releaseWorker(generation)) continue; break;
 +      }
 +      if (!Storage.remove(path.c_str())) {
 +        LOG_ERR("WF", "Cannot remove acknowledged outbox item; receipts prevent resending");
-+        notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY)); if (releaseWorker(generation)) continue; break;
++        if (releaseWorker(generation)) continue; break;
 +      }
 +      Storage.remove((path + ".started").c_str());
 +      finishShare(result);
@@ -905,11 +927,12 @@ index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f6
 +  };
 +  if (xTaskCreate(sendTask, "wf-share", 12288, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
 +    sending.store(false);
-+    notice.store(static_cast<int>(StrId::STR_WORKFLOWY_SAVED_LOCALLY));
++    LOG_ERR("WF", "Share remains queued; cannot start network worker");
 +  }
 +}
 +
-+bool workflowy::shareInProgress() { return sending.load(); }
++bool workflowy::shareInProgress() { return sending.load() || pendingKick.load(); }
++bool workflowy::shareNoticePending() { return notice.load() >= 0; }
 +
 +std::optional<StrId> workflowy::takeShareError() {
 +  const auto result = error.exchange(StrId::STR_WORKFLOWY_SENT);
@@ -923,10 +946,10 @@ index 0000000000000000000000000000000000000000..ca98edd0028f27f2a35be55e972962f6
 +}
 diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..fec871e5858d2cbc818e42513eaba211b9489438
+index 0000000000000000000000000000000000000000..756edd3c4a59b6c0df8dc4fb1a856c2ee32c4777
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,17 @@
 +#pragma once
 +
 +#include <I18n.h>
@@ -938,19 +961,22 @@ index 0000000000000000000000000000000000000000..fec871e5858d2cbc818e42513eaba211
 +// SIZE_MAX sends all clippings in the current book that match the list filter.
 +void shareClippings(size_t index, int colorFilter = 0);
 +bool shareInProgress();
++bool shareNoticePending();
++// Called only after the queued confirmation has been painted.
++void startQueuedShares();
 +std::optional<StrId> takeShareError();
 +std::optional<StrId> takeShareNotice();
 +}
 diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
-index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9c8928a7b 100644
+index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..744a7f2a1bc09a6c24c43049343e64cb95621240 100644
 --- a/src/activities/util/KeyboardEntryActivity.cpp
 +++ b/src/activities/util/KeyboardEntryActivity.cpp
 @@ -7,6 +7,7 @@
- 
+
  #include <algorithm>
  #include <cstring>
 +#include <new>
- 
+
  #include "DeviceCapabilities.h"
  #include "KeyboardLayoutSet.h"
 @@ -14,6 +15,8 @@
@@ -959,12 +985,15 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
  #include "fontIds.h"
 +#include "workflowy/WorkflowyTagInput.h"
 +#include "workflowy/WorkflowyTextDrawing.h"
- 
+
  namespace fui = freeink::ui;
- 
-@@ -137,11 +140,12 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
+
+@@ -136,12 +139,15 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
+
  void KeyboardEntryActivity::onEnter() {
    Activity::onEnter();
++  manualInputStart = -1;
++  paintedInputWidth = 0;
    inputLineHeight = renderer.getLineHeight(UI_12_FONT_ID);
 -  cursorPos = text.length();
 +  cursorPos = std::min(initialCursor, text.length());
@@ -976,15 +1005,20 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    symbols = false;
    urlPanel = false;
    cursorMode = false;
-@@ -161,6 +165,7 @@ void KeyboardEntryActivity::onEnter() {
+@@ -161,6 +167,7 @@ void KeyboardEntryActivity::onEnter() {
    touchRouter.holdMs = TOUCH_LONG_PRESS_MS;
    touchRouter.overrideHoldMs = TOUCH_DEL_LONG_PRESS_MS;
    interactionsReady = false;
 +  textOnlyPaint = false;
    requestUpdate();
  }
- 
-@@ -263,6 +268,12 @@ void KeyboardEntryActivity::insertUtf8(const char* out) {
+
+@@ -259,27 +266,42 @@ size_t KeyboardEntryActivity::utf8Next(const std::string& s, size_t pos) {
+ }
+
+ void KeyboardEntryActivity::insertUtf8(const char* out) {
++  manualInputStart = -1;
+   if (!out || !*out) return;
    const size_t n = strlen(out);
    if (maxLength != 0 && text.length() + n > maxLength) return;
    if (cursorPos > text.length()) cursorPos = text.length();
@@ -997,8 +1031,9 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    text.insert(cursorPos, out, n);
    cursorPos += n;
  }
-@@ -270,6 +281,11 @@ void KeyboardEntryActivity::insertUtf8(const char* out) {
+
  bool KeyboardEntryActivity::backspaceUtf8() {
++  manualInputStart = -1;
    if (text.empty() || cursorPos == 0) return false;
    const size_t prev = utf8Prev(text, cursorPos);
 +  if (!workflowyStyles.empty()) {
@@ -1009,7 +1044,11 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    text.erase(prev, cursorPos - prev);
    cursorPos = prev;
    return true;
-@@ -280,6 +296,7 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+ }
+
+ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPress) {
++  manualInputStart = -1;
+   switch (value) {
      case fui::QWERTY_KEY_SHIFT:
        delPressCount = 0;
        hintVisible = false;
@@ -1017,7 +1056,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
        // Letters: case toggle. Symbols: pages between "?123" and "#+=".
        shifted = !shifted;
        clampSelection();
-@@ -321,6 +338,8 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+@@ -321,6 +343,8 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
        if (longPress) {
          if (text.empty()) return false;
          text.clear();
@@ -1026,7 +1065,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
          cursorPos = 0;
          return true;
        }
-@@ -342,8 +361,11 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+@@ -342,8 +366,11 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
        const auto oldLength = text.size();
        insertUtf8(out);
        if (text.size() == oldLength) return false;
@@ -1040,7 +1079,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
          clampSelection();
        }
        return true;
-@@ -356,6 +378,8 @@ bool KeyboardEntryActivity::clearAllOrAltOnSelected() {
+@@ -356,6 +383,8 @@ bool KeyboardEntryActivity::clearAllOrAltOnSelected() {
    if (!key) return false;
    if (key->value == fui::QWERTY_KEY_BACKSPACE) {
      text.clear();
@@ -1049,9 +1088,9 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
      cursorPos = 0;
      return true;
    }
-@@ -389,6 +413,11 @@ std::string KeyboardEntryActivity::displayTextForCurrentState() const {
+@@ -389,6 +418,11 @@ std::string KeyboardEntryActivity::displayTextForCurrentState() const {
  }
- 
+
  int KeyboardEntryActivity::measureRange(std::string& s, const int start, const int end) const {
 +  if (!workflowyStyles.empty() && workflowyStyles.size() == s.size() && start >= 0 && end >= start &&
 +      static_cast<size_t>(end) <= s.size()) {
@@ -1061,8 +1100,8 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    if (end <= start) return 0;
    // s[end] is writable even at s.length() (the terminator slot); only '\0' may
    // be written there, which is exactly what the measurement needs.
-@@ -410,10 +439,14 @@ bool KeyboardEntryActivity::rangeIsRtl(std::string& s, const int start, const in
- 
+@@ -410,10 +444,14 @@ bool KeyboardEntryActivity::rangeIsRtl(std::string& s, const int start, const in
+
  int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const int maxWidth) const {
    const int len = static_cast<int>(s.length());
 -  if (measureRange(s, start, len) <= maxWidth) return len;
@@ -1079,11 +1118,12 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    while (lo <= hi) {
      const int mid = lo + (hi - lo) / 2;
      if (measureRange(s, start, mid) <= maxWidth) {
-@@ -435,6 +468,18 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
+@@ -435,6 +473,19 @@ int KeyboardEntryActivity::lineBreakEnd(std::string& s, const int start, const i
    return best < firstCharEnd ? firstCharEnd : best;
  }
- 
+
 +int KeyboardEntryActivity::firstVisibleInputLine(std::string& display, int width, int capacity) const {
++  if (workflowyFormatting && manualInputStart >= 0) return std::min<int>(manualInputStart, display.size());
 +  if (!keepCursorVisible) return 0;
 +  int first = 0, start = 0, before = 0;
 +  while (start < static_cast<int>(display.size())) {
@@ -1098,10 +1138,20 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
  KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTouchTargetFromPoint(
      const int x, const int y, size_t& position) const {
    // Key taps are the overwhelmingly common case; they land on the keyboard,
-@@ -464,7 +509,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+@@ -453,7 +504,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+   if (deviceUsesSideButtonHintGutters(gpio)) {
+     availableWidth -= 2 * metrics.sideButtonHintsWidth;
+   }
+-  const int effectiveMargin = (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2;
++  const int effectiveMargin = std::max(workflowyFormatting ? 44 : 0,
++      (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2);
+   const int toggleGap = inputType == InputType::Password ? 4 : 0;
+   const int toggleReserve = inputType == InputType::Password ? std::max(renderer.getTextWidth(UI_12_FONT_ID, "[abc]"),
+                                                                         renderer.getTextWidth(UI_12_FONT_ID, "[***]")) +
+@@ -464,7 +516,9 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
    const bool centerText = metrics.keyboardCenteredText;
    std::string displayText = displayTextForCurrentState();
- 
+
 -  int lineStartIdx = 0;
 +  const int inputBottom = textInputBottom();
 +  const int capacity = std::max(1, (inputBottom - inputStartY - 6) / lineHeight);
@@ -1109,20 +1159,20 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    int lineY = inputStartY;
    int lastLineStartIdx = 0;
    int lastLineEndIdx = static_cast<int>(displayText.length());
-@@ -516,7 +563,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
+@@ -516,7 +570,8 @@ KeyboardEntryActivity::InputFieldTouchTarget KeyboardEntryActivity::inputFieldTo
        return InputFieldTouchTarget::Cursor;
      }
- 
+
 -    if (lineEndIdx == static_cast<int>(displayText.length())) {
 +    if (lineEndIdx == static_cast<int>(displayText.length()) ||
 +        (keepCursorVisible && lineY + lineHeight >= inputStartY + capacity * lineHeight)) {
        break;
      }
- 
-@@ -555,19 +603,226 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
+
+@@ -555,19 +610,276 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
                     static_cast<int16_t>(hasTouch ? pageHeight - y : height)};
  }
- 
+
 -void KeyboardEntryActivity::loop() {
 -#if CROSSINK_APP_CAP_TOUCH
 -  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
@@ -1155,12 +1205,10 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +            return tag.starts_with(prefix);
 +          })) return start;
 +    }
-   }
++  }
 +  return workflowyTagPalette ? std::min(cursorPos, text.size()) : std::string::npos;
 +}
- 
--  int tx = 0;
--  int ty = 0;
++
 +bool KeyboardEntryActivity::insertTagAt(int x, int y) {
 +  const auto start = tagStart();
 +  if (start == std::string::npos) return false;
@@ -1238,8 +1286,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +  }
 +  if (workflowyDatePicker) drawCell(tr(STR_DATE), DATE_CELL);
 +}
- 
--  if (mappedInput.wasScreenTapped(tx, ty)) {
++
 +bool KeyboardEntryActivity::hasTextSelection() const {
 +  return selectionAnchor != std::string::npos && selectionEnd != std::string::npos && selectionAnchor != selectionEnd;
 +}
@@ -1324,7 +1371,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +      }
 +      return true;
 +    }
-+  }
+   }
 +  if (mappedInput.wasScreenTouchReleased() || tapped) {
 +    const bool consumed = draggingSelection;
 +    touchSelectionStart = std::string::npos;
@@ -1334,11 +1381,64 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +  return false;
 +}
 +
++bool KeyboardEntryActivity::handleInputScroll(bool tapped, int x, int y) {
++  if (!workflowyFormatting || paintedInputWidth <= 0) return false;
++  int heldX = 0, heldY = 0;
++  const bool contact = mappedInput.wasScreenTouchDown(heldX, heldY) || mappedInput.isScreenTouchHeld(heldX, heldY);
++  const auto inGutter = [&](int px, int py) {
++    return px >= renderer.getScreenWidth() - 44 && py >= paintedInputTop && py < paintedInputBottom;
++  };
++  if (!((tapped && inGutter(x, y)) || (contact && inGutter(heldX, heldY)))) return false;
++  touchSelectionStart = std::string::npos;
++  draggingSelection = false;
++  touchRouter.reset();
++  if (!tapped) return true;
++  RenderLock lock(*this);
++  auto display = displayTextForCurrentState();
++  int next = paintedInputFirst;
++  if (y < (paintedInputTop + paintedInputBottom) / 2) {
++    int previous = 0, start = 0;
++    while (start < paintedInputFirst) {
++      previous = start;
++      const int end = lineBreakEnd(display, start, paintedInputWidth);
++      if (end <= start || end >= paintedInputFirst) break;
++      start = end;
++    }
++    next = previous;
++  } else if (paintedInputLast < static_cast<int>(display.size())) {
++    next = lineBreakEnd(display, paintedInputFirst, paintedInputWidth);
++  }
++  if (next != paintedInputFirst) {
++    manualInputStart = next;
++    touchRouter.reset();
++    textOnlyPaint.store(true);
++    requestUpdate();
++  }
++  return true;
++}
+
+-  int tx = 0;
+-  int ty = 0;
++void KeyboardEntryActivity::drawInputScroll() const {
++  if (!workflowyFormatting || !mappedInput.hasTouchHardware() ||
++      (paintedInputFirst == 0 && paintedInputLast >= static_cast<int>(text.size()))) return;
++  const int x = renderer.getScreenWidth() - 24;
++  for (int direction : {-1, 1}) {
++    const bool available = direction < 0 ? paintedInputFirst > 0 : paintedInputLast < static_cast<int>(text.size());
++    const int y = direction < 0 ? paintedInputTop + 16 : paintedInputBottom - 16;
++    const int stroke = available ? 3 : 1;
++    renderer.drawLine(x - 6, y - direction * 3, x, y + direction * 3, stroke, true);
++    renderer.drawLine(x, y + direction * 3, x + 6, y - direction * 3, stroke, true);
++  }
++}
+
+-  if (mappedInput.wasScreenTapped(tx, ty)) {
 +void KeyboardEntryActivity::loop() {
 +#if CROSSINK_APP_CAP_TOUCH
 +  int tapX = 0;
 +  int tapY = 0;
 +  const bool tapped = mappedInput.wasScreenTapped(tapX, tapY);
++  if (handleInputScroll(tapped, tapX, tapY)) return;
 +  if (workflowyFormatting && handleFormattingTouch(tapped, tapX, tapY)) return;
 +  if (tapped) {
 +    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
@@ -1355,7 +1455,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
      if (inputTarget == InputFieldTouchTarget::PasswordToggle) {
        buttonSelectionVisible = false;
        passwordVisible = !passwordVisible;
-@@ -578,6 +833,7 @@ void KeyboardEntryActivity::loop() {
+@@ -578,6 +890,7 @@ void KeyboardEntryActivity::loop() {
      }
      if (inputTarget == InputFieldTouchTarget::Cursor) {
        buttonSelectionVisible = false;
@@ -1363,9 +1463,9 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
        cursorPos = std::min(touchedCursorPos, text.length());
        cursorMode = false;
        togglePos = false;
-@@ -594,11 +850,10 @@ void KeyboardEntryActivity::loop() {
+@@ -594,11 +907,10 @@ void KeyboardEntryActivity::loop() {
    }
- 
+
    if (!cursorMode && interactionsReady.load(std::memory_order_acquire)) {
 +    int tx = 0;
 +    int ty = 0;
@@ -1377,7 +1477,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
      int hx = 0;
      int hy = 0;
      const bool inContact = mappedInput.isScreenTouchHeld(hx, hy);
-@@ -607,9 +862,11 @@ void KeyboardEntryActivity::loop() {
+@@ -607,9 +919,11 @@ void KeyboardEntryActivity::loop() {
          touchRouter.update(interactions, tapCandidate, static_cast<int16_t>(tx), static_cast<int16_t>(ty), tapped,
                             static_cast<int16_t>(tapX), static_cast<int16_t>(tapY), inContact, millis());
      if (result.event) {
@@ -1390,9 +1490,9 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
          requestUpdate();
        }
        return;
-@@ -780,22 +1037,36 @@ void KeyboardEntryActivity::loop() {
+@@ -780,22 +1094,36 @@ void KeyboardEntryActivity::loop() {
  }
- 
+
  void KeyboardEntryActivity::render(RenderLock&&) {
 -  renderer.clearScreen();
 +  auto* const frameBuffer = renderer.getFrameBuffer();
@@ -1400,7 +1500,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +  const bool windowRefresh = mappedInput.hasTouchHardware() && frameBuffer && renderer.supportsWindowRefresh();
 +  // An intervening overlay or another full-screen paint invalidates the cached baseline.
 +  const bool sameScreen = windowRefresh && displayedFrame && memcmp(displayedFrame.get(), frameBuffer, frameSize) == 0;
- 
+
    const auto pageWidth = renderer.getScreenWidth();
 +  const auto pageHeight = renderer.getScreenHeight();
    const auto& metrics = UITheme::getInstance().getMetrics();
@@ -1433,30 +1533,45 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +      GUI.drawHeader(renderer, header, title.c_str());
 +    }
 +  }
- 
+
    std::string displayText = displayTextForCurrentState();
- 
-@@ -832,7 +1103,9 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+
+@@ -805,7 +1133,8 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+   if (deviceUsesSideButtonHintGutters(gpio)) {
+     availableWidth -= 2 * metrics.sideButtonHintsWidth;
+   }
+-  const int effectiveMargin = (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2;
++  const int effectiveMargin = std::max(workflowyFormatting ? 44 : 0,
++      (pageWidth - availableWidth * metrics.keyboardTextFieldWidthPercent / 100) / 2);
+   const int toggleGap = isPassword ? 4 : 0;
+   const int toggleReserve = isPassword ? std::max(renderer.getTextWidth(UI_12_FONT_ID, "[abc]"),
+                                                   renderer.getTextWidth(UI_12_FONT_ID, "[***]")) +
+@@ -832,7 +1161,12 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      if (w > cursorCharWidth) cursorCharWidth = w;
    }
- 
+
 -  int lineStartIdx = 0;
 +  const int inputBottom = textInputBottom();
 +  const int capacity = std::max(1, (inputBottom - inputStartY - 6) / lineHeight);
++  if (paintedInputWidth && paintedInputWidth != maxLineWidth) manualInputStart = -1;
 +  int lineStartIdx = firstVisibleInputLine(displayText, maxLineWidth, capacity);
++  paintedInputFirst = lineStartIdx; paintedInputLast = lineStartIdx;
++  paintedInputWidth = maxLineWidth; paintedInputTop = inputStartY; paintedInputBottom = inputBottom;
    int textWidth = 0;
    int cursorPixelX = effectiveMargin;
    int cursorLineY = inputStartY;
-@@ -841,7 +1114,7 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -840,8 +1174,9 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+
    while (true) {
      const int lineEndIdx = lineBreakEnd(displayText, lineStartIdx, maxLineWidth);
++    paintedInputLast = lineEndIdx;
      const std::string lineText = displayText.substr(lineStartIdx, lineEndIdx - lineStartIdx);
 -    textWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, lineText.c_str(), EpdFontFamily::REGULAR);
 +    textWidth = measureRange(displayText, lineStartIdx, lineEndIdx);
      {
        const bool isRtl = rangeIsRtl(displayText, lineStartIdx, lineEndIdx);
        const int lineStartX = centerText ? effectiveMargin + (maxLineWidth - textWidth) / 2 : effectiveMargin;
-@@ -855,10 +1128,11 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -855,10 +1190,11 @@ void KeyboardEntryActivity::render(RenderLock&&) {
          } else {
            beforeCursor = displayText.substr(lineStartIdx, cursorPos - lineStartIdx);
          }
@@ -1470,7 +1585,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
            std::string beforeAndCursor = beforeCursor + displayCursorChar;
            throughCursorWidth = renderer.getTextAdvanceX(UI_12_FONT_ID, beforeAndCursor.c_str(), EpdFontFamily::REGULAR);
            int charAdvance = renderer.getTextAdvanceX(UI_12_FONT_ID, displayCursorChar, EpdFontFamily::REGULAR);
-@@ -889,10 +1163,26 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -889,10 +1225,26 @@ void KeyboardEntryActivity::render(RenderLock&&) {
            const std::string part3 = displayText.substr(afterStart, afterEnd - afterStart);
            renderer.drawText(UI_12_FONT_ID, cursorPixelX + cursorCharWidth, inputStartY + inputHeight, part3.c_str());
          }
@@ -1497,12 +1612,29 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +          (keepCursorVisible && inputHeight + lineHeight >= capacity * lineHeight)) {
          break;
        }
- 
-@@ -964,7 +1254,14 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+
+@@ -906,13 +1258,13 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+   GUI.drawTextField(renderer, Rect{0, inputStartY, pageWidth, inputHeight}, fieldWidth, cursorMode, lineMargin,
+                     pageWidth - 2 * lineMargin);
+
+-  if (cursorMode && !togglePos && cursorPos <= displayText.length()) {
++  if (cursorDrawn && cursorMode && !togglePos && cursorPos <= displayText.length()) {
+     static constexpr int blockPadding = 1;
+     renderer.fillRect(cursorPixelX - blockPadding, cursorLineY, cursorCharWidth + blockPadding * 2, lineHeight, true);
+     if (cursorCharBytes > 0) {
+       renderer.drawText(UI_12_FONT_ID, cursorPixelX, cursorLineY, cursorChar, false);
+     }
+-  } else if (cursorPos <= displayText.length()) {
++  } else if (cursorDrawn && cursorPos <= displayText.length()) {
+     static constexpr int serifW = 3;
+     const int cX = cursorPixelX;
+     const int cY = cursorLineY;
+@@ -964,7 +1316,15 @@ void KeyboardEntryActivity::render(RenderLock&&) {
      }
    }
- 
+
 -  const fui::Rect kbRect = keyboardRect();
++  drawInputScroll();
 +  drawTags();
 +  if (workflowyFormatting) drawFormatting();
 +  if (onlyText) {
@@ -1514,7 +1646,7 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    const int keysHeight = std::min(keyboardKeysHeight(metrics, currentLayout().rowCount, mappedInput.hasTouchHardware()),
                                    static_cast<int>(kbRect.height));
    const auto orientation = renderer.getOrientation();
-@@ -1122,8 +1419,20 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+@@ -1122,8 +1482,20 @@ void KeyboardEntryActivity::render(RenderLock&&) {
  #if CROSSINK_APP_CAP_TOUCH
    interactions.beginPublishCycle();
    interactions.clear();
@@ -1536,10 +1668,10 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
    }
  #endif
    interactions.publish();
-@@ -1135,11 +1444,21 @@ void KeyboardEntryActivity::render(RenderLock&&) {
- 
+@@ -1135,11 +1507,21 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+
    GUI.drawSideButtonHints(renderer, ">", "<");
- 
+
 -  renderer.displayBuffer();
 +  if (sameScreen) {
 +    renderer.displayChangedWindow(displayedFrame.get());
@@ -1553,15 +1685,15 @@ index c1d44798d2cfd566e3ac1d2cbe607fcf19fb3041..46bac3e58824a767814cdf83e26a39a9
 +    displayedFrame.reset();
 +  }
  }
- 
+
  void KeyboardEntryActivity::onComplete(std::string text) {
 -  setResult(KeyboardResult{std::move(text)});
 +  setResult(KeyboardResult{std::move(text), workflowyStyles});
    finish();
  }
- 
+
 diff --git a/src/activities/util/KeyboardEntryActivity.h b/src/activities/util/KeyboardEntryActivity.h
-index 5335aef83dbecd89835ed12f65ce8085a31f071f..8c1b84e08c89c2c5f35e3b6994e451ba206898e0 100644
+index 5335aef83dbecd89835ed12f65ce8085a31f071f..5fbb96d1b6b5dbb784b93d5d50a8b49e695f3176 100644
 --- a/src/activities/util/KeyboardEntryActivity.h
 +++ b/src/activities/util/KeyboardEntryActivity.h
 @@ -1,9 +1,12 @@
@@ -1569,18 +1701,18 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8c1b84e08c89c2c5f35e3b6994e451ba
 +
  #include <FreeInkUIGfxRenderer.h>
  #include <GfxRenderer.h>
- 
+
  #include <atomic>
  #include <cstdint>
 +#include <functional>
 +#include <memory>
  #include <string>
  #include <utility>
- 
-@@ -29,14 +32,55 @@ class KeyboardEntryActivity : public Activity {
+
+@@ -29,14 +32,60 @@ class KeyboardEntryActivity : public Activity {
          inputType(inputType),
          minLength(minLength) {}
- 
+
 +  void setInitialCursor(size_t cursor) {
 +    initialCursor = cursor;
 +    keepCursorVisible = true;
@@ -1603,7 +1735,7 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8c1b84e08c89c2c5f35e3b6994e451ba
    bool preventAutoSleep() override { return true; }
 +  bool allowEdgeSlideGestures() const override { return false; }
    uint8_t inputPollDelayMs() const override { return mappedInput.hasTouchHardware() ? 2 : 10; }
- 
+
   private:
 +  bool workflowyFormatting = false;
 +  std::string workflowyStyles;
@@ -1629,13 +1761,18 @@ index 5335aef83dbecd89835ed12f65ce8085a31f071f..8c1b84e08c89c2c5f35e3b6994e451ba
 +  void drawTags() const;
 +  std::unique_ptr<uint8_t[]> displayedFrame;
 +  bool keepCursorVisible = false;
++  int manualInputStart = -1;
++  int paintedInputFirst = 0, paintedInputLast = 0, paintedInputWidth = 0;
++  int paintedInputTop = 0, paintedInputBottom = 0;
++  bool handleInputScroll(bool tapped, int x, int y);
++  void drawInputScroll() const;
 +  size_t initialCursor = std::string::npos;
    std::string title;
    std::string text;
    size_t maxLength;
-@@ -107,6 +151,7 @@ class KeyboardEntryActivity : public Activity {
+@@ -107,6 +156,7 @@ class KeyboardEntryActivity : public Activity {
    enum class InputFieldTouchTarget { None, Cursor, PasswordToggle };
- 
+
    void onComplete(std::string text);
 +  int firstVisibleInputLine(std::string& display, int width, int capacity) const;
    void onCancel();
@@ -1715,11 +1852,10 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f042ba4750
+index 0000000000000000000000000000000000000000..ff97cefc6deb60e919a40ef546e1bfb7878133e4
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5284 @@
-+#include "components/HomeNavigationIcon.h"
+@@ -0,0 +1,5288 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1748,6 +1884,7 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +#include "MappedInputManager.h"
 +#include "SdCardFontSystem.h"
 +#include "StatusIconRow.h"
++#include "components/StatusBarGeometry.h"
 +#include "components/HeaderDate.h"
 +#include "WifiCredentialStore.h"
 +#include "activities/ActivityManager.h"
@@ -1764,6 +1901,7 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +#include "fontIds.h"
 +#include "network/WifiUtils.h"
 +#include "workflowy/WorkflowySettings.h"
++#include "workflowy/WorkflowyActionBar.h"
 +#include "workflowy/WorkflowyTextDrawing.h"
 +#include "workflowy/WorkflowyIcon.h"
 +
@@ -5400,7 +5538,8 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +      if (x < bounds.x + bounds.width / 5) cancelSelection();
 +      return;
 +    }
-+    const auto control = static_cast<TodoControl>(std::clamp((x - bounds.x) * FOOTER_CONTROLS / bounds.width, 0, FOOTER_CONTROLS - 1));
++    const workflowy::ActionBar actions{FOOTER_CONTROLS, viewStack.empty() ? 1 : 0};
++    const auto control = static_cast<TodoControl>(actions.controlAt(x, bounds.x, bounds.width));
 +    if (control == TodoControl::Back) return back();
 +    if (control == TodoControl::Calendar) { calendarReturnHome = false; return openCalendar(false); }
 +    if (control == TodoControl::Refresh) return refresh(held);
@@ -5513,7 +5652,7 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +    char text[64]{};
 +    switch (config.slots[i]) {
 +      case ReaderStatusBarItem::Clock:
-+        if (WiFi.getMode() != WIFI_OFF) widths[i] += 24;
++        if (WiFi.getMode() != WIFI_OFF) widths[i] += StatusBarGeometry::WifiSpace;
 +        if (halClock.isAvailable()) halClock.formatTime(text, sizeof(text), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1);
 +        break;
 +      case ReaderStatusBarItem::Date:
@@ -5534,8 +5673,8 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +  const auto space = layoutReaderStatusBarItems(leftEdge, rightEdge, widths, reserve, 8);
 +  const int safeLeft = std::max(space.centerLeft, iconsRight + 8);
 +  const int safeRight = space.centerRight - 4;
-+  return Rect{safeLeft, bounds.top + UITheme::getTopStatusBarInset(renderer) + 1,
-+              std::max(0, safeRight - safeLeft), 26};
++  return Rect{safeLeft, UITheme::getTopStatusBarY(renderer),
++              std::max(0, safeRight - safeLeft), metrics.statusBarVerticalMargin};
 +}
 +
 +void WorkflowyDailyActivity::drawStatus(const Layout&, const size_t pending, const char* notice) {
@@ -5572,7 +5711,7 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +  const int inset = arrow + 4;
 +  const int x = std::clamp((renderer.getScreenWidth() - textWidth) / 2,
 +                           area.x + inset, area.x + area.width - inset - textWidth);
-+  const int y = area.y + (area.height - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
++  const int y = area.y + ReaderStatusBarConfig::TOP_TEXT_INSET;
 +  renderer.fillRect(area.x, area.y, area.width, area.height, false);
 +  renderer.beginTextClip(area.x, area.y, area.width, area.height);
 +  renderer.drawText(SMALL_FONT_ID, x, y, fitted.c_str());
@@ -5862,13 +6001,14 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +  renderer.drawLine(bounds.x, bounds.footer, bounds.x + bounds.width - 1, bounds.footer);
 +  if (!selecting) {
 +    const int iconY = bounds.footer + 23;
-+    const auto iconX = [&](TodoControl control) { return bounds.x + (2 * static_cast<int>(control) + 1) * bounds.width / (2 * FOOTER_CONTROLS); };
-+    int x = iconX(TodoControl::Back);
-+    if (viewStack.empty()) drawHomeNavigationIcon(renderer, x, iconY);
-+    else {
-+    renderer.drawLine(x - 9, iconY, x + 9, iconY, ICON_STROKE, true);
-+    renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, ICON_STROKE, true);
-+    renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, ICON_STROKE, true);
++    const workflowy::ActionBar actions{FOOTER_CONTROLS, viewStack.empty() ? 1 : 0};
++    const auto iconX = [&](TodoControl control) { return actions.center(static_cast<int>(control), bounds.x, bounds.width); };
++    int x = 0;
++    if (!viewStack.empty()) {
++      x = iconX(TodoControl::Back);
++      renderer.drawLine(x - 9, iconY, x + 9, iconY, ICON_STROKE, true);
++      renderer.drawLine(x - 9, iconY, x - 3, iconY - 6, ICON_STROKE, true);
++      renderer.drawLine(x - 9, iconY, x - 3, iconY + 6, ICON_STROKE, true);
 +    }
 +    const int viewX = iconX(TodoControl::ShowDone);
 +    const int eyeX[] = {viewX - 11, viewX - 7, viewX, viewX + 7, viewX + 11, viewX + 7, viewX, viewX - 7};
@@ -6594,7 +6734,8 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +    }
 +  }
 +  if (tapped && tapY >= bounds.footer) {
-+    const auto slot = static_cast<CalendarControl>(std::clamp((tapX - bounds.x) * 7 / bounds.width, 0, 6));
++    const workflowy::ActionBar actions{static_cast<int>(CalendarControl::Count), calendarReturnHome ? 1 : 0};
++    const auto slot = static_cast<CalendarControl>(actions.controlAt(tapX, bounds.x, bounds.width));
 +    if (slot == CalendarControl::Back) {
 +      if (calendarReturnHome) return finish();
 +      {
@@ -6912,16 +7053,16 @@ index 0000000000000000000000000000000000000000..f842f03aa07dcfc2d946edf2404902f0
 +void WorkflowyDailyActivity::calendarFooter(const Layout& bounds) {
 +  const int right = bounds.x + bounds.width;
 +  renderer.drawLine(bounds.x, bounds.footer, right, bounds.footer);
-+  const auto slot = [&](CalendarControl control) { return bounds.x + (2 * static_cast<int>(control) + 1) * bounds.width / 14; };
++  const workflowy::ActionBar actions{static_cast<int>(CalendarControl::Count), calendarReturnHome ? 1 : 0};
++  const auto slot = [&](CalendarControl control) { return actions.center(static_cast<int>(control), bounds.x, bounds.width); };
 +  const int y = bounds.footer + 23;
-+  if (calendarReturnHome) drawHomeNavigationIcon(renderer, slot(CalendarControl::Back), y);
-+  else {
-+  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) + 8, y, 3, true);
-+  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y - 6, 3, true);
-+  renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y + 6, 3, true);
++  if (!calendarReturnHome) {
++    renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) + 8, y, 3, true);
++    renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y - 6, 3, true);
++    renderer.drawLine(slot(CalendarControl::Back) - 8, y, slot(CalendarControl::Back) - 2, y + 6, 3, true);
 +  }
 +  const auto label = calendarSchedule ? tr(STR_WORKFLOWY_SCHEDULE_VIEW) : calendarWeek ? tr(STR_WORKFLOWY_WEEK) : tr(STR_WORKFLOWY_DAY);
-+  const auto mode = renderer.truncatedText(SMALL_FONT_ID, label, bounds.width / 7 - 8);
++  const auto mode = renderer.truncatedText(SMALL_FONT_ID, label, bounds.width / actions.count() - 8);
 +  renderer.drawText(SMALL_FONT_ID, slot(CalendarControl::View) - renderer.getTextWidth(SMALL_FONT_ID, mode.c_str()) / 2, y - 9,
 +                    mode.c_str(), true, EpdFontFamily::BOLD);
 +  renderer.drawLine(slot(CalendarControl::View) - 3, y + 11, slot(CalendarControl::View), y + 14, 2, true);
@@ -8594,10 +8735,10 @@ index 0000000000000000000000000000000000000000..58c24df55c717b51bd452d2a0ad62590
 +}
 diff --git a/test/workflowy_ui/CMakeLists.txt b/test/workflowy_ui/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..21e6e830d87caa108b5a7288b1b2ebf91b5d2b97
+index 0000000000000000000000000000000000000000..d7e73cf0abc81c916f45cb3dfef8f5177153a1fb
 --- /dev/null
 +++ b/test/workflowy_ui/CMakeLists.txt
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,23 @@
 +find_package(Python3 COMPONENTS Interpreter REQUIRED)
 +set(STATUS_INC ${CMAKE_CURRENT_BINARY_DIR}/WorkflowyStatusUnderTest.inc)
 +add_custom_command(OUTPUT ${STATUS_INC}
@@ -8612,6 +8753,15 @@ index 0000000000000000000000000000000000000000..21e6e830d87caa108b5a7288b1b2ebf9
 +target_compile_features(workflowy_ui_test PRIVATE cxx_std_20)
 +target_compile_options(workflowy_ui_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 +add_test(NAME workflowy_ui COMMAND workflowy_ui_test)
++
++set(EDITOR_SCROLL_INC ${CMAKE_CURRENT_BINARY_DIR}/EditorScroll.inc)
++add_custom_command(OUTPUT ${EDITOR_SCROLL_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractEditorScroll.py ${REPO_ROOT}/src/activities/util/KeyboardEntryActivity.cpp ${EDITOR_SCROLL_INC}
++ DEPENDS ${REPO_ROOT}/src/activities/util/KeyboardEntryActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractEditorScroll.py VERBATIM)
++add_executable(workflowy_editor_scroll_test EditorScrollTest.cpp ${EDITOR_SCROLL_INC})
++target_include_directories(workflowy_editor_scroll_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(workflowy_editor_scroll_test PRIVATE -UNDEBUG)
++add_test(NAME workflowy_editor_scroll COMMAND workflowy_editor_scroll_test)
 diff --git a/test/workflowy_ui/ExtractStatus.py b/test/workflowy_ui/ExtractStatus.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..bed4ade73d27017365e3492cb0740948bfadc67c
@@ -8648,10 +8798,12 @@ index 0000000000000000000000000000000000000000..bed4ade73d27017365e3492cb0740948
 +        output.write('\n' + source[start:source.index(end, start)])
 diff --git a/test/workflowy_ui/WorkflowyUiTest.cpp b/test/workflowy_ui/WorkflowyUiTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4f3f7a70e57cd3bf2dc26291d46a6b00a53b2a26
+index 0000000000000000000000000000000000000000..cfe2c231d8a9b3b1e0ae1ab0efdb10180a511bab
 --- /dev/null
 +++ b/test/workflowy_ui/WorkflowyUiTest.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,205 @@
++#include "components/StatusBarGeometry.h"
++#include "workflowy/WorkflowyActionBar.h"
 +#include "workflowy/WorkflowyTagInput.h"
 +#include <algorithm>
 +#include <cassert>
@@ -8740,6 +8892,15 @@ index 0000000000000000000000000000000000000000..4f3f7a70e57cd3bf2dc26291d46a6b00
 +};
 +#include "WorkflowyStatusUnderTest.inc"
 +int main(){
++  for (int total : {7, 10}) for (int first : {0, 1}) {
++    const workflowy::ActionBar actions{total, first};
++    assert(actions.count() == total - first);
++    assert(actions.controlAt(0, 0, 480) == first);
++    assert(actions.controlAt(479, 0, 480) == total - 1);
++    for (int control = first; control < total; ++control)
++      assert(actions.controlAt(actions.center(control, 0, 480), 0, 480) == control);
++  }
++
 +  assert(!isErrorNotice(tr(STR_WORKFLOWY_EMPTY)));
 +  assert(!isErrorNotice(tr(STR_WORKFLOWY_CAPTURE_QUEUED)));
 +  assert(isErrorNotice("Server error"));
@@ -8991,7 +9152,7 @@ index 0000000000000000000000000000000000000000..2c5638a9e6e8335ebc40fd82c48fccbd
 +add_test(NAME workflowy_share COMMAND workflowy_share_test)
 diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..63c05fd1e65ab80674221974b856f536cc8ba198
+index 0000000000000000000000000000000000000000..88d4a5aa1a53af84ae81e3feda4069721ef910fb
 --- /dev/null
 +++ b/test/workflowy_share/WorkflowyShareTest.cpp
 @@ -0,0 +1,21 @@
@@ -9003,11 +9164,11 @@ index 0000000000000000000000000000000000000000..63c05fd1e65ab80674221974b856f536
 +int main(){
 + sdRoot=(std::filesystem::temp_directory_path()/"crashink-workflowy-share-test").string();std::filesystem::remove_all(sdRoot);std::filesystem::create_directories(sdRoot);
 + assert(workflowy::writeSetting(workflowy::KEY_FILE,"test-key"));
-+ workflowy::shareClippings(0);assert(workflowy::shareInProgress());assert(httpCalls==0&&jobs()==1);for(auto& f:std::filesystem::recursive_directory_iterator(sdRoot))if(f.path().extension()==".job"){std::ifstream in(f.path(),std::ios::binary);std::string data((std::istreambuf_iterator<char>(in)),{});assert(data.find("test-key")==std::string::npos);}runWorker();assert(!workflowy::shareInProgress()&&jobs()==1&&remote.empty());assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_SAVED_LOCALLY);assert(!workflowy::takeShareError());
++ workflowy::shareClippings(0);assert(workflowy::shareInProgress());assert(httpCalls==0&&jobs()==1&&pendingTask==nullptr);workflowy::startQueuedShares();assert(pendingTask==nullptr&&httpCalls==0);assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_SHARING);for(auto& f:std::filesystem::recursive_directory_iterator(sdRoot))if(f.path().extension()==".job"){std::ifstream in(f.path(),std::ios::binary);std::string data((std::istreambuf_iterator<char>(in)),{});assert(data.find("test-key")==std::string::npos);}runWorker();assert(!workflowy::shareInProgress()&&jobs()==1&&remote.empty());assert(!workflowy::takeShareNotice());assert(!workflowy::takeShareError());
 + // Change foreground book: queued text and metadata must survive independently.
 + CLIPPINGS.title="Second Book";CLIPPINGS.path="/second.epub";CLIPPINGS.quote="Second quote";online=true;
 + workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(jobs()==0&&remote.size()==4);assert(remote[0].name=="📘 Book — Author");assert(remote[1].parent==remote[0].id);assert(remote[2].name=="📘 Second Book — Author");assert(remote[3].parent==remote[2].id);assert(!WiFi.connected);
-+ const auto count=remote.size();workflowy::shareClippings(0);runWorker();assert(remote.size()==count&&jobs()==0);assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_ALREADY_SENT);
++ const auto count=remote.size();workflowy::shareClippings(0);runWorker();assert(remote.size()==count&&jobs()==0);assert(!workflowy::takeShareNotice());
 + // Two taps while worker is running publish both durable records.
 + CLIPPINGS.quote="Third quote";workflowy::shareClippings(0);CLIPPINGS.quote="Fourth quote";workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(remote.size()==count+2&&jobs()==0);
 + // Ambiguous POST: server accepted it but response was lost. Retry must not duplicate.
@@ -9042,10 +9203,10 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#include "Harness.h"
 diff --git a/test/workflowy_share/stubs/Harness.h b/test/workflowy_share/stubs/Harness.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..bf73c6e62294f8da05f672f3054fabfce98ca367
+index 0000000000000000000000000000000000000000..f6f81a32c1fa53cec7c19e60537eed2911c14afe
 --- /dev/null
 +++ b/test/workflowy_share/stubs/Harness.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,93 @@
 +#pragma once
 +#include <ArduinoJson.h>
 +#include <algorithm>
@@ -9101,7 +9262,8 @@ index 0000000000000000000000000000000000000000..bf73c6e62294f8da05f672f3054fabfc
 +constexpr int pdPASS=1,tskIDLE_PRIORITY=0;
 +inline int xTaskCreate(void(*f)(void*),const char*,int,void* data,int,void*){assert(!pendingTask);pendingTask=f;pendingContext=data;return pdPASS;}
 +inline void vTaskDelete(void*){}
-+inline void runWorker(){auto fn=pendingTask;auto data=pendingContext;pendingTask=nullptr;assert(fn);fn(data);}
++namespace workflowy {void startQueuedShares();std::optional<StrId> takeShareNotice();}
++inline void runWorker(){workflowy::takeShareNotice();workflowy::startQueuedShares();auto fn=pendingTask;auto data=pendingContext;pendingTask=nullptr;assert(fn);fn(data);}
 +inline uint32_t esp_random(){static uint32_t n=1;return n++;}
 +constexpr int WIFI_OFF=0,WIFI_STA=1; inline bool online=false;
 +struct Wifi {int modeValue=0;bool connected=false;
@@ -9235,7 +9397,7 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#pragma once
 +#include "Harness.h"
 diff --git a/src/components/AppNavigation.cpp b/src/components/AppNavigation.cpp
-index 87ea3c3e2bca4703b72dcad88b9d8402e5363b98..5d738f24eea9ad7ad187ee06c9b121d260eaaa9b 100644
+index 4e57f1a141850c5c71f56248221b733163e07382..b3d4f73cf9fd5a66cbe3c7d0c2bd7183bb1a7848 100644
 --- a/src/components/AppNavigation.cpp
 +++ b/src/components/AppNavigation.cpp
 @@ -4,6 +4,9 @@
@@ -9245,9 +9407,9 @@ index 87ea3c3e2bca4703b72dcad88b9d8402e5363b98..5d738f24eea9ad7ad187ee06c9b121d2
 +#ifndef SIMULATOR
 +#include "activities/workflowy/WorkflowyDailyActivity.h"
 +#endif
- #include "components/icons/listIcons.h"
  namespace AppNavigation {
  const freeink::Icon& icon(View view, bool large) {
+   if (view == View::Home) return launcher_home_32;
 @@ -44,6 +47,14 @@ void open(View view, GfxRenderer& renderer, MappedInputManager& input) {
      case View::Browse: activityManager.goToFileBrowser(); break;
      case View::Transfer: activityManager.goToFileTransfer(); break;
@@ -9263,3 +9425,88 @@ index 87ea3c3e2bca4703b72dcad88b9d8402e5363b98..5d738f24eea9ad7ad187ee06c9b121d2
      default: break;
    }
  }
+diff --git a/src/workflowy/WorkflowyActionBar.h b/src/workflowy/WorkflowyActionBar.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f703342f687228bd244618bc8d097e82bb03e3d
+--- /dev/null
++++ b/src/workflowy/WorkflowyActionBar.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include <algorithm>
++
++namespace workflowy {
++// Drawing and hit testing use the same contiguous subset of action IDs.
++struct ActionBar {
++  int total;
++  int first;
++  int count() const { return total - first; }
++  int controlAt(int x, int left, int width) const {
++    return first + std::clamp((x - left) * count() / std::max(1, width), 0, count() - 1);
++  }
++  int center(int control, int left, int width) const {
++    return left + (2 * (control - first) + 1) * width / (2 * count());
++  }
++};
++}  // namespace workflowy
+diff --git a/test/workflowy_ui/EditorScrollTest.cpp b/test/workflowy_ui/EditorScrollTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..669cb06e4bc441b388a6ea8f5862e43919362e2f
+--- /dev/null
++++ b/test/workflowy_ui/EditorScrollTest.cpp
+@@ -0,0 +1,43 @@
++#include <algorithm>
++#include <atomic>
++#include <cassert>
++#include <string>
++#include <vector>
++struct RenderLock {template<class T>explicit RenderLock(T&) {}};
++class KeyboardEntryActivity {
++ public:
++ bool workflowyFormatting=true,keepCursorVisible=true,draggingSelection=false;
++ int manualInputStart=-1,paintedInputFirst=0,paintedInputLast=0,paintedInputWidth=4,paintedInputTop=100,paintedInputBottom=200;
++ size_t touchSelectionStart=std::string::npos,cursorPos=20;
++ std::string text="abcdefghijklmnopqrstuvwx";
++ std::atomic<bool> textOnlyPaint{false};int redraws=0;
++ struct Input {bool down=false,held=false;int x=0,y=0;bool wasScreenTouchDown(int& a,int& b){a=x;b=y;return down;}bool isScreenTouchHeld(int& a,int& b){a=x;b=y;return held;}bool hasTouchHardware()const{return true;}} mappedInput;
++ struct Renderer {mutable int lines=0;int getScreenWidth()const{return 480;}void drawLine(int,int y,int,int b,int,bool)const{assert(y>=100&&y<200&&b>=100&&b<200);++lines;}} renderer;
++ struct Router {int resets=0;void reset(){++resets;}}touchRouter;
++ void requestUpdate(){++redraws;}
++ std::string displayTextForCurrentState()const{return text;}
++ int lineBreakEnd(std::string& display,int start,int width)const {
++  int end=start;
++  for(int count=0;count<width&&end<(int)display.size();++count){++end;while(end<(int)display.size()&&(static_cast<unsigned char>(display[end])&0xc0)==0x80)++end;}
++  return end;
++ }
++ int firstVisibleInputLine(std::string&,int,int)const;
++ bool handleInputScroll(bool,int,int);
++ void drawInputScroll()const;
++ void paint(){paintedInputFirst=firstVisibleInputLine(text,4,3);paintedInputLast=paintedInputFirst;for(int i=0;i<3;++i)paintedInputLast=lineBreakEnd(text,paintedInputLast,4);}
++};
++#include "EditorScroll.inc"
++int main(){
++ KeyboardEntryActivity editor;editor.paint();assert(editor.paintedInputFirst==12);
++ const auto text=editor.text;const auto cursor=editor.cursorPos;
++ assert(editor.handleInputScroll(true,460,110));editor.paint();assert(editor.paintedInputFirst==8);
++ assert(editor.cursorPos==cursor&&editor.text==text&&editor.textOnlyPaint.load());
++ assert(editor.handleInputScroll(true,460,190));editor.paint();assert(editor.paintedInputFirst==12);
++ auto count=editor.redraws;assert(editor.handleInputScroll(true,460,190));assert(editor.redraws==count);
++ while(editor.paintedInputFirst){assert(editor.handleInputScroll(true,460,110));editor.paint();}
++ count=editor.redraws;editor.handleInputScroll(true,460,110);assert(editor.redraws==count);
++ assert(!editor.handleInputScroll(true,300,150));assert(!editor.handleInputScroll(true,460,250));
++ editor.drawInputScroll();assert(editor.renderer.lines==4);
++ editor.manualInputStart=-1;editor.paint();assert(editor.paintedInputFirst==12);
++ editor.text="éééééééééééééééééééééééé";editor.cursorPos=40;editor.manualInputStart=-1;editor.paint();editor.handleInputScroll(true,460,110);editor.paint();assert(editor.paintedInputFirst%2==0);assert(editor.cursorPos==40);
++}
+diff --git a/test/workflowy_ui/ExtractEditorScroll.py b/test/workflowy_ui/ExtractEditorScroll.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfb600e9bb06c38f38c3a534c0b7365ee26a6e31
+--- /dev/null
++++ b/test/workflowy_ui/ExtractEditorScroll.py
+@@ -0,0 +1,7 @@
++from pathlib import Path
++import sys
++source=Path(sys.argv[1]).read_text()
++parts=[]
++for start,end in [('int KeyboardEntryActivity::firstVisibleInputLine(', 'KeyboardEntryActivity::InputFieldTouchTarget'), ('bool KeyboardEntryActivity::handleInputScroll(', 'void KeyboardEntryActivity::loop()')]:
++ a=source.index(start);b=source.index(end,a);parts.append(source[a:b])
++Path(sys.argv[2]).write_text('\n'.join(parts))
