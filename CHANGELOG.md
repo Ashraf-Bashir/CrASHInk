@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- The File Transfer menu now includes the shared bottom app ribbon, with menu rows kept above it and File Transfer marked as selected.
+
 - Workflowy quote sharing displays one immediate “Queued for Workflowy” confirmation before Wi-Fi starts, with no duplicate completion toast. Offline quotes remain safely queued.
 - Status bars keep one vertical position across apps; the Wi-Fi symbol stays within the bar. Launcher spacing is balanced, icons have consistent padding, and selected apps reverse colors in both themes.
 - Workflowy text editing includes up/down scrolling without closing the keyboard. Calendar uses its shorter name, and Home explicitly follows the configured auto-sleep timeout.
