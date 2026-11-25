@@ -1666,212 +1666,6 @@ index c07271b23befcfd2b1b2210a7756cc694b886c8f..03f0e4cbc5467bc79d159d129d855b34
    activityManager.goToReader(path);
  }
 
-diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index d53409d729e14a7ffc8e8ff8485065eb5c08a687..93c434fc9dd53b98735ce4ec1a7e56e5d3cb48f0 100644
---- a/src/activities/reader/EpubReaderActivity.cpp
-+++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -43,6 +43,7 @@
- #include "../settings/DictionarySelectActivity.h"
- #include "../settings/KOReaderSettingsActivity.h"
- #include "BookFontSystem.h"
-+#include "../settings/ReadestSettingsActivity.h"
- #include "BookStatsActivity.h"
- #include "BookStatsTracking.h"
- #include "ClipSelectionActivity.h"
-@@ -78,6 +79,7 @@
- #include "ReaderUtils.h"
- #include "ReadingPace.h"
- #include "ReadingSessionStats.h"
-+#include "ReadestSyncActivity.h"
- #include "RecentBooksStore.h"
- #include "SdCardFont.h"
- #include "SdCardFontSystem.h"
-@@ -94,6 +96,7 @@
- #include "clippings/ClippingTextMatcher.h"
- #include "clippings/ClippingsManager.h"
- #include "components/UITheme.h"
-+#include "readest/ReadestStore.h"
- #if CROSSINK_APP_CAP_TOUCH
- #include "components/TouchHeaderBackButton.h"
- #endif
-@@ -480,11 +483,13 @@ uint16_t countClipTokens(const std::string& text) {
-
- ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
-                                                               const char* token, const size_t tokenLen,
--                                                              const size_t tokenOffset = 0) {
-+                                                              const size_t tokenOffset = 0,
-+                                                              const bool clipStart = false,
-+                                                              const bool clipEnd = false) {
-   const char* word = block.wordText(wordIndex);
-   const char* visibleWord = word + (hasEmSpacePrefix(word) ? 3 : 0);
-   return ClippingTextMatcher::matchTokenFragmentWithLength(visibleWord, block.wordEndsWithInsertedHyphen(wordIndex),
--                                                           token, tokenLen, tokenOffset);
-+                                                           token, tokenLen, tokenOffset, clipStart, clipEnd);
- }
-
- template <typename Pages, typename Callback>
-@@ -567,7 +572,10 @@ bool matchClipRunFromPageWord(const Pages& page, const uint16_t clipTokenCount,
-           return true;
-         }
-
--        const auto fragmentResult = matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset);
-+        const uint16_t clipTokenIndex = static_cast<uint16_t>(startClipToken + matchedTokens);
-+        const auto fragmentResult =
-+            matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset, clipTokenIndex == 0,
-+                                 clipTokenIndex + 1 == clipTokenCount);
-         if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::MISMATCH) {
-           stoppedByMismatch = true;
-           return false;
-@@ -626,6 +634,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
-   const bool tableColumnOnly = expectedTableColumn != UINT8_MAX;
-
-   ClippingMatchTracker matches;
-+  bool bestIsComplete = false;
-
-   forEachVisiblePageWord(
-       page, [&](const uint16_t wordIndex, const PageTextLine& line, const TextBlock& block, const size_t i) {
-@@ -647,7 +656,9 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
-             break;
-           }
-           ClippingPageMatch candidate;
--          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen).match !=
-+          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, 0, tokenIndex == 0,
-+                                   tokenIndex + 1 == tokenCount)
-+                  .match !=
-                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
-               matchClipRunFromPageWord(page, tokenCount, cursor, token, tokenLen, wordIndex, tokenIndex,
-                                        minPartialMatch, expectedTableColumn, candidate, allowShortBoundary || shortBoundaryFound) &&
-@@ -669,8 +680,11 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
-             // clipping: a full match always beats a partial run.
-             if (matches.record(candidate.startWord, candidate.endWord) || (candidateComplete && !bestIsComplete)) {
-               match = candidate;
-+              bestIsComplete = candidateComplete;
-             }
--            if (!uniqueMatch || !matches.unique()) {
-+            // Keep scanning until a whole-clipping match is in hand, so a
-+            // partial run found earlier on the page cannot hide it.
-+            if (bestIsComplete && (!uniqueMatch || !matches.unique())) {
-               return false;
-             }
-           }
-@@ -819,9 +833,8 @@ bool findClippingTextOnPage(Section& section, const Page& page, const std::strin
-     if (!(boundaryDirections & (direction > 0 ? 1 : 2))) continue;
-     const int neighborIndex = (requestedPage >= 0 ? requestedPage : section.currentPage) + direction;
-     if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
--    // Keep at most one temporary neighboring page, and release it on each attempt.
--    // loadPage scopes its reader or reuses the build handle; currentPage is unchanged.
--    auto neighbor = section.loadPage(neighborIndex);
-+    // loadPage leaves currentPage unchanged; reuse this neighbor for later clips.
-+    const auto* neighbor = neighborCache.load(section, neighborIndex);
-     if (!neighbor) {
-       LOG_ERR("CLIP", "Could not verify clipping across page %d", neighborIndex);
-       continue;
-@@ -2749,6 +2762,10 @@ void EpubReaderActivity::onEnter() {
-     EpubReaderUtils::Progress progress;
-     if (EpubReaderUtils::loadProgress(*epub, progress)) {
-       progressLoaded = true;
-+      resumeProgressTimestamp = progress.updatedAtMs;
-+      lastSavedSpineIndex = progress.spineIndex;
-+      lastSavedPage = progress.pageNumber;
-+      lastSavedPageCount = progress.hasPageCount ? progress.pageCount : -1;
-       currentSpineIndex = progress.spineIndex;
-       nextPageNumber = progress.pageNumber;
-       cachedSpineIndex = currentSpineIndex;
-@@ -4889,6 +4906,36 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
-       }
-       break;
-     }
-+    case EpubReaderMenuAction::READEST_SYNC: {
-+      if (!READEST_STORE.hasCredentials()) {
-+        pauseReadingPaceTimer("readest_settings");
-+        startActivityForResult(std::make_unique<ReadestSettingsActivity>(renderer, mappedInput),
-+                               [this](const ActivityResult&) { resumeReadingPaceTimer("readest_settings_return"); });
-+        break;
-+      }
-+      // The sync runs after a clean network reboot and comes back through
-+      // goToReader(), so the current position must be on disk first.
-+      const bool saved = saveReadingProgress();
-+      if (!saved) {
-+        LOG_ERR("RDS", "Aborting Readest sync because current progress could not be saved");
-+        pendingSyncSaveError = true;
-+        requestUpdate();
-+        return;
-+      }
-+
-+      auto restartActivity = makeUniqueNoThrow<ReadestSyncActivity>(renderer, mappedInput, SETTINGS.orientation);
-+      if (!restartActivity) {
-+        LOG_ERR("RDS", "OOM: restart handoff (free=%u maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-+        drawToast(renderer, tr(STR_READEST_ERR_MEMORY));
-+        delay(1200);
-+        requestUpdate();
-+        break;
-+      }
-+      if (replacementResume) APP_STATE.setPendingOverlayResume(*replacementResume);
-+      pauseReadingPaceTimer("readest_sync");
-+      activityManager.replaceActivity(std::move(restartActivity));
-+      break;
-+    }
-     case EpubReaderMenuAction::NEARBY_POSITION_SYNC: {
-       const int currentPage = section ? section->currentPage : nextPageNumber;
-       const int totalPages = section ? section->estimatedTotalPages() : std::max(1, cachedChapterTotalPageCount);
-@@ -5215,10 +5262,16 @@ bool EpubReaderActivity::handleFrontlightPanelResult(const FrontlightPanelResult
-   }
-   if (result.action == FrontlightPanelAction::None) return handled;
-   if (result.action != FrontlightPanelAction::SyncProgress &&
-+      result.action != FrontlightPanelAction::ReadestSync &&
-       result.action != FrontlightPanelAction::NearbyPositionSync &&
-       result.action != FrontlightPanelAction::SendNearbyBook) {
-     return false;
-   }
-+  if (result.action == FrontlightPanelAction::ReadestSync) {
-+    // Same save-and-handoff path as the reader menu's Sync Readest entry.
-+    onReaderMenuConfirm(EpubReaderMenuAction::READEST_SYNC, false, nullptr);
-+    return true;
-+  }
-
-   PendingOverlayResume resume;
-   resume.origin = PendingOverlayOrigin::Reader;
-@@ -7674,14 +7727,19 @@ void EpubReaderActivity::render(RenderLock&& lock) {
-     const int totalPages = section->estimatedTotalPages();
-     // render() also runs on menu/bookmark/screenshot re-renders. Avoid repeating
-     // the same progress.bin write unless the rendered position or estimated total changed.
-+    const bool restoring = resumeProgressTimestamp.has_value();
-     if (progressSaveRequiredAfterRelayout || currentSpineIndex != lastSavedSpineIndex ||
-         section->currentPage != lastSavedPage || totalPages != lastSavedPageCount) {
--      if (!queueProgressSave(currentSpineIndex, section->currentPage, totalPages, progressSaveRequiredAfterRelayout)) {
-+      if (!queueProgressSave(currentSpineIndex, section->currentPage, totalPages,
-+                             restoring || progressSaveRequiredAfterRelayout)) {
-         pendingSyncSaveError = true;
-       } else if (progressSaveRequiredAfterRelayout) {
-         progressSaveRequiredAfterRelayout = false;
-       }
-     }
-+    // Refreshing a saved location for the current layout is not a reading event.
-+    // A subsequent user page turn gets its own timestamp.
-+    resumeProgressTimestamp.reset();
-     silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
-     queueCompletionPromptIfNeeded();
-   }
-@@ -8025,7 +8083,8 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
-     // another file open while a still-building EPUB section keeps files open.
-     section->releaseBuildFile();
-   }
--  const bool saved = EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount, visibleTextOffset);
-+  const bool saved =
-+      EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount, visibleTextOffset, resumeProgressTimestamp);
-   if (saved) {
-     lastSavedSpineIndex = spineIndex;
-     lastSavedPage = currentPage;
-@@ -8867,7 +8926,8 @@ void EpubReaderActivity::collectClippingPageMatches(const Page& page, ClippingPa
-         bool uniqueTextMatch = false;
-         const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
-         matchedText =
--            findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn);
-+            findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn,
-+                                   &neighborCache, entry.page);
-         const bool coversStoredBoundaries = (currentPage != clipping.startPage || match.startsAtClipStart) &&
-                                             (currentPage != clipping.endPage || match.reachesClipEnd);
-         if (matchedText && uniqueTextMatch && coversStoredBoundaries && legacyWordLayout) {
 diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
 index 2125bd32c80b5b8b3121346900fd1144b26b8f41..db0630a2168f27d9e5ff7a250251e1fbf1cf0e7f 100644
 --- a/src/activities/reader/EpubReaderActivity.h
@@ -7063,6 +6857,212 @@ index 0000000000000000000000000000000000000000..b56fdbd7f060a2b39ce3488ce6121ea7
 +#pragma once
 +#include <string>
 +namespace ProgressBookIterator { inline void rememberPath(const std::string&, const std::string&) {} }
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index d880f1fec2a84f587b5fec335efd22d0084e6bbb..7bb63e1da6a16cc4b2cfadfa213fddb95b8c9821 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -44,6 +44,7 @@
+ #include "../settings/DictionarySelectActivity.h"
+ #include "../settings/KOReaderSettingsActivity.h"
+ #include "BookFontSystem.h"
++#include "../settings/ReadestSettingsActivity.h"
+ #include "BookStatsActivity.h"
+ #include "BookStatsTracking.h"
+ #include "ClipSelectionActivity.h"
+@@ -79,6 +80,7 @@
+ #include "ReaderUtils.h"
+ #include "ReadingPace.h"
+ #include "ReadingSessionStats.h"
++#include "ReadestSyncActivity.h"
+ #include "RecentBooksStore.h"
+ #include "SdCardFont.h"
+ #include "SdCardFontSystem.h"
+@@ -95,6 +97,7 @@
+ #include "clippings/ClippingTextMatcher.h"
+ #include "clippings/ClippingsManager.h"
+ #include "components/UITheme.h"
++#include "readest/ReadestStore.h"
+ #if CROSSINK_APP_CAP_TOUCH
+ #include "components/TouchHeaderBackButton.h"
+ #endif
+@@ -481,11 +484,13 @@ uint16_t countClipTokens(const std::string& text) {
+
+ ClippingTextMatcher::TokenFragmentResult matchPageWordToToken(const TextBlock& block, const uint16_t wordIndex,
+                                                               const char* token, const size_t tokenLen,
+-                                                              const size_t tokenOffset = 0) {
++                                                              const size_t tokenOffset = 0,
++                                                              const bool clipStart = false,
++                                                              const bool clipEnd = false) {
+   const char* word = block.wordText(wordIndex);
+   const char* visibleWord = word + (hasEmSpacePrefix(word) ? 3 : 0);
+   return ClippingTextMatcher::matchTokenFragmentWithLength(visibleWord, block.wordEndsWithInsertedHyphen(wordIndex),
+-                                                           token, tokenLen, tokenOffset);
++                                                           token, tokenLen, tokenOffset, clipStart, clipEnd);
+ }
+
+ template <typename Pages, typename Callback>
+@@ -568,7 +573,10 @@ bool matchClipRunFromPageWord(const Pages& page, const uint16_t clipTokenCount,
+           return true;
+         }
+
+-        const auto fragmentResult = matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset);
++        const uint16_t clipTokenIndex = static_cast<uint16_t>(startClipToken + matchedTokens);
++        const auto fragmentResult =
++            matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, tokenOffset, clipTokenIndex == 0,
++                                 clipTokenIndex + 1 == clipTokenCount);
+         if (fragmentResult.match == ClippingTextMatcher::TokenFragmentMatch::MISMATCH) {
+           stoppedByMismatch = true;
+           return false;
+@@ -627,6 +635,7 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+   const bool tableColumnOnly = expectedTableColumn != UINT8_MAX;
+
+   ClippingMatchTracker matches;
++  bool bestIsComplete = false;
+
+   forEachVisiblePageWord(
+       page, [&](const uint16_t wordIndex, const PageTextLine& line, const TextBlock& block, const size_t i) {
+@@ -648,7 +657,9 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+             break;
+           }
+           ClippingPageMatch candidate;
+-          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen).match !=
++          if (matchPageWordToToken(block, static_cast<uint16_t>(i), token, tokenLen, 0, tokenIndex == 0,
++                                   tokenIndex + 1 == tokenCount)
++                  .match !=
+                   ClippingTextMatcher::TokenFragmentMatch::MISMATCH &&
+               matchClipRunFromPageWord(page, tokenCount, cursor, token, tokenLen, wordIndex, tokenIndex,
+                                        minPartialMatch, expectedTableColumn, candidate, allowShortBoundary || shortBoundaryFound) &&
+@@ -670,8 +681,11 @@ bool findClippingTextInPages(const Pages& page, const std::string& clippingText,
+             // clipping: a full match always beats a partial run.
+             if (matches.record(candidate.startWord, candidate.endWord) || (candidateComplete && !bestIsComplete)) {
+               match = candidate;
++              bestIsComplete = candidateComplete;
+             }
+-            if (!uniqueMatch || !matches.unique()) {
++            // Keep scanning until a whole-clipping match is in hand, so a
++            // partial run found earlier on the page cannot hide it.
++            if (bestIsComplete && (!uniqueMatch || !matches.unique())) {
+               return false;
+             }
+           }
+@@ -820,9 +834,8 @@ bool findClippingTextOnPage(Section& section, const Page& page, const std::strin
+     if (!(boundaryDirections & (direction > 0 ? 1 : 2))) continue;
+     const int neighborIndex = (requestedPage >= 0 ? requestedPage : section.currentPage) + direction;
+     if (neighborIndex < 0 || neighborIndex >= section.pageCount) continue;
+-    // Keep at most one temporary neighboring page, and release it on each attempt.
+-    // loadPage scopes its reader or reuses the build handle; currentPage is unchanged.
+-    auto neighbor = section.loadPage(neighborIndex);
++    // loadPage leaves currentPage unchanged; reuse this neighbor for later clips.
++    const auto* neighbor = neighborCache.load(section, neighborIndex);
+     if (!neighbor) {
+       LOG_ERR("CLIP", "Could not verify clipping across page %d", neighborIndex);
+       continue;
+@@ -2763,6 +2776,10 @@ void EpubReaderActivity::onEnter() {
+     EpubReaderUtils::Progress progress;
+     if (EpubReaderUtils::loadProgress(*epub, progress)) {
+       progressLoaded = true;
++      resumeProgressTimestamp = progress.updatedAtMs;
++      lastSavedSpineIndex = progress.spineIndex;
++      lastSavedPage = progress.pageNumber;
++      lastSavedPageCount = progress.hasPageCount ? progress.pageCount : -1;
+       currentSpineIndex = progress.spineIndex;
+       nextPageNumber = progress.pageNumber;
+       cachedSpineIndex = currentSpineIndex;
+@@ -4903,6 +4920,36 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
+       }
+       break;
+     }
++    case EpubReaderMenuAction::READEST_SYNC: {
++      if (!READEST_STORE.hasCredentials()) {
++        pauseReadingPaceTimer("readest_settings");
++        startActivityForResult(std::make_unique<ReadestSettingsActivity>(renderer, mappedInput),
++                               [this](const ActivityResult&) { resumeReadingPaceTimer("readest_settings_return"); });
++        break;
++      }
++      // The sync runs after a clean network reboot and comes back through
++      // goToReader(), so the current position must be on disk first.
++      const bool saved = saveReadingProgress();
++      if (!saved) {
++        LOG_ERR("RDS", "Aborting Readest sync because current progress could not be saved");
++        pendingSyncSaveError = true;
++        requestUpdate();
++        return;
++      }
++
++      auto restartActivity = makeUniqueNoThrow<ReadestSyncActivity>(renderer, mappedInput, SETTINGS.orientation);
++      if (!restartActivity) {
++        LOG_ERR("RDS", "OOM: restart handoff (free=%u maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
++        drawToast(renderer, tr(STR_READEST_ERR_MEMORY));
++        delay(1200);
++        requestUpdate();
++        break;
++      }
++      if (replacementResume) APP_STATE.setPendingOverlayResume(*replacementResume);
++      pauseReadingPaceTimer("readest_sync");
++      activityManager.replaceActivity(std::move(restartActivity));
++      break;
++    }
+     case EpubReaderMenuAction::NEARBY_POSITION_SYNC: {
+       const int currentPage = section ? section->currentPage : nextPageNumber;
+       const int totalPages = section ? section->estimatedTotalPages() : std::max(1, cachedChapterTotalPageCount);
+@@ -5229,10 +5276,16 @@ bool EpubReaderActivity::handleFrontlightPanelResult(const FrontlightPanelResult
+   }
+   if (result.action == FrontlightPanelAction::None) return handled;
+   if (result.action != FrontlightPanelAction::SyncProgress &&
++      result.action != FrontlightPanelAction::ReadestSync &&
+       result.action != FrontlightPanelAction::NearbyPositionSync &&
+       result.action != FrontlightPanelAction::SendNearbyBook) {
+     return false;
+   }
++  if (result.action == FrontlightPanelAction::ReadestSync) {
++    // Same save-and-handoff path as the reader menu's Sync Readest entry.
++    onReaderMenuConfirm(EpubReaderMenuAction::READEST_SYNC, false, nullptr);
++    return true;
++  }
+
+   PendingOverlayResume resume;
+   resume.origin = PendingOverlayOrigin::Reader;
+@@ -7689,14 +7742,19 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+     const int totalPages = section->estimatedTotalPages();
+     // render() also runs on menu/bookmark/screenshot re-renders. Avoid repeating
+     // the same progress.bin write unless the rendered position or estimated total changed.
++    const bool restoring = resumeProgressTimestamp.has_value();
+     if (progressSaveRequiredAfterRelayout || currentSpineIndex != lastSavedSpineIndex ||
+         section->currentPage != lastSavedPage || totalPages != lastSavedPageCount) {
+-      if (!queueProgressSave(currentSpineIndex, section->currentPage, totalPages, progressSaveRequiredAfterRelayout)) {
++      if (!queueProgressSave(currentSpineIndex, section->currentPage, totalPages,
++                             restoring || progressSaveRequiredAfterRelayout)) {
+         pendingSyncSaveError = true;
+       } else if (progressSaveRequiredAfterRelayout) {
+         progressSaveRequiredAfterRelayout = false;
+       }
+     }
++    // Refreshing a saved location for the current layout is not a reading event.
++    // A subsequent user page turn gets its own timestamp.
++    resumeProgressTimestamp.reset();
+     silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
+     queueCompletionPromptIfNeeded();
+   }
+@@ -8040,7 +8098,8 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
+     // another file open while a still-building EPUB section keeps files open.
+     section->releaseBuildFile();
+   }
+-  const bool saved = EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount, visibleTextOffset);
++  const bool saved =
++      EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount, visibleTextOffset, resumeProgressTimestamp);
+   if (saved) {
+     lastSavedSpineIndex = spineIndex;
+     lastSavedPage = currentPage;
+@@ -8883,7 +8942,8 @@ void EpubReaderActivity::collectClippingPageMatches(const Page& page, ClippingPa
+       if (CLIPPINGS.readClippingText(clipping, clippingText, clippingReader)) {
+         const uint8_t expectedTableColumn = tableColumnForSelection(clipping.tableSelection);
+         matchedText =
+-            findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn);
++            findClippingTextOnPage(*section, page, clippingText, match, &uniqueTextMatch, expectedTableColumn,
++                                   &neighborCache, entry.page);
+         const bool coversStoredBoundaries = (currentPage != clipping.startPage || match.startsAtClipStart) &&
+                                             (currentPage != clipping.endPage || match.reachesClipEnd);
+         if (matchedText && uniqueTextMatch && coversStoredBoundaries && legacyWordLayout) {
 diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
 index 6ca043e95544a498aa5ca58b65b84aafbdbe7c17..3ab602b17819b3f82543667f066996f825b3e0b1 100644
 --- a/src/activities/reader/EpubReaderMenuModel.h
