@@ -5,7 +5,7 @@ index 5f348ee8116f7484312180ebd1bbcba2238c44e4..12ad1268b5f345a8435a2cca019abb1e
 @@ -101,6 +101,14 @@
  - Show the Back button hint while viewing EPUB footnotes on button-only readers.
  - Releasing Power after starting Picco no longer selects a menu item on the first screen.
- 
+
 +### Changed
 +
 +
@@ -15,7 +15,7 @@ index 5f348ee8116f7484312180ebd1bbcba2238c44e4..12ad1268b5f345a8435a2cca019abb1e
 +
 +- Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
  ## [v1.6.1] - 2026-10-03
- 
+
  ### Added
 diff --git a/lib/Epub/Epub.cpp b/lib/Epub/Epub.cpp
 index 0f58b03c37d505831ab1be23fc46d4cf93a67820..a9c2a537eeb33aaba1e24c45ae6bb9b23ddd5aa1 100644
@@ -23,19 +23,19 @@ index 0f58b03c37d505831ab1be23fc46d4cf93a67820..a9c2a537eeb33aaba1e24c45ae6bb9b2
 +++ b/lib/Epub/Epub.cpp
 @@ -435,10 +435,14 @@ Epub::Epub(std::string filepath, const std::string& cacheDir) : filepath(std::mo
  }
- 
+
  uint64_t Epub::legacyCachePathHash(const std::string& filepath) { return std::hash<std::string>{}(filepath); }
 +std::string Epub::cacheSubdirectory(const char* name) const {
 +  return cachePath + (cachePath.rfind("/.crashink/", 0) == 0 ? "/." : "/") + name;
 +}
- 
+
  std::string Epub::cachePathForFilePath(const std::string& filepath, const std::string& cacheDir) {
    // Keep on-disk EPUB cache keys stable across standard library/toolchain changes.
 -  return cacheDir + "/epub_" + std::to_string(ZipFile::fnvHash64(filepath.c_str(), filepath.size()));
 +  const char* prefix = cacheDir == "/.crashink/.readest" ? "/.epub_" : "/epub_";
 +  return cacheDir + prefix + std::to_string(ZipFile::fnvHash64(filepath.c_str(), filepath.size()));
  }
- 
+
  bool Epub::hasCache(const std::string& filepath, const std::string& cacheDir) {
 @@ -987,7 +991,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss, const XLoc
          if (cssStatus == CssParseStatus::Complete ||
@@ -72,13 +72,13 @@ index 9d8377c1a4acfa666b7e8d90fcb4c96e8329728c..d39ac9fa213f08ada4867bfa215c8a85
 --- a/lib/Epub/Epub/Section.cpp
 +++ b/lib/Epub/Epub/Section.cpp
 @@ -105,7 +105,7 @@ size_t sectionHtmlStreamChunkSize(const bool preview) {
- 
+
  // Each FAT directory holds at most 32 chapter numbers (plus their layout variants).
  std::string chapterDirectory(const Epub& epub, const char* root, int spine) {
 -  return epub.getCachePath() + root + "/" + std::to_string(spine / 32);
 +  return epub.cacheSubdirectory(root + 1) + "/" + std::to_string(spine / 32);
  }
- 
+
  std::string sectionBackupPath(const std::string& filePath) { return filePath + ".bak"; }
 diff --git a/lib/LibraryIndex/LibraryBuilder.cpp b/lib/LibraryIndex/LibraryBuilder.cpp
 index 45057b5696f246fa0044121706bde23ecfbb37b0..f4aeb5e3d998a85683a44a3e40dbedd825c78085 100644
@@ -91,11 +91,11 @@ index 45057b5696f246fa0044121706bde23ecfbb37b0..f4aeb5e3d998a85683a44a3e40dbedd8
 +#include <strings.h>
  #include <limits>
  #include <optional>
- 
+
 @@ -34,19 +35,19 @@
  namespace library {
  namespace {
- 
+
 -constexpr char INDEX_PATH[] = "/.crosspoint/library.idx";
 -constexpr char NEW_PATH[] = "/.crosspoint/library.new";
 -constexpr char BACKUP_PATH[] = "/.crosspoint/library.bak";
@@ -126,16 +126,16 @@ index 45057b5696f246fa0044121706bde23ecfbb37b0..f4aeb5e3d998a85683a44a3e40dbedd8
 @@ -843,7 +844,7 @@ void walk(WalkState& st, const std::string& path, const int depth) {
      const uint32_t modificationTime = isDir ? 0 : entry.modificationTime();
      entry.close();
- 
+
 -    if (st.nameBuf[0] == '\0' || isHiddenOrSidecar(st.nameBuf) || (isDir && isSystemDirectory(st.nameBuf))) continue;
 +    if (st.nameBuf[0] == '\0' || isHiddenOrSidecar(st.nameBuf) || (isDir && (isSystemDirectory(st.nameBuf) || strcasecmp(st.nameBuf, "crashink") == 0))) continue;
      const std::string name(st.nameBuf);
- 
+
      if (isDir) {
 @@ -1683,6 +1684,7 @@ static bool rebuildLibraryIndex(const char* rootPath, BuildStats& stats, const b
    const uint32_t startMs = millis();
    stats = BuildStats{};
- 
+
 +  Storage.mkdir("/.crashink");
    Storage.mkdir(CACHE_DIR);
    if (!recoverInterruptedInstall()) return false;
@@ -147,7 +147,7 @@ index 6d05c36ec0be31fdc23b5f357fadc57bd32b6dfb..3c203d0625b079224a8f824c189a5af8
 @@ -102,7 +102,7 @@ inline constexpr uint32_t LIBRARY_PROGRESS_INTERVAL_MS = 3000;
  // does not limit this on any device; the format ceiling does.
  uint16_t libraryBookLimit();
- 
+
 -// Walk `rootPath`, write `/.crosspoint/library.idx`, and report what happened.
 +// Walk `rootPath`, write `/.crashink/.library/library.idx`, and report what happened.
  // The previous index, including its monotonic "recently added" counter, is read
@@ -160,7 +160,7 @@ index 0995e9bf30aef4384c0fb8a8e67b600704813a99..868e9d4ef5c613e7907b7e8ff8a865dd
 @@ -12,8 +12,8 @@
  namespace library {
  namespace {
- 
+
 -constexpr char SLOT_PATH[] = "/.crosspoint/library.meta";
 -constexpr char PAYLOAD_PATH[] = "/.crosspoint/library.metd";
 +constexpr char SLOT_PATH[] = "/.crashink/.library/library.meta";
@@ -180,7 +180,7 @@ index 14414c04e173070e685faf4a8439067169524591..8a993f48cce9e4b68577b69d1edc688e
 +constexpr char CLIPPINGS_DIR[] = "/.crashink/.clippings";
 +constexpr size_t INITIAL_CLIPPING_RESERVE = 4;
  constexpr size_t TEXT_COPY_BUFFER_SIZE = 128;
- 
+
  uint32_t creationTimeUtc() {
 diff --git a/src/activities/home/BookActions.cpp b/src/activities/home/BookActions.cpp
 index 2b28f726c73a826d4d6dbdc55abecad51d9afb6c..d83c3fbeed26537c8ce5e2de47cb5dfeace1301e 100644
@@ -201,7 +201,7 @@ index d7facd157ef82f6975142235d7bf1d299fe62214..8f79693d8e6ec9842ec8e59bbb7e3439
 +++ b/src/activities/reader/BookReadingStats.cpp
 @@ -443,6 +443,8 @@ bool BookReadingStats::save(const std::string& cachePath) const {
  }
- 
+
  bool BookReadingStats::remove(const std::string& cachePath) {
 +  Storage.remove("/.crashink/.library/library-filter.cache");
 +  Storage.remove("/.crashink/.library/library-recents.cache");
@@ -214,7 +214,7 @@ index 249dfac96c998311640e2d7b24b979db6a36d00b..e9b1169783c5a112ef9f7a99b6f0c737
 +++ b/src/activities/reader/BookStatsActivity.cpp
 @@ -167,6 +167,8 @@ void BookStatsActivity::applyCompletedState(const bool completed) {
    }
- 
+
    stats.isCompleted = completed;
 +  Storage.remove("/.crashink/.library/library-filter.cache");
 +  Storage.remove("/.crashink/.library/library-recents.cache");
@@ -227,7 +227,7 @@ index 4922f3cd3f29e75fee160dd5309b9676ffe75fb8..f8170e37ff311a064ad4ae8d55f33772
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -6225,6 +6225,8 @@ void EpubReaderActivity::setBookCompleted(bool isCompleted) {
    }
- 
+
    stats.isCompleted = isCompleted;
 +  Storage.remove("/.crashink/.library/library-filter.cache");
 +  Storage.remove("/.crashink/.library/library-recents.cache");
@@ -240,7 +240,7 @@ index c887725c3939cac37a0d65572947a33b478888c1..48fc829f32a5ea96c1c31b66139ef1d7
 +++ b/src/activities/reader/XtcReaderActivity.cpp
 @@ -823,6 +823,8 @@ void XtcReaderActivity::setBookCompleted(const bool isCompleted) {
    }
- 
+
    stats.isCompleted = isCompleted;
 +  Storage.remove("/.crashink/.library/library-filter.cache");
 +  Storage.remove("/.crashink/.library/library-recents.cache");
@@ -252,7 +252,7 @@ index 669d814ddd3d38f6cc6b0da1a009f01e55b7cc7e..3a76d9b86d8eb5a491367f33d43ed49f
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -94,6 +94,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
- 
+
  #include "AppVersion.h"
  #include "CrossPointSettings.h"
 +#include "util/CrASHinkStorage.h"
@@ -264,9 +264,9 @@ index 669d814ddd3d38f6cc6b0da1a009f01e55b7cc7e..3a76d9b86d8eb5a491367f33d43ed49f
    logBootHeap("storage ready");
    display.startBegin();
 +  crashinkStorage::migrate();
- 
+
    HalSystem::checkPanic();
- 
+
 diff --git a/src/util/CrASHinkStorage.cpp b/src/util/CrASHinkStorage.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..42a71445f7267fc5d109e82c44311854c1483cdf
@@ -431,29 +431,29 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
 --- a/test/library_builder/LibraryBuilderTest.cpp
 +++ b/test/library_builder/LibraryBuilderTest.cpp
 @@ -31,7 +31,7 @@ bool clearBookCachePreservingUserState(const std::string& path, const bool sourc
- 
+
  namespace {
- 
+
 -constexpr char INDEX[] = "/.crosspoint/library.idx";
 +constexpr char INDEX[] = "/.crashink/.library/library.idx";
- 
+
  std::string numbered(const char* prefix, const unsigned value) {
    char text[32];
 @@ -342,8 +342,8 @@ TEST_F(LibraryBuilderTest, StagingAndIndexWritesAreBatched) {
- 
+
    ASSERT_TRUE(buildLibraryIndex("/", stats, false));
- 
+
 -  EXPECT_LT(fake::writesByPath["/.crosspoint/library.stage"], 64u);
 -  EXPECT_LT(fake::writesByPath["/.crosspoint/library.new"], 32u);
 +  EXPECT_LT(fake::writesByPath["/.crashink/.library/library.stage"], 64u);
 +  EXPECT_LT(fake::writesByPath["/.crashink/.library/library.new"], 32u);
  }
- 
+
  TEST_F(LibraryBuilderTest, ParentDuplicateTrackingSurvivesDirectoryRecursion) {
 @@ -585,7 +585,7 @@ TEST_F(LibraryBuilderTest, InterruptedUpgradeKeepsValidOldLiveIndexOverStaleBack
    before.close();
    ASSERT_TRUE(downgradeIndexToVersionFive());
- 
+
 -  constexpr char BACKUP[] = "/.crosspoint/library.bak";
 +  constexpr char BACKUP[] = "/.crashink/.library/library.bak";
    fake::files[BACKUP] = std::make_shared<fake::Node>(*fake::files[INDEX]);
@@ -462,7 +462,7 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
 @@ -692,7 +692,7 @@ TEST_F(LibraryBuilderTest, InterruptedUpgradeRestoresVersionThreeBackup) {
    ASSERT_TRUE(recordAtPath(before, "/a.epub", original));
    before.close();
- 
+
 -  constexpr char BACKUP[] = "/.crosspoint/library.bak";
 +  constexpr char BACKUP[] = "/.crashink/.library/library.bak";
    fake::files[BACKUP] = std::make_shared<fake::Node>(*fake::files[INDEX]);
@@ -474,7 +474,7 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
    fake::files[INDEX]->bytes[offsetof(ClixHeader, formatVersion)] = 3;
 -  fake::failWritePath = "/.crosspoint/library.new";
 +  fake::failWritePath = "/.crashink/.library/library.new";
- 
+
    EXPECT_FALSE(buildLibraryIndex("/", stats, true));
    LibraryIndexFile shelf;
 @@ -976,8 +976,8 @@ TEST_F(LibraryBuilderTest, EveryAllocationFailureFailsCleanlyOrBuildsTheSameInde
@@ -491,19 +491,19 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
 @@ -1098,11 +1098,11 @@ TEST_F(LibraryBuilderTest, ReadWriteCloseAndAllocationFailuresRetainPreviousInde
    EXPECT_EQ(fake::files[INDEX]->bytes, old);
    fake::failWrite = -1;
- 
+
 -  fake::failWritePath = "/.crosspoint/library.new";
 +  fake::failWritePath = "/.crashink/.library/library.new";
    EXPECT_FALSE(buildLibraryIndex("/", stats, true));
    EXPECT_EQ(fake::files[INDEX]->bytes, old);
- 
+
 -  fake::failClosePath = "/.crosspoint/library.new";
 +  fake::failClosePath = "/.crashink/.library/library.new";
    EXPECT_FALSE(buildLibraryIndex("/", stats, true));
    EXPECT_EQ(fake::files[INDEX]->bytes, old);
- 
+
 @@ -1129,8 +1129,8 @@ TEST_F(LibraryBuilderTest, TruncatedPersistedPathHashAbortsAndRetainsTheLiveInde
- 
+
    EXPECT_FALSE(buildLibraryIndex("/", stats, true));
    EXPECT_EQ(fake::files[INDEX]->bytes, corrupted);
 -  EXPECT_FALSE(Storage.exists("/.crosspoint/library.stage"));
@@ -511,7 +511,7 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.stage"));
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.stage.f"));
  }
- 
+
  TEST_F(LibraryBuilderTest, LibrariesPastOldGateAndOldCeilingKeepAllOrders) {
 @@ -1193,8 +1193,8 @@ TEST_F(LibraryBuilderTest, BookPastFormatCeilingKeepsPreviousIndex) {
    EXPECT_FALSE(buildLibraryIndex("/", stats, false));
@@ -522,7 +522,7 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.stage"));
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.stage.f"));
  }
- 
+
  TEST_F(LibraryBuilderTest, FormatCeilingLibraryBuildsWithBoundedSortRuns) {
 @@ -1248,7 +1248,7 @@ TEST_F(LibraryBuilderTest, DirtyIndexClearsOnSuccessAndRetriesAfterFailure) {
    initial();
@@ -544,7 +544,7 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.stage.f"));
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.new"));
    EXPECT_TRUE(libraryIndexNeedsRefresh());
- 
+
    // Cancellation belongs to one build: the next one without callbacks completes.
 @@ -1474,7 +1474,7 @@ TEST_F(LibraryBuilderTest, SpilledAndInRamSortsBuildIdenticalIndexes) {
    setSortRunCapacityForTesting(20);
@@ -552,6 +552,6 @@ index bbbf283f3f1cbc5908a3c08954d9133f3718232b..ca8e24e36191be464b529e6fab276cd1
    EXPECT_EQ(fake::files[INDEX]->bytes, inRam);
 -  EXPECT_FALSE(Storage.exists("/.crosspoint/library.runs"));
 +  EXPECT_FALSE(Storage.exists("/.crashink/.library/library.runs"));
- 
+
    // A device without PSRAM now indexes past the old 4,096-book limit too.
    EXPECT_EQ(libraryBookLimit(), CLIX_MAX_RECORDS);
