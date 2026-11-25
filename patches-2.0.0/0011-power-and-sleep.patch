@@ -1,0 +1,1369 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6a2697aea23eb17eea670f7763a82411921530d5..ff211d6d9d445ba7c557e86bf2373993e4baf1d3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,8 @@
+
+ - Library and Home cover grids show saved reading percentages in high-contrast badges.
+
++- Custom sleep-screen rotation accepts JPEG, PNG, and the first frame of GIF images alongside BMPs.
++
+ - The reader’s swipe-down drawer has a Library shortcut. Display → Frontlight offers independent black border widths from 0 to 16 pixels on each edge to mask light leakage.
+ - crASHink adds a reader Library shortcut and independent frontlight leakage borders.
+
+diff --git a/docs/user-guide.md b/docs/user-guide.md
+index ccae5ace771fb371c3c4a04dfc4731a1af6211f4..21c30a1edac39048b9a77fabf27455f1385d8480 100644
+--- a/docs/user-guide.md
++++ b/docs/user-guide.md
+@@ -533,7 +533,11 @@ When using **Cover**, **Cover + Custom**, or **Cover Overlay**, two more setting
+
+ To use custom sleep images, set the sleep screen to **Custom**, **Cover + Custom**, **Page Overlay**, or **Cover Overlay**, then place images on the SD card:
+
+-- **Multiple Images (recommended):** Create a `.sleep` directory in the root of the SD card and place any number of `.bmp` images inside. In **Page Overlay** and **Cover Overlay** modes, `.png` images are also supported. One image will be randomly selected each time the device sleeps. (A directory named `sleep` is also accepted as a fallback.)
++- **Multiple Images (recommended):** Create a `.sleep` directory in the root of the SD card and place BMP, PNG, JPEG (`.jpg` or `.jpeg`), or GIF images inside for **Custom** and **Cover + Custom** modes. GIFs display their first frame only (up to 480 pixels wide on the device). **Page Overlay** mode supports BMP and PNG. One image will be randomly selected each time the device sleeps. (A directory named `sleep` is also accepted as a fallback.)
++- **Single Image:** In **Custom** mode, place `sleep.bmp`, `sleep.png`, `sleep.jpg`, `sleep.jpeg`, or `sleep.gif` in the root directory. **Page Overlay** supports `sleep.bmp` and `sleep.png`. These files are used as fallbacks if no valid image is found in the `.sleep`/`sleep` directory.
++
++In **Page Overlay** mode, white BMP pixels and transparent PNG pixels let the current reader page show through; the remaining wallpaper pixels are drawn over the page.
++In **Page Overlay** and **Cover Overlay** modes, `.png` images are also supported. One image will be randomly selected each time the device sleeps. (A directory named `sleep` is also accepted as a fallback.)
+ - **Single Image:** Place a file named `sleep.bmp` in the root directory. In **Page Overlay** and **Cover Overlay** modes, `sleep.png` is also supported. These files are used as fallbacks if no valid image is found in the `.sleep`/`sleep` directory.
+
+ In **Page Overlay** mode, white BMP pixels and transparent PNG pixels let the current reader page show through; the remaining wallpaper pixels are drawn over the page. **Cover Overlay** uses the same image selection over the current book cover. PNG alpha transparency preserves cover grayscale on supported panels; BMP white pixels are transparent and other pixels form a black mask.
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 22645f64c990f2410b4b836c66a554bc8c9219a4..d212b2806fe272158def9dd55ba2868cf1f9e0f4 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -591,7 +591,7 @@ STR_READING_PACE_RESET: "Reading Pace Reset"
+ STR_DELETE: "Delete"
+ STR_PIN_AS_FAVORITE: "Set Sleep Screen"
+ STR_UNPIN_AS_FAVORITE: "Unset Sleep Screen"
+-STR_PIN_PNG_WARNING: "Pinning a PNG is only compatible with Page Overlay mode"
++STR_PIN_PNG_WARNING: "Pinning this PNG will switch the sleep screen to Page Overlay mode"
+ STR_SET_AS_BOOT_SCREEN: "Set Boot Screen"
+ STR_CLEAR_BOOT_SCREEN: "Clear Boot Screen"
+ STR_SET_AS_SLEEP_FOLDER: "Set as Sleep Folder"
+diff --git a/lib/hal/HalTiltSensor.h b/lib/hal/HalTiltSensor.h
+index 115d044eac3c6e652b1d6e656e4ecd35fc4b92d2..6e11a0d79a73ec3b9b90df5944349e16abf7df16 100644
+--- a/lib/hal/HalTiltSensor.h
++++ b/lib/hal/HalTiltSensor.h
+@@ -40,11 +40,7 @@ class HalTiltSensor {
+   unsigned long _wakeMs = 0;       // Timestamp of last wake() for stabilization
+
+   // Tuning constants
+-#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+-  static constexpr float RATE_THRESHOLD_DPS = 200.0f;  // Stay below the Sticky IMU's ±245 dps range
+-#else
+   static constexpr float RATE_THRESHOLD_DPS = 270.0f;  // Deg/sec speed to trigger flick
+-#endif
+   static constexpr float NEUTRAL_RATE_DPS = 50.0f;         // Must stop moving below this rate before next trigger
+   static constexpr unsigned long COOLDOWN_MS = 600;        // Minimum ms between triggers
+   static constexpr unsigned long POLL_INTERVAL_MS = 50;    // 20 Hz polling
+diff --git a/src/activities/boot_sleep/BootActivity.cpp b/src/activities/boot_sleep/BootActivity.cpp
+index 9d28efea100c0b753703df066ec38c2a06b6ac64..6cdc400983831eca9f165a96dfc20bab31c9b4ab 100644
+--- a/src/activities/boot_sleep/BootActivity.cpp
++++ b/src/activities/boot_sleep/BootActivity.cpp
+@@ -107,7 +107,7 @@ bool tryDrawRotatingBootImage(const GfxRenderer& renderer) {
+
+   const auto pickAndDraw = [&](const bool validateBmpHeaders) {
+     ImageFolderIndex::Selection selection;
+-    if (!ImageFolderIndex::select(bootDir, false, validateBmpHeaders, APP_STATE.recentBootImages,
++    if (!ImageFolderIndex::select(bootDir, ImageFolderIndex::Formats::Bmp, validateBmpHeaders, APP_STATE.recentBootImages,
+                                   CrossPointState::BOOT_RECENT_COUNT, APP_STATE.recentBootPos, APP_STATE.recentBootFill,
+                                   std::min(APP_STATE.recentBootFill, CrossPointState::BOOT_RECENT_COUNT), selection)) {
+       return false;
+diff --git a/src/activities/boot_sleep/ImageFolderIndex.cpp b/src/activities/boot_sleep/ImageFolderIndex.cpp
+index bb09e5dc49f67dd129f7353a80e1c4bd6246fb49..6d8a9acba81924e037d6fce3b2544d6ca884635c 100644
+--- a/src/activities/boot_sleep/ImageFolderIndex.cpp
++++ b/src/activities/boot_sleep/ImageFolderIndex.cpp
+@@ -30,6 +30,7 @@ constexpr char INDEX_DIR[] = "/.crosspoint/sleep-image-index";
+ constexpr char INDEX_MAGIC[] = {'C', 'S', 'I', 'X'};
+ constexpr uint8_t INDEX_VERSION = 2;
+ constexpr uint8_t FLAG_INCLUDE_PNG = 1 << 0;
++constexpr uint8_t FLAG_CUSTOM_FORMATS = 1 << 2;
+ constexpr uint8_t FLAG_VALIDATED = 1 << 1;
+ constexpr size_t MAX_FILENAME_LENGTH = 255;
+ constexpr size_t NAME_BUFFER_SIZE = MAX_FILENAME_LENGTH + 1;
+@@ -72,9 +73,9 @@ uint64_t fnv1a64(std::string_view value) {
+   return hash;
+ }
+
+-bool isCandidate(const FsFile& file, const std::string_view name, const bool includePng) {
++bool isCandidate(const FsFile& file, const std::string_view name, const Formats formats) {
+   return !file.isDirectory() && !name.empty() && name.front() != '.' &&
+-         (FsHelpers::hasBmpExtension(name) || (includePng && FsHelpers::hasPngExtension(name)));
++         accepts(name, formats);
+ }
+
+ void fingerprintEntry(uint64_t& fingerprint, FsFile& file, const std::string_view name) {
+@@ -88,7 +89,7 @@ void fingerprintEntry(uint64_t& fingerprint, FsFile& file, const std::string_vie
+   fingerprint *= 1099511628211ULL;
+ }
+
+-bool folderFingerprint(const std::string& directory, const bool includePng, uint64_t& fingerprint) {
++bool folderFingerprint(const std::string& directory, const Formats formats, uint64_t& fingerprint) {
+   FsFile dir = Storage.open(directory.c_str());
+   if (!dir || !dir.isDirectory()) {
+     dir.close();
+@@ -100,7 +101,7 @@ bool folderFingerprint(const std::string& directory, const bool includePng, uint
+   uint32_t scanned = 0;
+   for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+     const size_t length = file.getName(name, sizeof(name));
+-    if (length > 0 && length <= MAX_FILENAME_LENGTH && isCandidate(file, std::string_view(name, length), includePng)) {
++    if (length > 0 && length <= MAX_FILENAME_LENGTH && isCandidate(file, std::string_view(name, length), formats)) {
+       fingerprintEntry(fingerprint, file, std::string_view(name, length));
+     }
+     file.close();
+@@ -141,10 +142,11 @@ bool isTrackedImageFolderPath(std::string_view path) {
+          pathHasPrefix("/bootscreen", path, true);
+ }
+
+-bool makeCachePath(const std::string& directory, const bool includePng, char* output, const size_t outputSize) {
++bool makeCachePath(const std::string& directory, const Formats formats, char* output, const size_t outputSize) {
+   const uint64_t hash = fnv1a64(directory);
+   const int written = snprintf(output, outputSize, "%s/%016llx-%s.idx", INDEX_DIR,
+-                               static_cast<unsigned long long>(hash), includePng ? "all" : "bmp");
++                               static_cast<unsigned long long>(hash),
++                               formats == Formats::Custom ? "custom" : formats == Formats::Overlay ? "all" : "bmp");
+   return written > 0 && static_cast<size_t>(written) < outputSize;
+ }
+
+@@ -154,23 +156,28 @@ bool readExact(HalFile& file, void* buffer, const size_t size) {
+
+ bool writeExact(HalFile& file, const void* buffer, const size_t size) { return file.write(buffer, size) == size; }
+
+-bool headerMatches(const IndexHeader& header, const std::string& directory, const bool includePng,
++uint8_t formatFlags(Formats formats) {
++  return formats == Formats::Custom ? FLAG_CUSTOM_FORMATS | FLAG_INCLUDE_PNG
++       : formats == Formats::Overlay ? FLAG_INCLUDE_PNG : 0;
++}
++
++bool headerMatches(const IndexHeader& header, const std::string& directory, const Formats formats,
+                    const bool requireValidated) {
+   return memcmp(header.magic, INDEX_MAGIC, sizeof(INDEX_MAGIC)) == 0 && header.version == INDEX_VERSION &&
+-         (header.flags & FLAG_INCLUDE_PNG) == (includePng ? FLAG_INCLUDE_PNG : 0) &&
++         (header.flags & (FLAG_INCLUDE_PNG | FLAG_CUSTOM_FORMATS)) == formatFlags(formats) &&
+          (!requireValidated || (header.flags & FLAG_VALIDATED) != 0) && header.pathLength == directory.size() &&
+          header.recordSize == sizeof(IndexRecord) && header.recordsOffset == sizeof(IndexHeader) + header.pathLength &&
+          header.recordCount <= MAX_RECORDS;
+ }
+
+-bool openValidIndex(const std::string& directory, const bool includePng, const bool requireValidated, HalFile& file,
++bool openValidIndex(const std::string& directory, const Formats formats, const bool requireValidated, HalFile& file,
+                     IndexHeader& header, char* cachePath, const size_t cachePathSize) {
+-  if (!makeCachePath(directory, includePng, cachePath, cachePathSize)) return false;
++  if (!makeCachePath(directory, formats, cachePath, cachePathSize)) return false;
+   if (!OwnedFileSwap::recover(cachePath)) return false;
+   file = Storage.open(cachePath);
+   if (!file) return false;
+
+-  if (!readExact(file, &header, sizeof(header)) || !headerMatches(header, directory, includePng, requireValidated)) {
++  if (!readExact(file, &header, sizeof(header)) || !headerMatches(header, directory, formats, requireValidated)) {
+     file.close();
+     return false;
+   }
+@@ -209,7 +216,9 @@ bool readRecordName(HalFile& file, const IndexHeader& header, const uint16_t ind
+   if (!readExact(file, name.data(), NAME_BUFFER_SIZE) || name[nameLength] != '\0') return false;
+   name.resize(nameLength);
+   isPng = (flags & 1) != 0;
+-  return (isPng && FsHelpers::hasPngExtension(name)) || (!isPng && FsHelpers::hasBmpExtension(name));
++  return isPng == FsHelpers::hasPngExtension(name) && accepts(name,
++      (header.flags & FLAG_CUSTOM_FORMATS) ? Formats::Custom :
++      (header.flags & FLAG_INCLUDE_PNG) ? Formats::Overlay : Formats::Bmp);
+ }
+
+ bool cacheRecordExists(const std::string& directory, const std::string& name) {
+@@ -252,14 +261,14 @@ uint16_t chooseIndex(const uint16_t recordCount, const uint16_t* recentIndices,
+   return rank;
+ }
+
+-bool buildIndex(const std::string& directory, const bool includePng, const bool validateBmpHeaders, char* cachePath,
++bool buildIndex(const std::string& directory, const Formats formats, const bool validateBmpHeaders, char* cachePath,
+                 const size_t cachePathSize) {
+   if (!Storage.ensureDirectoryExists("/.crosspoint") || !Storage.ensureDirectoryExists(INDEX_DIR)) {
+     LOG_ERR("IMGIDX", "Cannot create image index directory");
+     return false;
+   }
+
+-  if (!makeCachePath(directory, includePng, cachePath, cachePathSize)) return false;
++  if (!makeCachePath(directory, formats, cachePath, cachePathSize)) return false;
+   char tempPath[MAX_CACHE_PATH] = {};
+   const int tempWritten = snprintf(tempPath, sizeof(tempPath), "%s.tmp", cachePath);
+   if (tempWritten <= 0 || static_cast<size_t>(tempWritten) >= sizeof(tempPath)) return false;
+@@ -280,7 +289,7 @@ bool buildIndex(const std::string& directory, const bool includePng, const bool
+   IndexHeader header{};
+   memcpy(header.magic, INDEX_MAGIC, sizeof(INDEX_MAGIC));
+   header.version = INDEX_VERSION;
+-  header.flags = includePng ? FLAG_INCLUDE_PNG : 0;
++  header.flags = formatFlags(formats);
+   header.flags |= validateBmpHeaders ? FLAG_VALIDATED : 0;
+   header.pathLength = static_cast<uint16_t>(directory.size());
+   header.recordSize = sizeof(IndexRecord);
+@@ -305,8 +314,9 @@ bool buildIndex(const std::string& directory, const bool includePng, const bool
+     const size_t nameLength = file.getName(nameBuffer.get(), NAME_BUFFER_SIZE);
+     const std::string_view name(nameBuffer.get(), std::min(nameLength, MAX_FILENAME_LENGTH));
+     const bool isBmp = FsHelpers::hasBmpExtension(name);
+-    const bool isPng = includePng && FsHelpers::hasPngExtension(name);
+-    bool valid = nameLength > 0 && nameLength <= MAX_FILENAME_LENGTH && isCandidate(file, name, includePng);
++    const bool isPng = formats != Formats::Bmp && FsHelpers::hasPngExtension(name);
++    bool valid = nameLength > 0 && nameLength <= MAX_FILENAME_LENGTH && !name.empty() && name.front() != '.' &&
++                 !file.isDirectory() && accepts(name, formats);
+     if (valid) fingerprintEntry(header.fingerprint, file, name);
+
+     if (valid && validateBmpHeaders && isBmp) {
+@@ -355,17 +365,17 @@ bool buildIndex(const std::string& directory, const bool includePng, const bool
+   return true;
+ }
+
+-bool selectFromCache(const std::string& directory, const bool includePng, const bool validateBmpHeaders,
++bool selectFromCache(const std::string& directory, const Formats formats, const bool validateBmpHeaders,
+                      const uint16_t* recentIndices, const uint8_t recentCapacity, const uint8_t recentPos,
+                      const uint8_t recentFill, const uint8_t recentWindow, Selection& selection,
+                      const bool allowRebuild) {
+   char cachePath[MAX_CACHE_PATH] = {};
+   IndexHeader header{};
+   HalFile cache;
+-  if (!openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
+-    if (!allowRebuild || !buildIndex(directory, includePng, validateBmpHeaders, cachePath, sizeof(cachePath)))
++  if (!openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
++    if (!allowRebuild || !buildIndex(directory, formats, validateBmpHeaders, cachePath, sizeof(cachePath)))
+       return false;
+-    if (!openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath)))
++    if (!openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath)))
+       return false;
+   }
+
+@@ -375,8 +385,8 @@ bool selectFromCache(const std::string& directory, const bool includePng, const
+   bool isPng = false;
+   if (!readRecordName(cache, header, selectedIndex, filename, isPng)) {
+     cache.close();
+-    if (!allowRebuild || !buildIndex(directory, includePng, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
+-        !openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
++    if (!allowRebuild || !buildIndex(directory, formats, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
++        !openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
+       return false;
+     }
+     const uint16_t rebuiltIndex =
+@@ -400,8 +410,8 @@ bool selectFromCache(const std::string& directory, const bool includePng, const
+   // The card can be changed outside the firmware, so an otherwise valid index
+   // may point at a deleted or renamed entry. Rebuild once before giving the
+   // caller a chance to use its safe legacy fallback.
+-  if (!allowRebuild || !buildIndex(directory, includePng, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
+-      !openValidIndex(directory, includePng, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
++  if (!allowRebuild || !buildIndex(directory, formats, validateBmpHeaders, cachePath, sizeof(cachePath)) ||
++      !openValidIndex(directory, formats, validateBmpHeaders, cache, header, cachePath, sizeof(cachePath))) {
+     return false;
+   }
+
+@@ -433,7 +443,7 @@ bool resolveBootScreenDirectory(std::string& directory) {
+   return true;
+ }
+
+-bool select(const std::string& directory, const bool includePng, const bool validateBmpHeaders,
++bool select(const std::string& directory, const Formats formats, const bool validateBmpHeaders,
+             const uint16_t* recentIndices, const uint8_t recentCapacity, const uint8_t recentPos,
+             const uint8_t recentFill, const uint8_t recentWindow, Selection& selection) {
+   selection = Selection{};
+@@ -442,7 +452,7 @@ bool select(const std::string& directory, const bool includePng, const bool vali
+   // A normal selection may use an existing index. A missing entry triggers one
+   // rebuild, which catches deletions and renames without a directory walk on
+   // every selection. A second miss falls back to the caller's legacy scan.
+-  if (selectFromCache(directory, includePng, validateBmpHeaders, recentIndices, recentCapacity, recentPos, recentFill,
++  if (selectFromCache(directory, formats, validateBmpHeaders, recentIndices, recentCapacity, recentPos, recentFill,
+                       recentWindow, selection, true))
+     return true;
+
+@@ -450,7 +460,7 @@ bool select(const std::string& directory, const bool includePng, const bool vali
+   return false;
+ }
+
+-bool selectShuffled(const std::string& directory, const bool includePng, const bool validateBmpHeaders,
++bool selectShuffled(const std::string& directory, const Formats formats, const bool validateBmpHeaders,
+                     Selection& selection, const bool bmpOnly) {
+   selection = Selection{};
+   if (directory.empty() || directory.size() > MAX_FILENAME_LENGTH) return false;
+@@ -459,17 +469,17 @@ bool selectShuffled(const std::string& directory, const bool includePng, const b
+   // There is no reliable FAT notification for external writes. Walk metadata
+   // on each sleep so direct card copies are visible on the very next pick;
+   // image contents/headers are still read only on rebuild or render failure.
+-  if (!folderFingerprint(directory, includePng, fingerprint)) return false;
++  if (!folderFingerprint(directory, formats, fingerprint)) return false;
+   char cachePath[MAX_CACHE_PATH] = {};
+   IndexHeader header{};
+   HalFile cache;
+-  const bool loaded = openValidIndex(directory, includePng, false, cache, header, cachePath, sizeof(cachePath));
++  const bool loaded = openValidIndex(directory, formats, false, cache, header, cachePath, sizeof(cachePath));
+   // Sleep retries filter the same stable collection instead of rebuilding a
+   // smaller validated/BMP-only index and forgetting already displayed cards.
+   if (!loaded || header.fingerprint != fingerprint || (header.flags & FLAG_VALIDATED) != 0) {
+     cache.close();
+-    if (!buildIndex(directory, includePng, false, cachePath, sizeof(cachePath)) ||
+-        !openValidIndex(directory, includePng, false, cache, header, cachePath, sizeof(cachePath))) {
++    if (!buildIndex(directory, formats, false, cachePath, sizeof(cachePath)) ||
++        !openValidIndex(directory, formats, false, cache, header, cachePath, sizeof(cachePath))) {
+       LOG_ERR("IMGIDX", "Cannot refresh sleep image index: %s", directory.c_str());
+       return false;
+     }
+@@ -567,6 +577,12 @@ bool recordSleepAttempt(const Selection& selection, const bool displayed) {
+                                        selection.index, displayed);
+ }
+
++bool accepts(std::string_view name, Formats formats) {
++  if (FsHelpers::hasBmpExtension(name)) return true;
++  if (formats != Formats::Bmp && FsHelpers::hasPngExtension(name)) return true;
++  return formats == Formats::Custom && (FsHelpers::hasJpgExtension(name) || FsHelpers::hasGifExtension(name));
++}
++
+ void invalidate() {
+   FsFile dir = Storage.open(INDEX_DIR);
+   if (!dir) return;
+diff --git a/src/activities/boot_sleep/ImageFolderIndex.h b/src/activities/boot_sleep/ImageFolderIndex.h
+index 45cdeaf25386a9f1190320bcbcf6783750c7a71f..9b59c5aa27612ffe50c1a45f758ceb8f556b5134 100644
+--- a/src/activities/boot_sleep/ImageFolderIndex.h
++++ b/src/activities/boot_sleep/ImageFolderIndex.h
+@@ -2,9 +2,13 @@
+
+ #include <cstdint>
+ #include <string>
++#include <string_view>
+
+ namespace ImageFolderIndex {
+
++enum class Formats : uint8_t { Bmp, Overlay, Custom };
++bool accepts(std::string_view name, Formats formats);
++
+ struct Selection {
+   std::string path;
+   bool isPng = false;
+@@ -30,12 +34,12 @@ bool resolveBootScreenDirectory(std::string& directory);
+ // write slot, recentFill is the number of valid entries), so this module has
+ // no dependency on any particular caller's history storage. recentWindow caps
+ // how far back to look when avoiding repeats.
+-bool select(const std::string& directory, bool includePng, bool validateBmpHeaders, const uint16_t* recentIndices,
++bool select(const std::string& directory, Formats formats, bool validateBmpHeaders, const uint16_t* recentIndices,
+             uint8_t recentCapacity, uint8_t recentPos, uint8_t recentFill, uint8_t recentWindow, Selection& selection);
+
+ // Sleep rotation: discover external folder changes on every pick and persist
+ // draws without replacement. A changed collection starts a new shuffled deck.
+-bool selectShuffled(const std::string& directory, bool includePng, bool validateBmpHeaders, Selection& selection,
++bool selectShuffled(const std::string& directory, Formats formats, bool validateBmpHeaders, Selection& selection,
+                     bool bmpOnly = false);
+ bool recordSleepAttempt(const Selection& selection, bool displayed);
+
+diff --git a/src/activities/boot_sleep/SleepGif.cpp b/src/activities/boot_sleep/SleepGif.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..35937a3f84e4124ab3f0d6bfef3af693872dde70
+--- /dev/null
++++ b/src/activities/boot_sleep/SleepGif.cpp
+@@ -0,0 +1,152 @@
++#include "SleepGif.h"
++
++#include <AnimatedGIF.h>
++#include <Logging.h>
++#include <Memory.h>
++
++#include <algorithm>
++#include <array>
++#include <climits>
++#include <cstring>
++
++namespace {
++
++void* openGif(const char* path, int32_t* size) {
++  auto file = makeUniqueNoThrow<HalFile>();
++  if (!file || !Storage.openFileForRead("SLP", path, *file)) return nullptr;
++  const size_t bytes = file->size();
++  if (bytes == 0 || bytes > INT32_MAX) {
++    file->close();
++    return nullptr;
++  }
++  *size = static_cast<int32_t>(bytes);
++  return file.release();  // AnimatedGIF calls closeGif for this handle.
++}
++
++void closeGif(void* handle) {
++  auto* file = static_cast<HalFile*>(handle);
++  if (!file) return;
++  file->close();
++  delete file;
++}
++
++int32_t readGif(GIFFILE* source, uint8_t* buffer, int32_t length) {
++  auto* file = static_cast<HalFile*>(source->fHandle);
++  const int32_t remaining = source->iSize - source->iPos;
++  if (length <= 0 || remaining <= 0) return 0;
++  const int read = file->read(buffer, std::min(length, remaining));
++  if (read > 0) source->iPos += read;
++  return std::max(0, read);
++}
++
++int32_t seekGif(GIFFILE* source, int32_t position) {
++  auto* file = static_cast<HalFile*>(source->fHandle);
++  if (position < 0 || position > source->iSize || !file->seek(position)) return -1;
++  source->iPos = position;
++  return position;
++}
++
++constexpr size_t headerSize = 70;
++
++// The sleeping cover renderer already accepts top-down 2-bit grayscale BMPs.
++bool writeHeader(HalFile& out, int width, int height, int stride, bool imageLevels) {
++  std::array<uint8_t, headerSize> header{};
++  const auto set = [&](size_t pos, uint32_t value, int bytes = 4) {
++    for (int i = 0; i < bytes; ++i) header[pos + i] = static_cast<uint8_t>(value >> (i * 8));
++  };
++  header[0] = 'B';
++  header[1] = 'M';
++  set(2, headerSize + stride * height);
++  set(10, headerSize);
++  set(14, 40);
++  set(18, width);
++  set(22, static_cast<uint32_t>(-height));
++  set(26, 1, 2);
++  set(28, 2, 2);
++  set(34, stride * height);
++  set(46, 4);
++  set(50, 4);
++  const uint8_t levels[] = {0, uint8_t(imageLevels ? 120 : 85), uint8_t(imageLevels ? 190 : 170), 255};
++  for (int i = 0; i < 4; ++i) memset(header.data() + 54 + 4 * i, levels[i], 3);
++  return out.write(header.data(), header.size()) == header.size();
++}
++
++struct GifRows {
++  HalFile& out;
++  uint8_t* row;
++  int width, height, stride, sourceWidth, sourceHeight;
++  bool failed = false;
++  bool drew = false;
++};
++
++void writeGifRow(GIFDRAW* source) {
++  auto& ctx = *static_cast<GifRows*>(source->pUser);
++  if (ctx.failed) return;
++  const int sourceY = source->iY + source->y;
++  if (sourceY < 0 || sourceY >= ctx.sourceHeight) {
++    ctx.failed = true;
++    return;
++  }
++  ctx.drew = true;
++  const auto scaleY = [&](int y) { return (y * ctx.height + ctx.sourceHeight - 1) / ctx.sourceHeight; };
++  const int first = scaleY(sourceY);
++  const int end = scaleY(sourceY + 1);
++  if (first == end) return;
++  memset(ctx.row, 0xff, ctx.stride);
++  for (int x = 0; x < ctx.width; ++x) {
++    const int pixel = x * ctx.sourceWidth / ctx.width - source->iX;
++    if (pixel < 0 || pixel >= source->iWidth) continue;
++    const uint8_t value = source->pPixels[pixel];
++    if (source->ucHasTransparency && value == source->ucTransparent) continue;
++    const auto* rgb = source->pPalette24 + value * 3;
++    const int gray = (77 * rgb[0] + 150 * rgb[1] + 29 * rgb[2]) >> 8;
++    const int shift = 6 - 2 * (x % 4);
++    ctx.row[x / 4] = (ctx.row[x / 4] & ~(3 << shift)) | (((gray * 3 + 127) / 255) << shift);
++  }
++  ctx.failed = !ctx.out.seek(headerSize + first * ctx.stride);
++  // Interlaced GIFs can deliver rows out of order, so seek to the scaled row.
++  for (int y = first; y < end && !ctx.failed; ++y)
++    ctx.failed = ctx.out.write(ctx.row, ctx.stride) != static_cast<size_t>(ctx.stride);
++}
++}  // namespace
++
++bool SleepGif::toBitmap(const std::string& path, HalFile& output, int maxWidth, int maxHeight, bool imageLevels) {
++  // AnimatedGIF owns its LZW tables. Heap allocation avoids a large stack frame.
++  auto gif = makeUniqueNoThrow<AnimatedGIF>();
++  if (!gif) return false;
++  gif->begin(GIF_PALETTE_RGB888);
++  if (!gif->open(path.c_str(), openGif, closeGif, readGif, seekGif, writeGifRow)) {
++    LOG_ERR("SLP", "Could not open sleep GIF (error %d): %s", gif->getLastError(), path.c_str());
++    gif->close();
++    return false;
++  }
++  const int sourceWidth = gif->getCanvasWidth();
++  const int sourceHeight = gif->getCanvasHeight();
++  // Bound decode time while still allowing tall phone-size backgrounds.
++  if (sourceWidth <= 0 || sourceHeight <= 0 || sourceHeight > 4096 || maxWidth <= 0 || maxHeight <= 0) {
++    gif->close();
++    return false;
++  }
++  const int width = std::max(1, std::min({sourceWidth, maxWidth, sourceWidth * maxHeight / sourceHeight}));
++  const int height = std::max(1, sourceHeight * width / sourceWidth);
++  const int stride = (width + 15) / 16 * 4;
++  auto row = makeUniqueNoThrow<uint8_t[]>(stride);
++  if (!row || !writeHeader(output, width, height, stride, imageLevels)) {
++    gif->close();
++    return false;
++  }
++  // Initialize the canvas for transparent pixels and GIFs whose first frame is
++  // smaller than the canvas. No full image buffer is needed.
++  memset(row.get(), 0xff, stride);
++  for (int y = 0; y < height; ++y) {
++    if (output.write(row.get(), stride) != static_cast<size_t>(stride)) {
++      gif->close();
++      return false;
++    }
++  }
++  GifRows ctx{output, row.get(), width, height, stride, sourceWidth, sourceHeight};
++  const int result = gif->playFrame(false, nullptr, &ctx);
++  const bool success = result >= 0 && ctx.drew && !ctx.failed && gif->getLastError() == GIF_SUCCESS;
++  gif->close();
++  return success;
++}
+diff --git a/src/activities/boot_sleep/SleepGif.h b/src/activities/boot_sleep/SleepGif.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c44b1812b241f475101af01ee0da4cd1da9e52a
+--- /dev/null
++++ b/src/activities/boot_sleep/SleepGif.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++#include <HalStorage.h>
++
++#include <string>
++
++namespace SleepGif {
++bool toBitmap(const std::string& path, HalFile& output, int maxWidth, int maxHeight, bool imageLevels);
++}
+diff --git a/src/activities/home/AppLauncherActivity.h b/src/activities/home/AppLauncherActivity.h
+index 85c2a5049a687e37eeb50fe901c8a6840bbe570c..c0caef662fb842a3692532827d00da8eff7c3601 100644
+--- a/src/activities/home/AppLauncherActivity.h
++++ b/src/activities/home/AppLauncherActivity.h
+@@ -8,6 +8,8 @@ class AppLauncherActivity final : public Activity {
+  public:
+   AppLauncherActivity(GfxRenderer& renderer, MappedInputManager& input) : Activity("Home", renderer, input) {}
+   bool isHomeActivity() const override { return true; }
++  // Use the global configured inactivity deadline; rendering never holds it awake.
++  bool preventAutoSleep() override { return false; }
+   void onEnter() override;
+   void loop() override;
+   void render(RenderLock&&) override;
+diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+index d9058bd317b1fc4caed7da40294b92c9d550b3f3..e1f96419c5c5ff250712894c3d23ff343a68f572 100644
+--- a/src/activities/home/FileBrowserActivity.cpp
++++ b/src/activities/home/FileBrowserActivity.cpp
+@@ -659,10 +659,11 @@ void FileBrowserActivity::pinSleepFavorite(const std::string& fullPath) {
+   }
+   LOG_INF("FileBrowser", "Pinned favorite sleep image: %s", fullPath.c_str());
+
+-  // PNG sleep images only render in Page Overlay mode, so make selecting one
+-  // from the File Browser immediately usable.
++  // PNG works directly in Custom and as a fallback in Cover + Custom.
+   if (FsHelpers::hasPngExtension(fullPath) && SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY &&
+-      SETTINGS.sleepScreen != CrossPointSettings::COVER_OVERLAY) {
++      SETTINGS.sleepScreen != CrossPointSettings::COVER_OVERLAY &&
++      SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM &&
++      SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM) {
+     SETTINGS.sleepScreen = CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY;
+     if (!SETTINGS.saveToFile()) {
+       LOG_ERR("FileBrowser", "Failed to save Page Overlay mode for PNG sleep image");
+@@ -916,7 +917,10 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
+             return;
+           }
+           case FileBrowserAction::PinFavorite:
+-            if (FsHelpers::hasPngExtension(fullPath)) {
++            if (FsHelpers::hasPngExtension(fullPath) &&
++                SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM &&
++                SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM &&
++                SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY) {
+               startActivityForResult(
+                   std::make_unique<ConfirmationActivity>(renderer, mappedInput, "", tr(STR_PIN_PNG_WARNING)),
+                   [this, fullPath](const ActivityResult& confirmation) {
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index 7f46711b5a449978e6abe9a8fc94f564ff55b3f5..ed8a2f3ba26954b3e24f9454190e1cbe54b64a93 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -263,12 +263,15 @@ bool LibraryActivity::scanCancelRequested(void* context) {
+   input.update();
+   int x = 0;
+   int y = 0;
+-  if (self->scanTouchEnabled() && input.wasScreenTouchDown(x, y)) {
++  const bool touchDown = self->scanTouchEnabled() && input.wasScreenTouchDown(x, y);
++  const bool homeGesture = input.wasHomeGesture();
++  const bool sleepDue = shouldStopLibraryScanForSleep(touchDown || homeGesture);
++  if (touchDown) {
+     // The release must not reach the list as a tap once the scan unwinds.
+     input.suppressCurrentTouchContact();
+     return true;
+   }
+-  if (input.wasHomeGesture()) return true;
++  if (homeGesture || sleepDue) return true;
+   const bool backHeld = input.isPressed(MappedInputManager::Button::Back);
+   if (self->scanBackHeldAtStart) {
+     if (!backHeld) self->scanBackHeldAtStart = false;
+diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
+index 459445e5242f40b501cef71fdd273d66ae334a49..1a27b932755e42a50c97c7dfd2c786e487d07626 100644
+--- a/src/activities/network/CrossPointWebServerActivity.cpp
++++ b/src/activities/network/CrossPointWebServerActivity.cpp
+@@ -520,6 +520,13 @@ void CrossPointWebServerActivity::loop() {
+         }
+       }
+       lastHandleClientTime = millis();
++      if (webServer->transferIdleExpired(static_cast<uint32_t>(millis()))) {
++        LOG_DBG("WEBACT", "No file transfer for five minutes; closing WiFi transfer");
++        // Use the same exit path as Back: it stops services/WiFi and restores
++        // the originating reader or library, including boot-isolated sessions.
++        exitToOrigin();
++        return;
++      }
+     }
+   }
+ }
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index 51ec74e57627eb7d8c94eb08117669fc1fade895..7d5cb19b8734391ca1442aa9b9567a16c83084eb 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -410,6 +410,7 @@ CrossPointWebServer::CrossPointWebServer() {}
+ CrossPointWebServer::~CrossPointWebServer() { stop(); }
+
+ void CrossPointWebServer::begin() {
++  noteTransfer();
+   if (running) {
+     LOG_DBG("WEB", "Web server already running");
+     return;
+@@ -604,10 +605,17 @@ void CrossPointWebServer::begin() {
+   server->onNotFound([this] { handleNotFound(); });
+
+   // Collect WebDAV headers and register handler
+-  const char* davHeaders[] = {"Depth",      "Destination", "Overwrite",     "If",
+-                              "Lock-Token", "Timeout",     "If-None-Match", "Host"};
++  const char* davHeaders[] = {"Depth", "Destination", "Overwrite", "If", "Lock-Token", "Timeout", "If-None-Match", "Host"};
+   server->collectHeaders(davHeaders, 8);
+-  server->addHandler(new WebDAVHandler());  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
++  auto dav = makeUniqueNoThrow<WebDAVHandler>(
++      [](void* context) { static_cast<CrossPointWebServer*>(context)->noteTransfer(); }, this);
++  if (!dav) {
++    LOG_ERR("WEB", "Cannot allocate WebDAV handler for transfer session");
++    server.reset();
++    return;
++  }
++  webDavHandler = dav.get();
++  server->addHandler(dav.release());  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
+
+   server->begin();
+
+@@ -705,6 +713,7 @@ void CrossPointWebServer::stop() {
+   // Brief delay before deletion
+   delay(10);
+
++  webDavHandler = nullptr;
+   server.reset();
+   pluginJobs.reset();
+
+@@ -736,6 +745,12 @@ void CrossPointWebServer::handleClient() {
+   // Read-only requests remain available while a WebSocket upload owns the file-transfer slot.
+   // Each mutating route rejects with 423, including streaming callbacks.
+   server->handleClient();
++  if (transferTouched) {
++    // Blocking HTTP uploads/downloads must start their idle period on return,
++    // not at the beginning of a potentially long transfer.
++    lastTransferAt = millis();
++    transferTouched = false;
++  }
+
+   // Handle WebSocket events
+   if (wsServer) {
+@@ -794,6 +809,19 @@ void CrossPointWebServer::answerDiscovery() const {
+          reinterpret_cast<sockaddr*>(&from), fromLen);
+ }
+
++void CrossPointWebServer::noteTransfer() const {
++  lastTransferAt = millis();
++  transferTouched = true;
++}
++
++bool CrossPointWebServer::transferIdleExpired(uint32_t now) const {
++  // A connected browser (including its status polling) isn't a transfer.
++  // Never terminate an active multipart, font, or WebSocket upload.
++  if (wsUploadInProgress || upload.file.isOpen() || fontUpload.file.isOpen() ||
++      (webDavHandler && webDavHandler->transferInProgress())) return false;
++  return static_cast<uint32_t>(now - lastTransferAt) >= 300000u;
++}
++
+ CrossPointWebServer::WsUploadStatus CrossPointWebServer::getWsUploadStatus() const {
+   WsUploadStatus status;
+   status.inProgress = wsUploadInProgress;
+@@ -1082,6 +1110,7 @@ void CrossPointWebServer::handleFileListData() const {
+ }
+
+ void CrossPointWebServer::handleDownload() const {
++  noteTransfer();
+   if (!server->hasArg("path")) {
+     server->send(400, "text/plain", "Missing path");
+     return;
+@@ -1180,6 +1209,7 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
+   }
+
+   const HTTPUpload& upload = server->upload();
++  noteTransfer();
+   if (webtransfer::isWebSocketUploadInProgress()) {
+     if (upload.status == UPLOAD_FILE_START) {
+       if (state.file) abortUpload(state);
+@@ -2548,6 +2578,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t*
+     }
+
+     case WStype_BIN: {
++      noteTransfer();
+       if (!wsUploadInProgress || !wsUploadFile || num != wsUploadClientNum) {
+         wsServer->sendTXT(num, "ERROR:No upload in progress");
+         return;
+diff --git a/src/network/CrossPointWebServer.h b/src/network/CrossPointWebServer.h
+index cda179709f1033f3fa1906c0709bb49fa4e67be8..fa0c0e3e81fb982d447b1005e6c3d80ae9380afd 100644
+--- a/src/network/CrossPointWebServer.h
++++ b/src/network/CrossPointWebServer.h
+@@ -5,10 +5,13 @@
+ #include <WebServer.h>
+ #include <WebSocketsServer.h>
+
++#include <cstdint>
+ #include <memory>
+ #include <string>
+ #include <vector>
+
++class WebDAVHandler;
++
+ // Structure to hold file information
+ struct FileInfo {
+   String name;
+@@ -65,6 +68,8 @@ class CrossPointWebServer {
+   bool isRunning() const { return running; }
+
+   WsUploadStatus getWsUploadStatus() const;
++  bool transferIdleExpired(uint32_t now) const;
++
+
+   // Borrowed callback/context, owned by the activity that owns this server.
+   using UploadCancelCheck = bool (*)(void*);
+@@ -80,6 +85,11 @@ class CrossPointWebServer {
+   std::unique_ptr<WebServer> server = nullptr;
+   std::unique_ptr<WebSocketsServer> wsServer = nullptr;
+   bool running = false;
++  WebDAVHandler* webDavHandler = nullptr;  // Borrowed; owned by server request handlers.
++  mutable uint32_t lastTransferAt = 0;
++  mutable bool transferTouched = false;
++  void noteTransfer() const;
++
+   bool apMode = false;  // true when running in AP mode, false for STA mode
+   uint16_t port = 80;
+   uint16_t wsPort = 81;  // WebSocket port
+diff --git a/src/network/WebDAVHandler.cpp b/src/network/WebDAVHandler.cpp
+index 150f176c166b832f3cf8d4683c731a814ca5a3e9..37ad60094cffb654b0a0d6fb36a1273c2b5fba74 100644
+--- a/src/network/WebDAVHandler.cpp
++++ b/src/network/WebDAVHandler.cpp
+@@ -87,6 +87,7 @@ bool WebDAVHandler::canRaw(WebServer& server, const String& uri) {
+ }
+
+ void WebDAVHandler::raw(WebServer& server, const String& uri, HTTPRaw& raw) {
++  noteTransfer();
+   (void)uri;
+   if (raw.status == RAW_START) {
+     _putErrorStatus = 0;
+@@ -180,6 +181,7 @@ void WebDAVHandler::raw(WebServer& server, const String& uri, HTTPRaw& raw) {
+ }
+
+ bool WebDAVHandler::handle(WebServer& server, HTTPMethod method, const String& uri) {
++  if (method == HTTP_GET || method == HTTP_PUT) noteTransfer();
+   (void)uri;
+   if (method != HTTP_OPTIONS && method != HTTP_PROPFIND && method != HTTP_GET && method != HTTP_HEAD &&
+       webtransfer::rejectMutationDuringWebSocketUpload(server))
+diff --git a/src/network/WebDAVHandler.h b/src/network/WebDAVHandler.h
+index 2365a0b977d748ffa220140843332b5fee4f3034..06dfc8b998c8f6439ead03a35b67c5f34d427a16 100644
+--- a/src/network/WebDAVHandler.h
++++ b/src/network/WebDAVHandler.h
+@@ -15,6 +15,11 @@ inline bool rejectMutationDuringWebSocketUpload(WebServer& server) {
+
+ class WebDAVHandler : public RequestHandler {
+  public:
++  using TransferActivity = void (*)(void*);
++  explicit WebDAVHandler(TransferActivity activity = nullptr, void* context = nullptr)
++      : transferActivity(activity), transferContext(context) {}
++  bool transferInProgress() const { return _putFile.isOpen(); }
++
+   // RequestHandler interface
+   bool canHandle(WebServer& server, HTTPMethod method, const String& uri) override;
+   bool canRaw(WebServer& server, const String& uri) override;
+@@ -22,6 +27,9 @@ class WebDAVHandler : public RequestHandler {
+   bool handle(WebServer& server, HTTPMethod method, const String& uri) override;
+
+  private:
++  TransferActivity transferActivity = nullptr;
++  void* transferContext = nullptr;
++  void noteTransfer() const { if (transferActivity) transferActivity(transferContext); }
+   // PUT streaming state (raw() is called in chunks)
+   HalFile _putFile;
+   String _putPath;
+diff --git a/src/util/SleepWakePolicy.h b/src/util/SleepWakePolicy.h
+index af2d3dbf2f7b10ed96be949aca2729ad41c29328..c8b2df9a5d6e30bb678b6049decaa466b29780d2 100644
+--- a/src/util/SleepWakePolicy.h
++++ b/src/util/SleepWakePolicy.h
+@@ -12,14 +12,6 @@ enum class Resume : uint8_t {
+   SplashlessWake,
+ };
+
+-constexpr bool hasValidSavedFrame(const bool exists, const size_t actualSize, const size_t expectedSize) {
+-  return exists && actualSize == expectedSize;
+-}
+-
+-// A UC8279 X3 can skip its initial resync only after a saved Quick Resume frame
+-// has been verified. Other resume paths retain their existing behavior.
+-constexpr bool shouldInitializeSeamlessly(const Resume resume, const bool isUc8279X3, const bool hasValidFrame) {
+-  return resume != Resume::Splash && !(resume == Resume::SplashlessWake && isUc8279X3 && !hasValidFrame);
+-}
++constexpr bool shouldInitializeSeamlessly(const Resume resume) { return resume != Resume::Splash; }
+
+ }  // namespace SleepWakePolicy
+diff --git a/test/sleep_wake_policy/SleepWakePolicyTest.cpp b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
+index 027d0179a3b9880b500f5506c0522f81c5c04abd..c9f8e26f1829e0d447bdcd339b6b84bc31408269 100644
+--- a/test/sleep_wake_policy/SleepWakePolicyTest.cpp
++++ b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
+@@ -2,40 +2,12 @@
+
+ #include "SleepWakePolicy.h"
+
+-namespace {
+-constexpr size_t kExpectedFrameBytes = 52272;
++TEST(SleepWakePolicy, X4ProColdBootUsesNormalInitialization) {
++  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash));
+ }
+
+-TEST(SleepWakePolicy, Uc8279X3OrdinaryWakeWithoutFrameIsNotSeamless) {
+-  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, Uc8279X3QuickResumeWithValidFrameIsSeamless) {
+-  const bool validFrame =
+-      SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes, kExpectedFrameBytes);
+-  EXPECT_TRUE(validFrame);
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                          /*isUc8279X3=*/true, validFrame));
+-}
+-
+-TEST(SleepWakePolicy, ColdBootIsNotSeamless) {
+-  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash,
+-                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/true));
+-}
+-
+-TEST(SleepWakePolicy, SilentRestartRetainsExistingSeamlessBehavior) {
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent,
+-                                                          /*isUc8279X3=*/true, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, OtherProfilesRetainExistingSplashlessBehavior) {
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                          /*isUc8279X3=*/false, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, MissingOrWrongSizedFrameIsInvalid) {
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/false, kExpectedFrameBytes, kExpectedFrameBytes));
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes - 1, kExpectedFrameBytes));
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes + 1, kExpectedFrameBytes));
++TEST(SleepWakePolicy, X4ProResumePathsUseSeamlessInitialization) {
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent));
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Network));
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake));
+ }
+diff --git a/scripts/patch_animatedgif.py b/scripts/patch_animatedgif.py
+index ab1dd67880e7b0bc9aad1642234f7c2c543da1a8..c440a294fd4ca1c97804199c6905e457e92cfa6f 100644
+--- a/scripts/patch_animatedgif.py
++++ b/scripts/patch_animatedgif.py
+@@ -3,6 +3,7 @@ Apply the pinned AnimatedGIF width guard and bounded-copy/palette fixes.
+ """
+
+ import argparse
++import glob
+ import os
+ import re
+ import sys
+@@ -140,12 +141,14 @@ def patch_library(library_path):
+
+ 
+ def patch_animatedgif(env, require_found=False):
+-    library_path = os.path.join(
+-        env.subst("$PROJECT_LIBDEPS_DIR"),
+-        env.subst("$PIOENV"),
+-        "AnimatedGIF",
+-    )
+-    patched_any = os.path.isdir(library_path) and patch_library(library_path)
++    dependency_root = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"))
++    # Git-pinned PlatformIO libraries use AnimatedGIF@src-<hash> directories.
++    candidates = [os.path.join(dependency_root, "AnimatedGIF")]
++    candidates.extend(sorted(glob.glob(os.path.join(dependency_root, "AnimatedGIF@*"))))
++    patched_any = False
++    for library_path in candidates:
++        if os.path.isfile(os.path.join(library_path, "src", "AnimatedGIF.h")):
++            patched_any = patch_library(library_path) or patched_any
+
+     if require_found and not patched_any:
+         sys.stderr.write("ERROR: AnimatedGIF dependency was not found to patch\n")
+diff --git a/src/activities/boot_sleep/SleepActivity.cpp b/src/activities/boot_sleep/SleepActivity.cpp
+index c98b7b42021f08c5147b7e4c8f3e740bad65b4f8..685171a5dc5a87e104c1913d26c893a5f73714be 100644
+--- a/src/activities/boot_sleep/SleepActivity.cpp
++++ b/src/activities/boot_sleep/SleepActivity.cpp
+@@ -10,6 +10,8 @@
+ #include <HalGPIO.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
++#include <JpegToBmpConverter.h>
++#include <PngToBmpConverter.h>
+ #include <Memory.h>
+ #include <PNGdec.h>
+ // PNGdec's bundled zlib internals leak this macro into later FreeInkUI headers.
+@@ -35,6 +37,7 @@
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+ #include "ImageFolderIndex.h"
++#include "SleepGif.h"
+ #include "RecentBooksStore.h"
+ #include "SleepCoverAssets.h"
+ #include "activities/reader/ReaderUtils.h"
+@@ -374,6 +377,9 @@ bool sleepImageFingerprint(FsFile& file, uint64_t& hash) {
+ bool isBmpSleepImagePath(const std::string& path) { return FsHelpers::hasBmpExtension(path); }
+
+ bool isPngSleepImagePath(const std::string& path) { return FsHelpers::hasPngExtension(path); }
++ImageFolderIndex::Formats sleepFormats(SleepImageMode mode) {
++  return mode == SleepImageMode::Overlay ? ImageFolderIndex::Formats::Overlay : ImageFolderIndex::Formats::Custom;
++}
+
+ bool tryOpenSleepDirectory(FsFile& dir, std::string& sleepDir, const std::string& candidate) {
+   if (candidate.empty()) {
+@@ -433,23 +439,12 @@ bool selectPinnedSleepImage(SleepImageMode mode, SleepImageSelection& selection)
+     return false;
+   }
+
+-  if (isBmpSleepImagePath(favorite)) {
++  if (ImageFolderIndex::accepts(favorite, sleepFormats(mode))) {
+     selection.path = favorite;
+-    selection.isPng = false;
++    selection.isPng = FsHelpers::hasPngExtension(favorite);
+     return true;
+   }
+
+-  if (isPngSleepImagePath(favorite)) {
+-    if (mode == SleepImageMode::Overlay) {
+-      selection.path = favorite;
+-      selection.isPng = true;
+-      return true;
+-    }
+-
+-    LOG_INF("SLP", "Pinned PNG sleep image requires Page Overlay mode, falling back: %s", favorite.c_str());
+-    return false;
+-  }
+-
+   LOG_ERR("SLP", "Pinned sleep image has unsupported extension: %s", favorite.c_str());
+   return false;
+ }
+@@ -461,10 +456,9 @@ bool selectRandomSleepImage(SleepImageMode mode, SleepImageSelection& selection,
+   std::string sleepDir;
+   if (!resolvePreferredSleepDirectory(sleepDir)) return false;
+
+-  const bool allowPng = mode == SleepImageMode::Overlay && !bmpOnly;
++  const auto formats = bmpOnly ? ImageFolderIndex::Formats::Bmp : sleepFormats(mode);
+   ImageFolderIndex::Selection indexedSelection;
+-  if (ImageFolderIndex::selectShuffled(sleepDir, mode == SleepImageMode::Overlay, validateBmpHeaders, indexedSelection,
+-                                       bmpOnly)) {
++  if (ImageFolderIndex::selectShuffled(sleepDir, formats, validateBmpHeaders, indexedSelection, bmpOnly)) {
+     selection.path = std::move(indexedSelection.path);
+     selection.isPng = indexedSelection.isPng;
+     APP_STATE.pushRecentSleep(indexedSelection.index);
+@@ -508,8 +502,7 @@ bool selectRandomSleepImage(SleepImageMode mode, SleepImageSelection& selection,
+     }
+
+     const bool isBmp = FsHelpers::hasBmpExtension(filename);
+-    const bool isPng = allowPng && FsHelpers::hasPngExtension(filename);
+-    if (!isBmp && !isPng) {
++    if (!ImageFolderIndex::accepts(filename, formats)) {
+       file.close();
+       continue;
+     }
+@@ -739,33 +732,69 @@ bool SleepActivity::renderCustomSleepBmp(const std::string& path) const {
+ }
+
+ void SleepActivity::renderCustomSleepScreen() const {
++  const auto tryRender = [this](const std::string& path) {
++    constexpr char convertedPath[] = "/.crashink/.sleep-image.bmp.tmp";
++    const bool converted = !FsHelpers::hasBmpExtension(path);
++    const bool imageLevels = renderer.supportsAbsoluteGrayscale() &&
++        SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
++    if (converted) {
++      FsFile output;
++      if (!Storage.ensureDirectoryExists("/.crashink") ||
++          !Storage.openFileForWrite("SLP", convertedPath, output)) return false;
++      bool decoded = false;
++      if (FsHelpers::hasGifExtension(path)) {
++        decoded = SleepGif::toBitmap(path, output, renderer.getScreenWidth(), renderer.getScreenHeight(), imageLevels);
++      } else {
++        FsFile image;
++        if (Storage.openFileForRead("SLP", path, image)) {
++          const bool crop = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
++          decoded = FsHelpers::hasJpgExtension(path)
++                        ? JpegToBmpConverter::jpegFileToBmpStream(image, output, crop, imageToneProfile(imageLevels))
++                        : PngToBmpConverter::pngFileToBmpStream(image, output, crop, imageToneProfile(imageLevels));
++          image.close();
++        }
++      }
++      const bool flushed = output.sync();
++      const bool closed = output.close();
++      if (!decoded || !flushed || !closed) {
++        Storage.remove(convertedPath);
++        LOG_ERR("SLP", "Could not decode custom sleep image: %s", path.c_str());
++        return false;
++      }
++    }
++
++    FsFile file;
++    bool success = false;
++    if (Storage.openFileForRead("SLP", converted ? std::string(convertedPath) : path, file)) {
++      Bitmap bitmap(file, true, imageToneProfile(imageLevels));
++      const auto parsed = bitmap.parseHeaders();
++      if (parsed == BmpReaderError::Ok) success = renderBitmapSleepScreen(bitmap);
++      file.close();
++    }
++    if (converted) Storage.remove(convertedPath);
++    return success;
++  };
++
+   const auto tryRenderSelection = [&](const SleepImageSelection& image) {
+-    const bool displayed = renderCustomSleepBmp(image.path);
++    const bool displayed = tryRender(image.path);
+     ImageFolderIndex::recordSleepAttempt(image.rotation, displayed);
+     return displayed;
+   };
+-
+   SleepImageSelection selection;
+-  if (selectPinnedSleepImage(SleepImageMode::Custom, selection) && tryRenderSelection(selection)) {
+-    return;
+-  }
++  if (selectPinnedSleepImage(SleepImageMode::Custom, selection) && tryRenderSelection(selection)) return;
+
+-  if (selectRandomSleepImage(SleepImageMode::Custom, selection) && tryRenderSelection(selection)) {
+-    return;
+-  }
+-
+-  // A corrupt BMP should not make an otherwise valid custom folder fall back
+-  // to the dark default screen. Re-scan only on this error path and choose
+-  // from the files whose headers are valid.
+-  if (!selection.path.empty() && selectRandomSleepImage(SleepImageMode::Custom, selection, true) &&
+-      tryRenderSelection(selection)) {
+-    return;
++  for (int attempt = 0; attempt < 4; ++attempt) {
++    if (!selectRandomSleepImage(SleepImageMode::Custom, selection)) break;
++    if (tryRenderSelection(selection)) return;
+   }
+
+-  // Look for sleep.bmp on the root of the sd card to determine if we should
+-  // render a custom sleep screen instead of the default.
+-  if (renderCustomSleepBmp("/sleep.bmp")) return;
++  // A failed decoder or bad image should not hide valid BMPs in the folder.
++  if (!selection.path.empty() && selectRandomSleepImage(SleepImageMode::Custom, selection, true, true) &&
++      tryRenderSelection(selection)) return;
+
++  for (const char* fallback : {"/sleep.bmp", "/sleep.png", "/sleep.jpg", "/sleep.jpeg", "/sleep.gif"}) {
++    if (Storage.exists(fallback) && tryRender(fallback)) return;
++  }
+   renderDefaultSleepScreen();
+ }
+
+@@ -1074,11 +1103,7 @@ void SleepActivity::renderLastScreenSleepScreen() const {
+   }
+   // Only the moon differs from the displayed frame, so a differential FAST
+   // update avoids the flashing clean pass on an inverted night-mode page.
+-  if (gpio.deviceIsX3()) {
+-    renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
+-  } else {
+-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+-  }
++  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+ }
+
+ void SleepActivity::renderBlankSleepScreen() const {
+diff --git a/src/main.cpp b/src/main.cpp
+index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c6ee23085 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1142,41 +1142,6 @@ static bool loadSleepFrameBuffer() {
+   return true;
+ }
+
+-static bool preflightSleepFrameBuffer() {
+-  if (!Storage.exists(SLEEP_FRAME_FILE)) return false;
+-
+-  HalFile file;
+-  if (!Storage.openFileForRead("SLP", SLEEP_FRAME_FILE, file)) {
+-    LOG_ERR("SLP", "Failed to open Quick Resume frame for preflight");
+-    Storage.remove(SLEEP_FRAME_FILE);
+-    return false;
+-  }
+-
+-#ifdef SIMULATOR
+-  // The simulator's legacy display stub has no X3 runtime geometry. This path
+-  // is unreachable there because it cannot identify a UC8279 X3 profile.
+-  const size_t expectedSize = HalDisplay::BUFFER_SIZE;
+-#else
+-  const size_t expectedSize = EInkDisplay::X3_BUFFER_SIZE;
+-#endif
+-  const size_t actualSize = file.fileSize();
+-  file.close();
+-  if (SleepWakePolicy::hasValidSavedFrame(true, actualSize, expectedSize)) return true;
+-
+-  LOG_ERR("SLP", "Invalid Quick Resume frame: expected=%u actual=%u", static_cast<unsigned>(expectedSize),
+-          static_cast<unsigned>(actualSize));
+-  Storage.remove(SLEEP_FRAME_FILE);
+-  return false;
+-}
+-
+-bool shouldClearX4WakeGhosting() {
+-#if FREEINK_DEVICE_X4
+-  return gpio.deviceIsX4();
+-#else
+-  return false;
+-#endif
+-}
+-
+ // Wake validation runs before the SD card and its settings file are available.
+ // Mirror the one setting that changes its behavior while entering sleep, so a
+ // permitted short wake press can pass verification even after the button has
+@@ -1629,17 +1594,10 @@ void setup() {
+ #endif
+   trustedtime::init();
+
+-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+-  LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : "X4");
+-  LOG_INF("BOOT", "Post-GPIO diagnostic: device=%s usb=%d silentReboot=%d silentTarget=%lu",
+-          gpio.deviceIsX3() ? "X3" : "X4", gpio.isUsbConnected() ? 1 : 0, isSilentReboot ? 1 : 0,
+-          static_cast<unsigned long>(snapshotTarget));
+-#else
+ #ifdef SIMULATOR
+   LOG_INF("MAIN", "Device: Simulator");
+ #else
+   LOG_INF("MAIN", "Device: %s", BoardConfig::ACTIVE.name);
+-#endif
+ #endif
+
+   LOG_INF("BOOT", "Wake route: %s", wakeupRouteName(wakeupReason));
+@@ -1837,20 +1795,14 @@ void setup() {
+                             : isSilentReboot   ? BootResume::Silent
+                             : skipSplashOnWake ? BootResume::SplashlessWake
+                                                : BootResume::Splash;
+-  bool isUc8279X3 = false;
+-#ifndef SIMULATOR
+-  isUc8279X3 = gpio.deviceIsX3() && BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3Uc8279;
+-#endif
+-  const bool hasValidSleepFrame = resume == BootResume::SplashlessWake && isUc8279X3 && preflightSleepFrameBuffer();
+-  const bool shouldRestoreSleepFrame =
+-      resume == BootResume::SplashlessWake && (isUc8279X3 ? hasValidSleepFrame : Storage.exists(SLEEP_FRAME_FILE));
++  const bool shouldRestoreSleepFrame = resume == BootResume::SplashlessWake && Storage.exists(SLEEP_FRAME_FILE);
+   bool allowFastInitialReaderRefresh = false;
+   bool x4WakeCanFastPaint = false;
+   bool x3WakeNeedsRefresh = false;
+   // A retained page is useful opening feedback even when a fast refresh is unavailable.
+   bool quickResumeFrameVisible = false;
+
+-  setupDisplayAndFonts(SleepWakePolicy::shouldInitializeSeamlessly(resume, isUc8279X3, hasValidSleepFrame),
++  setupDisplayAndFonts(SleepWakePolicy::shouldInitializeSeamlessly(resume),
+                        resume != BootResume::Network, useReaderRenderStack);
+   logBootHeap("display and font resolver ready");
+
+@@ -1882,32 +1834,9 @@ void setup() {
+           x3WakeNeedsRefresh = false;
+         }
+ #ifndef SIMULATOR
+-        else if (display.restoreVisibleFrame()) {
+-          // Quick Resume left this exact frame on the glass. Rebuild the panel's
+-          // old-image plane so the first Home/reader paint only drives changed
+-          // pixels, including removal of the sleep moon.
+-          allowFastInitialReaderRefresh = true;
+-          x4WakeCanFastPaint = true;
+-        }
++        // Restore the panel baseline so the first paint updates only changed pixels.
++        allowFastInitialReaderRefresh = display.restoreVisibleFrame();
+ #endif
+-      } else if (isUc8279X3 && hasValidSleepFrame) {
+-        // The frame passed the size preflight but could not be read after display
+-        // setup. Do one clean, device-specific recovery rather than painting
+-        // differentially against an invalid controller baseline.
+-        LOG_ERR("BOOT", "Quick Resume frame load failed; rebuilding UC8279 X3 display baseline");
+-        Storage.remove(SLEEP_FRAME_FILE);
+-        renderer.clearScreen();
+-        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+-        x3WakeNeedsRefresh = false;
+-      } else if (shouldClearX4WakeGhosting() && SETTINGS.fadingFix != 0) {
+-        LOG_INF("BOOT", "X4 wake: clearing retained sleep image with half refresh");
+-        renderer.clearScreen();
+-        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+-        // The explicit HALF refresh above has already established a clean panel
+-        // baseline, so the reader's first page can use its fast initial cycle
+-        // instead of repeating the cleanup waveform.
+-        allowFastInitialReaderRefresh = true;
+-        x4WakeCanFastPaint = true;
+       }
+       break;
+     case BootResume::Splash:
+@@ -2047,17 +1976,13 @@ void setup() {
+     // target == home (or reader with no open book): land on home — don't fall
+     // through to the sleep-wake "resume reader" logic, which fires on stale
+     // openEpubPath + lastSleepFromReader from a prior session.
+-    // X4's HALF refresh is the same single-pass clean transition already used
+-    // by network screens. Keep X3's existing full refresh behavior unchanged.
+-    const auto homeRefreshMode = gpio.deviceIsX3() ? HalDisplay::FULL_REFRESH : HalDisplay::HALF_REFRESH;
+-    activityManager.goHome(HomeMenuItem::NONE, homeRefreshMode);
++    activityManager.goHome(HomeMenuItem::NONE, HalDisplay::HALF_REFRESH);
+   } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
+              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
+     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
+     // crashed (indicated by readerActivityLoadCount > 0)
+     // Use the first Home paint to clean any retained sleep image without a restored baseline.
+-    const auto homeRefreshMode = x3WakeNeedsRefresh || (resume == BootResume::SplashlessWake &&
+-                                                        shouldClearX4WakeGhosting() && !x4WakeCanFastPaint)
++    const auto homeRefreshMode = x3WakeNeedsRefresh
+                                      ? HalDisplay::HALF_REFRESH
+                                      : HalDisplay::FAST_REFRESH;
+     activityManager.goHome(HomeMenuItem::NONE, homeRefreshMode);
+@@ -2133,6 +2058,23 @@ static void idleDisplayWhileAwake() {
+ #endif
+ }
+
++static unsigned long& inactivityTimestamp() {
++  static unsigned long lastActivityTime = millis();
++  return lastActivityTime;
++}
++
++static bool autoSleepDeadlineReached(const unsigned long now, const unsigned long timeoutMs) {
++  return timeoutMs > 0 && !buttonShortcutController.isQuickLocked() && !gpio.isPressed(HalGPIO::BTN_POWER) &&
++         now - inactivityTimestamp() >= timeoutMs;
++}
++
++bool shouldStopLibraryScanForSleep(const bool touchActivity) {
++  auto& lastActivityTime = inactivityTimestamp();
++  const auto now = millis();
++  if (touchActivity || gpio.wasAnyPressed() || gpio.wasAnyReleased()) lastActivityTime = now;
++  return autoSleepDeadlineReached(now, SETTINGS.getSleepTimeoutMs());
++}
++
+ void loop() {
+   static unsigned long maxLoopDuration = 0;
+   const unsigned long loopStartTime = millis();
+@@ -2213,11 +2155,40 @@ void loop() {
+     logSerial.printf("SCREENSHOT_END\n");
+   }
+
++  int touchX = 0, touchY = 0;
++  const bool touchHeld = mappedInputManager.isScreenTouchHeld(touchX, touchY);
++  static bool hadTouch = false;
++  static bool touchConfirmed = false;
++  static unsigned long touchBeganAt = 0;
++  static int activityTouchX = 0, activityTouchY = 0;
++  const unsigned long now = millis();
++  const bool touchInView = touchHeld && touchX >= 0 && touchY >= 0 && touchX < renderer.getScreenWidth() &&
++                           touchY < renderer.getScreenHeight();
++  if (touchInView && !hadTouch) {
++    touchBeganAt = now;
++    activityTouchX = touchX;
++    activityTouchY = touchY;
++  }
++  // Count sustained contact or deliberate motion. Raw noise at a screen
++  // edge and contacts from a disabled touchscreen should not stop auto-sleep.
++  constexpr unsigned long touchConfirmMs = 25;
++  const bool touchMoved = touchInView && hadTouch &&
++                          (abs(touchX - activityTouchX) + abs(touchY - activityTouchY) >= 4);
++  const bool touchSettled = touchInView && !touchConfirmed && (touchMoved || now - touchBeganAt >= touchConfirmMs);
++  if (touchMoved) {
++    activityTouchX = touchX;
++    activityTouchY = touchY;
++  }
++  const bool touchReleased = hadTouch && !touchHeld && (touchConfirmed || now - touchBeganAt >= touchConfirmMs);
++  touchConfirmed = touchHeld && (touchConfirmed || touchSettled);
++  hadTouch = touchInView || (hadTouch && touchHeld);
++
+   // Notify the active activity before global shortcut and gesture routes consume
+   // the input and skip its loop() for this frame.
+-  const bool userInputReceived = gpio.wasAnyPressed() || gpio.wasAnyReleased()
++  const bool userInputReceived = gpio.wasAnyPressed() || gpio.wasAnyReleased() || touchMoved || touchSettled ||
++                                 touchReleased
+ #if CROSSINK_APP_CAP_TOUCH
+-                                 || gpio.wasTouchActivity()
++                                 || gpio.wasHomeKeyPressed() || gpio.wasHomeKeyTapped() || gpio.wasHomeKeyLongPressed()
+ #endif
+ #if FREEINK_DEVICE_PICCO
+                                  || slideSwitchChanged
+@@ -2227,7 +2198,7 @@ void loop() {
+   idleDisplayWhileAwake();
+
+   // Check for any user activity (button press or release) or active background work
+-  static unsigned long lastActivityTime = millis();
++  auto& lastActivityTime = inactivityTimestamp();
+   const bool transitionWasAborted = storageTransitionAborted.exchange(false, std::memory_order_relaxed);
+   if (userInputReceived || activityManager.preventAutoSleep() || transitionWasAborted ||
+       usbResult == UsbSerialFileTransfer::ProcessResult::SyncActivity) {
+@@ -2246,6 +2217,17 @@ void loop() {
+     return;
+   }
+
++  // Check the deadline before routing shortcuts. A consumed input frame
++  // can return early, but only a new input edge should extend the deadline.
++  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
++  const bool checkingTouch = touchInView && !touchConfirmed && now - touchBeganAt < touchConfirmMs;
++  if (!checkingTouch && autoSleepDeadlineReached(millis(), sleepTimeoutMs)) {
++    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
++    enterDeepSleep(true);
++    lastActivityTime = millis();  // Deep sleep returns only in the simulator.
++    return;
++  }
++
+   const bool modalOwnsInput = activityManager.blocksGlobalInput();
+
+   // Keep Power + Down screenshot-only. The configurable chord below uses Up,
+@@ -2336,7 +2318,6 @@ void loop() {
+       lastActivityTime = millis();
+       return;
+     }
+-    const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+     if (sleepTimeoutMs > 0 && buttonShortcutController.shouldQuickLockSleep(millis(), sleepTimeoutMs)) {
+       LOG_DBG("SLP", "Quick Lock timeout triggered after %lu ms", sleepTimeoutMs);
+       APP_STATE.quickLockResumePending = true;
+@@ -2349,6 +2330,12 @@ void loop() {
+       lastActivityTime = millis();
+     }
+     mappedInputManager.clearInjectedReleases();
++    // Quick Lock bypasses the normal idle loop below. Yield between unlock
++    // polls and apply the same clock reduction while the display is static.
++    if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
++      powerManager.setPowerSaving(true);
++    }
++    delay(20);
+     return;
+   }
+
+@@ -2371,17 +2358,6 @@ void loop() {
+     return;
+   }
+
+-  const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
+-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+-    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
+-    enterDeepSleep(true);
+-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+-    // In the simulator, deep sleep is a no-op and returns — reset the timer so
+-    // the main loop does not immediately re-trigger auto-sleep.
+-    lastActivityTime = millis();
+-    return;
+-  }
+-
+   // Do not feed the wake gesture into getPowerButtonAction(). In particular,
+   // the release edge can otherwise run the configured short/long Power action
+   // in the same loop that arms the post-wake guard.
+diff --git a/test/test_patch_animatedgif.py b/test/test_patch_animatedgif.py
+index d480d1dea26b1c193d6ce53ba84676fd0b0e5252..f555bf165e4eb30d5b463d8960a3de8fa06dc9d0 100644
+--- a/test/test_patch_animatedgif.py
++++ b/test/test_patch_animatedgif.py
+@@ -45,6 +45,14 @@ class PatchAnimatedGifTest(unittest.TestCase):
+         self.assertIn(PATCH.PALETTE_NEW, first["gif.inl"].decode())
+         self.assertIn(PATCH.COPY_NEW, first["gif.inl"].decode())
+
++    def test_git_pinned_dependency_directory(self):
++        library = self.library()
++        pinned = library.with_name("AnimatedGIF@src-67cfacafe12e")
++        library.rename(pinned)
++        self.assertTrue(PATCH.patch_animatedgif(Environment(self.root), require_found=True))
++        self.assertIn(PATCH.NEW_SNIPPET, (pinned / "src/AnimatedGIF.h").read_text())
++        self.assertIn(PATCH.COPY_NEW, (pinned / "src/gif.inl").read_text())
++
+     def test_unknown_decoder_source_fails_without_rewriting_it(self):
+         source = self.library() / "src" / "gif.inl"
+         source.write_text("unknown upstream implementation")

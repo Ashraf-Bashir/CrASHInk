@@ -1,8 +1,9 @@
 # crASHink patch domains and versioned baselines
 
 `patches-1.6.1/` is the preserved v1.6.1 feature stack. Its existing patch
-contents are frozen during the v2.0.0 port. `patches-2.0.0/` is the in-progress port with the same domain names and order,
-targeting the exact v2.0.0 stable baseline. It is not build-ready yet.
+contents remain frozen. `patches-2.0.0/` is the completed port with the same
+domain names and order, targeting the exact v2.0.0 stable baseline. Both versions
+are independently selectable in the build workflow.
 
 Each row below is one domain, not one individual change. Shared settings,
 translations and ActivityManager files may occur in several patches: each
@@ -57,6 +58,7 @@ firmware as before. It never follows the newest tag automatically.
 
 `patchsets.json` is the source of truth for revisions and readiness. The
 resolver verifies `SHA256SUMS` before applying the archived stack, preventing
-accidental changes to the preserved version. The 2.0.0 option will only be
-added to the workflow after the port is complete and tested. Future work must
-not update the archived stack as a side effect of adapting a newer version.
+accidental changes to the preserved version. The 2.0.0 option is the default
+after completing the port, selected native tests, and X4 Pro compilation.
+Select 1.6.1 explicitly for the archived build. Future work must not update the
+archived stack as a side effect of adapting a newer version.

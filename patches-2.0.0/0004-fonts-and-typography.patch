@@ -1,0 +1,942 @@
+diff --git a/lib/Epub/Epub/WordSpacing.h b/lib/Epub/Epub/WordSpacing.h
+index dc8565cd1189595e7f5dd492a40cbd8330b7ea0d..eba2e4b1eae7765197fa064aac46ba938ab3df82 100644
+--- a/lib/Epub/Epub/WordSpacing.h
++++ b/lib/Epub/Epub/WordSpacing.h
+@@ -8,7 +8,7 @@ namespace WordSpacing {
+ constexpr uint8_t MAX_VALUE = 8;
+ constexpr int MIN_LEVEL = -4;
+ constexpr int MAX_LEVEL = 4;
+-inline int level(const uint8_t value) { return value <= 4 ? value : -std::min<int>(value - 4, 4); }
++inline int level(const uint8_t value) { return value >= 252 ? static_cast<int8_t>(value) : value <= 4 ? value : -std::min<int>(value - 4, 4); }
+ inline uint8_t fromLevel(const int value) {
+   const int bounded = std::clamp(value, MIN_LEVEL, MAX_LEVEL);
+   return static_cast<uint8_t>(bounded < 0 ? 4 - bounded : bounded);
+diff --git a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h
+index eb44a06061696c31635b02cea6eb2a5f8b8b3b4d..455f016d4e299168ac6d22815aa75ab2996db6c4 100644
+--- a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h
++++ b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h
+@@ -433,7 +433,7 @@ class ChapterHtmlSlimParser {
+         hyphenationEnabled(hyphenationEnabled),
+         focusReadingEnabled(focusReadingEnabled),
+         guideReadingEnabled(guideReadingEnabled),
+-        wordSpacing(std::min<uint8_t>(wordSpacing, WordSpacing::MAX_VALUE)),
++        wordSpacing(WordSpacing::fromLevel(WordSpacing::level(wordSpacing))),
+         characterSpacing(characterSpacing),
+         cssParser(cssParser),
+         embeddedStyle(embeddedStyle),
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index a13edf39426a5266bf77e2ad06ef23dae1ddc48e..1fb72d079752176c87390ee9a8e3d5f61e595246 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -877,6 +877,76 @@ static void renderCharSmallCaps(const GfxRenderer& renderer, GfxRenderer::Render
+   }
+ }
+
++// Draws a glyph lighter or bolder than it was built. Works on an "effective level"
++// per pixel (0 black, 1 dark grey, 2 light grey, 3 white - the same scale the
++// unweighted path derives from the bitmap) and then emits it exactly like the
++// unweighted path, so BW and both grayscale passes stay consistent with each other.
++//   +1  ink spreads 1px to the right      +2  ...and 1px down as well
++//   -1  every grey step gets one lighter  -2  two steps lighter (only solid black stays)
++// 1-bit fonts have no grey steps, so lighter erodes instead: -1 drops the right edge
++// of each stroke, -2 the bottom edge too. Advance widths are untouched, so layout,
++// page breaks and highlights are identical whatever the weight.
++static void renderCharWeighted(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
++                               const EpdFontData* fontData, const EpdGlyph* glyph, const int cursorX,
++                               const int cursorY, const bool pixelState, const int weight) {
++  const bool is2Bit = fontData->is2Bit;
++  const int width = glyph->width;
++  const int height = glyph->height;
++  const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
++  if (bitmap == nullptr || width <= 0 || height <= 0) return;
++
++  const int baseX = cursorX + glyph->left;
++  const int baseY = cursorY - glyph->top;
++  const int extraRight = weight >= 1 ? 1 : 0;
++  const int extraDown = weight >= 2 ? 1 : 0;
++
++  if (!renderer.glyphIntersectsStrip(baseX, baseY, baseX + width - 1 + extraRight, baseY + height - 1 + extraDown)) {
++    return;
++  }
++
++  // Source level at glyph coordinates; outside the glyph is white.
++  const auto levelAt = [&](const int gx, const int gy) -> int {
++    if (gx < 0 || gy < 0 || gx >= width || gy >= height) return 3;
++    const int position = gy * width + gx;
++    if (is2Bit) {
++      const uint8_t byte = bitmap[position >> 2];
++      const uint8_t bitIndex = (3 - (position & 3)) * 2;
++      return 3 - ((byte >> bitIndex) & 0x3);
++    }
++    return ((bitmap[position >> 3] >> (7 - (position & 7))) & 1) ? 0 : 3;
++  };
++
++  for (int gy = 0; gy < height + extraDown; gy++) {
++    for (int gx = 0; gx < width + extraRight; gx++) {
++      int level = levelAt(gx, gy);
++      if (weight > 0) {
++        level = std::min(level, levelAt(gx - 1, gy));
++        if (weight >= 2) {
++          level = std::min(level, levelAt(gx, gy - 1));
++          level = std::min(level, levelAt(gx - 1, gy - 1));
++        }
++      } else if (is2Bit) {
++        level = std::min(3, level + (-weight));
++      } else if (level == 0) {
++        // 1-bit erosion: keep a pixel only while its right (and, at -2, lower) neighbour is inked too.
++        if (levelAt(gx + 1, gy) != 0 || (weight <= -2 && levelAt(gx, gy + 1) != 0)) level = 3;
++      }
++      if (level >= 3) continue;
++
++      const int screenX = baseX + gx;
++      const int screenY = baseY + gy;
++      if (!is2Bit || renderMode == GfxRenderer::BW) {
++        // Black (also paints over the greys in BW mode). 1-bit fonts draw in every pass, as unweighted.
++        renderer.drawPixel(screenX, screenY, pixelState);
++      } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (level == 1 || level == 2)) {
++        renderer.drawPixel(screenX, screenY, false);
++      } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && level == 1) {
++        renderer.drawPixel(screenX, screenY, false);
++      }
++    }
++  }
++}
++
+ template <TextRotation rotation = TextRotation::None>
+ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
+                            const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
+@@ -894,6 +964,12 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode
+   const uint8_t height = glyph->height;
+   const int left = glyph->left;
+   const int top = glyph->top;
++  // Weighted drawing is horizontal text only; rotated text (rare, UI) is drawn as built.
++  const int weight = rotation == TextRotation::None ? renderer.getTextWeight() : 0;
++  if (weight != 0) {
++    renderCharWeighted(renderer, renderMode, fontData, glyph, cursorX, cursorY, pixelState, weight);
++    return;
++  }
+
+   // Tiled-grayscale band culling: if this glyph's physical y-extent is entirely
+   // outside the active strip, skip it before the expensive bitmap decode. This
+diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
+index 360fc6c213ef26408ca2d4c0f806b9cfe58f0956..b47d7c519ff66640076dfa94b339093cf73a0711 100644
+--- a/lib/GfxRenderer/GfxRenderer.h
++++ b/lib/GfxRenderer/GfxRenderer.h
+@@ -118,6 +118,12 @@ class GfxRenderer {
+   // table cell. Glyph bitmaps and background fills both pass through this
+   // guard, so an emergency oversized codepoint cannot paint into a neighbour.
+   mutable bool textClipActive_ = false;
++  // Glyph weight adjustment, -2 (lightest) .. +2 (boldest), 0 = font as built.
++  // Only set for book text (see TextWeightScope); UI text is always drawn as-is.
++  mutable int8_t textWeight_ = 0;
++  uint8_t imageContrast_ = NORMAL_IMAGE_CONTRAST;
++  // Reader images drawn as a negative in Dark Mode (see setInvertImages). Reader pages only; covers ignore it.
++  mutable bool invertImages_ = false;
+   mutable int textClipLeft_ = 0;
+   mutable int textClipTop_ = 0;
+   mutable int textClipRight_ = 0;   // half-open
+@@ -489,6 +495,30 @@ class GfxRenderer {
+     GfxRenderer& renderer_;
+     uint8_t previous_;
+   };
++
++  int8_t getTextWeight() const { return textWeight_; }
++  void setTextWeight(const int8_t weight) const { textWeight_ = weight < -2 ? -2 : (weight > 2 ? 2 : weight); }
++  void setImageContrast(uint8_t contrast) { imageContrast_ = contrast; }
++  uint8_t getImageContrast() const { return imageContrast_; }
++  // When set, images inside book pages are not pre-inverted for Dark Mode, so the panel's
++  // frame inversion shows them as a negative. The reader sets this before drawing a page;
++  // it only affects ImageBlock, never covers or sleep screens.
++  void setInvertImages(const bool invert) const { invertImages_ = invert; }
++  bool invertImages() const { return invertImages_; }
++  // Applies a glyph weight for the lifetime of the scope, then restores the old one.
++  class TextWeightScope {
++   public:
++    TextWeightScope(const GfxRenderer& renderer, const int8_t weight) : renderer_(renderer), previous_(renderer.textWeight_) {
++      renderer.setTextWeight(weight);
++    }
++    ~TextWeightScope() { renderer_.setTextWeight(previous_); }
++    TextWeightScope(const TextWeightScope&) = delete;
++    TextWeightScope& operator=(const TextWeightScope&) = delete;
++
++   private:
++    const GfxRenderer& renderer_;
++    int8_t previous_;
++  };
+   // Grayscale preconditioning settle pass (no-op on X4). The rect overload
+   // takes the gray region in LOGICAL screen coordinates and rotates it to the
+   // panel; the no-arg overload settles the full frame. Call after the BW base
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 62bde79850a99718ca4218c5b40fcf5781258ab8..cd0d55525b9e95cd00065d0fbdbc3032d14aeef2 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -331,6 +331,12 @@ STR_LANDSCAPE_CCW: "Landscape CCW"
+ STR_DISABLED: "Disabled"
+ STR_NEXT_NEXT: "Next/Next"
+ STR_DOUBLE_PRESS_ACTION: "Double-press"
++STR_TEXT_WEIGHT: "Font Weight"
++STR_WEIGHT_LIGHTEST: "Lightest"
++STR_WEIGHT_LIGHTER: "Lighter"
++STR_WEIGHT_NORMAL: "Normal"
++STR_WEIGHT_BOLDER: "Bolder"
++STR_WEIGHT_BOLDEST: "Boldest"
+ STR_LEXEND_DECA: "Lexend Deca"
+ STR_BITTER: "Bitter"
+ STR_COMPACT: "Compact"
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+index 7c735d4b6e596a9beddf4d318739efee98020a68..b4786a8e07496216311b06a332c38399e7e5942a 100644
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -617,7 +617,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
+       const uint16_t fieldDefault = this->*(info.value16Ptr);
+       uint16_t value = doc[info.key] | fieldDefault;
+       if (info.type == SettingType::VALUE) {
+-        value = std::clamp(value, info.valueRange.min, info.valueRange.max);
++        value = static_cast<uint16_t>(std::clamp<int32_t>(value, info.valueRange.min, info.valueRange.max));
+       }
+       this->*(info.value16Ptr) = value;
+       return;
+@@ -667,6 +667,9 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
+       needsResave = true;
+     } else if (info.type == SettingType::TOGGLE) {
+       value = clamp(value, 2, fieldDefault);
++    } else if (info.type == SettingType::VALUE && info.isSigned) {
++      value = encodeSignedSetting(decodeSignedSetting(value, info.valueRange.min, info.valueRange.max),
++                                  info.valueRange.min, info.valueRange.max);
+     } else if (info.type == SettingType::VALUE) {
+       value = std::clamp(value, static_cast<uint8_t>(info.valueRange.min), static_cast<uint8_t>(info.valueRange.max));
+     }
+@@ -1384,7 +1387,7 @@ ReaderRenderSpec CrossPointSettings::readerRenderSpec(const uint16_t viewportWid
+   spec.focusReadingEnabled = focusReadingEnabled != 0;
+   spec.guideReadingEnabled = guideReadingEnabled != 0;
+   spec.ruled = ruledLines != 0;
+-  spec.wordSpacing = wordSpacing;
++  spec.wordSpacing = sanitizeWordSpacing(wordSpacing);
+   spec.characterSpacing = characterSpacingLevel(characterSpacing);
+   spec.renderMode = renderMode;
+ #if CROSSINK_SCALABLE_FONTS
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index 96e9a5d2cfb7f72511911f879628c7338b69a16e..972871c6e850224fb8f2dfc675f8cdc9b674776c 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -520,6 +520,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   uint8_t twoToneTextAA = 0;
+   uint8_t textDarkness = 0;
+   uint8_t ruledLines = 0;
++  // Book text weight: 0 lightest .. 2 normal (as the font was built) .. 4 boldest.
++  enum TEXT_WEIGHT { WEIGHT_LIGHTEST = 0, WEIGHT_LIGHTER, WEIGHT_NORMAL, WEIGHT_BOLDER, WEIGHT_BOLDEST, TEXT_WEIGHT_COUNT };
++  uint8_t textWeight = WEIGHT_NORMAL;
++  int8_t textWeightOffset() const { return static_cast<int8_t>(textWeight) - static_cast<int8_t>(WEIGHT_NORMAL); }
+   // Touch screen reader zones/gestures on boards with a touch controller.
+   // Shortcut pause remains independent of touch reader controls.
+   uint8_t disablePageTurnGestures = 0;
+@@ -763,7 +767,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   static constexpr uint8_t MAX_SLEEP_TIMEOUT_MINUTES = SLEEP_TIMEOUT_NEVER_MINUTES;
+   static constexpr uint8_t SD_FONT_MAX_SIZE_STEPS = 8;
+   static constexpr uint8_t MIN_READER_FONT_POINT_SIZE = 8;
+-  static constexpr uint8_t MIN_LINE_HEIGHT_PERCENT = 70;
++  static constexpr uint8_t MIN_LINE_HEIGHT_PERCENT = 30;
+   static constexpr uint8_t MAX_LINE_HEIGHT_PERCENT = 200;
+   static constexpr uint8_t LINE_HEIGHT_PERCENT_STEP = 1;
+   static constexpr uint8_t MIN_SCREEN_MARGIN = 5;
+@@ -777,6 +781,43 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+     return static_cast<int8_t>(std::min<uint8_t>(value, MAX_CHARACTER_SPACING)) - 5;
+   }
+   static void formatCharacterSpacing(int value, char* buffer, size_t length);
++  // Negative values: word spacing and margins are stored in their existing byte as a signed
++  // (two's complement) value, so old settings files keep their meaning. Word spacing runs
++  // -4..4 (each negative step removes a quarter of the natural gap). Margins run -30..127
++  // and are added to the panel's viewable insets; the reader never lets the total go below 0.
++  static constexpr int WORD_SPACING_LOWEST = -4;
++  static constexpr int WORD_SPACING_HIGHEST = 4;
++  static constexpr int MARGIN_LOWEST = -30;
++  static constexpr int MARGIN_HIGHEST = 127;
++  // Decodes a stored byte. A byte below the lowest allowed negative can only be an old
++  // (pre-negative) value that was larger than the signed range, so it maps to the highest.
++  static int decodeSignedSetting(const uint8_t raw, const int lowest, const int highest) {
++    const int value = static_cast<int8_t>(raw);
++    if (value < lowest) return highest;
++    return value > highest ? highest : value;
++  }
++  static uint8_t encodeSignedSetting(const int value, const int lowest, const int highest) {
++    const int clamped = value < lowest ? lowest : (value > highest ? highest : value);
++    return static_cast<uint8_t>(static_cast<int8_t>(clamped));
++  }
++  static int wordSpacingLevelOf(const uint8_t raw) {
++    return WordSpacing::level(raw);
++  }
++  static uint8_t sanitizeWordSpacing(const uint8_t raw) {
++    return WordSpacing::fromLevel(wordSpacingLevelOf(raw));
++  }
++  static int marginOf(const uint8_t raw) { return decodeSignedSetting(raw, MARGIN_LOWEST, MARGIN_HIGHEST); }
++  static uint8_t sanitizeMargin(const uint8_t raw) {
++    return encodeSignedSetting(marginOf(raw), MARGIN_LOWEST, MARGIN_HIGHEST);
++  }
++  int wordSpacingLevel() const { return wordSpacingLevelOf(wordSpacing); }
++  int marginVertical() const { return marginOf(screenMarginVertical); }
++  int marginHorizontal() const { return marginOf(screenMarginHorizontal); }
++  // For readers that cannot use a negative margin (TXT, dictionary sheets).
++  uint8_t marginVerticalNonNegative() const { return static_cast<uint8_t>(marginVertical() < 0 ? 0 : marginVertical()); }
++  uint8_t marginHorizontalNonNegative() const {
++    return static_cast<uint8_t>(marginHorizontal() < 0 ? 0 : marginHorizontal());
++  }
+   static constexpr uint16_t DEFAULT_READING_IDLE_TIME_THRESHOLD_SECONDS = 5 * 60;
+   static constexpr uint16_t MIN_READING_IDLE_TIME_THRESHOLD_SECONDS = 30;
+   static constexpr uint16_t MAX_READING_IDLE_TIME_THRESHOLD_SECONDS = 10 * 60;
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index a174d9b199f98891b987434d434d549a2e11e3b5..811721f9ab95d34641de0a036a5c37209205cc69 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -864,6 +864,7 @@ inline std::vector<SettingInfo> buildReaderFontSettingsList(const std::vector<Se
+   addSettingByName(settings, allSettings, StrId::STR_FONT_FAMILY);
+   addSettingByName(settings, allSettings, StrId::STR_FONT_SIZE);
+   addSettingByName(settings, allSettings, StrId::STR_PUBLISHER_FONTS);
++  addSettingByName(settings, allSettings, StrId::STR_TEXT_WEIGHT);
+   addSettingByName(settings, allSettings, StrId::STR_DICTIONARY_FONT);
+   addSettingByName(settings, allSettings, StrId::STR_DICTIONARY_FONT_SIZE);
+   addSettingByName(settings, allSettings, StrId::STR_LINE_SPACING);
+diff --git a/src/activities/reader/ClipSelectionActivity.cpp b/src/activities/reader/ClipSelectionActivity.cpp
+index 028021b669026b8dca913a6fc67c251089dac605..6f66e4320ef668d817dc09cd6cf228b0abe39d61 100644
+--- a/src/activities/reader/ClipSelectionActivity.cpp
++++ b/src/activities/reader/ClipSelectionActivity.cpp
+@@ -579,6 +579,10 @@ bool ClipSelectionActivity::switchToPage(const int pageIdx) {
+     return false;
+   }
+
++  // Book text is drawn with the reader's Font Weight; keep it while selecting.
++  const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
++  renderer.setInvertImages(SETTINGS.invertImagesDark != 0);
++
+   // The snapshot is almost a full framebuffer. Release it before SD-font
+   // prewarming so its chunks do not crowd out the contiguous glyph bitmap.
+   resetSavedBufferChunks();
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 614abd7dd9d2ebb7dd3070b14aaffd5e4dd4d5f2..cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -1051,10 +1051,10 @@ void drawPublisherPageMarkers(const GfxRenderer& renderer, const Page& page, con
+   }
+ }
+
+-uint8_t effectiveReaderLeftMargin() {
++int effectiveReaderLeftMargin() {
+   return SETTINGS.publisherPageNumbers
+-             ? std::max<uint8_t>(SETTINGS.screenMarginHorizontal, PUBLISHER_PAGE_NUMBER_LEFT_MARGIN_MIN)
+-             : SETTINGS.screenMarginHorizontal;
++             ? std::max(SETTINGS.marginHorizontal(), static_cast<int>(PUBLISHER_PAGE_NUMBER_LEFT_MARGIN_MIN))
++             : SETTINGS.marginHorizontal();
+ }
+
+ struct ReaderViewportLayout {
+@@ -1081,21 +1081,21 @@ ReaderViewportLayout computeReaderViewportLayout(GfxRenderer& renderer, const bo
+   ReaderViewportLayout layout{};
+   renderer.getOrientedViewableTRBL(&layout.marginTop, &layout.marginRight, &layout.marginBottom, &layout.marginLeft);
+   layout.marginLeft += effectiveReaderLeftMargin();
+-  layout.marginRight += SETTINGS.screenMarginHorizontal;
++  layout.marginRight += SETTINGS.marginHorizontal();
+
+   const int topStatusBarReservedHeight = ReaderUtils::getTopStatusBarReservedHeight(renderer);
+   if (topStatusBarReservedHeight > 0) {
+-    layout.marginTop += std::max(static_cast<int>(SETTINGS.screenMarginVertical),
++    layout.marginTop += std::max(SETTINGS.marginVertical(),
+                                  topStatusBarReservedHeight + ReaderUtils::TOP_STATUS_BAR_TEXT_PADDING);
+   } else {
+-    layout.marginTop += SETTINGS.screenMarginVertical;
++    layout.marginTop += SETTINGS.marginVertical();
+   }
+
+ #if CROSSINK_APP_CAP_TOUCH
+   if (showFootnoteHeader) {
+     const Rect header = TouchHeaderBackButton::compactHeaderRect(renderer);
+     layout.marginTop =
+-        std::max(layout.marginTop, header.y + header.height + static_cast<int>(SETTINGS.screenMarginVertical));
++        std::max(layout.marginTop, header.y + header.height + SETTINGS.marginVertical());
+   }
+ #else
+   if (showFootnoteHeader) {
+@@ -1110,6 +1110,11 @@ ReaderViewportLayout computeReaderViewportLayout(GfxRenderer& renderer, const bo
+
+   layout.marginBottom += ReaderUtils::getReaderFooterReservedHeight(renderer, automaticPageTurnActive);
+
++  // Negative margins may eat into the panel's viewable inset but never past the screen edge.
++  layout.marginLeft = std::max(0, layout.marginLeft);
++  layout.marginRight = std::max(0, layout.marginRight);
++  layout.marginTop = std::max(0, layout.marginTop);
++
+   layout.viewportWidth = renderer.getScreenWidth() - layout.marginLeft - layout.marginRight;
+   layout.viewportHeight = renderer.getScreenHeight() - layout.marginTop - layout.marginBottom;
+   return layout;
+@@ -1245,6 +1250,7 @@ void captureReaderSettings(EpubReaderActivity::ReaderSettingsSnapshot& out) {
+   out.twoToneTextAA = SETTINGS.twoToneTextAA;
+   out.textDarkness = SETTINGS.textDarkness;
+   out.ruledLines = SETTINGS.ruledLines;
++  out.textWeight = SETTINGS.textWeight;
+   out.imageRendering = SETTINGS.imageRendering;
+   out.imageGrayscale = SETTINGS.imageGrayscale;
+   out.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+@@ -1275,10 +1281,8 @@ void applyReaderSettings(const EpubReaderActivity::ReaderSettingsSnapshot& in) {
+   SETTINGS.wordSpacing = std::min<uint8_t>(in.wordSpacing, CrossPointSettings::MAX_WORD_SPACING);
+   SETTINGS.characterSpacing = std::min<uint8_t>(in.characterSpacing, CrossPointSettings::MAX_CHARACTER_SPACING);
+   SETTINGS.orientation = in.orientation < CrossPointSettings::ORIENTATION_COUNT ? in.orientation : SETTINGS.orientation;
+-  SETTINGS.screenMarginVertical = std::clamp<uint8_t>(in.screenMarginVertical, CrossPointSettings::MIN_SCREEN_MARGIN,
+-                                                      CrossPointSettings::MAX_SCREEN_MARGIN);
+-  SETTINGS.screenMarginHorizontal = std::clamp<uint8_t>(
+-      in.screenMarginHorizontal, CrossPointSettings::MIN_SCREEN_MARGIN, CrossPointSettings::MAX_SCREEN_MARGIN);
++  SETTINGS.screenMarginVertical = CrossPointSettings::sanitizeMargin(in.screenMarginVertical);
++  SETTINGS.screenMarginHorizontal = CrossPointSettings::sanitizeMargin(in.screenMarginHorizontal);
+   SETTINGS.publisherPageNumbers = in.publisherPageNumbers ? 1 : 0;
+   SETTINGS.paragraphAlignment = in.paragraphAlignment < CrossPointSettings::PARAGRAPH_ALIGNMENT_COUNT
+                                     ? in.paragraphAlignment
+@@ -1290,6 +1294,7 @@ void applyReaderSettings(const EpubReaderActivity::ReaderSettingsSnapshot& in) {
+   SETTINGS.twoToneTextAA = in.twoToneTextAA != 0;
+   SETTINGS.textDarkness = in.textDarkness <= 2 ? in.textDarkness : 0;
+   SETTINGS.ruledLines = in.ruledLines <= 3 ? in.ruledLines : 0;
++  SETTINGS.textWeight = in.textWeight < CrossPointSettings::TEXT_WEIGHT_COUNT ? in.textWeight : CrossPointSettings::WEIGHT_NORMAL;
+   SETTINGS.imageRendering =
+       in.imageRendering < CrossPointSettings::IMAGE_RENDERING_COUNT ? in.imageRendering : SETTINGS.imageRendering;
+   SETTINGS.imageGrayscale = in.imageGrayscale ? 1 : 0;
+@@ -1354,6 +1359,8 @@ uint32_t changedReaderSettingsMask(const ReaderSettingsSnapshot& current, const
+     if (current.*field != global.*field) mask |= readerSettingBit(i);
+   }
+   if (std::strcmp(current.sdFontFamilyName, global.sdFontFamilyName) != 0) mask |= SD_FONT_FAMILY_OVERRIDE;
++  if (current.textWeight != global.textWeight) mask |= TEXT_WEIGHT_OVERRIDE;
++  if (current.invertImagesDark != global.invertImagesDark) mask |= INVERT_IMAGES_OVERRIDE;
+   return mask;
+ }
+
+@@ -1368,6 +1375,8 @@ void applyReaderSettingsOverrides(ReaderSettingsSnapshot& target, const ReaderSe
+   if (mask & SD_FONT_FAMILY_OVERRIDE) {
+     std::memcpy(target.sdFontFamilyName, book.sdFontFamilyName, sizeof(target.sdFontFamilyName));
+   }
++  if (mask & TEXT_WEIGHT_OVERRIDE) target.textWeight = book.textWeight;
++  if (mask & INVERT_IMAGES_OVERRIDE) target.invertImagesDark = book.invertImagesDark;
+ }
+
+ using BookReaderSettingsData = EpubReaderActivity::BookReaderSettingsData;
+@@ -1412,7 +1421,7 @@ bool readReaderSettingsSnapshot(FsFile& file, EpubReaderActivity::ReaderSettings
+
+ bool writeReaderSettingsSnapshot(FsFile& file, const EpubReaderActivity::ReaderSettingsSnapshot& in) {
+   return writeU8(file, in.fontFamily) && writeU8(file, in.readerFontPointSize) && writeU8(file, in.lineHeightPercent) &&
+-         writeU8(file, std::min<uint8_t>(in.wordSpacing, CrossPointSettings::MAX_WORD_SPACING)) &&
++         writeU8(file, CrossPointSettings::sanitizeWordSpacing(in.wordSpacing)) &&
+          writeU8(file, in.orientation) && writeU8(file, in.screenMarginVertical) &&
+          writeU8(file, in.screenMarginHorizontal) && writeU8(file, in.publisherPageNumbers) &&
+          writeU8(file, in.paragraphAlignment) && writeU8(file, in.embeddedStyle) &&
+@@ -1489,6 +1498,10 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath,
+   // Version 2 books inherit the current global indexing method instead of
+   // silently changing modes when their older custom settings are loaded.
+   snapshot.indexingMethod = data.readerSettings.indexingMethod;
++  // Text weight is a trailing byte added after this format shipped: files written
++  // before it simply end early and the book keeps the global weight.
++  snapshot.textWeight = data.readerSettings.textWeight;
++  snapshot.invertImagesDark = data.readerSettings.invertImagesDark;
+   bool ok = readU8(file, flags) && readU16(file, seconds);
+   if (ok) {
+     ok = readU8(file, renderMode);
+@@ -1545,6 +1558,15 @@ BookReaderSettingsData loadBookReaderSettingsFile(const std::string& cachePath,
+   if (ok && version >= READER_SETTINGS_FILE_VERSION) {
+     ok = readU8(file, wordHoldAction);
+   }
++  if (ok) {
++    // Font weight is a trailing byte added after this format shipped: older files
++    // simply end early and the book keeps the global weight.
++    uint8_t storedTextWeight = 0;
++    if (readU8(file, storedTextWeight)) snapshot.textWeight = storedTextWeight;
++    // Invert Images in Dark Mode is one more trailing byte; files without it keep the global value.
++    uint8_t storedInvertImages = 0;
++    if (readU8(file, storedInvertImages)) snapshot.invertImagesDark = storedInvertImages ? 1 : 0;
++  }
+   file.close();
+   if (!ok) {
+     LOG_ERR("ERS", "Reader settings file is truncated, using defaults");
+@@ -8122,6 +8144,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+     ruling.drawPage(renderer, *page, fontId, orientedMarginTop);
+   };
+   const auto composePageBuffer = [&]() {
++    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+     drawTextAndRules();
+     if (deferImageLoading) {
+       page->renderImagesWithPlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
+@@ -8135,6 +8158,7 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+
+   bool imageReplayOk = true;
+   const auto composeGrayscaleBuffer = [&]() {
++    const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+     if (needsTextGrayscale) {
+       page->renderText(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack);
+     }
+diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
+index 6fcf2516d82e29865b829b4f0bc37c4ba7dda6c1..e800f400eac6ecec21c21951114934ef03cd3746 100644
+--- a/src/activities/reader/EpubReaderActivity.h
++++ b/src/activities/reader/EpubReaderActivity.h
+@@ -87,6 +87,7 @@ class EpubReaderActivity final : public Activity {
+     uint8_t textDarkness = 0;
+     uint8_t ruledLines = 0;
+     uint8_t twoToneTextAA = 0;
++    uint8_t textWeight = CrossPointSettings::WEIGHT_NORMAL;
+     uint8_t imageRendering = 0;
+     uint8_t imageGrayscale = 1;
+     uint8_t extraParagraphSpacing = 1;
+diff --git a/src/activities/reader/ReaderUtils.h b/src/activities/reader/ReaderUtils.h
+index ab40b36a618a4b86fd5107f1ec143e1cfd9a36f6..b8eb6d649cf51e35582459540d6959c114b6611d 100644
+--- a/src/activities/reader/ReaderUtils.h
++++ b/src/activities/reader/ReaderUtils.h
+@@ -109,10 +109,10 @@ inline int getReaderFooterReservedHeight(const GfxRenderer& renderer, const bool
+     const int autoTurnBarHeight =
+         readerStatusBarTotalHeight(ReaderStatusBarPosition::Bottom, true, UITheme::getProgressBarHeight(),
+                                    UITheme::getReaderStatusBarTextHeight(renderer));
+-    return std::max(static_cast<int>(SETTINGS.screenMarginVertical),
++    return std::max(SETTINGS.marginVertical(),
+                     std::max(statusBarHeight, autoTurnBarHeight) + STATUS_BAR_TEXT_PADDING);
+   }
+-  return std::max(static_cast<int>(SETTINGS.screenMarginVertical),
++  return std::max(SETTINGS.marginVertical(),
+                   static_cast<int>(statusBarHeight + STATUS_BAR_TEXT_PADDING));
+ }
+
+diff --git a/src/activities/reader/TxtReaderActivity.cpp b/src/activities/reader/TxtReaderActivity.cpp
+index 905bae34dfca689d80f9b42c1f7d0a70ac1ccfa4..3caba9017263541001804650c7970a0edc85efa7 100644
+--- a/src/activities/reader/TxtReaderActivity.cpp
++++ b/src/activities/reader/TxtReaderActivity.cpp
+@@ -679,8 +679,8 @@ void TxtReaderActivity::initializeReader() {
+   // Store current settings for cache validation
+   cachedFontId = SETTINGS.getReaderFontId();
+   cachedCharacterSpacing = SETTINGS.characterSpacingLevel(SETTINGS.characterSpacing);
+-  cachedVerticalMargin = SETTINGS.screenMarginVertical;
+-  cachedHorizontalMargin = SETTINGS.screenMarginHorizontal;
++  cachedVerticalMargin = SETTINGS.marginVerticalNonNegative();
++  cachedHorizontalMargin = SETTINGS.marginHorizontalNonNegative();
+   cachedParagraphAlignment = SETTINGS.paragraphAlignment;
+   cachedTopStatusBarHeight = ReaderUtils::getTopStatusBarReservedHeight(renderer);
+   cachedFooterReservedHeight = ReaderUtils::getReaderFooterReservedHeight(renderer, false);
+@@ -1222,8 +1222,8 @@ bool TxtReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gfx
+
+   // Compute layout values that match what initializeReader() produces
+   const int fontId = SETTINGS.getReaderFontId();
+-  const uint8_t verticalMargin = SETTINGS.screenMarginVertical;
+-  const uint8_t horizontalMargin = SETTINGS.screenMarginHorizontal;
++  const uint8_t verticalMargin = SETTINGS.marginVerticalNonNegative();
++  const uint8_t horizontalMargin = SETTINGS.marginHorizontalNonNegative();
+   const uint8_t paragraphAlignment = SETTINGS.paragraphAlignment;
+
+   int marginTop, marginRight, marginBottom, marginLeft;
+diff --git a/src/activities/settings/FontSelectionActivity.cpp b/src/activities/settings/FontSelectionActivity.cpp
+index 07d9216561110d019dc14427e849f3013262f2f7..a8aff1ac9eac3eb4cd005a69449756f343d77769 100644
+--- a/src/activities/settings/FontSelectionActivity.cpp
++++ b/src/activities/settings/FontSelectionActivity.cpp
+@@ -290,6 +290,7 @@ void FontSelectionActivity::handleSelection() {
+ }
+
+ void FontSelectionActivity::renderPreviewPane(int top, int height, int fontId, const char* fontName) const {
++  const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
+   const auto safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+   const int left = std::max(metrics_.previewPadding, safe.x);
+   const int right = std::min(renderer.getScreenWidth() - metrics_.previewPadding, safe.x + safe.width);
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 52f7613b31fdaf1d003ce598f2426fa3ee24d5ba..f5518c37cd8bcc51d3afb59d35151a38abab1162 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -660,8 +660,9 @@ void SettingsActivity::openScreenMarginPicker(const SettingInfo& setting) {
+   const SettingInfo selectedSetting = setting;
+   startActivityForResult(
+       std::make_unique<IntervalSelectionActivity>(
+-          renderer, mappedInput, "ScreenMarginInterval", selectedSetting.nameId, SETTINGS.*(selectedSetting.valuePtr),
+-          CrossPointSettings::MIN_SCREEN_MARGIN, CrossPointSettings::MAX_SCREEN_MARGIN,
++          renderer, mappedInput, "ScreenMarginInterval", selectedSetting.nameId,
++          CrossPointSettings::marginOf(SETTINGS.*(selectedSetting.valuePtr)), CrossPointSettings::MARGIN_LOWEST,
++          CrossPointSettings::MARGIN_HIGHEST,
+           CrossPointSettings::SCREEN_MARGIN_SMALL_STEP, CrossPointSettings::SCREEN_MARGIN_LARGE_STEP,
+           StrId::STR_NONE_OPT, /*readerActivity=*/false,
+           /*allowPowerAsConfirm=*/false, /*ignoreInitialConfirmRelease=*/false, /*showPercentValue=*/false,
+@@ -672,9 +673,8 @@ void SettingsActivity::openScreenMarginPicker(const SettingInfo& setting) {
+               : IntervalSelectionActivity::ReaderPreviewSetting::HorizontalMargin),
+       [this, selectedSetting](const ActivityResult& result) {
+         if (!result.isCancelled) {
+-          SETTINGS.*(selectedSetting.valuePtr) = static_cast<uint8_t>(std::clamp(
+-              std::get<IntervalResult>(result.data).value, static_cast<uint32_t>(CrossPointSettings::MIN_SCREEN_MARGIN),
+-              static_cast<uint32_t>(CrossPointSettings::MAX_SCREEN_MARGIN)));
++          SETTINGS.*(selectedSetting.valuePtr) = CrossPointSettings::sanitizeMargin(
++              static_cast<uint8_t>(static_cast<int32_t>(std::get<IntervalResult>(result.data).value)));
+           SETTINGS.saveToFile();
+         }
+         requestUpdate();
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 6b1dfab80660692f2992eac6b84dbdf83f2f4f89..ec0b2d17d01adf6b3e1938a7357625f706759301 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -77,11 +77,12 @@ struct SettingInfo {
+   SettingAction action = SettingAction::None;
+
+   struct ValueRange {
+-    uint16_t min;
+-    uint16_t max;
+-    uint16_t step;
++    int32_t min;
++    int32_t max;
++    int32_t step;
+   };
+   ValueRange valueRange = {};
++  bool isSigned = false;  // valuePtr holds a signed (two's complement) byte, e.g. word spacing, margins
+
+   const char* key = nullptr;             // JSON API key (nullptr for ACTION types)
+   StrId category = StrId::STR_NONE_OPT;  // Category for web UI grouping
+@@ -125,6 +126,11 @@ struct SettingInfo {
+     return s;
+   }
+
++  SettingInfo& asSigned() {
++    isSigned = true;
++    return *this;
++  }
++
+   SettingInfo& withEnumRawValues(std::vector<uint8_t> values) {
+     enumRawValues = std::move(values);
+     return *this;
+diff --git a/src/activities/util/IntervalSelectionActivity.cpp b/src/activities/util/IntervalSelectionActivity.cpp
+index a32a80bce5d172ef5c5b62b4ed6002438a35c0ad..070300dffa88c4bb8067bd4e23235427a83036a3 100644
+--- a/src/activities/util/IntervalSelectionActivity.cpp
++++ b/src/activities/util/IntervalSelectionActivity.cpp
+@@ -385,9 +385,9 @@ void IntervalSelectionActivity::renderReaderPreview(const Rect& area) {
+   const uint8_t wordSpacing =
+       readerPreviewSetting == ReaderPreviewSetting::WordSpacing ? WordSpacing::fromSlider(value) : SETTINGS.wordSpacing;
+   const int marginX =
+-      readerPreviewSetting == ReaderPreviewSetting::HorizontalMargin ? value : SETTINGS.screenMarginHorizontal;
++      readerPreviewSetting == ReaderPreviewSetting::HorizontalMargin ? value : SETTINGS.marginHorizontal();
+   const int marginVertical =
+-      readerPreviewSetting == ReaderPreviewSetting::VerticalMargin ? value : SETTINGS.screenMarginVertical;
++      readerPreviewSetting == ReaderPreviewSetting::VerticalMargin ? value : SETTINGS.marginVertical();
+   const int marginY = marginVertical * textHeight / std::max(1, static_cast<int>(renderer.getScreenHeight()));
+   const int left = area.x + metrics.previewPadding + marginX;
+   const int top = area.y + topPadding + marginY;
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index 0feec916f06d67b6f6fc53e37853e0019aee5eab..51ec74e57627eb7d8c94eb08117669fc1fade895 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -1967,7 +1967,9 @@ void CrossPointWebServer::handleGetSettings() const {
+       case SettingType::VALUE: {
+         doc["type"] = "value";
+         if (s.valuePtr) {
+-          doc["value"] = static_cast<int>(SETTINGS.*(s.valuePtr));
++          doc["value"] = s.isSigned ? CrossPointSettings::decodeSignedSetting(SETTINGS.*(s.valuePtr), s.valueRange.min,
++                                                                              s.valueRange.max)
++                                    : static_cast<int>(SETTINGS.*(s.valuePtr));
+         } else if (s.value16Ptr) {
+           doc["value"] = static_cast<int>(SETTINGS.*(s.value16Ptr));
+         }
+@@ -2083,7 +2085,9 @@ void CrossPointWebServer::handlePostSettings() {
+         const int val = doc[s.key].as<int>();
+         if (val >= s.valueRange.min && val <= s.valueRange.max) {
+           if (s.valuePtr) {
+-            SETTINGS.*(s.valuePtr) = static_cast<uint8_t>(val);
++            SETTINGS.*(s.valuePtr) =
++                s.isSigned ? CrossPointSettings::encodeSignedSetting(val, s.valueRange.min, s.valueRange.max)
++                           : static_cast<uint8_t>(val);
+           } else if (s.value16Ptr) {
+             SETTINGS.*(s.value16Ptr) = static_cast<uint16_t>(val);
+           }
+diff --git a/test/reader_drawer_model/ReaderDrawerModelTest.cpp b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
+index ed3971f849ab64ab74aacd3b5cbffffecffbf12d..0ee58845a3a1c93adc4d28f0342573673b3387df 100644
+--- a/test/reader_drawer_model/ReaderDrawerModelTest.cpp
++++ b/test/reader_drawer_model/ReaderDrawerModelTest.cpp
+@@ -138,9 +138,9 @@ TEST(ReaderDrawerModel, CatalogOrderAndConditionalRowsMatchTouchDesign) {
+   EXPECT_EQ(stableMore.items[2], ReaderDrawerCatalogItem::GoToStablePage);
+
+   const auto& minimalLocation = minimal[static_cast<size_t>(ReaderDrawerTab::Location)];
+-  EXPECT_EQ(minimalLocation.count, 4);
++  EXPECT_EQ(minimalLocation.count, 5);
+   EXPECT_EQ(minimalLocation.items[0], ReaderDrawerCatalogItem::BookmarkToggle);
+-  EXPECT_EQ(minimalLocation.items[3], ReaderDrawerCatalogItem::DisplayQr);
++  EXPECT_EQ(minimalLocation.items[4], ReaderDrawerCatalogItem::DisplayQr);
+
+   const ReaderDrawerCatalog complete = makeReaderDrawerCatalog({true, true, true, true, true, true});
+   const auto& more = complete[static_cast<size_t>(ReaderDrawerTab::More)];
+diff --git a/lib/SupportInfo/SupportInfo.cpp b/lib/SupportInfo/SupportInfo.cpp
+index 244d15fa492fb0f498b5a6dcd485e611a90ea99e..0bfeaf1e63c2c79882ec2dd5c775c07ee27850f6 100644
+--- a/lib/SupportInfo/SupportInfo.cpp
++++ b/lib/SupportInfo/SupportInfo.cpp
+@@ -51,7 +51,7 @@ void normalizeBookValues(BookContext& b, const uint16_t* g) {
+     v[Reader_fontFamily] = g[fontFamily];
+     b.fallbackMask |= 1U << Reader_fontFamily;
+   }
+-  v[Reader_lineHeightPercent] = std::clamp<uint8_t>(v[Reader_lineHeightPercent], 70, 200);
++  v[Reader_lineHeightPercent] = std::clamp<uint8_t>(v[Reader_lineHeightPercent], 30, 200);
+   v[Reader_wordSpacing] = std::min<uint8_t>(v[Reader_wordSpacing], 8);
+   if (v[Reader_orientation] >= 4) {
+     v[Reader_orientation] = g[orientation];
+diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
+index 8890a5ebc28385b00996bbd299ce6ca565b608ee..bd63fa4566c624da8a617f2b51d6bb33c8951665 100644
+--- a/src/SettingsList.cpp
++++ b/src/SettingsList.cpp
+@@ -144,6 +144,8 @@ void forEachBaseSetting(SettingVisitor visitor, void* context) {
+                           "forceParagraphIndents", StrId::STR_CAT_READER));
+   add(SettingInfo::Toggle(StrId::STR_FOCUS_READING, &CrossPointSettings::focusReadingEnabled, "focusReadingEnabled",
+                           StrId::STR_CAT_READER));
++  add(SettingInfo::Enum(StrId::STR_TEXT_WEIGHT, &CrossPointSettings::textWeight,
++      {StrId::STR_WEIGHT_LIGHTEST, StrId::STR_WEIGHT_LIGHTER, StrId::STR_WEIGHT_NORMAL, StrId::STR_WEIGHT_BOLDER, StrId::STR_WEIGHT_BOLDEST}, "textWeight", StrId::STR_CAT_READER));
+   add(SettingInfo::Toggle(StrId::STR_GUIDE_READING, &CrossPointSettings::guideReadingEnabled, "guideReadingEnabled",
+                           StrId::STR_CAT_READER));
+   add(SettingInfo::Enum(StrId::STR_INDEXING_METHOD, &CrossPointSettings::indexingMethod,
+diff --git a/src/SupportInfoExport.cpp b/src/SupportInfoExport.cpp
+index fe728101a02b3d2bcf7dbc77765ca9e0a0ed3d99..4f4e03ccc3eb468da78f91c7e2d75c4a5447f9a4 100644
+--- a/src/SupportInfoExport.cpp
++++ b/src/SupportInfoExport.cpp
+@@ -15,7 +15,7 @@
+ namespace {
+ // Keep the tested support normalizer aligned with applyReaderSettings' constraints.
+ static_assert(CrossPointSettings::BUILTIN_FONT_COUNT == 2 && CrossPointSettings::ORIENTATION_COUNT == 4 &&
+-              CrossPointSettings::MIN_LINE_HEIGHT_PERCENT == 70 && CrossPointSettings::MAX_LINE_HEIGHT_PERCENT == 200 &&
++              CrossPointSettings::MIN_LINE_HEIGHT_PERCENT == 30 && CrossPointSettings::MAX_LINE_HEIGHT_PERCENT == 200 &&
+               CrossPointSettings::MAX_WORD_SPACING == 8 && CrossPointSettings::MIN_SCREEN_MARGIN == 5 &&
+               CrossPointSettings::MAX_SCREEN_MARGIN == 150 && CrossPointSettings::PARAGRAPH_ALIGNMENT_COUNT == 5 &&
+               CrossPointSettings::IMAGE_RENDERING_COUNT == 3 && CrossPointSettings::INDEXING_METHOD_COUNT == 2 &&
+diff --git a/src/activities/reader/EpubReaderDrawerActivity.cpp b/src/activities/reader/EpubReaderDrawerActivity.cpp
+index 2656a3fa7d751d053c0f048a60fefd0acb6bbc26..3bc123460da3ba61b756361445ea00ab68aea597 100644
+--- a/src/activities/reader/EpubReaderDrawerActivity.cpp
++++ b/src/activities/reader/EpubReaderDrawerActivity.cpp
+@@ -423,6 +423,17 @@ uint8_t percentToByte(const int16_t permille, const uint8_t minimum, const uint8
+   return static_cast<uint8_t>(minimum + (static_cast<int>(permille) * range + 500) / 1000);
+ }
+
++uint8_t percentToSignedByte(const int16_t permille, const int minimum, const int maximum) {
++  const int range = maximum - minimum;
++  return CrossPointSettings::encodeSignedSetting(minimum + (static_cast<int>(permille) * range + 500) / 1000, minimum,
++                                                 maximum);
++}
++
++int16_t signedByteToPermille(const int value, const int minimum, const int maximum) {
++  if (maximum <= minimum) return 0;
++  return static_cast<int16_t>(((value - minimum) * 1000) / (maximum - minimum));
++}
++
+ int16_t byteToPermille(const uint8_t value, const uint8_t minimum, const uint8_t maximum) {
+   if (maximum <= minimum) return 0;
+   return static_cast<int16_t>((static_cast<int>(value - minimum) * 1000) / (maximum - minimum));
+@@ -714,6 +725,8 @@ ReaderSettingsDraft EpubReaderDrawerActivity::captureSettings() {
+   value.twoToneTextAA = SETTINGS.twoToneTextAA;
+   value.textDarkness = SETTINGS.textDarkness;
+   value.ruledLines = SETTINGS.ruledLines;
++  value.textWeight = SETTINGS.textWeight;
++  value.invertImagesDark = SETTINGS.invertImagesDark;
+   value.focusReadingEnabled = SETTINGS.focusReadingEnabled;
+   value.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+   value.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+@@ -745,6 +758,8 @@ void EpubReaderDrawerActivity::applySettings(const ReaderSettingsDraft& value) {
+   SETTINGS.twoToneTextAA = value.twoToneTextAA;
+   SETTINGS.textDarkness = value.textDarkness;
+   SETTINGS.ruledLines = value.ruledLines;
++  SETTINGS.textWeight = value.textWeight;
++  SETTINGS.invertImagesDark = value.invertImagesDark;
+   SETTINGS.focusReadingEnabled = value.focusReadingEnabled;
+   SETTINGS.guideReadingEnabled = value.guideReadingEnabled;
+   SETTINGS.hyphenationEnabled = value.hyphenationEnabled;
+@@ -841,9 +856,8 @@ void EpubReaderDrawerActivity::onSliderEvent(const fui::ActionEvent& event, void
+     }
+   } else if (self->state.pane == ReaderDrawerPane::Margins) {
+     auto& target = second ? self->draft.screenMarginHorizontal : self->draft.screenMarginVertical;
+-    target = tapValue(
+-        percentToByte(event.dragPermille, CrossPointSettings::MIN_SCREEN_MARGIN, CrossPointSettings::MAX_SCREEN_MARGIN),
+-        CrossPointSettings::MIN_SCREEN_MARGIN, CrossPointSettings::MAX_SCREEN_MARGIN);
++    target = percentToSignedByte(event.dragPermille, CrossPointSettings::MARGIN_LOWEST,
++                                 CrossPointSettings::MARGIN_HIGHEST);
+   } else if (self->state.pane == ReaderDrawerPane::AutoPageTurn) {
+     self->autoPageTurnIntervalSeconds = static_cast<uint16_t>(tapValue(
+         percentToByte(event.dragPermille, READER_AUTO_PAGE_TURN_MIN_SECONDS, READER_AUTO_PAGE_TURN_MAX_SECONDS),
+@@ -875,9 +889,9 @@ void EpubReaderDrawerActivity::onStepEvent(const fui::ActionEvent& event, void*
+     if (self->state.pane == ReaderDrawerPane::Spacing) {
+       self->draft.wordSpacing = WordSpacing::fromLevel(WordSpacing::level(self->draft.wordSpacing) + event.value);
+     } else if (self->state.pane == ReaderDrawerPane::Margins) {
+-      self->draft.screenMarginHorizontal =
+-          std::clamp<int>(self->draft.screenMarginHorizontal + event.value, CrossPointSettings::MIN_SCREEN_MARGIN,
+-                          CrossPointSettings::MAX_SCREEN_MARGIN);
++      self->draft.screenMarginHorizontal = CrossPointSettings::encodeSignedSetting(
++          CrossPointSettings::marginOf(self->draft.screenMarginHorizontal) + event.value,
++          CrossPointSettings::MARGIN_LOWEST, CrossPointSettings::MARGIN_HIGHEST);
+     }
+   } else {
+     self->adjustActiveSlider(event.value);
+@@ -1249,7 +1263,7 @@ void EpubReaderDrawerActivity::buildSpacingPane(UiApp::ScreenType& screen) {
+   line.sliderAction = ACTION_SLIDER;
+   line.decrement = ACTION_STEP;
+   line.increment = ACTION_STEP;
+-  configureReaderSliderScale(line, "70%", "200%");
++  configureReaderSliderScale(line, "30%", "200%");
+   ReaderSliderRowProps word;
+   word.label = tr(STR_WORD_SPACING);
+   word.value = wordSpacingValue(draft.wordSpacing);
+@@ -1275,23 +1289,25 @@ void EpubReaderDrawerActivity::buildMarginsPane(UiApp::ScreenType& screen) {
+   buildPaneHeader(screen);
+   char verticalValue[16];
+   char horizontalValue[16];
+-  std::snprintf(verticalValue, sizeof(verticalValue), "%u", draft.screenMarginVertical);
+-  std::snprintf(horizontalValue, sizeof(horizontalValue), "%u", draft.screenMarginHorizontal);
++  std::snprintf(verticalValue, sizeof(verticalValue), "%d", CrossPointSettings::marginOf(draft.screenMarginVertical));
++  std::snprintf(horizontalValue, sizeof(horizontalValue), "%d",
++                CrossPointSettings::marginOf(draft.screenMarginHorizontal));
+   ReaderSliderRowProps vertical;
+   vertical.label = tr(STR_TOP_BOTTOM);
+   vertical.value = verticalValue;
+-  vertical.sliderValue = byteToPermille(draft.screenMarginVertical, CrossPointSettings::MIN_SCREEN_MARGIN,
+-                                        CrossPointSettings::MAX_SCREEN_MARGIN);
++  vertical.sliderValue = signedByteToPermille(CrossPointSettings::marginOf(draft.screenMarginVertical),
++                                              CrossPointSettings::MARGIN_LOWEST, CrossPointSettings::MARGIN_HIGHEST);
+   vertical.max = 1000;
+   vertical.sliderAction = ACTION_SLIDER;
+   vertical.decrement = ACTION_STEP;
+   vertical.increment = ACTION_STEP;
+-  configureReaderSliderScale(vertical, "5", "150");
++  configureReaderSliderScale(vertical, "-30", "127");
+   ReaderSliderRowProps horizontal;
+   horizontal.label = tr(STR_LEFT_RIGHT);
+   horizontal.value = horizontalValue;
+-  horizontal.sliderValue = byteToPermille(draft.screenMarginHorizontal, CrossPointSettings::MIN_SCREEN_MARGIN,
+-                                          CrossPointSettings::MAX_SCREEN_MARGIN);
++  horizontal.sliderValue =
++      signedByteToPermille(CrossPointSettings::marginOf(draft.screenMarginHorizontal),
++                           CrossPointSettings::MARGIN_LOWEST, CrossPointSettings::MARGIN_HIGHEST);
+   horizontal.max = 1000;
+   horizontal.sliderAction = ACTION_SLIDER + 3;
+   horizontal.decrement = ACTION_STEP + 3;
+@@ -1664,7 +1680,7 @@ void EpubReaderDrawerActivity::openPane(const ReaderDrawerPane pane) {
+   }
+   paneRows.clear();
+   if (pane == ReaderDrawerPane::ReaderFont) {
+-    paneRows = {RowId::FontFamily, RowId::FontSize, RowId::CharacterSpacing};
++    paneRows = {RowId::FontFamily, RowId::FontSize, RowId::CharacterSpacing, RowId::TextWeight};
+     refreshTtfRenderingRow();
+   }
+   if (pane == ReaderDrawerPane::DictionaryFont) {
+@@ -1702,7 +1718,7 @@ void EpubReaderDrawerActivity::closePane() {
+   }
+   paneRows.clear();
+   if (state.pane == ReaderDrawerPane::ReaderFont) {
+-    paneRows = {RowId::FontFamily, RowId::FontSize, RowId::CharacterSpacing};
++    paneRows = {RowId::FontFamily, RowId::FontSize, RowId::CharacterSpacing, RowId::TextWeight};
+     refreshTtfRenderingRow();
+   }
+   if (state.pane == ReaderDrawerPane::DictionaryFont) {
+@@ -1749,7 +1765,7 @@ void EpubReaderDrawerActivity::activateListIndex(const int index) {
+     if (index < 0 || index >= static_cast<int>(fontSettingIndexes.size())) return;
+     if (state.pendingFontIndex == index) {
+       state.pane = ReaderDrawerPane::ReaderFont;
+-      paneRows = {RowId::FontFamily, RowId::FontSize, RowId::CharacterSpacing};
++      paneRows = {RowId::FontFamily, RowId::FontSize, RowId::CharacterSpacing, RowId::TextWeight};
+       refreshTtfRenderingRow();
+       state.pendingFontIndex = -1;
+       state.selectedIndex = 0;
+@@ -1836,6 +1852,7 @@ void EpubReaderDrawerActivity::activateRow(const RowId row) {
+     case RowId::PublisherFonts:
+     case RowId::RenderMode:
+     case RowId::BookWordHoldAction:
++    case RowId::TextWeight:
+       showEnumOptions(row);
+       return;
+     case RowId::IndexingMethod:
+@@ -2093,6 +2110,13 @@ void EpubReaderDrawerActivity::showEnumOptions(const RowId row) {
+       labels = {tr(STR_OFF), tr(STR_PUBLISHER_FONTS_ACCENTS), tr(STR_PUBLISHER_FONTS_ALL)};
+       raw = {0, 1, 2};
+       currentRaw = draft.publisherFonts;
++      break;
++        case RowId::TextWeight:
++      title = StrId::STR_TEXT_WEIGHT;
++      labels = {tr(STR_WEIGHT_LIGHTEST), tr(STR_WEIGHT_LIGHTER), tr(STR_WEIGHT_NORMAL), tr(STR_WEIGHT_BOLDER),
++                tr(STR_WEIGHT_BOLDEST)};
++      raw = {0, 1, 2, 3, 4};
++      currentRaw = draft.textWeight;
+       break;
+     case RowId::Images:
+       title = StrId::STR_IMAGES;
+@@ -2234,6 +2258,12 @@ void EpubReaderDrawerActivity::selectEnumOption(const int index) {
+       draft.publisherFonts = value;
+       markSettingChanged(ReaderSettingsChangeMask::Relayout);
+       break;
++    case RowId::TextWeight:
++      draft.textWeight = value;
++      enumOptionSelectedIndex = static_cast<int16_t>(index);
++      previewedEnumOptionIndex = -1;
++      markSettingChanged(ReaderSettingsChangeMask::Preview | ReaderSettingsChangeMask::NonLayout);
++      break;
+     case RowId::Images:
+       ImageDisplayMode::apply(value, draft.imageRendering, draft.imageGrayscale);
+       markSettingChanged(ReaderSettingsChangeMask::NonLayout);
+@@ -2527,9 +2557,9 @@ void EpubReaderDrawerActivity::adjustActiveSlider(const int delta) {
+         std::clamp<int>(draft.lineHeightPercent + delta, CrossPointSettings::MIN_LINE_HEIGHT_PERCENT,
+                         CrossPointSettings::MAX_LINE_HEIGHT_PERCENT)));
+   } else if (state.pane == ReaderDrawerPane::Margins) {
+-    draft.screenMarginVertical =
+-        std::clamp<int>(draft.screenMarginVertical + delta, CrossPointSettings::MIN_SCREEN_MARGIN,
+-                        CrossPointSettings::MAX_SCREEN_MARGIN);
++    draft.screenMarginVertical = CrossPointSettings::encodeSignedSetting(
++        CrossPointSettings::marginOf(draft.screenMarginVertical) + delta, CrossPointSettings::MARGIN_LOWEST,
++        CrossPointSettings::MARGIN_HIGHEST);
+   } else if (state.pane == ReaderDrawerPane::AutoPageTurn) {
+     autoPageTurnIntervalSeconds = static_cast<uint16_t>(std::clamp<int>(
+         autoPageTurnIntervalSeconds + delta, READER_AUTO_PAGE_TURN_MIN_SECONDS, READER_AUTO_PAGE_TURN_MAX_SECONDS));
+@@ -2556,8 +2586,9 @@ void EpubReaderDrawerActivity::adjustButtonSlider(const int delta) {
+     }
+   } else if (state.pane == ReaderDrawerPane::Margins) {
+     uint8_t& target = buttonSliderState.focus == 0 ? draft.screenMarginVertical : draft.screenMarginHorizontal;
+-    const uint8_t value = static_cast<uint8_t>(
+-        std::clamp<int>(target + delta, CrossPointSettings::MIN_SCREEN_MARGIN, CrossPointSettings::MAX_SCREEN_MARGIN));
++    const uint8_t value = CrossPointSettings::encodeSignedSetting(
++        CrossPointSettings::marginOf(target) + delta, CrossPointSettings::MARGIN_LOWEST,
++        CrossPointSettings::MARGIN_HIGHEST);
+     changed = value != target;
+     target = value;
+   } else if (state.pane == ReaderDrawerPane::AutoPageTurn) {
+@@ -2731,9 +2762,9 @@ void EpubReaderDrawerActivity::renderSamplePreviewText(const ReaderSettingsDraft
+   const int textHeight = std::max(0, area.height - labelHeight - metrics.previewPadding);
+   // The sample is a short page: show top AND bottom margins proportionally
+   // to its height, while horizontal margins and font sizes remain actual pixels.
+-  const int marginY =
+-      settings.screenMarginVertical * textHeight / std::max(1, static_cast<int>(renderer.getScreenHeight()));
+-  const int marginX = settings.screenMarginHorizontal;
++  const int marginY = std::max(0, CrossPointSettings::marginOf(settings.screenMarginVertical)) * textHeight /
++                      std::max(1, static_cast<int>(renderer.getScreenHeight()));
++  const int marginX = std::max(0, CrossPointSettings::marginOf(settings.screenMarginHorizontal));
+   const int top = area.y + metrics.previewPadding + marginY;
+   const int width = std::max(1, area.width - marginX * 2);
+   renderer.beginTextClip(area.x + marginX, top, width, std::max(0, textHeight - marginY * 2));
+@@ -3216,6 +3247,8 @@ const char* EpubReaderDrawerActivity::rowLabel(const RowId row) const {
+       return tr(STR_TWO_TONE_TEXT_AA);
+     case RowId::TextAa:
+       return tr(STR_TEXT_AA);
++    case RowId::TextWeight:
++      return tr(STR_TEXT_WEIGHT);
+     case RowId::Focus:
+       return tr(STR_FOCUS_READING);
+     case RowId::GuideDots:
+diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
+index d33a70b316c79427798eb14742bb0f9eca9d301c..6ca043e95544a498aa5ca58b65b84aafbdbe7c17 100644
+--- a/src/activities/reader/EpubReaderMenuModel.h
++++ b/src/activities/reader/EpubReaderMenuModel.h
+@@ -157,6 +157,7 @@ enum class ReaderDrawerCatalogItem : uint8_t {
+   NearbyPositionSync,
+   SendNearbyBook,
+   BookWordHoldAction,
++  TextWeight,
+ };
+
+ struct ReaderDrawerAvailability {
+@@ -359,6 +360,8 @@ struct ReaderSettingsDraft {
+   uint8_t twoToneTextAA = 0;
+   uint8_t textDarkness = 0;
+   uint8_t ruledLines = 0;
++  uint8_t textWeight = 0;
++  uint8_t invertImagesDark = 0;
+   uint8_t focusReadingEnabled = 0;
+   uint8_t guideReadingEnabled = 0;
+   uint8_t hyphenationEnabled = 0;
+diff --git a/src/activities/reader/TouchReaderPreviewModel.h b/src/activities/reader/TouchReaderPreviewModel.h
+index e996ff03ca5f2ad909069f071e44133340a348bc..ea065bc21b0c6a428e7a24777c597a64f4462e6b 100644
+--- a/src/activities/reader/TouchReaderPreviewModel.h
++++ b/src/activities/reader/TouchReaderPreviewModel.h
+@@ -621,7 +621,8 @@ class ReaderPreviewModel {
+     const int extra =
+         WordSpacing::extra(renderer.getSpaceAdvance(fontId, leftCodepoint, rightCodepoint, left.style), wordSpacing);
+     if (!guideReadingEnabled) {
+-      return renderer.getSpaceAdvance(fontId, leftCodepoint, rightCodepoint, left.style) + extra;
++      const int natural = renderer.getSpaceAdvance(fontId, leftCodepoint, rightCodepoint, left.style);
++      return natural + WordSpacing::extra(natural, wordSpacing);
+     }
+     return renderer.getSpaceAdvance(fontId, leftCodepoint, GUIDE_DOT_CODEPOINT, left.style) +
+            renderer.getTextAdvanceX(fontId, GUIDE_DOT_UTF8, EpdFontFamily::REGULAR, 0, characterSpacing) +

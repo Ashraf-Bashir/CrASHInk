@@ -1,0 +1,1594 @@
+diff --git a/lib/LibraryIndex/LibraryBuilder.cpp b/lib/LibraryIndex/LibraryBuilder.cpp
+index 4a914a67d4bf76d10be4e897c67d5b8215e75052..9fc227215f8297b20dd55789e0c0531de69b8d60 100644
+--- a/lib/LibraryIndex/LibraryBuilder.cpp
++++ b/lib/LibraryIndex/LibraryBuilder.cpp
+@@ -1863,9 +1863,9 @@ uint32_t pathRevision;
+ void advancePathRevision() { std::atomic_ref(pathRevision).fetch_add(1, std::memory_order_relaxed); }
+ }  // namespace
+
+-void invalidateLibraryIndex() {
++void invalidateLibraryIndex(const bool keepVisibleCache) {
++  if (!keepVisibleCache) invalidateViewCache();
+   advancePathRevision();
+-  invalidateViewCache();
+   indexDirty.store(true, std::memory_order_relaxed);
+ }
+
+diff --git a/lib/LibraryIndex/LibraryBuilder.h b/lib/LibraryIndex/LibraryBuilder.h
+index c1f031122e5f1855b7dd43a0f31645e5e6c0dbaf..0220212fc2dbc912970affd14f395b8263460457 100644
+--- a/lib/LibraryIndex/LibraryBuilder.h
++++ b/lib/LibraryIndex/LibraryBuilder.h
+@@ -122,7 +122,7 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, bool readMetadat
+ // clears only changes known when it started; failures and allocation-starved
+ // builds remain retryable. Results a rescan would repeat, such as skipped
+ // unreadable files or a capped duplicate tracker, do not re-dirty the index.
+-void invalidateLibraryIndex();
++void invalidateLibraryIndex(bool keepVisibleCache = false);
+ bool libraryIndexNeedsRefresh();
+ // Changes when known book paths change or Library reconciles the card.
+ uint32_t libraryPathRevision();
+diff --git a/lib/LibraryIndex/LibraryChangeProbe.cpp b/lib/LibraryIndex/LibraryChangeProbe.cpp
+index c23589fd54dfc02701c5b23bc4a1443861bcfd8f..ea9f288320f07f95c43b04fe4e0a187d7a6e185c 100644
+--- a/lib/LibraryIndex/LibraryChangeProbe.cpp
++++ b/lib/LibraryIndex/LibraryChangeProbe.cpp
+@@ -28,12 +28,20 @@ bool LibraryChangeProbe::Fingerprint::operator==(const Fingerprint& other) const
+ }
+ void LibraryChangeProbe::reset() {
+   if (directory) directory.close();
++  countOnly = false;
+   expected = {};
+   actual = {};
+   state = State::Idle;
+   indexRow = depth = 0;
+   entriesSeen = 0;
+ }
++void LibraryChangeProbe::beginCount() {
++  reset();
++  countOnly = true;
++  nameText.reserve(255);
++  std::strcpy(folders[0].path, "/");
++  state = openFolder(false) ? State::Walking : State::Unavailable;
++}
+ void LibraryChangeProbe::begin(const LibraryIndexFile& index, const bool requireReusableMetadata) {
+   reset();
+   this->requireReusableMetadata = requireReusableMetadata;
+@@ -80,7 +88,7 @@ LibraryChangeProbe::State LibraryChangeProbe::step(LibraryIndexFile& index) {
+   if (!entry) {
+     if (entry.allocationFailed() || FsHelpers::directoryIterationFailed(directory)) return finish(State::Unavailable);
+     directory.close();
+-    if (depth == 0) return finish(expected == actual ? State::Unchanged : State::Changed);
++    if (depth == 0) return finish(countOnly || expected == actual ? State::Unchanged : State::Changed);
+     --depth;
+     if (!openFolder(true)) return finish(State::Unavailable);
+     return state;
+@@ -116,7 +124,7 @@ LibraryChangeProbe::State LibraryChangeProbe::step(LibraryIndexFile& index) {
+   if (fileTypeFor(nameText) == 0) return state;
+   actual.add(clixPathHash(fullPath, static_cast<size_t>(length)), size, modified, created);
+   // More current books than indexed books already proves a change.
+-  if (actual.count > expected.count) return finish(State::Changed);
++  if (!countOnly && actual.count > expected.count) return finish(State::Changed);
+   return state;
+ }
+ }  // namespace library
+diff --git a/lib/LibraryIndex/LibraryChangeProbe.h b/lib/LibraryIndex/LibraryChangeProbe.h
+index 3605448b494f393ed86aa09478ddad5652a5bfae..72f80b35f15de9c5eb3ddfa8c87d902a828983af 100644
+--- a/lib/LibraryIndex/LibraryChangeProbe.h
++++ b/lib/LibraryIndex/LibraryChangeProbe.h
+@@ -15,6 +15,8 @@ class LibraryChangeProbe {
+   enum class State : uint8_t { Idle, ReadingIndex, Walking, Unchanged, Changed, Unavailable };
+   ~LibraryChangeProbe() { reset(); }
+   void reset();
++  void beginCount();
++  uint32_t bookCount() const { return actual.count; }
+   void begin(const LibraryIndexFile& index, bool requireReusableMetadata = false);
+   State step(LibraryIndexFile& index);
+
+@@ -39,6 +41,7 @@ class LibraryChangeProbe {
+   std::string nameText;
+   State state = State::Idle;
+   bool requireReusableMetadata = false;
++  bool countOnly = false;
+   uint16_t indexRow = 0;
+   uint8_t depth = 0;
+   uint32_t entriesSeen = 0;
+diff --git a/src/GlobalActions.h b/src/GlobalActions.h
+index 783081ce4a1f4d3c457782b05130c2c38d1ef9a4..1de63aced78332fb5c4e6a01b1fd2e5306d69e51 100644
+--- a/src/GlobalActions.h
++++ b/src/GlobalActions.h
+@@ -58,8 +58,6 @@ inline bool isPowerButtonActionAvailableOutsideReader(const CrossPointSettings::
+ }
+
+ void enterDeepSleep(bool fromTimeout = false);
+-// Called after polling input during a synchronous Library scan.
+-bool shouldStopLibraryScanForSleep(bool touchActivity);
+ // Deep sleep from the silent Readest sleep-sync boot: the sleep screen is still on the
+ // panel (nothing was drawn during the sync), so this only powers down.
+ void enterDeepSleepAfterReadestSync(bool keepSleepFrame);
+diff --git a/src/activities/Activity.h b/src/activities/Activity.h
+index fdd748d9031f03fa013d24c9d5fe730f236265d2..c241d84286f8d1069ed9127a0b6e3f786e93d9c5 100644
+--- a/src/activities/Activity.h
++++ b/src/activities/Activity.h
+@@ -43,7 +43,12 @@ class Activity {
+   virtual void prepareForSleep() {}
+   // Join storage workers before sleep artwork starts decoding or SD powers down.
+   virtual void onBeforeSleep() {}
++  // Transient app scopes can close before the sleep screen is composed.
++  virtual bool closeBeforeSleep() const { return false; }
++  virtual bool idleTimeoutExpired() const { return false; }
+   virtual void loop() {}
++  // Suspended activities may advance worker transport here without changing the activity stack.
++  virtual void serviceBackgroundWork() {}
+
+   virtual void render(RenderLock&&) {}
+
+@@ -71,6 +76,7 @@ class Activity {
+   // Called from the main loop as soon as raw input arrives, before a global
+   // shortcut or gesture can consume it instead of entering activity loop().
+   virtual void onUserInput() {}
++  virtual void onChildUserInput() {}
+   // Quick Lock may permit one reader-only long-press trigger to unlock. The
+   // activity validates that trigger without routing any other normal input.
+   virtual bool handleQuickLockUnlock(QuickLockTrigger) { return false; }
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index 74fea23648fa9cd28ab987a81ca422a222a7bc1b..076b901b995848d6af289ed94519776fbc855c6c 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -479,6 +479,14 @@ bool applyTwoFingerRotation(Activity& activity, MappedInputManager& mappedInput)
+ }
+ }  // namespace
+
++ActivityManager::ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
++    : renderer(renderer), mappedInput(mappedInput), renderingMutex(xSemaphoreCreateMutex()) {
++  assert(renderingMutex != nullptr && "Failed to create rendering mutex");
++  stackActivities.reserve(10);
++}
++
++ActivityManager::~ActivityManager() { assert(false); /* should never be called */ }
++
+ void ActivityManager::begin(const uint32_t renderTaskStackBytes) {
+ #if CROSSINK_APP_CAP_TOUCH
+   touchHardwareAvailable = mappedInput.hasTouchHardware();
+@@ -576,6 +584,8 @@ void ActivityManager::loop() {
+     }
+   }
+
++  if (pendingAction == PendingAction::None) closeExpiredActivityScope(false);
++
+ #if CROSSINK_APP_CAP_TOUCH
+   // Touch firmware can finish loading after the first wake render (EEGO A4).
+   // Rebuild the screen and its touch targets when readiness changes, without
+@@ -670,6 +680,9 @@ void ActivityManager::loop() {
+     }
+   }
+
++  for (auto& suspended : stackActivities) suspended->serviceBackgroundWork();
++  pollBookOpen();
++
+   processPendingActivities();
+ }
+
+@@ -992,6 +1005,35 @@ void ActivityManager::notifyInputLockChanged(const bool locked) {
+
+ void ActivityManager::notifyUserInput() {
+   if (currentActivity) currentActivity->onUserInput();
++  for (const auto& activity : stackActivities) activity->onChildUserInput();
++}
++
++bool ActivityManager::closeExpiredActivityScope(const bool forSleep) {
++  const auto target = std::find_if(stackActivities.begin(), stackActivities.end(), [&](const auto& activity) {
++    return forSleep ? activity->closeBeforeSleep() : activity->idleTimeoutExpired();
++  });
++  const bool closesTop = forSleep && currentActivity && currentActivity->closeBeforeSleep();
++  if (target == stackActivities.end() && !closesTop) return false;
++
++  // On idle, resume the owning app first so it can drain writes through its
++  // normal result handlers. Sleep closes the owner and all of its children.
++  const size_t keep = target == stackActivities.end()
++                          ? stackActivities.size()
++                          : static_cast<size_t>(target - stackActivities.begin()) + (forSleep ? 0 : 1);
++  RenderLock lock;
++  exitActivity(lock);
++  while (stackActivities.size() > keep) {
++    stackActivities.back()->onExit();
++    stackActivities.pop_back();
++  }
++  if (!stackActivities.empty()) {
++    currentActivity = std::move(stackActivities.back());
++    stackActivities.pop_back();
++    currentActivity->resultHandler = nullptr;
++    restoredActivityNeedsRender = true;
++  }
++  if (!forSleep) requestUpdate();
++  return true;
+ }
+
+ void ActivityManager::exitActivity(const RenderLock& lock) {
+@@ -1017,6 +1059,7 @@ void ActivityManager::enterCurrentActivity() {
+
+ void ActivityManager::replaceActivity(std::unique_ptr<Activity>&& newActivity) {
+   // Note: no lock here, this is usually called by loop() and we may run into deadlock
++  cancelBookOpen();
+   if (currentActivity) {
+     TouchRegistry::getInstance().clear();
+     // Defer launch if we're currently in an activity, to avoid deleting the current activity
+@@ -1073,6 +1116,8 @@ void ActivityManager::goToHotspotFileTransfer(const std::string& returnBookPath)
+ }
+
+ void ActivityManager::goToUsbDrive() {
++  cancelBookOpen(true);
++  LibraryActivity::stopBackgroundScan();
+ #if CROSSINK_APP_CAP_USB_DRIVE
+   auto activity = makeUniqueNoThrow<UsbDriveActivity>(renderer, mappedInput);
+   if (!activity) {
+@@ -1213,9 +1258,43 @@ void ActivityManager::goToReader(std::string path, const bool suppressBackReleas
+                                  const bool cleanImageBaseOnEntry, const bool keepWakeFrame) {
+   // OPDS credentials are unrelated to local reading and may contain several
+   // heap-backed strings. Home reloads them lazily when it becomes active.
++  if ((nextBookOpen && nextBookOpen->matchesPath(path)) ||
++      (bookOpen && !discardBookOpen && bookOpen->matchesPath(path))) return;
+   OPDS_STORE.release();
+-  replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path), suppressBackRelease,
+-                                                   allowFastInitialRefresh, cleanImageBaseOnEntry, keepWakeFrame));
++  nextBookOpen = makeUniqueNoThrow<ReaderActivity>(renderer, mappedInput, std::move(path), suppressBackRelease,
++                                                   allowFastInitialRefresh, cleanImageBaseOnEntry, keepWakeFrame);
++  if (bookOpen) discardBookOpen = true;
++  if (nextBookOpen) LibraryActivity::cancelBackgroundScan();
++  if (!nextBookOpen && !currentActivity) goHome();
++}
++
++void ActivityManager::pollBookOpen() {
++  if (bookOpen && bookOpen->isOpenReady()) {
++    auto completed = std::move(bookOpen);
++    if (!discardBookOpen && pendingAction == PendingAction::None) {
++      completed->completeOpen(currentActivity != nullptr);
++    }
++  }
++  if (bookOpen || !nextBookOpen || pendingAction != PendingAction::None || LibraryActivity::backgroundScanActive()) return;
++  bookOpen = std::move(nextBookOpen);
++  discardBookOpen = false;
++  if (!bookOpen->startOpen()) {
++    LOG_ERR("READER", "Could not start book preparation task");
++    pendingReaderMenuAction = -1;
++    bookOpen.reset();
++    if (!currentActivity) goHome();
++  }
++}
++
++void ActivityManager::cancelBookOpen(const bool wait) {
++  if (isPreparingBook()) pendingReaderMenuAction = -1;
++  nextBookOpen.reset();
++  if (!bookOpen) return;
++  discardBookOpen = true;
++  if (wait) {
++    while (!bookOpen->isOpenReady()) vTaskDelay(1);
++    bookOpen.reset();
++  }
+ }
+
+ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t action) {
+@@ -1224,6 +1303,9 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
+ }
+
+ bool ActivityManager::goToSleep(bool fromTimeout) {
++  cancelBookOpen(true);
++  LibraryActivity::stopBackgroundScan();
++  closeExpiredActivityScope(true);
+   if (currentActivity) currentActivity->onBeforeSleep();
+   for (auto& activity : stackActivities) activity->onBeforeSleep();
+   // Hold the visible page steady from the first sleep indication through reader saves.
+@@ -1292,6 +1374,7 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::Ref
+ void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
+
+ void ActivityManager::pushActivity(std::unique_ptr<Activity>&& activity) {
++  cancelBookOpen();
+   if (pendingActivity) {
+     // Should never happen in practice
+     LOG_ERR("ACT", "pendingActivity while pushActivity is not expected");
+@@ -1310,6 +1393,7 @@ void ActivityManager::replaceAfterReturn(std::unique_ptr<Activity>&& activity) {
+ }
+
+ void ActivityManager::popActivity() {
++  cancelBookOpen();
+   if (pendingActivity) {
+     // Should never happen in practice
+     LOG_ERR("ACT", "pendingActivity while popActivity is not expected");
+@@ -1320,7 +1404,8 @@ void ActivityManager::popActivity() {
+ }
+
+ bool ActivityManager::preventAutoSleep() const {
+-  return workflowy::shareInProgress() || (currentActivity && currentActivity->preventAutoSleep());
++  return isPreparingBook() || workflowy::shareInProgress() ||
++         (currentActivity && currentActivity->preventAutoSleep());
+ }
+
+ bool ActivityManager::requiresExclusiveStorageLoop() const {
+diff --git a/src/activities/ActivityManager.h b/src/activities/ActivityManager.h
+index c8feabc6de1be38d9972c577db0d22dba54dbd13..8dec60fab856f507f4ec0bb8883874e47c4c8b1f 100644
+--- a/src/activities/ActivityManager.h
++++ b/src/activities/ActivityManager.h
+@@ -28,6 +28,7 @@ enum class StrId : uint16_t;
+
+ class Activity;    // forward declaration
+ class RenderLock;  // forward declaration
++class ReaderActivity;
+
+ #if CROSSINK_APP_CAP_TOUCH
+ struct LiveLightSwipeState {
+@@ -76,6 +77,11 @@ class ActivityManager {
+   MappedInputManager& mappedInput;
+   std::vector<std::unique_ptr<Activity>> stackActivities;
+   std::unique_ptr<Activity> currentActivity;
++  std::unique_ptr<ReaderActivity> bookOpen;
++  std::unique_ptr<ReaderActivity> nextBookOpen;
++  bool discardBookOpen = false;
++  void pollBookOpen();
++  void cancelBookOpen(bool wait = false);
+ #if CROSSINK_APP_CAP_TOUCH
+   LiveLightSwipeState edgeLightSwipe;
+   LiveLightSwipeState twoFingerLightSwipe;
+@@ -85,6 +91,7 @@ class ActivityManager {
+   // Apply navigation and render requests without polling the outgoing activity.
+   void processPendingActivities();
+   bool prepareSleepPlugins(bool quickResume, bool fromReaderOrHome);
++  bool closeExpiredActivityScope(bool forSleep);
+
+   // Pending activity to be launched on next loop iteration
+   std::unique_ptr<Activity> pendingActivity;
+@@ -146,12 +153,8 @@ class ActivityManager {
+   bool handleGlobalHomeGesture();
+
+  public:
+-  explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
+-      : renderer(renderer), mappedInput(mappedInput), renderingMutex(xSemaphoreCreateMutex()) {
+-    assert(renderingMutex != nullptr && "Failed to create rendering mutex");
+-    stackActivities.reserve(10);
+-  }
+-  ~ActivityManager() { assert(false); /* should never be called */ };
++  explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput);
++  ~ActivityManager();
+
+   void begin(uint32_t renderTaskStackBytes = 16384);
+   void loop();
+@@ -179,6 +182,7 @@ class ActivityManager {
+   bool goToOpdsServer(uint32_t serverIndex, bool networkBootReady = false);
+   void goToReader(std::string path, bool suppressBackRelease = false, bool allowFastInitialRefresh = false,
+                   bool cleanImageBaseOnEntry = false, bool keepWakeFrame = false);
++  bool isPreparingBook() const { return bookOpen || nextBookOpen; }
+   void goToReaderAndRunMenuAction(std::string path, uint8_t action);
+   // Returns true only when sleep rendered a known complete B/W frame.
+   bool goToSleep(bool fromTimeout = false);
+diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
+index ed8a2f3ba26954b3e24f9454190e1cbe54b64a93..d870c49713e828b9be2742a944c469ac8224252c 100644
+--- a/src/activities/library/LibraryActivity.cpp
++++ b/src/activities/library/LibraryActivity.cpp
+@@ -64,6 +64,18 @@ constexpr int BATCH_APPLY_CONTROL = BATCH_CANCEL_CONTROL + 1;
+ int gridColumns() { return CoverGridLayout::Columns; }
+ int gridPageSize() { return 9; }
+
++constexpr char VISIBLE_INDEX[] = "/.crashink/.library/library.visible";
++uint64_t indexedViewKey(const std::string& query, uint8_t sort, bool descending, uint8_t hideFinished,
++                        uint8_t metadata, const library::ClixHeader& header) {
++  uint64_t key = library::clixPathHash(query.data(), query.size());
++  const auto add = [&](const void* data, size_t size) {
++    const auto* bytes = static_cast<const uint8_t*>(data);
++    for (size_t i = 0; i < size; ++i) { key ^= bytes[i]; key *= 1099511628211ULL; }
++  };
++  const uint8_t preferences[] = {sort, static_cast<uint8_t>(descending), library::FileEpub, hideFinished, metadata};
++  add(preferences, sizeof(preferences)); add(&header, sizeof(header)); return key;
++}
++
+ const RecentBook* recentBookForPath(const std::string& path) {
+   const auto& books = RECENT_BOOKS.getBooks();
+   const auto it =
+@@ -84,6 +96,135 @@ LibraryActivity::LibraryActivity(GfxRenderer& renderer, MappedInputManager& mapp
+       app(uiTarget, uiTarget.deviceContext()),
+       paintedCovers(renderer) {}
+
++struct LibraryActivity::Scan {
++  library::BuildStats stats;
++  std::atomic<bool> cancel{false};
++  std::atomic<bool> ready{false};
++  std::atomic<uint32_t> progress{0};
++  std::atomic<uint8_t> percent{0};
++  std::atomic<bool> snapshotReady{false};
++  bool keepVisible = false, snapshotValid = false, snapshotOpened = false, viewCached = false;
++  uint64_t cachedKey = 0;
++  uint32_t totalBooks = 0;
++  Sort viewSort = Sort::DateAdded;
++  bool descending = true;
++  uint8_t hideFinished = 0;
++  library::SortOrder order = library::SortOrder::TitleAsc;
++  std::string query;
++
++  bool snapshot() {
++    FsFile source, target;
++    if (!Storage.openFileForRead("LIB", library::libraryIndexPath(), source) ||
++        !Storage.openFileForWrite("LIB", VISIBLE_INDEX, target)) return false;
++    uint8_t bytes[256]; // bounded worker-stack copy; no second in-RAM catalog
++    int count = 0;
++    while (!cancel.load() && (count = source.read(bytes, sizeof(bytes))) > 0)
++      if (target.write(bytes, count) != static_cast<size_t>(count)) return false;
++    return !cancel.load() && count == 0 && target.sync();
++  }
++
++  void prepareView() {
++    if (viewSort == Sort::RecentlyRead || cancel.load()) return;
++    library::LibraryIndexFile next;
++    if (!next.open(library::libraryIndexPath())) { LOG_ERR("LIB", "Cannot open refreshed catalog view"); return; }
++    const auto count = next.bookCount();
++    if (!count) return;
++    // At most 8 KiB for the complete persisted membership; released at handoff.
++    auto bits = makeUniqueNoThrow<uint8_t[]>((count + 7u) / 8u);
++    if (!bits) { LOG_ERR("LIB", "Cannot prepare updated membership"); return; }
++    std::memset(bits.get(), 0, (count + 7u) / 8u);
++    const auto needle = library::fold(query);
++    std::string path, title, author, text, folded, cache;
++    path.reserve(512); title.reserve(255); author.reserve(255);
++    text.reserve(512); folded.reserve(512); cache.reserve(96);
++    uint16_t included = 0;
++    for (uint32_t row = 0; row < count; ++row) {
++      if (cancel.load()) return;
++      library::ClixRecord record{};
++      const auto ordinal = next.ordinalForRow(order, row);
++      if (ordinal == UINT16_MAX || !next.readRecord(ordinal, record) || !next.readPath(record, path)) {
++        LOG_ERR("LIB", "Cannot read refreshed catalog row %u", row); return;
++      }
++      bool include = library::fileTypeFor(path) == library::FileEpub && Storage.exists(path.c_str());
++      if (include && !needle.empty()) {
++        if (!next.readDisplayText(record, title, author)) { LOG_ERR("LIB", "Cannot read refreshed title"); return; }
++        text.assign(title); text += ' '; text += author; library::foldInto(text, folded);
++        include = library::matchesQuery(folded, needle);
++      }
++      if (include && hideFinished) {
++        uint64_t hash = 0;
++        if (!next.readPathHash(record, hash)) { LOG_ERR("LIB", "Cannot read refreshed identity"); return; }
++        cache = "/.crosspoint/epub_" + std::to_string(hash);
++        if (!Storage.exists(cache.c_str())) cache = "/.crosspoint/epub_" + std::to_string(std::hash<std::string>{}(path));
++        include = !BookReadingStats::load(cache).isCompleted;
++      }
++      if (include) { bits[row / 8] |= 1u << (row % 8); ++included; }
++      progress.store((1u << 16) | (row + 1), std::memory_order_relaxed);
++      percent.store(80 + (row + 1) * 19u / count, std::memory_order_relaxed);
++      if ((row & 15u) == 0) vTaskDelay(1);
++    }
++    cachedKey = indexedViewKey(query, static_cast<uint8_t>(viewSort), descending, hideFinished, readMetadata, next.header());
++    viewCached = library::saveViewCache(false, cachedKey, count, included, bits.get(), (count + 7u) / 8u);
++  }
++  bool readMetadata = false;
++  bool refresh = false;
++  bool succeeded = false;
++
++  static void run(void* context) {
++    auto& scan = *static_cast<Scan*>(context);
++    library::BuildCallbacks callbacks{};
++    callbacks.context = &scan;
++    callbacks.cancelRequested = [](void* context) {
++      return static_cast<Scan*>(context)->cancel.load(std::memory_order_relaxed);
++    };
++    callbacks.progress = [](void* context, const library::BuildProgress& progress) {
++      auto& scan = *static_cast<Scan*>(context);
++      scan.progress.store((static_cast<uint32_t>(progress.phase) << 16) | progress.books, std::memory_order_relaxed);
++      const unsigned measured = progress.phase == library::BuildPhase::Organizing ? 75u
++                       : std::min<unsigned>(70u, scan.totalBooks ? progress.books * 70u / scan.totalBooks : 0u);
++      scan.percent.store(measured, std::memory_order_relaxed);
++    };
++    if (scan.keepVisible) {
++      scan.snapshotValid = scan.snapshot();
++      if (!scan.snapshotValid && !scan.cancel.load()) LOG_ERR("LIB", "Cannot retain visible catalog during update");
++      scan.snapshotReady.store(true, std::memory_order_release);
++    }
++    {
++      library::LibraryChangeProbe counter;
++      library::LibraryIndexFile unused;
++      counter.beginCount();
++      auto state = counter.step(unused);
++      while (state == library::LibraryChangeProbe::State::Walking && !scan.cancel.load()) {
++        state = counter.step(unused);
++        vTaskDelay(1);
++      }
++      scan.totalBooks = counter.bookCount();
++    }
++    // A requested refresh always walks the card. Unchanged per-book metadata
++    // is still reused, but the whole-catalog probe cannot skip this walk.
++    scan.succeeded = library::buildLibraryIndex("/", scan.stats, scan.readMetadata, &callbacks, nullptr);
++    if (scan.succeeded) { scan.percent.store(80); scan.prepareView(); scan.percent.store(100); }
++    scan.ready.store(true, std::memory_order_release);
++    vTaskDelete(nullptr);
++  }
++};
++
++std::shared_ptr<LibraryActivity::Scan> LibraryActivity::activeScan;
++
++bool LibraryActivity::backgroundScanActive() {
++  if (activeScan && activeScan->ready.load(std::memory_order_acquire)) activeScan.reset();
++  return activeScan != nullptr;
++}
++
++void LibraryActivity::cancelBackgroundScan() {
++  if (backgroundScanActive()) activeScan->cancel.store(true, std::memory_order_relaxed);
++}
++
++void LibraryActivity::stopBackgroundScan() {
++  cancelBackgroundScan();
++  while (backgroundScanActive()) vTaskDelay(1);
++}
++
+ void LibraryActivity::onEnter() {
+   const unsigned long openedAt = millis();
+   pendingInput.clear();
+@@ -109,25 +250,8 @@ void LibraryActivity::onEnter() {
+     app.on(ACTION_ROW, &LibraryActivity::onRowEvent, this);
+     app.on(ACTION_CONTROL, &LibraryActivity::onControlEvent, this);
+     app.setScreen(&LibraryActivity::listScreen, this);
+-    // Validate the saved snapshot before drawing. Only a missing, incompatible
+-    // index needs a scan; ordinary opens and known file changes reuse it.
+     scanCancelledThisVisit = false;
+-    initialScanPending = sort != Sort::RecentlyRead &&
+-                         ((!index.isOpen() && !index.open(library::libraryIndexPath())) ||
+-                          index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0));
+-  }
+-
+-  // Paint the scan message before the main task starts reading the card.
+-  // The render task normally paints only after onEnter() returns.
+-  if (initialScanPending && requestUpdateAndWait() != RequestUpdateResult::Rendered) {
+-    RenderLock lock;
+-    drawScanScreen(tr(STR_LIBRARY_SCANNING));
+-  }
+-
+-  {
+-    RenderLock lock;
+     refreshIndexIfNeeded();
+-    initialScanPending = false;
+     resetViewport();
+     ignoreConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
+     requestUpdate();
+@@ -138,9 +262,11 @@ void LibraryActivity::onEnter() {
+ }
+
+ void LibraryActivity::onExit() {
++  if (scan) scan->cancel.store(true, std::memory_order_relaxed);
++  saveViewProgress();
++  scan.reset();
+   pendingInput.clear();
+   coverWorker.stop();
+-  saveViewProgress();
+   changeProbe.reset();
+   index.close();
+   filterBits.reset();
+@@ -149,7 +275,7 @@ void LibraryActivity::onExit() {
+   Activity::onExit();
+ }
+
+-void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
++void LibraryActivity::refreshIndexIfNeeded() {
+   changeProbe.reset();
+   changeCheckStarted = false;
+   refreshCheckFailed = false;
+@@ -161,6 +287,10 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+     applyFilter();
+     return;
+   }
++  if (scan || backgroundScanActive()) {
++    if (!scan) scanQueued = true;
++    return;
++  }
+   if (scanCancelledThisVisit) {
+     // Respect the cancel until the user asks for a refresh; keep showing
+     // whatever index is already on the card.
+@@ -174,7 +304,7 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+   // instead of blocking entry; only missing/incompatible indexes require a scan.
+   if ((!index.isOpen() && !index.open(library::libraryIndexPath())) ||
+       index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0)) {
+-    rebuildIndex(showScanning);
++    rebuildIndex();
+     return;
+   }
+   scanFailed = false;
+@@ -182,33 +312,74 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+   applyFilter();
+ }
+
+-bool LibraryActivity::rebuildIndex(const bool showScanning, const bool refresh) {
+-  coverWorker.stop();
++void LibraryActivity::rebuildIndex(const bool refresh, const bool keepVisible) {
++  if (scan || backgroundScanActive() || activityManager.isPreparingBook()) {
++    scanQueued = true;
++    queuedRefresh |= refresh;
++    queuedKeepVisible |= keepVisible;
++    return;
++  }
+   changeProbe.reset();
+   changeCheckStarted = false;
+   refreshSuggested = false;
+   refreshCheckFailed = false;
+-  uiReady = false;
++  if (!keepVisible) uiReady = false;
+   index.close();
+-  if (showScanning) drawScanScreen(tr(STR_LIBRARY_SCANNING));
+-  library::BuildStats stats;
+-  library::BuildCallbacks callbacks;
+-  callbacks.context = this;
+-  callbacks.cancelRequested = &LibraryActivity::scanCancelRequested;
+-  callbacks.progress = &LibraryActivity::onScanProgress;
+   scanCancelledThisVisit = false;
+-  scanBackHeldAtStart = mappedInput.isPressed(MappedInputManager::Button::Back);
+-  scanFailed = !library::buildLibraryIndex("/", stats, SETTINGS.libraryUseMetadata != 0, &callbacks,
+-                                          refresh ? &changeProbe : nullptr);
++  scan = makeUniqueNoThrow<Scan>();
++  if (scan) {
++    scan->readMetadata = SETTINGS.libraryUseMetadata != 0;
++    scan->refresh = refresh;
++    scan->keepVisible = keepVisible;
++    scan->viewSort = sort; scan->descending = descending; scan->hideFinished = SETTINGS.libraryHideFinishedBooks;
++    scan->query = query; scan->order = indexOrder();
++    activeScan = scan;
++    if (xTaskCreate(&Scan::run, "LibraryScan", 12288, scan.get(), tskIDLE_PRIORITY, nullptr) == pdPASS) {
++      if (!refresh && !keepVisible) applyFilter();
++      requestUpdate();
++      return;
++    }
++    activeScan.reset();
++    scan.reset();
++  }
++  Scan failed;
++  failed.refresh = refresh;
++  finishScan(failed);
++}
++
++void LibraryActivity::pollScan() {
++  if (scan) {
++    if (scan->keepVisible && !scan->snapshotOpened && scan->snapshotReady.load(std::memory_order_acquire)) {
++      scan->snapshotOpened = true;
++      if (!scan->snapshotValid || !index.open(VISIBLE_INDEX)) { scan->keepVisible = false; applyFilter(); }
++    }
++    const auto progress = (static_cast<uint32_t>(scan->percent.load()) << 24) | scan->progress.load(std::memory_order_relaxed);
++    if (progress != paintedScanProgress) { paintedScanProgress = progress; requestUpdate(); }
++  }
++  if (scan && scan->ready.load(std::memory_order_acquire)) {
++    auto completed = std::move(scan);
++    finishScan(*completed);
++  }
++  if (!scanQueued || backgroundScanActive() || activityManager.isPreparingBook()) return;
++  scanQueued = false;
++  const bool refresh = std::exchange(queuedRefresh, false);
++  const bool keepVisible = std::exchange(queuedKeepVisible, false);
++  if (refresh) rebuildIndex(true, keepVisible);
++  else refreshIndexIfNeeded();
++  requestUpdate();
++}
++
++void LibraryActivity::finishScan(const Scan& finished) {
++  const auto& stats = finished.stats;
++  const bool refresh = finished.refresh;
++  scanFailed = !finished.succeeded;
+   scanFailureText = stats.failure == library::BuildFailure::Cancelled      ? StrId::STR_LIBRARY_SCAN_CANCELLED
+                     : stats.failure == library::BuildFailure::TooManyBooks ? StrId::STR_LIBRARY_TOO_MANY_BOOKS
+                                                                            : StrId::STR_LIBRARY_SCAN_FAILED;
+-  if (stats.failure == library::BuildFailure::Cancelled) {
+-    scanCancelledThisVisit = true;
+-    ignoreBackRelease = mappedInput.isPressed(MappedInputManager::Button::Back);
+-  }
++  scanCancelledThisVisit = stats.failure == library::BuildFailure::Cancelled;
+   if (scanFailed) LOG_ERR("LIB", "Library scan failed; retaining the previous index");
+-  if (!index.open(library::libraryIndexPath())) {
++  index.close();
++  if (sort != Sort::RecentlyRead && !index.open(library::libraryIndexPath())) {
+     // A failed one-time upgrade leaves the previous index on the card. Keep
+     // its books readable while the next visit retries the rebuild.
+     if (!scanFailed || !index.openForReconciliation(library::libraryIndexPath())) {
+@@ -227,70 +398,18 @@ bool LibraryActivity::rebuildIndex(const bool showScanning, const bool refresh)
+   libraryCheckedThisBoot = !scanFailed;
+   libraryChangedThisBoot = refreshSuggested;
+   coverWorker.start();
+-  if (refresh && !scanFailed && !stats.indexReplaced && !filterFailed) return true;
++  // Filtering may have saved the old view while the worker reconciled files.
++  // Explicit Refresh also rechecks saved progress/completion with an unchanged
++  // catalog; invalidate at handoff, before applyFilter can restore that view.
++  if (refresh && !scanFailed && !finished.viewCached) library::invalidateViewCache();
++  if (finished.viewCached && sort != Sort::RecentlyRead && finished.cachedKey == viewCacheKey(false)) verifyRefreshFiles = false;
++  if (Storage.exists(VISIBLE_INDEX)) Storage.remove(VISIBLE_INDEX);
+   if (refresh && !scanFailed && RECENT_BOOKS.pruneMissing()) RECENT_BOOKS.saveToFile();
+   warmedCoverView = 0;
+   applyFilter();
+-  if (refresh && stats.indexReplaced) resetViewport();
+-  return !scanFailed;
+-}
+-
+-bool LibraryActivity::scanTouchEnabled() const {
+-  // hasTouch() also honours the Disable Touchscreen setting.
+-  return mappedInput.hasTouch();
+-}
+-
+-void LibraryActivity::drawScanScreen(const char* message) const {
+-  renderer.clearScreen();
+-  if (scanTouchEnabled()) {
+-    int bounds[4]{};
+-    renderer.getOrientedViewableTRBL(&bounds[0], &bounds[1], &bounds[2], &bounds[3]);
+-    renderer.drawCenteredText(UI_10_FONT_ID,
+-                              renderer.getScreenHeight() - bounds[2] - renderer.getLineHeight(UI_10_FONT_ID) * 2,
+-                              tr(STR_TAP_TO_CANCEL));
+-  } else {
+-    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
+-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+-  }
+-  // drawPopup() pushes the whole buffer, including the hint above.
+-  GUI.drawPopup(renderer, message);
+-}
+-
+-bool LibraryActivity::scanCancelRequested(void* context) {
+-  auto* self = static_cast<LibraryActivity*>(context);
+-  auto& input = self->mappedInput;
+-  // The build blocks the main loop, so poll here as web uploads do.
+-  input.update();
+-  int x = 0;
+-  int y = 0;
+-  const bool touchDown = self->scanTouchEnabled() && input.wasScreenTouchDown(x, y);
+-  const bool homeGesture = input.wasHomeGesture();
+-  const bool sleepDue = shouldStopLibraryScanForSleep(touchDown || homeGesture);
+-  if (touchDown) {
+-    // The release must not reach the list as a tap once the scan unwinds.
+-    input.suppressCurrentTouchContact();
+-    return true;
+-  }
+-  if (homeGesture || sleepDue) return true;
+-  const bool backHeld = input.isPressed(MappedInputManager::Button::Back);
+-  if (self->scanBackHeldAtStart) {
+-    if (!backHeld) self->scanBackHeldAtStart = false;
+-    return false;
+-  }
+-  // Polls stall during an EPUB parse, so a held button counts as well as a
+-  // press edge.
+-  return backHeld || input.wasPressed(MappedInputManager::Button::Back);
+-}
+-
+-void LibraryActivity::onScanProgress(void* context, const library::BuildProgress& progress) {
+-  const auto* self = static_cast<const LibraryActivity*>(context);
+-  if (progress.phase == library::BuildPhase::Organizing) {
+-    self->drawScanScreen(tr(STR_LIBRARY_ORGANIZING));
+-    return;
+-  }
+-  char message[96];
+-  snprintf(message, sizeof(message), tr(STR_LIBRARY_SCAN_COUNT), static_cast<unsigned>(progress.books));
+-  self->drawScanScreen(message);
++  if (!finished.keepVisible && (stats.indexReplaced || !refresh)) resetViewport();
++  else if (gridPageStart >= rowCount()) resetViewport();
++  requestUpdate();
+ }
+
+ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book) const {
+@@ -308,7 +427,7 @@ void LibraryActivity::resolveRecents() {
+   recentCount = 0;
+   cachedViewKey = viewCacheKey(true);
+   uint16_t restored = 0, processed = 0, resumeRow = 0;
+-  if (library::loadViewCache(true, cachedViewKey, RECENT_BOOKS.getCount(), restored, recentRows, sizeof(recentRows),
++  if (!verifyRefreshFiles && library::loadViewCache(true, cachedViewKey, RECENT_BOOKS.getCount(), restored, recentRows, sizeof(recentRows),
+                              &processed)) {
+     const auto count = RECENT_BOOKS.getCount();
+     bool valid = restored <= RecentBooksStore::MAX_RECENT_BOOKS;
+@@ -341,6 +460,7 @@ void LibraryActivity::advanceRecentFilter() {
+   if (row < books.size() && recentCount < RecentBooksStore::MAX_RECENT_BOOKS) {
+     const auto& book = books[row];
+     bool include = library::fileTypeFor(book.path) == library::FileEpub;
++    if (include && verifyRefreshFiles) include = Storage.exists(book.path.c_str());
+     if (include && !filterWork->needle.empty()) {
+       readRecentBook(row, rowScratch);
+       filterWork->combined.assign(rowScratch.title);
+@@ -358,11 +478,13 @@ void LibraryActivity::advanceRecentFilter() {
+     prefetchCoverRow = -1;
+     prefetchFinished = false;
+   }
++  if (filterWork->cursor % std::max<size_t>(1, books.size() / 10) == 0) requestUpdate();
+   const bool finished = filterWork->cursor >= books.size() || recentCount >= RecentBooksStore::MAX_RECENT_BOOKS;
+   if (finished || (before < static_cast<size_t>(gridPageSize()) && recentCount >= static_cast<size_t>(gridPageSize())))
+     requestUpdate();
+   if (finished) {
+     library::saveViewCache(true, cachedViewKey, books.size(), recentCount, recentRows, sizeof(recentRows));
++    verifyRefreshFiles = false;
+     filterWork.reset();
+   }
+ }
+@@ -443,6 +565,8 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
+ }
+
+ uint64_t LibraryActivity::viewCacheKey(const bool recent) const {
++  if (!recent) return indexedViewKey(query, static_cast<uint8_t>(sort), descending,
++                                    SETTINGS.libraryHideFinishedBooks, SETTINGS.libraryUseMetadata, index.header());
+   uint64_t key = library::clixPathHash(query.data(), query.size());
+   const auto add = [&](const void* data, size_t bytes) {
+     const auto* p = static_cast<const uint8_t*>(data);
+@@ -495,12 +619,14 @@ bool LibraryActivity::restoreFilterCache() {
+   return true;
+ }
+ void LibraryActivity::saveFilterCache() {
++  if (scan && scan->keepVisible) return; // never overwrite the worker's new catalog membership
+   if (!filterFailed)
+     library::saveViewCache(false, cachedViewKey, filterSourceCount, filteredCount, filterBits.get(),
+                            (filterSourceCount + 7u) / 8u);
+ }
+
+ void LibraryActivity::saveViewProgress() {
++  if (scan && scan->keepVisible) return;
+   if (!filterWork || filterFailed) return;
+   if (sort == Sort::RecentlyRead)
+     library::saveViewCache(true, cachedViewKey, RECENT_BOOKS.getCount(), recentCount, recentRows, sizeof(recentRows),
+@@ -538,7 +664,7 @@ void LibraryActivity::applyFilter() {
+     filterFailed = true;
+     return;
+   }
+-  if (restoreFilterCache() && filterProcessedCount == filterSourceCount) return;
++  if (!verifyRefreshFiles && restoreFilterCache() && filterProcessedCount == filterSourceCount) return;
+   warmedCoverView = 0;
+   // One bounded scratch object (~2 KiB of reused strings plus optional 512-byte
+   // folder checkpoints), released on completion/cancel instead of per-book churn.
+@@ -604,6 +730,10 @@ void LibraryActivity::advanceFilter() {
+       break;
+     }
+     if (library::fileTypeFor(name) != library::FileEpub) continue;
++    if (verifyRefreshFiles) {
++      if (!readIndexedPath(record)) { filterFailed = true; break; }
++      if (!Storage.exists(path.c_str())) continue;
++    }
+     if (!needle.empty() && !index.readDisplayText(record, title, author)) {
+       LOG_ERR("LIB", "Cannot read Library search text");
+       filterFailed = true;
+@@ -642,6 +772,7 @@ void LibraryActivity::advanceFilter() {
+     filteredCount++;
+   }
+   filterProcessedCount = filterWork->cursor;
++  if ((filterProcessedCount % std::max<unsigned>(1, sourceCount / 10) == 0)) requestUpdate();
+   if (filteredCount != before) {
+     if (before < gridPageStart + gridPageSize()) loadedGridPageStart = -1;
+     prefetchCoverRow = -1;
+@@ -651,6 +782,7 @@ void LibraryActivity::advanceFilter() {
+   if (finished || (before < gridPageSize() && filteredCount >= gridPageSize())) requestUpdate();
+   if (finished) {
+     saveFilterCache();
++    verifyRefreshFiles = false;
+     filterWork.reset();
+   }
+ }
+@@ -671,7 +803,8 @@ void LibraryActivity::resetViewport() {
+ }
+
+ void LibraryActivity::reloadAfterBookAction() {
+-  refreshIndexIfNeeded(true);
++  library::invalidateViewCache();
++  refreshIndexIfNeeded();
+   selection = std::min(selection, std::max(CONTROL_COUNT, CONTROL_COUNT + rowCount() - 1));
+   listNav.selected = selection - CONTROL_COUNT;
+   listNav.top = topIndex;
+@@ -712,9 +845,8 @@ void LibraryActivity::openBook(const int row) {
+   app.clearTapFlash();
+   coverWorker.stop();
+   changeProbe.reset();
+-  index.close();
+   if (!Storage.exists(book.path.c_str())) {
+-    index.open(library::libraryIndexPath());
++    coverWorker.start();
+     refreshSuggested = true;
+     uiReady = false;
+     requestUpdate();
+@@ -734,7 +866,7 @@ void LibraryActivity::openSortPicker() {
+     SETTINGS.librarySortMethod = static_cast<uint8_t>(sort);
+     SETTINGS.librarySortDescending = true;
+     if (!SETTINGS.saveToFile()) LOG_ERR("LIB", "Cannot save Library sort");
+-    refreshIndexIfNeeded(true);
++    refreshIndexIfNeeded();
+     resetViewport();
+   });
+   requestUpdate();
+@@ -754,7 +886,17 @@ void LibraryActivity::openSearch() {
+
+ void LibraryActivity::refreshLibrary() {
+   RecentBookProgress::invalidateEpubPercents();
+-  rebuildIndex(true, true);
++  verifyRefreshFiles = true;
++  paintedScanProgress = UINT32_MAX;
++  library::invalidateViewCache();
++  filterWork.reset();
++  filterBits.reset();
++  filterRanks.reset();
++  filteredCount = recentCount = 0;
++  resetViewport();
++  // Refresh always reconciles the SD catalog, even in Currently reading. A
++  // later switch to Latest added must see the same refreshed book snapshot.
++  rebuildIndex(true);
+   requestUpdate();
+ }
+
+@@ -921,12 +1063,7 @@ void LibraryActivity::latchInput() {
+   }
+   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) queueInput(Type::ConfirmRelease);
+   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+-    if (ignoreBackRelease)
+-      ignoreBackRelease = false;
+-    else
+-      queueInput(Type::BackRelease);
+-  } else if (ignoreBackRelease && !mappedInput.isPressed(MappedInputManager::Button::Back)) {
+-    ignoreBackRelease = false;
++    queueInput(Type::BackRelease);
+   }
+   if (mappedInput.hasTouchHardware()) {
+     buttonNavigator.onNextRelease([&] { queueInput(gridEnabled() ? Type::SwipeLeft : Type::Next); });
+@@ -975,20 +1112,24 @@ void LibraryActivity::loop() {
+   // Keep sampling the finger while it moves. An SD read here can miss the
+   // motion samples and leave the controller with only a tap-sized contact.
+   if (touchTracking) return;
++  pollScan();
+   // One metadata entry per idle input cycle; no ZIP parsing or automatic rebuild.
+-  advanceFilter();
++  if (!scan || !scan->keepVisible || sort == Sort::RecentlyRead || index.isOpen()) advanceFilter();
+   pollLibraryChanges();
+-  // Prepare at most one cover between input checks.
+-  loadGridPageCovers();
++  // Keep the book opener and SD scan from competing for the same EPUB.
++  if (!activityManager.isPreparingBook() && !backgroundScanActive()) {
++    coverWorker.start();
++    loadGridPageCovers();
++  }
+ }
+
+ void LibraryActivity::pollLibraryChanges() {
+   // Start after the first library paint. All access shares this activity's render
+   // lock and index handle (SdFat permits only one reader per path).
+-  if (!uiReady || refreshSuggested || scanCancelledThisVisit) return;
++  if (!uiReady || scan || scanQueued || backgroundScanActive() || scanCancelledThisVisit) return;
+   if (library::libraryIndexNeedsRefresh()) {
+     changeProbe.reset();
+-    refreshSuggested = true;
++    rebuildIndex(true, true);
+     requestUpdate();
+     return;
+   }
+@@ -1070,12 +1211,9 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+       applyFilter();
+       resetViewport();
+       requestUpdate();
+-    } else if (!mappedInput.hasTouchHardware()) {
+-      static constexpr StrId choices[] = {StrId::STR_LIBRARY, StrId::STR_FILE_TRANSFER, StrId::STR_BROWSE,
+-                                          StrId::STR_SETTINGS_SHORT};
+-      actionPopup.show(StrId::STR_LIBRARY, choices, NAV_COUNT, 0,
+-                       [this](int selected) { activateControl(NAV_FIRST + selected); });
+-      requestUpdate();
++    } else {
++      activityManager.goHome();
++      return;
+     }
+     return;
+   }
+@@ -1368,11 +1506,6 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+                                : tr(STR_LIBRARY_UNSORTED),
+                   screen.theme().smallText);
+   }
+-  if (filterWork && !gridEnabled()) {
+-    const auto filtering =
+-        screen.take(fui::LayoutAnchor::Top, uiTarget.lineHeight(screen.theme().smallText.font) + 8).inset(statusInsets);
+-    uiTarget.text(filtering, tr(STR_LIBRARY_FILTERING), screen.theme().smallText);
+-  }
+   if (refreshSuggested && !gridEnabled()) {
+     fui::ButtonProps refresh;
+     refresh.action = ACTION_CONTROL;
+@@ -1391,8 +1524,32 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+     uiTarget.text(search, query.c_str(), screen.theme().smallText);
+   }
+   if (!gridEnabled()) screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
++  if (scan || scanQueued || filterWork) {
++    const auto area = screen.take(fui::LayoutAnchor::Top, 32, 4).inset(statusInsets);
++    char label[96];
++    const uint32_t progress = scan ? scan->progress.load(std::memory_order_relaxed) : 0;
++    const bool filtering = !scan && !scanQueued && filterWork;
++    const auto phase = static_cast<library::BuildPhase>(progress >> 16);
++    const auto total = sort == Sort::RecentlyRead ? RECENT_BOOKS.getCount() : filterSourceCount;
++    const unsigned done = filtering ? filterWork->cursor : progress & 0xffffu;
++    const unsigned percent = filtering ? std::min(100u, total ? done * 100u / total : 100u)
++                                       : scan ? scan->percent.load() : 0u;
++    snprintf(label, sizeof(label), "%s %u%% · %u", filtering || (scan && percent >= 80) ? tr(STR_LIBRARY_FILTERING)
++             : phase == library::BuildPhase::Organizing ? tr(STR_LIBRARY_ORGANIZING) : tr(STR_LIBRARY_SCANNING), percent, done);
++    uiTarget.text(fui::Rect{area.x, area.y, area.width, 22}, label, screen.theme().smallText);
++    fui::ProgressBarProps bar;
++    bar.track = fui::Paint::solid(fui::Color::White);
++    bar.border = fui::Paint::solid(fui::Color::Black);
++    bar.borderWidth = 1;
++    bar.fill = fui::Paint::solid(fui::Color::Black);
++    bar.max = 100;
++    bar.value = percent;
++    bar.radius = 3;
++    const fui::Rect track{area.x, static_cast<int16_t>(area.bottom() - 6), area.width, 6};
++    fui::progressBar(screen.frame(), track, bar);
++  }
+   if (rowCount() == 0) {
+-    if (!scanFailed && !filterFailed && !filterWork) {
++    if (!scan && !scanQueued && !scanFailed && !filterFailed && !filterWork) {
+       const char* message = tr(STR_LIBRARY_EMPTY);
+       if (!query.empty() || SETTINGS.libraryHideFinishedBooks)
+         message = tr(STR_LIBRARY_NO_RESULTS);
+@@ -1614,12 +1771,11 @@ bool LibraryActivity::loadGridCover(const int row) {
+ }
+
+ void LibraryActivity::render(RenderLock&&) {
++  // Keep the last complete page on the panel while the worker copies its
++  // disk snapshot; never replace existing covers with unavailable placeholders.
++  if (scan && scan->keepVisible && sort != Sort::RecentlyRead && !index.isOpen()) return;
+   app.setDevice(uiTarget.deviceContext());
+   uiReady = false;
+-  if (initialScanPending) {
+-    drawScanScreen(tr(STR_LIBRARY_SCANNING));
+-    return;
+-  }
+   const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+   const bool touch = mappedInput.hasTouchHardware();
+   for (int pass = 0; pass < 8; ++pass) {
+@@ -1735,7 +1891,7 @@ void LibraryActivity::applyBookBatch(BatchAction action) {
+   }
+   paintedGridPageStart = -1;
+   if (filesChanged && sort != Sort::RecentlyRead) {
+-    rebuildIndex(true, true);
++    rebuildIndex(true);
+     resetViewport();
+     requestUpdate();
+   } else {
+@@ -1768,7 +1924,7 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
+     scanCancelledThisVisit = false;
+     RECENT_BOOKS.removeByPath(path);
+     if (sort != Sort::RecentlyRead) {
+-      rebuildIndex(true);
++      rebuildIndex();
+       resetViewport();
+     } else
+       reloadAfterBookAction();
+diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
+index 0e0d71f29725a1c41836e9b22e349aed7151c26e..842467659ec95f9d0ff053c4849bbd1a34ab24bd 100644
+--- a/src/activities/library/LibraryActivity.h
++++ b/src/activities/library/LibraryActivity.h
+@@ -26,6 +26,9 @@ class LibraryActivity final : public Activity {
+   void onEnter() override;
+   void onExit() override;
+   void onBeforeSleep() override { coverWorker.stop(); }
++  static bool backgroundScanActive();
++  static void cancelBackgroundScan();
++  static void stopBackgroundScan();
+   void onFrontlightPanelOpened() override { coverWorker.stop(); }
+   void onFrontlightPanelClosed() override {
+     coverWorker.start();
+@@ -101,14 +104,16 @@ class LibraryActivity final : public Activity {
+   bool touchMoved = false;
+   bool touchCancelled = false;
+   bool uiReady = false;
+-  bool initialScanPending = false;
++  struct Scan;
++  static std::shared_ptr<Scan> activeScan;
++  std::shared_ptr<Scan> scan;
++  bool scanQueued = false;
++  bool queuedRefresh = false;
++  bool queuedKeepVisible = false;
++  bool verifyRefreshFiles = false;
++  uint32_t paintedScanProgress = UINT32_MAX;
+   bool confirmLongPressCaptured = false;
+   bool ignoreConfirmRelease = false;
+-  // Set when the Back press that cancelled a scan is still held.
+-  bool ignoreBackRelease = false;
+-  // Back held when a scan starts belongs to whatever opened Library (a reader
+-  // long-press shortcut, say); only a fresh press after its release cancels.
+-  bool scanBackHeldAtStart = false;
+   // A cancelled scan stays cancelled for this visit: sort changes and book
+   // actions show the previous index instead of starting the scan again.
+   bool scanCancelledThisVisit = false;
+@@ -179,12 +184,10 @@ class LibraryActivity final : public Activity {
+   void latchInput();
+   void queueInput(LibraryInputBuffer::Type type, int x = -1, int y = -1);
+   void handleInput(const LibraryInputBuffer::Event& input);
+-  void refreshIndexIfNeeded(bool showScanning = false);
+-  bool rebuildIndex(bool showScanning, bool refresh = false);
+-  void drawScanScreen(const char* message) const;
+-  bool scanTouchEnabled() const;
+-  static bool scanCancelRequested(void* context);
+-  static void onScanProgress(void* context, const library::BuildProgress& progress);
++  void refreshIndexIfNeeded();
++  void rebuildIndex(bool refresh = false, bool keepVisible = false);
++  void pollScan();
++  void finishScan(const Scan& finished);
+   void readRecentBook(size_t historyRow, RecentBook& book) const;
+   void resolveRecents();
+   void advanceRecentFilter();
+diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
+index 1a27b932755e42a50c97c7dfd2c786e487d07626..fe962788eb3f8c2487ac91e5cce8c0910b91741a 100644
+--- a/src/activities/network/CrossPointWebServerActivity.cpp
++++ b/src/activities/network/CrossPointWebServerActivity.cpp
+@@ -108,7 +108,7 @@ void CrossPointWebServerActivity::onEnter() {
+
+ void CrossPointWebServerActivity::onExit() {
+   pluginevents::refreshSubscriptions();
+-  library::invalidateLibraryIndex();
++  library::invalidateLibraryIndex(true);
+   Activity::onExit();
+
+   state = WebServerActivityState::SHUTTING_DOWN;
+diff --git a/src/activities/reader/ReaderActivity.cpp b/src/activities/reader/ReaderActivity.cpp
+index 335b0dbd2b26b143b540a30b91d315c758eecc6a..3344938ee58430d0b945071b11c663611ef64f5f 100644
+--- a/src/activities/reader/ReaderActivity.cpp
++++ b/src/activities/reader/ReaderActivity.cpp
+@@ -16,7 +16,6 @@
+ #include "XtcReaderActivity.h"
+ #include "activities/util/BmpViewerActivity.h"
+ #include "activities/util/FullScreenMessageActivity.h"
+-#include "components/UITheme.h"
+
+ bool ReaderActivity::isXtcFile(const std::string& path) { return FsHelpers::hasXtcExtension(path); }
+
+@@ -29,8 +28,19 @@ static bool isImagePreviewFile(const std::string& path) {
+   return FsHelpers::hasBmpExtension(path) || FsHelpers::hasPngExtension(path);
+ }
+
++ReaderActivity::ReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string initialBookPath,
++                               bool suppressInitialBackRelease, bool allowFastInitialRefresh, bool cleanImageBaseOnEntry, bool keepWakeFrame)
++    : Activity("Reader", renderer, mappedInput),
++      initialBookPath(std::move(initialBookPath)),
++      suppressInitialBackRelease(suppressInitialBackRelease),
++      allowFastInitialRefresh(allowFastInitialRefresh),
++      cleanImageBaseOnEntry(cleanImageBaseOnEntry), keepWakeFrame(keepWakeFrame) {}
++
++ReaderActivity::~ReaderActivity() = default;
++
+ int ReaderActivity::initialRefreshCountdown() const {
+-  if (!allowFastInitialRefresh) return 0;
++  // Opening a book is navigation, not a request to clean the panel.
++  // Start the normal configured cadence without an entry cleaning pulse.
+
+   const int refreshFrequency = SETTINGS.getRefreshFrequency();
+   return refreshFrequency > 1 ? refreshFrequency : 2;
+@@ -49,35 +59,11 @@ ReaderActivity::EpubOpenResult ReaderActivity::loadEpub(const std::string& path)
+     result.failure = Epub::OpenFailure::OutOfMemory;
+     return result;
+   }
+-  // Resolve the book orientation before any opening notice, without changing global settings.
+   result.readerSettings = EpubReaderActivity::readBookReaderSettings(*epub);
+-  const auto previousOrientation = renderer.getOrientation();
+-  const uint8_t bookOrientation = result.readerSettings.readerSettings.orientation;
+-  ReaderUtils::applyOrientation(
+-      renderer, bookOrientation < CrossPointSettings::ORIENTATION_COUNT ? bookOrientation : SETTINGS.orientation);
+-
+-  // First open: building the spine/TOC index (book.bin) takes a couple of seconds. Show the
+-  // indexing popup so it isn't a silent wait on the home screen. The cachePath/hash is known at
+-  // construction, so this check is valid before load(); a cached open loads in a blink -> no popup.
+-  const bool uncached = !Storage.exists((epub->getCachePath() + "/book.bin").c_str());
+-  if (uncached) {
+-    // The popup replaces the restored Quick Resume frame, so the reader must clean it.
+-    allowFastInitialRefresh = false;
+-    openingFeedback.showIndexing(renderer);
+-  }
+-  if (openingFeedback.showIfPending(renderer)) allowFastInitialRefresh = false;
+-  // Lend the framebuffer's 48 KB for every EPUB load: even a cached book may
+-  // rebuild stale/missing CSS and need miniz's ~43 KB streaming workspace. The
+-  // panel keeps showing its last image, and the next activity redraws fully.
+-  GfxRenderer::FrameBufferLoan loan(renderer);
+   const bool loaded = epub->load(
+       true, result.readerSettings.hasSafeModeOverride || result.readerSettings.readerSettings.embeddedStyle == 0,
+       Epub::XLocationLoadMode::Immediate, true);
+   if (loaded) epub->ensureOptimizerImageIndex();
+-  loan.end();
+-  if (loaded && openingFeedback.showIfPending(renderer)) allowFastInitialRefresh = false;
+-  // The reader applies its settings on entry; failed opens return to the original UI.
+-  renderer.setOrientation(previousOrientation);
+   if (loaded) {
+     result.epub = std::move(epub);
+     result.failure = Epub::OpenFailure::None;
+@@ -148,8 +134,6 @@ void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
+
+ void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub,
+                                       EpubReaderActivity::BookReaderSettingsData readerSettings) {
+-  const auto epubPath = epub->getPath();
+-  currentBookPath = epubPath;
+   // A retained-frame fast refresh is only supplied by the direct sleep-wake
+   // route. The current book is already first in recents, so avoid loading and
+   // rewriting that store solely to record the same entry again. Adapted from
+@@ -165,64 +149,47 @@ void ReaderActivity::onGoToBmpViewer(const std::string& path) {
+ }
+
+ void ReaderActivity::onGoToXtcReader(std::unique_ptr<Xtc> xtc) {
+-  const auto xtcPath = xtc->getPath();
+-  currentBookPath = xtcPath;
+   activityManager.replaceActivity(std::make_unique<XtcReaderActivity>(
+       renderer, mappedInput, std::move(xtc), initialRefreshCountdown(), allowFastInitialRefresh, openingFeedback));
+ }
+
+ void ReaderActivity::onGoToTxtReader(std::unique_ptr<Txt> txt) {
+-  const auto txtPath = txt->getPath();
+-  currentBookPath = txtPath;
+   activityManager.replaceActivity(std::make_unique<TxtReaderActivity>(
+       renderer, mappedInput, std::move(txt), initialRefreshCountdown(), allowFastInitialRefresh, openingFeedback));
+ }
+
+-void ReaderActivity::onEnter() {
+-  Activity::onEnter();
+-
+-  if (suppressInitialBackRelease) {
+-    mappedInput.suppressNextBackRelease();
+-  }
+-
+-  if (initialBookPath.empty()) {
+-    goToLibrary();  // Start from root when entering via Browse
+-    return;
+-  }
+-
+-  // Quick Resume already shows the book page. A loading notice would blank it.
+-  if (!keepWakeFrame) openingFeedback.start();
+-
+-  if (isImagePreviewFile(initialBookPath)) {
+-    GUI.drawPopup(renderer, tr(STR_LOADING));
+-    onGoToBmpViewer(initialBookPath);
+-    return;
++bool ReaderActivity::startOpen() {
++  if (suppressInitialBackRelease) mappedInput.suppressNextBackRelease();
++  imagePreview = isImagePreviewFile(initialBookPath);
++  if (initialBookPath.empty() || imagePreview) {
++    openReady.store(true, std::memory_order_release);
++    return true;
+   }
++  const auto open = [](void* context) {
++    auto& reader = *static_cast<ReaderActivity*>(context);
++    reader.prepareBook();
++    reader.openReady.store(true, std::memory_order_release);
++    vTaskDelete(nullptr);
++  };
++  return xTaskCreate(open, "BookOpen", 12288, this, tskIDLE_PRIORITY, nullptr) == pdPASS;
++}
+
+-  currentBookPath = initialBookPath;
++void ReaderActivity::prepareBook() {
+   if (isXtcFile(initialBookPath)) {
+-    auto xtc = loadXtc(initialBookPath);
+-    if (!xtc) {
+-      onGoBack();
+-      return;
+-    }
+-    onGoToXtcReader(std::move(xtc));
++    xtcOpen = loadXtc(initialBookPath);
+   } else if (isTxtFile(initialBookPath)) {
+-    auto txt = loadTxt(initialBookPath);
+-    if (!txt) {
+-      onGoBack();
+-      return;
+-    }
+-    onGoToTxtReader(std::move(txt));
++    txtOpen = loadTxt(initialBookPath);
+   } else {
+-    auto result = loadEpub(initialBookPath);
+-    if (!result.epub) {
+-      queueEpubOpenAlert(result.failure);
+-      onGoBack();
+-      return;
+-    }
+-    onGoToEpubReader(std::move(result.epub), std::move(result.readerSettings));
++    epubOpen = loadEpub(initialBookPath);
+   }
+ }
+
+-void ReaderActivity::onGoBack() { finish(); }
++void ReaderActivity::completeOpen(const bool hasSource) {
++  if (initialBookPath.empty()) return goToLibrary();
++  if (imagePreview) return onGoToBmpViewer(initialBookPath);
++  if (xtcOpen) return onGoToXtcReader(std::move(xtcOpen));
++  if (txtOpen) return onGoToTxtReader(std::move(txtOpen));
++  if (epubOpen.epub) return onGoToEpubReader(std::move(epubOpen.epub), std::move(epubOpen.readerSettings));
++  if (!isTxtFile(initialBookPath) && !isXtcFile(initialBookPath)) queueEpubOpenAlert(epubOpen.failure);
++  if (!hasSource) onGoHome();
++}
+diff --git a/src/activities/reader/ReaderActivity.h b/src/activities/reader/ReaderActivity.h
+index e2a67e766747fd20e1b9cba1cc9eb3535e5daeef..4e9e7db210bb6d42823202a752396b5e319aab59 100644
+--- a/src/activities/reader/ReaderActivity.h
++++ b/src/activities/reader/ReaderActivity.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <atomic>
+ #include <memory>
+
+ #include "EpubReaderActivity.h"
+@@ -17,12 +18,16 @@ class ReaderActivity final : public Activity {
+   };
+
+   std::string initialBookPath;
+-  std::string currentBookPath;  // Track current book path for navigation
+   bool suppressInitialBackRelease = false;
+   bool allowFastInitialRefresh = false;
+   bool cleanImageBaseOnEntry = false;
+   bool keepWakeFrame = false;
+-  // Non-static (unlike the other loaders): draws the first-open indexing popup, which needs the renderer.
++  EpubOpenResult epubOpen;
++  std::unique_ptr<Xtc> xtcOpen;
++  std::unique_ptr<Txt> txtOpen;
++  std::atomic<bool> openReady{false};
++  bool imagePreview = false;
++  void prepareBook();
+   EpubOpenResult loadEpub(const std::string& path);
+   static std::unique_ptr<Xtc> loadXtc(const std::string& path);
+   static std::unique_ptr<Txt> loadTxt(const std::string& path);
+@@ -37,19 +42,15 @@ class ReaderActivity final : public Activity {
+   void onGoToBmpViewer(const std::string& path);
+   void queueEpubOpenAlert(Epub::OpenFailure failure);
+
+-  void onGoBack();
+   int initialRefreshCountdown() const;
+
+  public:
+   explicit ReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string initialBookPath,
+                           bool suppressInitialBackRelease = false, bool allowFastInitialRefresh = false,
+-                          bool cleanImageBaseOnEntry = false, bool keepWakeFrame = false)
+-      : Activity("Reader", renderer, mappedInput),
+-        initialBookPath(std::move(initialBookPath)),
+-        suppressInitialBackRelease(suppressInitialBackRelease),
+-        allowFastInitialRefresh(allowFastInitialRefresh),
+-        cleanImageBaseOnEntry(cleanImageBaseOnEntry),
+-        keepWakeFrame(keepWakeFrame) {}
+-  void onEnter() override;
+-  bool isReaderActivity() const override { return true; }
++                          bool cleanImageBaseOnEntry = false, bool keepWakeFrame = false);
++  ~ReaderActivity() override;
++  bool startOpen();
++  bool matchesPath(const std::string& path) const { return initialBookPath == path; }
++  bool isOpenReady() const { return openReady.load(std::memory_order_acquire); }
++  void completeOpen(bool hasSource);
+ };
+diff --git a/src/main.cpp b/src/main.cpp
+index 9eed06e0ffbe877faff4fbd93038ede7ee56f57e..43bf16dfea07617a439cdae882071d4f2ceb18c4 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -2087,13 +2087,6 @@ static bool autoSleepDeadlineReached(const unsigned long now, const unsigned lon
+          now - inactivityTimestamp() >= timeoutMs;
+ }
+
+-bool shouldStopLibraryScanForSleep(const bool touchActivity) {
+-  auto& lastActivityTime = inactivityTimestamp();
+-  const auto now = millis();
+-  if (touchActivity || gpio.wasAnyPressed() || gpio.wasAnyReleased()) lastActivityTime = now;
+-  return autoSleepDeadlineReached(now, SETTINGS.getSleepTimeoutMs());
+-}
+-
+ void loop() {
+   static unsigned long maxLoopDuration = 0;
+   const unsigned long loopStartTime = millis();
+diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
+index 38ef0a0b2a9784a03e29c6fb9576988455228da7..26702a242e396bf1398078a2bf09ad40f90eafe9 100644
+--- a/test/library_thumbnails/CMakeLists.txt
++++ b/test/library_thumbnails/CMakeLists.txt
+@@ -45,3 +45,23 @@ add_executable(OpenedBooksTest OpenedBooksTest.cpp ${REPO_ROOT}/lib/LibraryIndex
+ target_include_directories(OpenedBooksTest PRIVATE ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
+ target_link_libraries(OpenedBooksTest PRIVATE crosspoint_test_common GTest::gtest_main)
+ gtest_discover_tests(OpenedBooksTest)
++
++set(LIBRARY_REFRESH_INC ${CMAKE_CURRENT_BINARY_DIR}/LibraryRefresh.inc)
++add_custom_command(OUTPUT ${LIBRARY_REFRESH_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryRefresh.py
++  ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${LIBRARY_REFRESH_INC}
++ DEPENDS ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryRefresh.py VERBATIM)
++add_executable(library_refresh_test LibraryRefreshTest.cpp ${LIBRARY_REFRESH_INC})
++target_include_directories(library_refresh_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(library_refresh_test PRIVATE -UNDEBUG)
++add_test(NAME library_refresh COMMAND library_refresh_test)
++
++set(LIBRARY_SNAPSHOT_INC ${CMAKE_CURRENT_BINARY_DIR}/LibrarySnapshot.inc)
++add_custom_command(OUTPUT ${LIBRARY_SNAPSHOT_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySnapshot.py
++  ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${LIBRARY_SNAPSHOT_INC}
++ DEPENDS ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySnapshot.py VERBATIM)
++add_executable(library_snapshot_test LibrarySnapshotTest.cpp ${LIBRARY_SNAPSHOT_INC})
++target_include_directories(library_snapshot_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(library_snapshot_test PRIVATE -UNDEBUG)
++add_test(NAME library_snapshot COMMAND library_snapshot_test)
+diff --git a/test/library_thumbnails/ExtractLibraryRefresh.py b/test/library_thumbnails/ExtractLibraryRefresh.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0be2ea3909c2658c52a22fa0d85f1456d6239855
+--- /dev/null
++++ b/test/library_thumbnails/ExtractLibraryRefresh.py
+@@ -0,0 +1,18 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++a=s.index('void LibraryActivity::rebuildIndex(')
++b=s.index('  changeProbe.reset();',a)
++guard=s[a:b].replace('void LibraryActivity::rebuildIndex(const bool refresh)', 'void LibraryActivity::rebuildIndex(const bool refresh)')
++out=guard+'  ++launches;\n  scan = std::make_unique<Scan>();\n  scan->refresh = refresh;\n}\n'
++a=s.index('void LibraryActivity::pollScan()')
++b=s.index('void LibraryActivity::readRecentBook(',a)
++out+=s[a:b]
++a=s.index('void LibraryActivity::refreshLibrary()')
++b=s.index('void LibraryActivity::toggleFinishedBooks()',a)
++out+=s[a:b]
++a=s.index('    if (verifyRefreshFiles) {',s.index('void LibraryActivity::advanceFilter()'))
++b=s.index('    if (!needle.empty()',a)
++out += '\nbool LibraryActivity::includeRefreshFile() {\n int record=0;std::string path;\n const auto readIndexedPath=[&](int){path="/book.epub";return canReadPath;};\n do {\n'+s[a:b]+' return true;\n }while(false);return false;\n}\n'
++a=s.index('void LibraryActivity::pollLibraryChanges()');b=s.index('void LibraryActivity::handleInput(',a);out+=s[a:b]
++Path(sys.argv[2]).write_text(out)
+diff --git a/test/library_thumbnails/ExtractLibrarySnapshot.py b/test/library_thumbnails/ExtractLibrarySnapshot.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5c14d2ac181e70a4e3c8d9fd3d3af15a23e4645
+--- /dev/null
++++ b/test/library_thumbnails/ExtractLibrarySnapshot.py
+@@ -0,0 +1,11 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++def body(signature):
++ a=s.index(signature);start=s.index('{',a);end=start+1;depth=1
++ while depth:
++  depth+=(s[end]=='{')-(s[end]=='}');end+=1
++ return s[a:end]
++key=body('uint64_t indexedViewKey(')
++warm=body('  void prepareView()').replace('  void prepareView()', 'void TestScan::prepareView()')
++Path(sys.argv[2]).write_text(key+'\n'+warm+'\n')
+diff --git a/test/library_thumbnails/LibraryRefreshTest.cpp b/test/library_thumbnails/LibraryRefreshTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2aff5fa24a0dc69cab573c99f4a97cc465c95b2a
+--- /dev/null
++++ b/test/library_thumbnails/LibraryRefreshTest.cpp
+@@ -0,0 +1,95 @@
++#include <atomic>
++#include <cassert>
++#include <iostream>
++#include <memory>
++#include <utility>
++#include <string>
++#define LOG_ERR(...) do {} while (0)
++#define LOG_INF(...) do {} while (0)
++enum class StrId { STR_LIBRARY_SCAN_CANCELLED, STR_LIBRARY_TOO_MANY_BOOKS, STR_LIBRARY_SCAN_FAILED };
++namespace library {
++enum class BuildFailure { None, Cancelled, TooManyBooks };
++struct LibraryChangeProbe{enum class State{Unchanged,Changed,Unavailable};void reset(){}template<class T>void begin(T&){}template<class T>State step(T&){return State::Unchanged;}};
++struct BuildStats { BuildFailure failure=BuildFailure::None; bool indexReplaced=false; };
++inline bool cacheValid=true,dirty=false;
++inline unsigned invalidations=0;
++void invalidateViewCache(){cacheValid=false;++invalidations;}
++bool libraryIndexNeedsRefresh(){return dirty;}
++const char* libraryIndexPath(){return "/library.idx";}
++}
++struct {bool pruneMissing(){return false;}void saveToFile(){}} RECENT_BOOKS;
++namespace RecentBookProgress {inline unsigned invalidations=0;void invalidateEpubPercents(){++invalidations;}}
++bool libraryCheckedThisBoot=false,libraryChangedThisBoot=false;
++unsigned warmedCoverView=123;
++constexpr const char* VISIBLE_INDEX="visible.idx";
++struct {bool present=true;bool exists(const char*){return present;}bool remove(const char*){return true;}} Storage;
++class LibraryActivity {
++ public:
++ enum class Sort {RecentlyRead,DateAdded,Series,Genre,Title};
++ Sort sort=Sort::RecentlyRead;
++ struct Scan {std::atomic<bool> ready{false};std::atomic<uint32_t> progress{0};bool succeeded=true,refresh=true,keepVisible=false,viewCached=false,snapshotOpened=false,snapshotValid=true;uint64_t cachedKey=0;std::atomic<bool> snapshotReady{false};std::atomic<uint8_t> percent{0};library::BuildStats stats;};
++ std::unique_ptr<Scan> scan;
++ bool uiReady=true,changeCheckStarted=false,refreshCheckFailed=false;library::LibraryChangeProbe changeProbe;void pollLibraryChanges();
++ bool filterFailed=false,canReadPath=true;bool includeRefreshFile();
++ bool verifyRefreshFiles=false;uint32_t paintedScanProgress=UINT32_MAX;
++ std::unique_ptr<int> filterWork,filterBits,filterRanks;unsigned filteredCount=0,recentCount=0;
++ bool queuedKeepVisible=false;bool scanQueued=false,queuedRefresh=false,scanFailed=false,scanCancelledThisVisit=false;
++ bool refreshSuggested=false,descending=true,workerBusy=false;
++ unsigned launches=0,filters=0,freshFilters=0,viewports=0,updates=0;
++ StrId scanFailureText=StrId::STR_LIBRARY_SCAN_FAILED;
++ struct Index {void close(){}bool isOpen(){return true;}bool ok=true;bool open(const char*){return ok;}bool openForReconciliation(const char*){return false;}
++ struct Header {int formatVersion=4;} h;const Header& header(){return h;}}index;
++ struct {bool preparing=false;bool isPreparingBook(){return preparing;}}activityManager;
++ struct {void start(){}}coverWorker;
++ bool backgroundScanActive(){return workerBusy;}
++ uint64_t viewCacheKey(bool){return 5;}unsigned rowCount(){return filteredCount;}unsigned gridPageStart=0;
++ void applyFilter(){++filters;if(!library::cacheValid)++freshFilters;library::cacheValid=true;}
++ void resetViewport(){++viewports;}
++ void requestUpdate(){++updates;}
++ void refreshIndexIfNeeded(){++filters;}
++ void rebuildIndex(bool refresh=false,bool keepVisible=false);void pollScan();void finishScan(const Scan&);void refreshLibrary();
++};
++#include "LibraryRefresh.inc"
++int main(){
++ // Refresh reconciles files in both views; opening a book is never a prerequisite.
++ for(auto sort:{LibraryActivity::Sort::RecentlyRead,LibraryActivity::Sort::DateAdded}){
++  LibraryActivity a;a.sort=sort;a.filteredCount=a.recentCount=1;a.refreshLibrary();
++  assert(a.verifyRefreshFiles&&a.filteredCount==0&&a.recentCount==0&&!library::cacheValid);
++  assert(a.launches==1&&a.scan&&a.scan->refresh);
++  // An old in-memory filter may finish while the catalog worker is running.
++  library::cacheValid=true;a.scan->ready=true;a.pollScan();
++  assert(!a.scan&&!a.scanFailed&&a.freshFilters==1&&a.filters==1);
++ }
++ // Repeated Refresh during a scan coalesces into exactly one follow-up check.
++ LibraryActivity queued;queued.refreshLibrary();queued.refreshLibrary();queued.refreshLibrary();
++ assert(queued.launches==1&&queued.scanQueued&&queued.queuedRefresh);
++ queued.scan->ready=true;queued.pollScan();
++ assert(queued.launches==2&&queued.scan&&!queued.scanQueued&&!queued.queuedRefresh);
++ queued.scan->ready=true;queued.pollScan();assert(queued.launches==2&&!queued.scan);
++ // Busy book preparation queues reconciliation without touching its storage.
++ LibraryActivity busy;busy.activityManager.preparing=true;busy.refreshLibrary();
++ assert(busy.launches==0&&busy.scanQueued&&busy.queuedRefresh);
++ busy.pollScan();assert(busy.launches==0);
++ busy.activityManager.preparing=false;busy.pollScan();assert(busy.launches==1&&busy.scan->refresh);
++ // Even an unchanged index must not restore stale progress/filter membership.
++ LibraryActivity unchanged;unchanged.refreshLibrary();unchanged.scan->stats.indexReplaced=false;
++ unchanged.scan->ready=true;unchanged.pollScan();assert(unchanged.freshFilters==1);
++ LibraryActivity files;files.verifyRefreshFiles=true;
++ Storage.present=false;assert(!files.includeRefreshFile()); // deleted file, even with saved title/progress
++ Storage.present=true;assert(files.includeRefreshFile());
++ files.canReadPath=false;assert(!files.includeRefreshFile()&&files.filterFailed);
++ // Failed scans retain the previous cache and expose the failure.
++ LibraryActivity failed;failed.refreshLibrary();failed.scan->succeeded=false;failed.scan->ready=true;
++ const auto count=library::invalidations;failed.pollScan();
++ assert(failed.scanFailed&&failed.refreshSuggested&&library::invalidations==count);
++  LibraryActivity uploaded;uploaded.filteredCount=35;uploaded.refreshSuggested=true;library::dirty=true;
++ uploaded.pollLibraryChanges();assert(uploaded.launches==1&&uploaded.filteredCount==35);
++ library::dirty=false;
++ LibraryActivity automatic;automatic.filteredCount=35;automatic.rebuildIndex(true,true);
++ assert(automatic.launches==1&&automatic.filteredCount==35);
++ automatic.rebuildIndex(true,true);assert(automatic.queuedKeepVisible);
++ LibraryActivity cached;cached.sort=LibraryActivity::Sort::DateAdded;cached.verifyRefreshFiles=true;
++ cached.refreshLibrary();cached.scan->viewCached=true;cached.scan->cachedKey=5;
++ cached.scan->ready=true;cached.pollScan();assert(!cached.verifyRefreshFiles);
++ std::cout<<"Both Library sorts, refresh handoff invalidation, queued retries, and scan failure passed\n";
++}
+diff --git a/test/library_thumbnails/LibrarySnapshotTest.cpp b/test/library_thumbnails/LibrarySnapshotTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..43a3009932b9fa4b4a7f11ebf5e2258a1042662e
+--- /dev/null
++++ b/test/library_thumbnails/LibrarySnapshotTest.cpp
+@@ -0,0 +1,70 @@
++#include <algorithm>
++#include <atomic>
++#include <cassert>
++#include <cstdint>
++#include <cstring>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <vector>
++#define LOG_ERR(...) do {} while(0)
++void vTaskDelay(int) {}
++template<class T>auto makeUniqueNoThrow(size_t count){return std::make_unique<T>(count);}
++enum class Sort{RecentlyRead,DateAdded};
++namespace library {
++constexpr uint8_t FileEpub=1;
++enum class SortOrder{TitleAsc};
++struct ClixHeader {uint16_t count=0;};
++struct ClixRecord{uint16_t row=0;};
++inline unsigned books=24;
++inline bool exists[32]{};
++inline unsigned savedCount=0,savedSource=0;inline uint64_t savedKey=0;
++inline std::vector<uint8_t> saved;
++const char* libraryIndexPath(){return "catalog";}
++uint64_t clixPathHash(const char* s,size_t n){uint64_t h=14695981039346656037ULL;for(size_t i=0;i<n;++i){h^=static_cast<uint8_t>(s[i]);h*=1099511628211ULL;}return h;}
++std::string fold(const std::string& s){return s;}
++void foldInto(const std::string& s,std::string& out){out=s;}
++bool matchesQuery(const std::string& text,const std::string& query){return text.find(query)!=std::string::npos;}
++int fileTypeFor(const std::string& s){return s.ends_with(".epub")?FileEpub:0;}
++struct LibraryIndexFile {
++ bool open(const char*){return true;}uint16_t bookCount(){return books;}
++ uint16_t ordinalForRow(SortOrder,unsigned row){return row;}
++ bool readRecord(unsigned row,ClixRecord& r){r.row=row;return true;}
++ bool readPath(const ClixRecord& r,std::string& s){s="/book"+std::to_string(r.row)+".epub";return true;}
++ bool readDisplayText(const ClixRecord& r,std::string& title,std::string& author){title="title"+std::to_string(r.row);author="writer";return true;}
++ bool readPathHash(const ClixRecord& r,uint64_t& hash){hash=100+r.row;return true;}
++ ClixHeader header(){return {static_cast<uint16_t>(books)};}
++};
++bool saveViewCache(bool,uint64_t key,uint16_t source,uint16_t count,const void* bits,size_t bytes){
++ savedKey=key;savedSource=source;savedCount=count;saved.assign(static_cast<const uint8_t*>(bits),static_cast<const uint8_t*>(bits)+bytes);return true;
++}
++}
++struct {bool exists(const char* raw){std::string s=raw;if(s.starts_with("/book"))return library::exists[std::stoi(s.substr(5))];return true;}} Storage;
++struct BookReadingStats{bool isCompleted=false;static BookReadingStats load(const std::string& path){return {path.ends_with("101")};}};
++uint64_t indexedViewKey(const std::string&,uint8_t,bool,uint8_t,uint8_t,const library::ClixHeader&);
++struct TestScan{
++ Sort viewSort=Sort::DateAdded;std::atomic<bool> cancel{false};std::atomic<uint8_t> percent{0};std::atomic<uint32_t> progress{0};
++ std::string query;bool descending=true,readMetadata=true,viewCached=false;uint8_t hideFinished=0;
++ uint64_t cachedKey=0;library::SortOrder order=library::SortOrder::TitleAsc;
++ void prepareView();
++};
++#include "LibrarySnapshot.inc"
++int main(){
++ std::fill(std::begin(library::exists),std::end(library::exists),true);
++ TestScan complete;complete.prepareView();
++ assert(complete.viewCached&&library::savedCount==24&&library::savedSource==24&&complete.percent==99);
++ for(unsigned i=0;i<24;++i)assert(library::saved[i/8]&(1u<<(i%8)));
++ // One added book updates membership without losing the other pages.
++ library::books=25;TestScan added;added.prepareView();
++ assert(library::savedCount==25&&library::savedSource==25);
++ // A deleted file disappears even if the catalog still has a title/progress.
++ library::exists[3]=false;TestScan removed;removed.prepareView();
++ assert(library::savedCount==24&&!(library::saved[0]&(1u<<3)));
++ TestScan filtered;filtered.query="title2";filtered.prepareView();assert(library::savedCount==6); // 2,20..24
++ TestScan unfinished;unfinished.hideFinished=1;unfinished.prepareView();assert(library::savedCount==23);
++ const auto previous=library::saved;TestScan cancelled;cancelled.cancel=true;cancelled.prepareView();
++ assert(!cancelled.viewCached&&library::saved==previous);
++ assert(added.cachedKey==indexedViewKey("",static_cast<uint8_t>(Sort::DateAdded),true,0,1,{25}));
++ std::cout<<"Complete multi-page membership, added/deleted books, filters, cancellation and cache identity passed\n";
++}

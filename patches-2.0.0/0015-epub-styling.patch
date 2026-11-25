@@ -1,0 +1,196 @@
+diff --git a/lib/Epub/Epub.cpp b/lib/Epub/Epub.cpp
+index f7d345f9051b084d68f2815389c5088a90a07370..08c76cb517f214f15a9cecfdbcc36c95b8ecf646 100644
+--- a/lib/Epub/Epub.cpp
++++ b/lib/Epub/Epub.cpp
+@@ -906,6 +906,7 @@ bool Epub::openProtection() const {
+ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss, const XLocationLoadMode xLocationLoadMode,
+                 const bool cacheCumulativeSpineSizes) {
+   zipDirectoryCache.clear();
++  stylesheetLoadingEnabled = !skipLoadingCss;
+   lastLoadFailure = OpenFailure::InvalidOrUnreadable;
+   // Enforce access before loading any previously rendered cache.
+   if (!openProtection()) {
+diff --git a/lib/Epub/Epub.h b/lib/Epub/Epub.h
+index bcb553dee4138441cdedce2895d61101d8697eb6..afb4fd6fb5c7365c82c43b45bbe4fbe27d8537a5 100644
+--- a/lib/Epub/Epub.h
++++ b/lib/Epub/Epub.h
+@@ -108,6 +108,7 @@ class Epub {
+   bool referencePagesUseCharacters = false;
+   bool xLocationsLoaded = false;
+   mutable ZipDirectoryCache zipDirectoryCache;
++  bool stylesheetLoadingEnabled = true;
+   OpenFailure lastLoadFailure = OpenFailure::None;
+   bool sourceSpineMapDeclared = false;
+   enum class CssParseStatus : uint8_t {
+@@ -250,7 +251,7 @@ class Epub {
+   bool findCurrentSpineForSource(int sourceIndex, uint8_t containerDepth, const char* childName,
+                                  uint16_t sourceSiblingIndex, int& currentSpineIndex,
+                                  uint16_t& currentSiblingIndex) const;
+-  CssParser* getCssParser() const { return cssParser.get(); }
++  CssParser* getCssParser() const { return stylesheetLoadingEnabled ? cssParser.get() : nullptr; }
+   int resolveHrefToSpineIndex(const std::string& href) const;
+
+  private:
+diff --git a/lib/Epub/Epub/ReaderRenderSpec.h b/lib/Epub/Epub/ReaderRenderSpec.h
+index 12a6bb00e8129620ee9a4fb1867ac687cfd86ec5..652c20ce7351c39f95152e4bddad2beb636dc101 100644
+--- a/lib/Epub/Epub/ReaderRenderSpec.h
++++ b/lib/Epub/Epub/ReaderRenderSpec.h
+@@ -33,6 +33,7 @@ struct ReaderRenderSpec {
+   PublisherFonts publisherFonts = PublisherFonts::Off;
+   uint32_t publisherFontSignature = 0;
+   EpubRenderMode renderMode = EpubRenderMode::CrossInkDefault;
++  bool skipStylesheet = false;
+ };
+
+ inline uint32_t readerRenderSpecSignature(const ReaderRenderSpec& spec) {
+@@ -50,6 +51,7 @@ inline uint32_t readerRenderSpecSignature(const ReaderRenderSpec& spec) {
+   mix(spec.viewportHeight);
+   mix(spec.hyphenationEnabled);
+   mix(spec.embeddedStyle);
++  mix(spec.skipStylesheet);
+   mix(spec.imageRendering);
+   mix(spec.focusReadingEnabled);
+   mix(spec.guideReadingEnabled);
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index 0340bb8d0a5e8dc60624f0b0b37133fc864a1283..557fa7dabd5ee8e186c6ddb5a1e40810118cfc88 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -315,8 +315,8 @@ SectionBuildProfile buildProfileForRenderMode(const EpubRenderMode renderMode) {
+                              false};
+ }
+
+-bool shouldAttemptSafeModeFallback() {
+-  return SETTINGS.embeddedStyle != 0 || SETTINGS.focusReadingEnabled != 0 || SETTINGS.guideReadingEnabled != 0;
++bool shouldAttemptSafeModeFallback(const Epub& epub) {
++  return epub.getCssParser() != nullptr || SETTINGS.focusReadingEnabled != 0 || SETTINGS.guideReadingEnabled != 0;
+ }
+
+ SectionBuildProfile safeModeBuildProfile() {
+@@ -378,6 +378,7 @@ ReaderRenderSpec readerRenderSpecForProfile(const int fontId, const uint16_t vie
+ #if CROSSINK_SCALABLE_FONTS
+   if (spec.publisherFonts != PublisherFonts::Off) spec.publisherFontSignature = bookFontSystem.signature();
+ #endif
++  spec.skipStylesheet = profile.safeMode;
+   spec.focusReadingEnabled = profile.focusReadingEnabled;
+   spec.guideReadingEnabled = profile.guideReadingEnabled;
+   return spec;
+@@ -7341,7 +7342,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+         }
+       }
+       const SectionFallbackResult fallbackResult = runSectionBuildFallbacks(
+-          selectedRenderMode, shouldAttemptSafeModeFallback(), buildWithFallback, beforeFallbackRetry, &initialAttempt);
++          selectedRenderMode, shouldAttemptSafeModeFallback(*epub), buildWithFallback, beforeFallbackRetry, &initialAttempt);
+       fallbackBuildSucceeded = fallbackResult.succeeded;
+       layoutAbortedForLowMemory = fallbackResult.lastAttemptLowMemory;
+
+@@ -7917,7 +7918,7 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
+   SectionFallbackResult fallbackResult;
+   const SectionBuildAttempt initialAttempt = buildWithFallback(buildProfileForRenderMode(selectedRenderMode));
+   if (!prefetchCancelled) {
+-    fallbackResult = runSectionBuildFallbacks(selectedRenderMode, shouldAttemptSafeModeFallback(), buildWithFallback,
++    fallbackResult = runSectionBuildFallbacks(selectedRenderMode, shouldAttemptSafeModeFallback(*epub), buildWithFallback,
+                                               beforeFallbackRetry, &initialAttempt);
+     buildSucceeded = fallbackResult.succeeded;
+     layoutAbortedForLowMemory = fallbackResult.lastAttemptLowMemory;
+@@ -9721,10 +9722,10 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+                                 ? normalizeRenderModeRaw(readerSettings.renderMode)
+                                 : static_cast<uint8_t>(EpubRenderMode::CrossInkDefault);
+
+-  // Load CSS when embeddedStyle is enabled, as createSectionFile may need it to rebuild the cache.
++  // Chapter reflow can use stylesheet emphasis even with publisher layout disabled.
+   {
+     GfxRenderer::FrameBufferLoan loan(renderer);
+-    if (!epub->load(true, SETTINGS.embeddedStyle == 0, Epub::XLocationLoadMode::Skip)) {
++    if (!epub->load(true, readerSettings.hasSafeModeOverride, Epub::XLocationLoadMode::Skip)) {
+       LOG_DBG("SLP", "EPUB: failed to load %s", filePath.c_str());
+       return false;
+     }
+@@ -9801,7 +9802,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+         releaseReaderSdFontCachesForLowMemory(renderer, "SLP", "sleep-page fallback rebuild");
+       }
+     };
+-    const SectionFallbackResult result = runSectionBuildFallbacks(selectedRenderMode, shouldAttemptSafeModeFallback(),
++    const SectionFallbackResult result = runSectionBuildFallbacks(selectedRenderMode, shouldAttemptSafeModeFallback(*epub),
+                                                                   buildWithFallback, beforeFallbackRetry);
+     safeModeBuildSucceeded = result.usedSafeMode;
+     return result.succeeded;
+diff --git a/src/activities/reader/ReaderActivity.cpp b/src/activities/reader/ReaderActivity.cpp
+index 3344938ee58430d0b945071b11c663611ef64f5f..42270d4d84a4b0b32d31035c1dba27d9b8b2558a 100644
+--- a/src/activities/reader/ReaderActivity.cpp
++++ b/src/activities/reader/ReaderActivity.cpp
+@@ -61,7 +61,7 @@ ReaderActivity::EpubOpenResult ReaderActivity::loadEpub(const std::string& path)
+   }
+   result.readerSettings = EpubReaderActivity::readBookReaderSettings(*epub);
+   const bool loaded = epub->load(
+-      true, result.readerSettings.hasSafeModeOverride || result.readerSettings.readerSettings.embeddedStyle == 0,
++      true, result.readerSettings.hasSafeModeOverride,
+       Epub::XLocationLoadMode::Immediate, true);
+   if (loaded) epub->ensureOptimizerImageIndex();
+   if (loaded) {
+diff --git a/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp b/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp
+index e4a3633bfbdef5fcd20f8986aacfa1ab1c883093..f348d9c62a19b230e6e6297802a25c9d4ce6621e 100644
+--- a/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp
++++ b/test/chapter_html_slim_parser/ChapterHtmlSlimParserTest.cpp
+@@ -330,6 +330,24 @@ TEST_F(ChapterHtmlSlimParserTest, NestedBlocksOverrideAndRestoreInheritedBoldAnd
+   EXPECT_EQ(parser.inlineStyleCount_, 0u);
+ }
+
++TEST_F(ChapterHtmlSlimParserTest, LayoutOffPreservesCombinedEmphasis) {
++  parser.embeddedStyle = false;
++  cssParser.rulesBySelector_[".accent"] = CssParser::parseInlineStyle(
++      "font-weight:bold; font-style:italic; text-decoration:underline; display:none; font-size:300%");
++  const XML_Char* attributes[] = {"class", "accent", nullptr};
++  ChapterHtmlSlimParser::startElement(&parser, "p", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "span", attributes);
++  ChapterHtmlSlimParser::characterData(&parser, "Combined ", 9);
++  ChapterHtmlSlimParser::endElement(&parser, "span");
++  ChapterHtmlSlimParser::characterData(&parser, "Plain", 5);
++  ChapterHtmlSlimParser::endElement(&parser, "p");
++
++  ASSERT_EQ(parser.currentTextBlock->size(), 2u);
++  EXPECT_EQ(parser.currentTextBlock->getWordStyleAt(0),
++            static_cast<EpdFontFamily::Style>(EpdFontFamily::BOLD | EpdFontFamily::ITALIC | EpdFontFamily::UNDERLINE));
++  EXPECT_EQ(parser.currentTextBlock->getWordStyleAt(1), EpdFontFamily::REGULAR);
++}
++
+ TEST_F(ChapterHtmlSlimParserTest, NestedHeadingAndListPreserveBlockFontInheritance) {
+   const XML_Char* attributes[] = {"style", "font-style: italic", nullptr};
+   ChapterHtmlSlimParser::startElement(&parser, "blockquote", attributes);
+@@ -1226,6 +1244,37 @@ TEST_F(ChapterHtmlSlimParserTest, HiddenIdsDoNotBecomeAnchorsOrTocPageBreaks) {
+   }
+ }
+
++TEST_F(ChapterHtmlSlimParserTest, RecordsNestedTocTargetsWithoutBreakingThePage) {
++  parser.tocSectionAnchors.push_back("subsection");
++  parser.currentPage = std::make_unique<Page>();
++  parser.currentPage->elements.push_back(std::make_unique<PageHorizontalRule>(10, 1, 0, 0));
++  const XML_Char* attributes[] = {"id", "subsection", nullptr};
++  ChapterHtmlSlimParser::startElement(&parser, "span", attributes);
++  ChapterHtmlSlimParser::endElement(&parser, "span");
++  parser.flushPendingAnchor();
++
++  ASSERT_EQ(parser.anchorData.size(), 1u);
++  EXPECT_EQ(parser.completedPageCount, 0);
++}
++
++TEST_F(ChapterHtmlSlimParserTest, KeepsListMarkerWithTextThroughNestedDivs) {
++  ChapterHtmlSlimParser::startElement(&parser, "ul", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "li", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "div", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "div", nullptr);
++  ChapterHtmlSlimParser::startElement(&parser, "p", nullptr);
++  ChapterHtmlSlimParser::characterData(&parser, "First item", 10);
++  parser.flushPartWordBuffer();
++
++  ASSERT_EQ(parser.currentTextBlock->size(), 3u);
++  EXPECT_EQ(parser.currentTextBlock->words[0], "•");
++  EXPECT_EQ(parser.currentTextBlock->words[1], "First");
++
++  ChapterHtmlSlimParser::endElement(&parser, "p");
++  ChapterHtmlSlimParser::startElement(&parser, "p", nullptr);
++  EXPECT_TRUE(parser.currentTextBlock->isEmpty());
++}
++
+ TEST_F(ChapterHtmlSlimParserTest, NumbersOrderedListsAndRestartsNestedCounters) {
+   ChapterHtmlSlimParser::startElement(&parser, "ol", nullptr);
+   ChapterHtmlSlimParser::startElement(&parser, "li", nullptr);
