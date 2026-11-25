@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 54 selected native regression checks have been
+The X4 Pro firmware build and 61 selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -33,6 +33,11 @@ check after installation.
 - Use `reader_settings.v2.bin` for the new per-book settings schema. Old v1
   per-book settings files remain intact for rollback; per-book preferences may
   need reapplying in v2. Global preferences remain in their existing store.
+- Library filtering uses read-only completion peeks and bounded batches of up
+  to 16 records, checking a six-millisecond budget between records. Visible covers still load,
+  while off-screen prefetch waits until filtering finishes. Background refresh
+  reuses folder checkpoints and repaints progress only when the phase or percent
+  changes. Saved view caches remain reusable on later opens.
 - Add a native Plugins entry to the launcher. Seven apps can be held and dragged
   across nine slots, swapping occupied slots or using empty ones. Save the small
   arrangement file under `/.crashink/.launcher.bin` with checksum and backup
