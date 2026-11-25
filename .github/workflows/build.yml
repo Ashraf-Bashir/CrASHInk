@@ -3,6 +3,12 @@ name: Build crASHink X4 Pro
 on:
   workflow_dispatch:
     inputs:
+      baseline:
+        description: 'CrossInk baseline (each version uses its own pinned feature patches)'
+        type: choice
+        default: '1.6.1'
+        options:
+          - '1.6.1'
       runner:
         description: 'Free build runner (try the other version if GitHub cannot start a job)'
         type: choice
@@ -22,6 +28,7 @@ jobs:
       PLATFORMIO_BUILD_CACHE_DIR: ${{ github.workspace }}/.pio-build-cache
     outputs:
       firmware-artifact: ${{ steps.raw.outputs.artifact-id }}
+      patch-directory: ${{ steps.get-release.outputs.patch-directory }}
     steps:
       - name: Checkout patches
         uses: actions/checkout@v4
@@ -31,24 +38,26 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Get latest stable CrossInk release
+      - name: Resolve pinned CrossInk baseline
         id: get-release
-        run: |
-          # Accept stable three/four-part versions, including hotfix tags;
-          # exclude RC, beta, alpha, and other suffixed tags.
-          LATEST=$(git ls-remote --tags --refs --sort=version:refname https://github.com/uxjulia/CrossInk.git | awk '{print $2}' | sed 's#refs/tags/##' | grep -E '^v[0-9]+(\.[0-9]+){2,3}$' | tail -1)
-          if [ -z "$LATEST" ]; then
-            echo "No stable CrossInk version tag found" >&2
-            exit 1
-          fi
-          echo "version=$LATEST" >> $GITHUB_OUTPUT
-          echo "Building CrossInk $LATEST"
+        env:
+          BASELINE: ${{ inputs.baseline || '1.6.1' }}
+        run: python3 scripts/resolve_crashink_patchset.py "$BASELINE" --github-output "$GITHUB_OUTPUT"
 
-      - name: Clone CrossInk
+      - name: Clone pinned CrossInk and SDK
+        env:
+          UPSTREAM: ${{ steps.get-release.outputs.repository }}
+          UPSTREAM_COMMIT: ${{ steps.get-release.outputs.commit }}
+          SDK_COMMIT: ${{ steps.get-release.outputs.sdk-commit }}
         run: |
-          git clone --depth 1 --branch ${{ steps.get-release.outputs.version }} https://github.com/uxjulia/CrossInk.git source
-          cd source
-          git submodule update --init --recursive
+          set -euo pipefail
+          git init source
+          git -C source remote add origin "$UPSTREAM"
+          git -C source fetch --depth 1 origin "$UPSTREAM_COMMIT"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          git -C source submodule update --init --recursive
+          test "$(git -C source/freeink-sdk rev-parse HEAD)" = "$SDK_COMMIT"
 
       - name: Cache PlatformIO
         uses: actions/cache@v4
@@ -80,14 +89,17 @@ jobs:
       - name: Install PlatformIO
         run: pip install platformio
 
-      - name: Apply crASHink patches
+      - name: Apply matching feature patches
+        env:
+          PATCH_DIRECTORY: ${{ steps.get-release.outputs.patch-directory }}
         run: |
+          set -euo pipefail
           cd source
-          for p in ../patches/*.patch; do
+          for p in ../"$PATCH_DIRECTORY"/*.patch; do
             echo "Applying $(basename "$p")"
             git apply --verbose "$p"
           done
-          for p in ../patches/sdk/*.patch; do
+          for p in ../"$PATCH_DIRECTORY"/sdk/*.patch; do
             echo "Applying FreeInk SDK patch $(basename "$p")"
             git -C freeink-sdk apply --verbose "../$p"
           done
@@ -132,6 +144,7 @@ jobs:
       - name: Sign and verify firmware
         env:
           CRASHINK_WIFI_SIGNING_KEY: ${{ secrets.CRASHINK_WIFI_SIGNING_KEY }}
+          PATCH_DIRECTORY: ${{ needs.build.outputs.patch-directory }}
         shell: bash
         run: |
           set -euo pipefail
@@ -142,7 +155,7 @@ jobs:
           printf '%s\n' "$CRASHINK_WIFI_SIGNING_KEY" > "$key"
           unset CRASHINK_WIFI_SIGNING_KEY
 
-          sed -n '/^+constexpr char SIGNING_PUBLIC_KEY/,/^+)pem";/p' patches/0016-wifi-firmware-updater.patch |
+          sed -n '/^+constexpr char SIGNING_PUBLIC_KEY/,/^+)pem";/p' "$PATCH_DIRECTORY/0016-wifi-firmware-updater.patch" |
             sed -e '1s/.*R"pem(//' -e '1!s/^+//' -e '$d' > builds/receiver-public.pem
           openssl pkey -in "$key" -pubout | cmp - builds/receiver-public.pem
 

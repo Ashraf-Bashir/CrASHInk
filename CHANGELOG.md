@@ -13,6 +13,8 @@
 
 ### Changed
 
+- Preserve the existing feature-domain patches in `patches-1.6.1`, with checksum verification and pinned upstream/SDK revisions. Builds no longer follow newer tags automatically. A separate `patches-2.0.0` port is in progress and is not enabled as a build target yet.
+
 - Workflowy compact calendar rows hide tags between the time and task title.
 
 ### Fixed

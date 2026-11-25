@@ -1,0 +1,653 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 12ad1268b5f345a8435a2cca019abb1e6075e1ec..1dab73c78f31a82176dfd5fa147da9d5dfd69392 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -239,6 +239,8 @@
+ 
+ - OPDS and download logs hide URL tokens, fragments, and embedded credentials.
+ 
++- Changed: touchscreen page turns use swipes only; removed tap page-turn settings.
++
+ ## [v1.6.0] - 2026-09-21
+ 
+ ### Added
+diff --git a/include/DeviceCapabilities.h b/include/DeviceCapabilities.h
+index 907c7caa55f15bba6a558025dc4885fe304cc15d..9631ffffea6e53ca156a7537f077d2de7044975d 100644
+--- a/include/DeviceCapabilities.h
++++ b/include/DeviceCapabilities.h
+@@ -20,7 +20,8 @@ inline constexpr bool deviceUsesGlobalTouchscreenLock() {
+ 
+ inline bool deviceHasEdgeSideButtons(const HalGPIO& gpio) {
+ #ifdef SIMULATOR
+-  return gpio.deviceIsX3();
++  (void)gpio;
++  return false;
+ #else
+   return gpio.hasEdgeSideButtons();
+ #endif
+@@ -29,10 +30,11 @@ inline bool deviceHasEdgeSideButtons(const HalGPIO& gpio) {
+ // Portrait side-button geometry for orientation-aware menu and slider input.
+ // Keep the legacy side-button hint layout separate.
+ inline bool deviceUsesHorizontalSideButtonsForMenus(const HalGPIO& gpio) {
+-#if defined(SIMULATOR_DEVICE_X4_PRO) || defined(SIMULATOR_DEVICE_X4_CLASSIC)
++#if defined(SIMULATOR_DEVICE_X4_PRO)
++  (void)gpio;
+   return true;
+ #else
+-  return deviceHasEdgeSideButtons(gpio) || gpio.deviceIsX3();
++  return deviceHasEdgeSideButtons(gpio);
+ #endif
+ }
+ 
+@@ -45,17 +47,5 @@ inline bool deviceUsesSideButtonHintGutters(const HalGPIO& gpio) {
+ #endif
+ }
+ 
+-// Touch readers can safely dedicate both side buttons to a chord because Back
+-// and Confirm remain available on-screen. X4 Classic has the same two edge
+-// buttons plus a separate four-button front cluster, so it has the same escape
+-// path without a touchscreen.
+-inline bool deviceSupportsSideButtonChord(const HalGPIO& gpio) {
+-#if FREEINK_DEVICE_EEGO_A4
+-  // EEGO reserves Up + Down for a hardware reset.
+-  return false;
+-#elif CROSSINK_APP_DEVICE_X4CLASSIC || defined(SIMULATOR_DEVICE_X4_CLASSIC)
+-  return true;
+-#else
+-  return gpio.hasTouch();
+-#endif
+-}
++// Back and Confirm stay available on screen while a side-button chord is active.
++inline bool deviceSupportsSideButtonChord(const HalGPIO& gpio) { return gpio.hasTouch(); }
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index d3d4c2e4baa83e44057bd7dde50aa65973ca0835..62bde79850a99718ca4218c5b40fcf5781258ab8 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -329,6 +329,8 @@ STR_INVERTED: "Inverted"
+ STR_ORIENTATION_INVERTED: "Portrait 180°"
+ STR_LANDSCAPE_CCW: "Landscape CCW"
+ STR_DISABLED: "Disabled"
++STR_NEXT_NEXT: "Next/Next"
++STR_DOUBLE_PRESS_ACTION: "Double-press"
+ STR_LEXEND_DECA: "Lexend Deca"
+ STR_BITTER: "Bitter"
+ STR_COMPACT: "Compact"
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index c6416d8b2144a83ea93abb90b5ae48f10218f771..96e9a5d2cfb7f72511911f879628c7338b69a16e 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -521,10 +521,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   uint8_t textDarkness = 0;
+   uint8_t ruledLines = 0;
+   // Touch screen reader zones/gestures on boards with a touch controller.
+-  // Shortcut-only pause; keep the saved tap/swipe choices unchanged.
++  // Shortcut pause remains independent of touch reader controls.
+   uint8_t disablePageTurnGestures = 0;
+-  uint8_t pageTurnGesture = TAP_AND_SWIPE;
+-  uint8_t previousPageGesture = TAP_AND_SWIPE;
++  uint8_t touchReaderControls = TOUCH_READER_ON;
++  // Page-turn gestures remain independently configurable while touch reader controls stay enabled.
++  uint8_t pageTurnGesture = SWIPE_ONLY;
++  uint8_t previousPageGesture = SWIPE_ONLY;
+   uint8_t customBootscreenEnabled = 1;
+   uint8_t tapToHideStatusBar = 1;
+   // Disables all touchscreen input while a reader is active. Reader menus temporarily override this.
+@@ -577,8 +579,11 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   // Legacy shared side-button long action, retained for migration only.
+   uint8_t sideButtonLongPress = SIDE_LONG_CHAPTER_SKIP;
+   uint8_t sideButtonUpShort = PREVIOUS_PAGE;
++  // Runs on two quick presses of the same button; IGNORE leaves that button's short press instant.
++  uint8_t sideButtonUpDouble = IGNORE;
+   uint8_t sideButtonUpLong = SIDE_PREVIOUS_CHAPTER;
+   uint8_t sideButtonDownShort = PAGE_TURN;
++  uint8_t sideButtonDownDouble = IGNORE;
+   uint8_t sideButtonDownLong = SIDE_NEXT_CHAPTER;
+   // Front button remap (logical -> hardware)
+   // Used by MappedInputManager to translate logical buttons into physical front buttons.
+diff --git a/src/GlobalActions.h b/src/GlobalActions.h
+index f637bd3d0b7d36dbfee700bb93d552c0fd2546ff..5eedc52c136efd913fa66a4c0c1f906adb766c2d 100644
+--- a/src/GlobalActions.h
++++ b/src/GlobalActions.h
+@@ -11,11 +11,6 @@
+ // Keep its manual shortcut on the clean HALF waveform used before the manual
+ // refresh change; X3 and every other device retain the explicit full refresh.
+ inline HalDisplay::RefreshMode manualScreenRefreshMode() {
+-#if FREEINK_DEVICE_X4
+-  if (gpio.deviceIsX4()) {
+-    return HalDisplay::HALF_REFRESH;
+-  }
+-#endif
+   return HalDisplay::FULL_REFRESH;
+ }
+ 
+diff --git a/src/MappedInputManager.cpp b/src/MappedInputManager.cpp
+index 275f324020b347dcfa7480630e3a529347dbe3d1..4ef825cee178890b59e22b0066bb67deb58e2fed 100644
+--- a/src/MappedInputManager.cpp
++++ b/src/MappedInputManager.cpp
+@@ -774,11 +774,8 @@ MappedInputManager::SwipeDir MappedInputManager::wasSwipe() const {
+ 
+ bool MappedInputManager::wasBackGesture() const {
+   if (!touchInputEnabled()) return false;
+-  // A disabled previous-page swipe must not fall through to Back/Home.
+-  if (readerMode && SETTINGS.previousPageGesture != CrossPointSettings::TAP_AND_SWIPE &&
+-      SETTINGS.previousPageGesture != CrossPointSettings::SWIPE_ONLY) {
+-    return false;
+-  }
++  // Horizontal swipes in readers belong to page navigation.
++  if (readerMode) return false;
+   // Back = left-to-right swipe starting near the left edge. Edge-anchored so that
+   // mid-screen horizontal swipes stay available to activities that consume
+   // SwipeDir::Left/Right (e.g. percent selection, image viewer).
+@@ -834,16 +831,24 @@ bool MappedInputManager::wasMenuGesture() const {
+   return usesFrontlightSwipeLayout() ? wasBottomEdgeUpSwipe() : wasTopEdgeDownSwipe();
+ }
+ 
+-// All touch readers share the same drawer gestures, independent of hardware.
+-bool MappedInputManager::wasReaderMenuGesture() const { return wasSwipe() == SwipeDir::Up; }
++bool MappedInputManager::wasReaderMenuGesture() const {
++  const SwipeDir direction = wasSwipe();
++  return hasHomeKeyHardware() ? direction == SwipeDir::Up : direction == SwipeDir::Down;
++}
+ 
+ bool MappedInputManager::wasReaderHomeGesture() const {
+-  // Vertical swipes belong to the drawers; Home stays available from the top
+-  // drawer's header and from a physical Home key when the device has one.
+-  return hasHomeKeyHardware() && wasHomeGesture();
++  // X4 Pro's capacitive Home key remains the reader's Home action. Only the
++  // touch gesture changes in reader mode: other touch boards use an upward
++  // swipe across the page.
++  if (hasHomeKeyHardware()) {
++    return wasHomeGesture();
++  }
++  return wasSwipe() == SwipeDir::Up;
+ }
+ 
+-bool MappedInputManager::wasReaderLightPanelGesture() const { return wasSwipe() == SwipeDir::Down; }
++bool MappedInputManager::wasReaderLightPanelGesture() const {
++  return hasHomeKeyHardware() && wasSwipe() == SwipeDir::Down;
++}
+ 
+ bool MappedInputManager::wasHomeGesture() const {
+   if (!hasHomeKeyHardware()) return wasBottomEdgeUpSwipe();
+diff --git a/src/SettingsList.cpp b/src/SettingsList.cpp
+index f7bdca87a2a6ce49e33dab2e754a0819cfb55d14..8890a5ebc28385b00996bbd299ce6ca565b608ee 100644
+--- a/src/SettingsList.cpp
++++ b/src/SettingsList.cpp
+@@ -229,6 +229,8 @@ void forEachBaseSetting(SettingVisitor visitor, void* context) {
+   add(SettingInfo::Enum(StrId::STR_ORIENTATION_AWARE, &CrossPointSettings::frontButtonOrientationAware,
+                         {StrId::STR_NO, StrId::STR_NAV_BUTTONS, StrId::STR_ALL_BUTTONS}, "frontButtonOrientationAware",
+                         StrId::STR_CAT_CONTROLS));
++  add(buildSideButtonActionSetting(StrId::STR_DOUBLE_PRESS_ACTION, &CrossPointSettings::sideButtonUpDouble, "sideButtonUpDouble"));
++  add(buildSideButtonActionSetting(StrId::STR_DOUBLE_PRESS_ACTION, &CrossPointSettings::sideButtonDownDouble, "sideButtonDownDouble"));
+ 
+   add(buildShortcutSetting(StrId::STR_SHORT_PWR_BTN, &CrossPointSettings::shortPwrBtn, "shortPwrBtn",
+                            ShortcutOptionCatalog::PowerButton));
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index c190549e0de9e1c70fb92c57c4686421d2100089..a174d9b199f98891b987434d434d549a2e11e3b5 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -92,8 +92,9 @@ inline bool isPageGestureSettingDisabled(const SettingInfo& setting) {
+ }
+ 
+ inline bool isSideButtonActionSetting(const SettingInfo& setting) {
+-  return settingKeyIs(setting, "sideButtonUpShort") || settingKeyIs(setting, "sideButtonUpLong") ||
+-         settingKeyIs(setting, "sideButtonDownShort") || settingKeyIs(setting, "sideButtonDownLong");
++  return settingKeyIs(setting, "sideButtonUpShort") || settingKeyIs(setting, "sideButtonUpDouble") ||
++         settingKeyIs(setting, "sideButtonUpLong") || settingKeyIs(setting, "sideButtonDownShort") ||
++         settingKeyIs(setting, "sideButtonDownDouble") || settingKeyIs(setting, "sideButtonDownLong");
+ }
+ 
+ inline bool isFrontButtonActionSetting(const SettingInfo& setting) {
+@@ -1045,16 +1046,18 @@ inline std::vector<SettingInfo> buildControlsFrontButtonSettingsList(const std::
+ inline std::vector<SettingInfo> buildControlsSideButtonSettingsList(const std::vector<SettingInfo>& allSettings) {
+   std::vector<SettingInfo> settings;
+   const bool hasChord = hasSideButtonChordSetting(allSettings);
+-  settings.reserve(8 + (hasChord ? 1u : 0u));
++  settings.reserve(10 + (hasChord ? 1u : 0u));
+   addSettingByKey(settings, allSettings, "sideButtonOrientationAware");
+   if (hasChord) {
+     addSettingByName(settings, allSettings, StrId::STR_SIDE_BUTTON_CHORD);
+   }
+   settings.push_back(SettingInfo::SectionHeader(StrId::STR_DIR_LEFT));
+   addSettingByKey(settings, allSettings, "sideButtonUpShort");
++  addSettingByKey(settings, allSettings, "sideButtonUpDouble");
+   addSettingByKey(settings, allSettings, "sideButtonUpLong");
+   settings.push_back(SettingInfo::SectionHeader(StrId::STR_DIR_RIGHT));
+   addSettingByKey(settings, allSettings, "sideButtonDownShort");
++  addSettingByKey(settings, allSettings, "sideButtonDownDouble");
+   addSettingByKey(settings, allSettings, "sideButtonDownLong");
+   return settings;
+ }
+diff --git a/src/activities/Activity.h b/src/activities/Activity.h
+index 8d2901646cb946ebbd06394259f2363175b6f9e6..b64198f24daab952edea3e6f645fa7d6e02e2b7e 100644
+--- a/src/activities/Activity.h
++++ b/src/activities/Activity.h
+@@ -83,6 +83,7 @@ class Activity {
+   virtual bool usesFullScreenReaderVerticalSwipes() const { return false; }
+   // Overlays can reserve the frontlight gesture for their own dismissal.
+   virtual bool allowFrontlightPanelGesture() const { return true; }
++  virtual bool allowEdgeSlideGestures() const { return true; }
+   // Partial-screen overlays preserve pixels from the activity beneath them.
+   // After a full-screen child pops, ActivityManager must redraw that source
+   // activity before pushing one of these overlays again.
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index c17b3b4ab5b6ba3a4c35129b161ca44a0ce4d89f..c2d6ff49f12f2b5ca7f779b36cbe0ab1af23930e 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -69,6 +69,10 @@ namespace {
+ constexpr uint32_t FILE_TRANSFER_MODE_MASK = 0xFF;
+ constexpr uint32_t FILE_TRANSFER_RETURN_TO_READER = 1U << 8;
+ 
++constexpr bool hasStickyReaderDetailsPanel() {
++  return false;
++}
++
+ uint32_t fileTransferBootPayload(const NetworkMode mode, const bool returnToReader) {
+   return static_cast<uint32_t>(mode) | (returnToReader ? FILE_TRANSFER_RETURN_TO_READER : 0);
+ }
+@@ -619,7 +623,9 @@ void ActivityManager::loop() {
+       }
+ 
+ #if CROSSINK_APP_CAP_TOUCH
+-      if (applyEdgeSlideAction(*currentActivity, mappedInput, *this, edgeLightSwipe)) {
++      if (!currentActivity->allowEdgeSlideGestures()) {
++        mappedInput.resetEdgeSlide();
++      } else if (applyEdgeSlideAction(*currentActivity, mappedInput, *this, edgeLightSwipe)) {
+         return;
+       }
+ #endif
+diff --git a/src/activities/reader/ReaderButtonShortcuts.h b/src/activities/reader/ReaderButtonShortcuts.h
+index 91a493b2ebdfa6f94453c8ea36adc9552fc044e4..e8e27e5fb423c9a3c9ec231387b79d0fd7d832a2 100644
+--- a/src/activities/reader/ReaderButtonShortcuts.h
++++ b/src/activities/reader/ReaderButtonShortcuts.h
+@@ -38,9 +38,9 @@ class ReaderButtonShortcuts {
+ 
+   Result update(MappedInputManager& input, const unsigned long now) {
+     Result upResult = updateOne(input, MappedInputManager::Button::Up, true, up_, now, SETTINGS.sideButtonUpShort,
+-                                SETTINGS.sideButtonUpLong);
++                                SETTINGS.sideButtonUpLong, SETTINGS.sideButtonUpDouble);
+     Result downResult = updateOne(input, MappedInputManager::Button::Down, false, down_, now,
+-                                  SETTINGS.sideButtonDownShort, SETTINGS.sideButtonDownLong);
++                                  SETTINGS.sideButtonDownShort, SETTINGS.sideButtonDownLong, SETTINGS.sideButtonDownDouble);
+     Result leftResult = updateOne(input, MappedInputManager::Button::Left, true, left_, now,
+                                   CrossPointSettings::PREVIOUS_PAGE, SETTINGS.frontButtonLeftLong);
+     Result rightResult = updateOne(input, MappedInputManager::Button::Right, false, right_, now,
+@@ -50,7 +50,11 @@ class ReaderButtonShortcuts {
+     if (rightResult.triggered) return rightResult;
+     if (upResult.triggered) return upResult;
+     if (downResult.triggered) return downResult;
+-    upResult.consumed = upResult.consumed || downResult.consumed || leftResult.consumed || rightResult.consumed;
++    Result expired = expirePending(up_, true, now);
++    if (expired.triggered) return expired;
++    expired = expirePending(down_, false, now);
++    if (expired.triggered) return expired;
++    upResult.consumed = upResult.consumed || downResult.consumed || leftResult.consumed || rightResult.consumed || up_.pending || down_.pending;
+     return upResult;
+   }
+ 
+@@ -59,15 +63,29 @@ class ReaderButtonShortcuts {
+     unsigned long pressedAt = 0;
+     bool tracking = false;
+     bool actionFired = false;
++    bool pending = false;
++    unsigned long pendingAt = 0;
++    uint8_t pendingAction = CrossPointSettings::IGNORE;
+   };
+   ButtonState up_;
+   ButtonState down_;
+   ButtonState left_;
+   ButtonState right_;
+ 
++  static Result expirePending(ButtonState& state, bool up, unsigned long now) {
++    Result result;
++    result.up = up;
++    if (!state.pending || now - state.pendingAt < 300) return result;
++    state.pending = false;
++    if (now - state.pendingAt > 1500 || state.pendingAction == CrossPointSettings::IGNORE) return result;
++    result.triggered = result.consumed = true;
++    result.action = state.pendingAction;
++    return result;
++  }
++
+   static Result updateOne(MappedInputManager& input, const MappedInputManager::Button button, const bool up,
+                           ButtonState& state, const unsigned long now, const uint8_t shortAction,
+-                          const uint8_t longAction) {
++                          const uint8_t longAction, const uint8_t doubleAction = CrossPointSettings::IGNORE) {
+     Result result;
+     result.up = up;
+     const bool pressEdge = input.wasPressed(button);
+@@ -82,7 +100,7 @@ class ReaderButtonShortcuts {
+     const bool pressed = input.isPressed(button);
+     const bool released = input.wasReleased(button);
+     const bool immediatePageTurn =
+-        longAction == CrossPointSettings::IGNORE &&
++        longAction == CrossPointSettings::IGNORE && doubleAction == CrossPointSettings::IGNORE &&
+         (shortAction == CrossPointSettings::PAGE_TURN || shortAction == CrossPointSettings::PREVIOUS_PAGE);
+     if (pressEdge && immediatePageTurn) {
+       state.actionFired = true;
+@@ -98,12 +116,23 @@ class ReaderButtonShortcuts {
+                now - state.pressedAt >= ReaderUtils::SKIP_HOLD_MS && (pressed || released)) {
+       state.actionFired = true;
+       result.triggered = true;
++      state.pending = false;
+       result.longPress = true;
+       result.action = longAction;
+     } else if (released) {
+       if (!state.actionFired) {
+-        result.triggered = true;
+-        result.action = shortAction;
++        if (doubleAction == CrossPointSettings::IGNORE) {
++          result.triggered = true;
++          result.action = shortAction;
++        } else if (state.pending && now - state.pendingAt <= 300) {
++          state.pending = false;
++          result.triggered = true;
++          result.action = doubleAction;
++        } else {
++          state.pending = true;
++          state.pendingAt = now;
++          state.pendingAction = shortAction;
++        }
+       }
+     }
+     if (!pressed) state.tracking = false;
+diff --git a/src/activities/reader/ReaderUtils.h b/src/activities/reader/ReaderUtils.h
+index 105d47694453fea0bd7c2b37e8d070708dcc2ce1..ab40b36a618a4b86fd5107f1ec143e1cfd9a36f6 100644
+--- a/src/activities/reader/ReaderUtils.h
++++ b/src/activities/reader/ReaderUtils.h
+@@ -154,26 +154,12 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
+     return result;
+   }
+ 
+-  const int width = renderer.getScreenWidth();
+-  if (width <= 0) {
+-    return result;
+-  }
+-
+-  const auto allowsSwipe = [](const uint8_t gesture) {
+-    return gesture == CrossPointSettings::TAP_AND_SWIPE || gesture == CrossPointSettings::SWIPE_ONLY;
+-  };
+-  const auto allowsTap = [](const uint8_t gesture) {
+-    return gesture == CrossPointSettings::TAP_AND_SWIPE || gesture == CrossPointSettings::TAP_ONLY ||
+-           gesture == CrossPointSettings::INVERTED_TAP;
+-  };
+-
++  (void)renderer;
+   const auto swipe = input.wasSwipe();
+   if (swipe != MappedInputManager::SwipeDir::None) {
+     if (SETTINGS.disablePageTurnGestures) return result;
+-    result.prev = swipe == (rtlBook ? MappedInputManager::SwipeDir::Left : MappedInputManager::SwipeDir::Right) &&
+-                  allowsSwipe(SETTINGS.previousPageGesture);
+-    result.next = swipe == (rtlBook ? MappedInputManager::SwipeDir::Right : MappedInputManager::SwipeDir::Left) &&
+-                  allowsSwipe(SETTINGS.pageTurnGesture);
++    result.prev = swipe == (rtlBook ? MappedInputManager::SwipeDir::Left : MappedInputManager::SwipeDir::Right);
++    result.next = swipe == (rtlBook ? MappedInputManager::SwipeDir::Right : MappedInputManager::SwipeDir::Left);
+     return result;
+   }
+ 
+@@ -186,19 +172,8 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
+   result.x = x;
+   result.y = y;
+   result.heldMs = input.getHeldTime();
+-  // wasScreenTapped() already rejects swipe motion. Stationary edge taps stay
+-  // available for page turns; readers reserve only enabled status-bar targets.
+-
+-  // Give the entire page tap area to the sole tap-enabled direction. When
+-  // both accept taps, RTL books and Inverted Tap each swap their shared zones.
+-  if (SETTINGS.disablePageTurnGestures) return result;
+-  const bool nextTaps = allowsTap(SETTINGS.pageTurnGesture);
+-  const bool previousTaps = allowsTap(SETTINGS.previousPageGesture);
+-  const bool invertedTaps = (SETTINGS.pageTurnGesture == CrossPointSettings::INVERTED_TAP ||
+-                             SETTINGS.previousPageGesture == CrossPointSettings::INVERTED_TAP) != rtlBook;
+-  const bool nextZone = invertedTaps ? x < (width * 2) / 3 : x >= width / 3;
+-  result.next = nextTaps && (!previousTaps || nextZone);
+-  result.prev = previousTaps && (!nextTaps || !nextZone);
++  // Preserve tap coordinates for highlights, links and reader controls.
++  // Content taps never turn pages, including with legacy tap settings.
+   return result;
+ #endif
+ }
+diff --git a/src/activities/util/KeyboardEntryActivity.cpp b/src/activities/util/KeyboardEntryActivity.cpp
+index 0105d669654c3ccff66e117f59d81167fd76dd8c..5c1ada809b5adf447010db22c282250c3a0a4acc 100644
+--- a/src/activities/util/KeyboardEntryActivity.cpp
++++ b/src/activities/util/KeyboardEntryActivity.cpp
+@@ -138,10 +138,6 @@ const fui::KeyboardLayout URL_SNIPPET_LAYOUT{URL_SNIP_ROWS, 4};
+ void KeyboardEntryActivity::onEnter() {
+   Activity::onEnter();
+   inputLineHeight = renderer.getLineHeight(UI_12_FONT_ID);
+-#if CROSSINK_APP_CAP_TOUCH
+-  pendingFeedback = 0;
+-  feedbackSequence = 0;
+-#endif
+   cursorPos = text.length();
+   layoutId = inputType == InputType::Url ? fui::KeyboardLayoutId::QwertyEn : keyboard_layouts::startingLayout();
+   const uint16_t enabledLayouts = keyboard_layouts::enabled();
+@@ -171,16 +167,6 @@ void KeyboardEntryActivity::onEnter() {
+ 
+ void KeyboardEntryActivity::onExit() { Activity::onExit(); }
+ 
+-#if CROSSINK_APP_CAP_TOUCH
+-void KeyboardEntryActivity::showTouchFeedback(const int16_t value) {
+-  // Keep zero reserved for no feedback, including after sequence wraparound.
+-  feedbackSequence = feedbackSequence == UINT16_MAX ? 1 : feedbackSequence + 1;
+-  pendingFeedback.store((static_cast<uint32_t>(feedbackSequence) << 16) | static_cast<uint16_t>(value));
+-  requestUpdate();
+-}
+-
+-#endif
+-
+ const fui::KeyboardLayout& KeyboardEntryActivity::currentLayout() const {
+   if (symbols) return fui::builtinKeyboardLayout(layoutId, shifted, true);
+   if (inputType == InputType::Url) {
+@@ -329,21 +315,22 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+       clampSelection();
+       return true;
+     case fui::QWERTY_KEY_ENTER:
+-      if (text.length() < minLength) return true;
++      if (text.length() < minLength) return false;
+       onComplete(text);
+       return false;
+     case fui::QWERTY_KEY_BACKSPACE:
+       if (longPress) {
++        if (text.empty()) return false;
+         text.clear();
+         cursorPos = 0;
+         return true;
+       }
++      if (!backspaceUtf8()) return false;
+       delPressCount++;
+       if (delPressCount >= 2) {
+         hintVisible = true;
+         hintShowTime = millis();
+       }
+-      backspaceUtf8();
+       return true;
+     default: {
+       delPressCount = 0;
+@@ -353,7 +340,9 @@ bool KeyboardEntryActivity::activateValue(const int16_t value, const bool longPr
+       const char* out = longPress ? fui::keyboardAltOutputFor(layer, value) : nullptr;
+       if (!out) out = fui::keyboardOutputFor(layer, value);
+       if (!out) return false;
++      const auto oldLength = text.size();
+       insertUtf8(out);
++      if (text.size() == oldLength) return false;
+       if (shifted && !symbols) {
+         shifted = false;  // shift auto-releases after one character
+         clampSelection();
+@@ -622,20 +611,15 @@ void KeyboardEntryActivity::loop() {
+     const fui::TouchHoldRouter::Result result =
+         touchRouter.update(interactions, tapCandidate, static_cast<int16_t>(tx), static_cast<int16_t>(ty), tapped,
+                            static_cast<int16_t>(tapX), static_cast<int16_t>(tapY), inContact, millis());
+-    if (result.activeChanged && interactions.activeIndex() >= 0) {
+-      buttonSelectionVisible = false;
+-      showTouchFeedback(interactions.publishedData()[interactions.activeIndex()].value);
+-    }
+     if (result.event) {
+       buttonSelectionVisible = false;
+-      showTouchFeedback(result.event.value);
+       syncSelectionToValue(result.event.value);
+       if (activateValue(result.event.value, result.event.longPress)) {
+         requestUpdate();
+       }
+       return;
+     }
+-    // Feedback requests coalesce while the panel is busy; input keeps polling.
++    // A held key only updates the panel when its action fires.
+     if (tapCandidate || tapped) {
+       return;
+     }
+@@ -801,9 +785,6 @@ void KeyboardEntryActivity::loop() {
+ }
+ 
+ void KeyboardEntryActivity::render(RenderLock&&) {
+-#if CROSSINK_APP_CAP_TOUCH
+-  const uint32_t feedback = pendingFeedback.load();
+-#endif
+   renderer.clearScreen();
+ 
+   const auto pageWidth = renderer.getScreenWidth();
+@@ -1052,9 +1033,6 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+ #if CROSSINK_APP_CAP_TOUCH
+   auto& frameInteractions = paintInteractions;
+   frameInteractions.clearFlash();
+-  if (feedback && !cursorMode && !buttonSelectionVisible.load()) {
+-    frameInteractions.setFlash(ACTION_KEY, static_cast<int16_t>(feedback & 0xFFFF));
+-  }
+ #else
+   auto& frameInteractions = interactions;
+   frameInteractions.beginPublishCycle();
+@@ -1152,14 +1130,6 @@ void KeyboardEntryActivity::render(RenderLock&&) {
+   GUI.drawSideButtonHints(renderer, ">", "<");
+ 
+   renderer.displayBuffer();
+-#if CROSSINK_APP_CAP_TOUCH
+-  // Only acknowledge the frame actually displayed. A newer press (including
+-  // the same key again) must survive an older refresh completing.
+-  uint32_t expected = feedback;
+-  if (feedback && pendingFeedback.compare_exchange_strong(expected, 0)) {
+-    requestUpdate();  // Remove the flash even if typing has stopped.
+-  }
+-#endif
+ }
+ 
+ void KeyboardEntryActivity::onComplete(std::string text) {
+diff --git a/src/activities/util/KeyboardEntryActivity.h b/src/activities/util/KeyboardEntryActivity.h
+index 5c339b838347624f4837e43c7e28679082ca72c0..88b64758734dc13774979514017ea4767be73233 100644
+--- a/src/activities/util/KeyboardEntryActivity.h
++++ b/src/activities/util/KeyboardEntryActivity.h
+@@ -67,12 +67,8 @@ class KeyboardEntryActivity : public Activity {
+   // 48 keys, so 56 retains headroom for the double-buffered interaction table.
+   freeink::ui::InteractionBuffer<56> interactions;
+ #if CROSSINK_APP_CAP_TOUCH
+-  // Render-only state prevents live contact changes from altering a frame's
+-  // feedback. Fixed storage is reused for the lifetime of this activity.
++  // Render-side scratch keeps the published hit map stable during repaint.
+   freeink::ui::InteractionBuffer<56> paintInteractions;
+-  std::atomic<uint32_t> pendingFeedback{0};
+-  uint16_t feedbackSequence = 0;  // Main task only; distinguishes repeated keys.
+-  void showTouchFeedback(int16_t value);
+ #endif
+ 
+   // GPIO selection over the current layout grid (row/col in layout terms;
+diff --git a/src/main.cpp b/src/main.cpp
+index 3a76d9b86d8eb5a491367f33d43ed49f4b61f9fc..a24a248797ed592b4c9638a8f24c5cf34c31c5fd 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -980,6 +980,12 @@ bool handleX4ProHomeKeyShortcuts() {
+     return false;
+   }
+ 
++  if (activityManager.isHomeActivity()) {
++    x4ProHomeKeyTapPending = false;
++    if (wasX4ProHomeKeyTapped()) mappedInputManager.queueDeferredHomeGesture();
++    return false;
++  }
++
+   // A modal owns Home too. Clear a pending single tap so a gesture started
+   // while Quick Actions is open cannot fire after the popup closes.
+   if (activityManager.blocksGlobalInput()) {
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index 034f481e861cb4bc4fb4ad4dc9b17883b20e8547..0feec916f06d67b6f6fc53e37853e0019aee5eab 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -1890,7 +1890,8 @@ void CrossPointWebServer::handleGetSettings() const {
+     doc.clear();
+     doc["key"] = s.key;
+     if (isSideButtonActionSetting(s)) {
+-      const bool up = settingKeyIs(s, "sideButtonUpShort") || settingKeyIs(s, "sideButtonUpLong");
++      const bool up = settingKeyIs(s, "sideButtonUpShort") || settingKeyIs(s, "sideButtonUpDouble") ||
++                      settingKeyIs(s, "sideButtonUpLong");
+       doc["name"] = sideButtonGroupLabel(up) + " " + I18N.get(s.nameId);
+     } else {
+       doc["name"] = I18N.get(s.nameId);
+diff --git a/test/touch_page_turn/test_swipe_only.py b/test/touch_page_turn/test_swipe_only.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..afece0c0a242f9fc8f22389985a904101359cefd
+--- /dev/null
++++ b/test/touch_page_turn/test_swipe_only.py
+@@ -0,0 +1,65 @@
++"""Compile and exercise the production touch routing function in isolation."""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'src/activities/reader/ReaderUtils.h').read_text()
++start = source.index('inline TouchPageTurn detectTouchPageTurn(')
++end = source.index('\ninline bool isBottomStatusBarTap', start)
++fixture = r'''
++#include <cassert>
++#include <cstdint>
++#define CROSSINK_APP_CAP_TOUCH 1
++struct { bool touchReaderControls=true; uint8_t pageTurnGesture=0, previousPageGesture=0; } SETTINGS;
++struct GfxRenderer {};
++struct MappedInputManager {
++ enum class SwipeDir { None, Left, Right, Up, Down };
++ SwipeDir swipe=SwipeDir::None;
++ bool touch=true, tap=false;
++ bool hasTouch() const { return touch; }
++ SwipeDir wasSwipe() const { return swipe; }
++ bool wasScreenTapped(int& x,int& y) const { x=120; y=300; return tap; }
++ unsigned long getHeldTime() const { return 50; }
++};
++struct TouchPageTurn { bool prev,next,tapped; int x,y; unsigned long heldMs; };
++'''
++checks = r'''
++int main() {
++ GfxRenderer renderer;
++ MappedInputManager input;
++ // Every old persisted gesture combination must now behave identically.
++ for(int next=0;next<5;++next) for(int prev=0;prev<5;++prev) {
++  SETTINGS.pageTurnGesture=next; SETTINGS.previousPageGesture=prev;
++  input.swipe=MappedInputManager::SwipeDir::None; input.tap=true;
++  auto tap=detectTouchPageTurn(renderer,input);
++  assert(tap.tapped && !tap.next && !tap.prev && tap.x==120 && tap.y==300);
++  input.tap=false;
++  for(bool rtl : {false,true}) {
++   input.swipe=MappedInputManager::SwipeDir::Left;
++   auto left=detectTouchPageTurn(renderer,input,rtl);
++   assert(left.next==!rtl && left.prev==rtl && !left.tapped);
++   input.swipe=MappedInputManager::SwipeDir::Right;
++   auto right=detectTouchPageTurn(renderer,input,rtl);
++   assert(right.prev==!rtl && right.next==rtl);
++  }
++ }
++ input.swipe=MappedInputManager::SwipeDir::Left;
++ SETTINGS.touchReaderControls=false;
++ auto disabled=detectTouchPageTurn(renderer,input);
++ assert(!disabled.next && !disabled.prev && !disabled.tapped);
++ SETTINGS.touchReaderControls=true; input.touch=false;
++ disabled=detectTouchPageTurn(renderer,input);
++ assert(!disabled.next && !disabled.prev);
++}
++'''
++with tempfile.TemporaryDirectory() as directory:
++    cpp = Path(directory)/'test.cpp'
++    cpp.write_text('#include <initializer_list>\n' + fixture + source[start:end] + checks)
++    executable = Path(directory)/'test'
++    subprocess.run(['c++','-std=c++17',str(cpp),'-o',str(executable)],check=True)
++    subprocess.run([str(executable)],check=True)
++settings = (root/'src/SettingsList.cpp').read_text()
++assert '&CrossPointSettings::pageTurnGesture' not in settings
++assert '&CrossPointSettings::previousPageGesture' not in settings
++print('Swipe-only routing passed: legacy settings, LTR/RTL, taps, disabled touch, settings removal.')
