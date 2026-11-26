@@ -416,31 +416,6 @@ index 1e0ac9c0ae564490823e5bdff68de4cdf07c3b81..ccae5ace771fb371c3c4a04dfc4731a1
    opening the book, when tracking is enabled for the device and that book.
    The action menu also includes book-specific controls such as **Mark Finished**
    and **Track Reading Stats** where supported.
-diff --git a/lib/Epub/Epub.cpp b/lib/Epub/Epub.cpp
-index a9c2a537eeb33aaba1e24c45ae6bb9b23ddd5aa1..f7d345f9051b084d68f2815389c5088a90a07370 100644
---- a/lib/Epub/Epub.cpp
-+++ b/lib/Epub/Epub.cpp
-@@ -1461,7 +1461,8 @@ bool Epub::generateThumbBmpFromSource(int height, const GfxRenderer* renderer, c
-   return generateThumbBmpFromSource(0, height, renderer, readerFontId);
- }
-
--bool Epub::generateThumbBmpFromSource(int width, int height, const GfxRenderer* renderer, const int readerFontId) {
-+bool Epub::generateThumbBmpFromSource(int width, int height, const GfxRenderer* renderer, const int readerFontId, bool* missingCover) {
-+  if (missingCover) *missingCover = false;
-   normalizeThumbDimensions(width, height);
-   const std::string thumbPath = getThumbBmpPathForDimensions(cachePath, width, height);
-   if (cachedBmpMatchesDimensions(thumbPath, width, height)) return true;
-@@ -1475,6 +1476,10 @@ bool Epub::generateThumbBmpFromSource(int width, int height, const GfxRenderer*
-   if (!parseContentOpf(*metadata, /*writeSpineEntries=*/false, /*collectCssFiles=*/false)) {
-     return false;
-   }
-+  if (metadata->coverItemHref.empty()) {
-+    if (missingCover) *missingCover = true;
-+    return false;
-+  }
-   return generateThumbBmpInternal(width, height, false, renderer, readerFontId, &metadata->coverItemHref);
- }
-
 diff --git a/lib/Epub/Epub.h b/lib/Epub/Epub.h
 index 0d66bbe79f73c9f6ae7ad71b2d06f842d0c44692..bcb553dee4138441cdedce2895d61101d8697eb6 100644
 --- a/lib/Epub/Epub.h
@@ -3035,39 +3010,6 @@ index df5aa1332c39d0d315442cc7c22eb0c10a380625..0d6f8b12f7f17af3acca651337e22c60
      const int16_t x = static_cast<int16_t>(actionBar.x + slotIndex * slotWidth);
      const int16_t width = slotIndex == slotCount - 1 ? static_cast<int16_t>(actionBar.right() - x) : slotWidth;
      const fui::Rect slot{x, actionBar.y, width, actionBar.height};
-diff --git a/src/components/BookCoverCache.cpp b/src/components/BookCoverCache.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..169ea214d118c1f6cf563f91cdc18a759104076a
---- /dev/null
-+++ b/src/components/BookCoverCache.cpp
-@@ -0,0 +1,27 @@
-+#include "BookCoverCache.h"
-+
-+#include <Bitmap.h>
-+#include <Epub.h>
-+#include <FsHelpers.h>
-+#include <HalStorage.h>
-+#include <Xtc.h>
-+
-+#include "RecentBooksStore.h"
-+
-+std::string gridThumbPath(const RecentBook& book, const int width, const int height) {
-+  if (FsHelpers::hasEpubExtension(book.path))
-+    return Epub::cachePathForFilePath(book.path, "/.crosspoint") + "/thumb_" + std::to_string(width) + "x" +
-+           std::to_string(height) + ".bmp";
-+  if (FsHelpers::hasXtcExtension(book.path)) return Xtc(book.path, "/.crosspoint").getThumbBmpPath(width, height);
-+  return {};
-+}
-+
-+bool hasValidGridThumb(const std::string& path, const int width, const int height) {
-+  FsFile file;
-+  if (path.empty() || !Storage.exists(path.c_str()) || !Storage.openFileForRead("LIB", path, file)) return false;
-+  Bitmap bitmap(file);
-+  const bool valid =
-+      bitmap.parseHeaders() == BmpReaderError::Ok && bitmap.getWidth() == width && bitmap.getHeight() == height;
-+  file.close();
-+  return valid;
-+}
 diff --git a/src/components/BookCoverCache.h b/src/components/BookCoverCache.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..8307c53f3b987a6536eef9c58753853cbe13c6b0
@@ -4213,59 +4155,6 @@ index 2a948f5c4e74f0ee931be43e4656bae2039be2d8..8e4daf86f7e0344283d1b72868652e85
 +  count = library::removeRecentRow(rows, count, 0, false, false);
 +  EXPECT_EQ(count, 2u);
 +}
-diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
-new file mode 100644
-index 0000000000000000000000000000000000000000..38ef0a0b2a9784a03e29c6fb9576988455228da7
---- /dev/null
-+++ b/test/library_thumbnails/CMakeLists.txt
-@@ -0,0 +1,47 @@
-+find_package(Python3 REQUIRED COMPONENTS Interpreter)
-+set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
-+add_custom_command(OUTPUT ${EXTRACTED}
-+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryThumbnails.py ${REPO_ROOT} ${EXTRACTED}
-+  DEPENDS ExtractLibraryThumbnails.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${REPO_ROOT}/src/components/BookCoverCache.cpp)
-+add_executable(LibraryThumbnailsTest LibraryThumbnailsTest.cpp ${EXTRACTED})
-+target_include_directories(LibraryThumbnailsTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
-+target_link_libraries(LibraryThumbnailsTest PRIVATE crosspoint_test_common GTest::gtest_main)
-+gtest_discover_tests(LibraryThumbnailsTest)
-+
-+find_package(Threads REQUIRED)
-+add_executable(LibraryCoverWorkerTest LibraryCoverWorkerTest.cpp ${REPO_ROOT}/src/activities/library/LibraryCoverWorker.cpp)
-+target_include_directories(LibraryCoverWorkerTest PRIVATE worker_stubs ${REPO_ROOT}/src/activities/library ${REPO_ROOT}/lib/Memory)
-+target_link_libraries(LibraryCoverWorkerTest PRIVATE crosspoint_test_common GTest::gtest_main Threads::Threads)
-+gtest_discover_tests(LibraryCoverWorkerTest)
-+
-+set(TOUCH_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryTouchMethods.inc)
-+add_custom_command(OUTPUT ${TOUCH_EXTRACTED}
-+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryTouch.py ${REPO_ROOT} ${TOUCH_EXTRACTED}
-+  DEPENDS ExtractLibraryTouch.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp)
-+add_executable(LibraryTouchTest LibraryTouchTest.cpp ${TOUCH_EXTRACTED})
-+target_include_directories(LibraryTouchTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src/activities/library)
-+target_link_libraries(LibraryTouchTest PRIVATE crosspoint_test_common GTest::gtest_main)
-+gtest_discover_tests(LibraryTouchTest)
-+
-+set(FILTER_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryFilterMethods.inc)
-+add_custom_command(OUTPUT ${FILTER_EXTRACTED}
-+ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryFilter.py ${REPO_ROOT} ${FILTER_EXTRACTED}
-+ DEPENDS ExtractLibraryFilter.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp)
-+add_executable(LibraryFilterPacingTest LibraryFilterPacingTest.cpp ${FILTER_EXTRACTED} ${REPO_ROOT}/lib/LibraryIndex/LibraryViewCache.cpp)
-+target_include_directories(LibraryFilterPacingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex ${REPO_ROOT}/lib/Memory)
-+target_link_libraries(LibraryFilterPacingTest PRIVATE crosspoint_test_common GTest::gtest_main)
-+gtest_discover_tests(LibraryFilterPacingTest)
-+
-+set(HOME_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/HomePagingMethods.inc)
-+add_custom_command(OUTPUT ${HOME_EXTRACTED}
-+ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractHomePaging.py ${REPO_ROOT} ${HOME_EXTRACTED}
-+ DEPENDS ExtractHomePaging.py ${REPO_ROOT}/src/activities/home/HomeActivity.cpp)
-+add_executable(HomePagingTest HomePagingTest.cpp ${HOME_EXTRACTED} ${REPO_ROOT}/lib/LibraryIndex/OpenedBooks.cpp)
-+target_include_directories(HomePagingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
-+target_link_libraries(HomePagingTest PRIVATE crosspoint_test_common GTest::gtest_main)
-+gtest_discover_tests(HomePagingTest)
-+
-+add_executable(OpenedBooksTest OpenedBooksTest.cpp ${REPO_ROOT}/lib/LibraryIndex/OpenedBooks.cpp)
-+target_include_directories(OpenedBooksTest PRIVATE ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
-+target_link_libraries(OpenedBooksTest PRIVATE crosspoint_test_common GTest::gtest_main)
-+gtest_discover_tests(OpenedBooksTest)
 diff --git a/test/library_thumbnails/ExtractHomePaging.py b/test/library_thumbnails/ExtractHomePaging.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..23942e596703ba2ae0ea3a63dc83b35c815a4a41
@@ -5129,6 +5018,85 @@ index 0000000000000000000000000000000000000000..146c2af8025cf5ed6e2dfd89efdb9de8
 +<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 +  <path d="M9 3H5a2 2 0 0 0-2 2v4h1a2 2 0 1 1 0 4H3v6a2 2 0 0 0 2 2h4v-1a2 2 0 1 1 4 0v1h6a2 2 0 0 0 2-2v-6h-1a2 2 0 1 1 0-4h1V5a2 2 0 0 0-2-2h-6V2a2 2 0 1 0-4 0z"/>
 +</svg>
+diff --git a/lib/Epub/Epub.cpp b/lib/Epub/Epub.cpp
+index a9c2a537eeb33aaba1e24c45ae6bb9b23ddd5aa1..d0eaa74a700f68a371c9da1d16fb768379de3af9 100644
+--- a/lib/Epub/Epub.cpp
++++ b/lib/Epub/Epub.cpp
+@@ -1,3 +1,4 @@
++#include "EpubThumbnailPath.h"
+ #include "Epub.h"
+
+ #include <ArduinoJson.h>
+@@ -240,11 +241,11 @@ void releaseReaderSdFontCachesBeforeCoverDecode(const GfxRenderer* renderer, con
+ }
+
+ std::string getThumbBmpPathForDimensions(const std::string& cachePath, int width, int height) {
+-  return cachePath + "/thumb_" + std::to_string(width) + "x" + std::to_string(height) + "_v2.bmp";
++  return EpubThumbnailPath::fixed(cachePath, width, height);
+ }
+
+ std::string getAdaptiveThumbBmpPathForDimensions(const std::string& cachePath, int width, int height) {
+-  return cachePath + "/thumb_" + std::to_string(width) + "x" + std::to_string(height) + "_fit_v2.bmp";
++  return EpubThumbnailPath::adaptive(cachePath, width, height);
+ }
+
+ std::string legacyCachePathForFilePath(const std::string& filepath, const std::string& cacheDir) {
+@@ -1396,7 +1397,7 @@ bool Epub::generateCoverBmp(bool cropped, const GfxRenderer* renderer, const int
+   return false;
+ }
+
+-std::string Epub::getThumbBmpPath() const { return cachePath + "/thumb_[WIDTH]x[HEIGHT]_v2.bmp"; }
++std::string Epub::getThumbBmpPath() const { return EpubThumbnailPath::pattern(cachePath); }
+ std::string Epub::getThumbBmpPath(int height) const { return getThumbBmpPath(0, height); }
+ std::string Epub::getThumbBmpPath(int width, int height) const {
+   normalizeThumbDimensions(width, height);
+@@ -1461,7 +1462,8 @@ bool Epub::generateThumbBmpFromSource(int height, const GfxRenderer* renderer, c
+   return generateThumbBmpFromSource(0, height, renderer, readerFontId);
+ }
+
+-bool Epub::generateThumbBmpFromSource(int width, int height, const GfxRenderer* renderer, const int readerFontId) {
++bool Epub::generateThumbBmpFromSource(int width, int height, const GfxRenderer* renderer, const int readerFontId, bool* missingCover) {
++  if (missingCover) *missingCover = false;
+   normalizeThumbDimensions(width, height);
+   const std::string thumbPath = getThumbBmpPathForDimensions(cachePath, width, height);
+   if (cachedBmpMatchesDimensions(thumbPath, width, height)) return true;
+@@ -1475,6 +1477,10 @@ bool Epub::generateThumbBmpFromSource(int width, int height, const GfxRenderer*
+   if (!parseContentOpf(*metadata, /*writeSpineEntries=*/false, /*collectCssFiles=*/false)) {
+     return false;
+   }
++  if (metadata->coverItemHref.empty()) {
++    if (missingCover) *missingCover = true;
++    return false;
++  }
+   return generateThumbBmpInternal(width, height, false, renderer, readerFontId, &metadata->coverItemHref);
+ }
+
+diff --git a/lib/Epub/EpubThumbnailPath.h b/lib/Epub/EpubThumbnailPath.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..951c35bd8aadccd45211a3ea64ec9870f60fbc8f
+--- /dev/null
++++ b/lib/Epub/EpubThumbnailPath.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include <string>
++
++// One cache identity for EPUB thumbnail producers and every cover consumer.
++// Change the revision here whenever the thumbnail encoding/layout changes.
++namespace EpubThumbnailPath {
++inline constexpr char Revision[] = "_v2";
++inline std::string stem(const std::string& cache, int width, int height) {
++  return cache + "/thumb_" + std::to_string(width) + "x" + std::to_string(height);
++}
++inline std::string fixed(const std::string& cache, int width, int height) {
++  return stem(cache, width, height) + Revision + ".bmp";
++}
++inline std::string adaptive(const std::string& cache, int width, int height) {
++  return stem(cache, width, height) + "_fit" + Revision + ".bmp";
++}
++inline std::string pattern(const std::string& cache) {
++  return cache + "/thumb_[WIDTH]x[HEIGHT]" + Revision + ".bmp";
++}
++}
 diff --git a/scripts/generate_launcher_icons.py b/scripts/generate_launcher_icons.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..5fd9febed43d4ef3bd72b56d38d388811da67b89
@@ -5487,7 +5455,7 @@ index 0000000000000000000000000000000000000000..24aee0abf8a2aca0f69ac742954efb8d
 +  void open(int index);
 +};
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672b08aa451 100644
+index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc759b1bdfc0 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
 @@ -6,62 +6,63 @@
@@ -6568,13 +6536,13 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
 +        refreshSuggested = true;
 +        requestUpdate();
 +      }
-+      return;
-+    }
+       return;
+     }
 +    if (!index.isOpen() && !index.open(library::libraryIndexPath())) {
 +      refreshSuggested = true;
 +      requestUpdate();
-       return;
-     }
++      return;
++    }
 +    changeProbe.begin(index);
 +  }
 +  if (libraryCheckedThisBoot) return;
@@ -7041,7 +7009,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
    props.action = ACTION_ROW;
    props.inputMask = fui::InputTouch | fui::InputLongPress;
    props.iconSize = 28;
-@@ -1387,248 +1428,337 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1387,248 +1428,347 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
    props.labelText.maxLines = 1;
    props.headerText = screen.theme().bodyText;
    props.headerText.bold = true;
@@ -7214,21 +7182,6 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
 -          }
 -        }
 -      }
--    }
--    if (!drawn) {
--      renderer.fillRoundedRect(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
--      if (coverWidth >= 36 && coverHeight >= 36)
--        drawLucideIcon(renderer, icon_book_marked_32, x + (coverWidth - 32) / 2, y + (coverHeight - 32) / 2);
--    }
--    renderer.maskRoundedRectOutsideCorners(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
--    renderer.drawRoundedRect(x, y, coverWidth, coverHeight, 2, GRID_COVER_CORNER_RADIUS, true);
--    if (row == selectedRow) {
--      renderer.drawRoundedRect(x - GRID_SELECTION_PADDING, y - GRID_SELECTION_PADDING,
--                               coverWidth + 2 * GRID_SELECTION_PADDING, coverHeight + 2 * GRID_SELECTION_PADDING, 3,
--                               GRID_COVER_CORNER_RADIUS + GRID_SELECTION_PADDING, true);
--      renderer.drawRoundedRect(
--          x - GRID_SELECTION_OUTER_INSET, y - GRID_SELECTION_OUTER_INSET, coverWidth + 2 * GRID_SELECTION_OUTER_INSET,
--          coverHeight + 2 * GRID_SELECTION_OUTER_INSET, 1, GRID_COVER_CORNER_RADIUS + GRID_SELECTION_OUTER_INSET, true);
 +bool LibraryActivity::paintGridCover(fui::DrawTarget& target, const fui::Rect rect, const int slot) {
 +  const auto ink = fui::Paint::solid(fui::Color::Black);
 +  // Same two-pixel shadow and one-pixel square frame as Home.
@@ -7243,6 +7196,21 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
 +    if (!path.empty() && !(failedCoverSlots & (1u << slot)) && !coverWorker.isWriting(path.c_str())) {
 +      drawn = paintedCovers.paint(rect, slot, path, false);
      }
+-    if (!drawn) {
+-      renderer.fillRoundedRect(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
+-      if (coverWidth >= 36 && coverHeight >= 36)
+-        drawLucideIcon(renderer, icon_book_marked_32, x + (coverWidth - 32) / 2, y + (coverHeight - 32) / 2);
+-    }
+-    renderer.maskRoundedRectOutsideCorners(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
+-    renderer.drawRoundedRect(x, y, coverWidth, coverHeight, 2, GRID_COVER_CORNER_RADIUS, true);
+-    if (row == selectedRow) {
+-      renderer.drawRoundedRect(x - GRID_SELECTION_PADDING, y - GRID_SELECTION_PADDING,
+-                               coverWidth + 2 * GRID_SELECTION_PADDING, coverHeight + 2 * GRID_SELECTION_PADDING, 3,
+-                               GRID_COVER_CORNER_RADIUS + GRID_SELECTION_PADDING, true);
+-      renderer.drawRoundedRect(
+-          x - GRID_SELECTION_OUTER_INSET, y - GRID_SELECTION_OUTER_INSET, coverWidth + 2 * GRID_SELECTION_OUTER_INSET,
+-          coverHeight + 2 * GRID_SELECTION_OUTER_INSET, 1, GRID_COVER_CORNER_RADIUS + GRID_SELECTION_OUTER_INSET, true);
+-    }
 -    if (available)
 -      screen.frame().hit(cell, ACTION_ROW, static_cast<int16_t>(row), fui::InputTouch | fui::InputLongPress);
 -  }
@@ -7385,9 +7353,19 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
 -    if (!epub.hasCoverImage()) {
 -      if (!RECENT_BOOKS.updateBook(book.path, recent->title, recent->author, "", RecentBook::CoverState::Missing))
 -        LOG_ERR("LIB", "Cannot mark missing EPUB cover for %s", book.path.c_str());
--    }
--    return false;
--  }
++  const RecentBook* recent = recentBookForPath(book.path);
++  const auto thumb = gridThumbPath(book, gridCoverWidth, gridCoverHeight);
++  if (hasValidGridThumb(thumb, gridCoverWidth, gridCoverHeight)) {
++    // A valid cached file must recover a slot whose first paint failed while
++    // storage was busy. No conversion job will arrive to clear that failure.
++    const int slot = row - gridPageStart;
++    if (slot >= 0 && slot < gridPageSize() && (failedCoverSlots & (1u << slot))) {
++      paintedCovers.invalidate(slot);
++      failedCoverSlots &= static_cast<uint16_t>(~(1u << slot));
++      dirtyCoverSlots |= static_cast<uint16_t>(1u << slot);
+     }
+     return false;
+   }
 -  Xtc xtc(book.path, "/.crosspoint");
 -  if (!xtc.load()) {
 -    LOG_ERR("LIB", "Cannot load XTC cover for %s", book.path.c_str());
@@ -7397,10 +7375,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
 -  if (!RECENT_BOOKS.updateBook(book.path, recent->title, recent->author, xtc.getThumbBmpPath(), recent->coverState))
 -    LOG_ERR("LIB", "Cannot update XTC cover path for %s", book.path.c_str());
 -  return true;
-+  const RecentBook* recent = recentBookForPath(book.path);
 +  if (recent && recent->coverState == RecentBook::CoverState::Missing) return false;
-+  const auto thumb = gridThumbPath(book, gridCoverWidth, gridCoverHeight);
-+  if (hasValidGridThumb(thumb, gridCoverWidth, gridCoverHeight)) return false;
 +  return coverWorker.submit(book.path.c_str(), thumb.c_str(), gridCoverWidth, gridCoverHeight, row);
  }
 
@@ -7570,7 +7545,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
  }
 
  void LibraryActivity::promptDeleteBook(const RecentBook& book) {
-@@ -1643,18 +1773,19 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
+@@ -1643,18 +1783,19 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
        LOG_ERR("LIB", "Failed to delete file: %s", path.c_str());
        return;
      }
@@ -7595,7 +7570,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
    openDialog(makeUniqueNoThrow<ConfirmationActivity>(renderer, mappedInput, heading, book.title), std::move(handler));
  }
 
-@@ -1668,8 +1799,7 @@ void LibraryActivity::promptRemoveBook(const std::string& path, const std::strin
+@@ -1668,8 +1809,7 @@ void LibraryActivity::promptRemoveBook(const std::string& path, const std::strin
      }
    };
 
@@ -7605,7 +7580,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..3d4c8a00c46d2717cecdfe8f5e0ef672
                                                       /*ignoreInitialConfirmRelease=*/false),
               std::move(handler));
  }
-@@ -1682,152 +1812,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+@@ -1682,152 +1822,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
                                      [&book](const RecentBook& recent) { return recent.path == book.path; });
    std::vector<FileBrowserActionActivity::MenuItem> items =
        BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/isRecent);
@@ -8314,6 +8289,39 @@ index 0000000000000000000000000000000000000000..9e2c86d1cad6361748e81f20f4e373a9
 +void draw(const GfxRenderer& renderer, View view);
 +bool handleInput(GfxRenderer& renderer, MappedInputManager& input, View current);
 +void open(View view, GfxRenderer& renderer, MappedInputManager& input);
++}
+diff --git a/src/components/BookCoverCache.cpp b/src/components/BookCoverCache.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d0f5aabd2fb943a6ad3cdb7061c8187012e6f0f
+--- /dev/null
++++ b/src/components/BookCoverCache.cpp
+@@ -0,0 +1,27 @@
++#include "BookCoverCache.h"
++
++#include <Bitmap.h>
++#include <Epub.h>
++#include <EpubThumbnailPath.h>
++#include <FsHelpers.h>
++#include <HalStorage.h>
++#include <Xtc.h>
++
++#include "RecentBooksStore.h"
++
++std::string gridThumbPath(const RecentBook& book, const int width, const int height) {
++  if (FsHelpers::hasEpubExtension(book.path))
++    return EpubThumbnailPath::fixed(Epub::cachePathForFilePath(book.path, "/.crosspoint"), width, height);
++  if (FsHelpers::hasXtcExtension(book.path)) return Xtc(book.path, "/.crosspoint").getThumbBmpPath(width, height);
++  return {};
++}
++
++bool hasValidGridThumb(const std::string& path, const int width, const int height) {
++  FsFile file;
++  if (path.empty() || !Storage.exists(path.c_str()) || !Storage.openFileForRead("LIB", path, file)) return false;
++  Bitmap bitmap(file);
++  const bool valid =
++      bitmap.parseHeaders() == BmpReaderError::Ok && bitmap.getWidth() == width && bitmap.getHeight() == height;
++  file.close();
++  return valid;
 +}
 diff --git a/src/components/LauncherLayout.cpp b/src/components/LauncherLayout.cpp
 new file mode 100644
@@ -9263,6 +9271,129 @@ index 0000000000000000000000000000000000000000..2da519c380a0c486254d84c83b9dbef2
 +struct Gui {void drawDisplayStatusBar(GfxRenderer&,int){} void drawPopup(GfxRenderer&,const char*){}};inline Gui GUI;
 +enum StrId {STR_LIBRARY,STR_WORKFLOWY,STR_WORKFLOWY_CALENDAR_VIEW,STR_BROWSE,STR_FILE_TRANSFER,STR_SETTINGS_SHORT,STR_PLUGINS,STR_ERROR_GENERAL_FAILURE};
 +inline const char* tr(StrId id){constexpr const char* words[]={"Library","Workflowy","Calendar","Browse","File Transfer","Settings","Plugins","Save failed"};return words[id];}
+diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..122b09b8e01de949141ec47e0aa4fae863356ae3
+--- /dev/null
++++ b/test/library_thumbnails/CMakeLists.txt
+@@ -0,0 +1,56 @@
++find_package(Python3 REQUIRED COMPONENTS Interpreter)
++set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
++add_custom_command(OUTPUT ${EXTRACTED}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryThumbnails.py ${REPO_ROOT} ${EXTRACTED}
++  DEPENDS ExtractLibraryThumbnails.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${REPO_ROOT}/src/components/BookCoverCache.cpp)
++add_executable(LibraryThumbnailsTest LibraryThumbnailsTest.cpp ${EXTRACTED})
++target_include_directories(LibraryThumbnailsTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
++target_link_libraries(LibraryThumbnailsTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(LibraryThumbnailsTest)
++
++set(COVER_IDENTITY_INC ${CMAKE_CURRENT_BINARY_DIR}/CoverIdentity.inc)
++add_custom_command(OUTPUT ${COVER_IDENTITY_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractCoverIdentity.py ${REPO_ROOT} ${COVER_IDENTITY_INC}
++ DEPENDS ExtractCoverIdentity.py ${REPO_ROOT}/lib/Epub/Epub.cpp ${REPO_ROOT}/src/components/BookCoverCache.cpp)
++add_executable(CoverIdentityTest CoverIdentityTest.cpp ${COVER_IDENTITY_INC})
++target_include_directories(CoverIdentityTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/lib/Epub)
++target_link_libraries(CoverIdentityTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(CoverIdentityTest)
++
++find_package(Threads REQUIRED)
++add_executable(LibraryCoverWorkerTest LibraryCoverWorkerTest.cpp ${REPO_ROOT}/src/activities/library/LibraryCoverWorker.cpp)
++target_include_directories(LibraryCoverWorkerTest PRIVATE worker_stubs ${REPO_ROOT}/src/activities/library ${REPO_ROOT}/lib/Memory)
++target_link_libraries(LibraryCoverWorkerTest PRIVATE crosspoint_test_common GTest::gtest_main Threads::Threads)
++gtest_discover_tests(LibraryCoverWorkerTest)
++
++set(TOUCH_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryTouchMethods.inc)
++add_custom_command(OUTPUT ${TOUCH_EXTRACTED}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryTouch.py ${REPO_ROOT} ${TOUCH_EXTRACTED}
++  DEPENDS ExtractLibraryTouch.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp)
++add_executable(LibraryTouchTest LibraryTouchTest.cpp ${TOUCH_EXTRACTED})
++target_include_directories(LibraryTouchTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src/activities/library)
++target_link_libraries(LibraryTouchTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(LibraryTouchTest)
++
++set(FILTER_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryFilterMethods.inc)
++add_custom_command(OUTPUT ${FILTER_EXTRACTED}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryFilter.py ${REPO_ROOT} ${FILTER_EXTRACTED}
++ DEPENDS ExtractLibraryFilter.py ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp)
++add_executable(LibraryFilterPacingTest LibraryFilterPacingTest.cpp ${FILTER_EXTRACTED} ${REPO_ROOT}/lib/LibraryIndex/LibraryViewCache.cpp)
++target_include_directories(LibraryFilterPacingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex ${REPO_ROOT}/lib/Memory)
++target_link_libraries(LibraryFilterPacingTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(LibraryFilterPacingTest)
++
++set(HOME_EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/HomePagingMethods.inc)
++add_custom_command(OUTPUT ${HOME_EXTRACTED}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractHomePaging.py ${REPO_ROOT} ${HOME_EXTRACTED}
++ DEPENDS ExtractHomePaging.py ${REPO_ROOT}/src/activities/home/HomeActivity.cpp)
++add_executable(HomePagingTest HomePagingTest.cpp ${HOME_EXTRACTED} ${REPO_ROOT}/lib/LibraryIndex/OpenedBooks.cpp)
++target_include_directories(HomePagingTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
++target_link_libraries(HomePagingTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(HomePagingTest)
++
++add_executable(OpenedBooksTest OpenedBooksTest.cpp ${REPO_ROOT}/lib/LibraryIndex/OpenedBooks.cpp)
++target_include_directories(OpenedBooksTest PRIVATE ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
++target_link_libraries(OpenedBooksTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(OpenedBooksTest)
+diff --git a/test/library_thumbnails/CoverIdentityTest.cpp b/test/library_thumbnails/CoverIdentityTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3572a9473c93839433515b5477a125ed22a6e997
+--- /dev/null
++++ b/test/library_thumbnails/CoverIdentityTest.cpp
+@@ -0,0 +1,34 @@
++#include <gtest/gtest.h>
++#include <string>
++#include "EpubThumbnailPath.h"
++struct RecentBook { std::string path; };
++struct Epub {
++  static std::string cachePathForFilePath(const std::string& path, const std::string& dir) {
++    return dir + "/opaque-cache-id" + path;
++  }
++};
++namespace FsHelpers {
++bool hasEpubExtension(const std::string& path) { return path.ends_with(".epub"); }
++bool hasXtcExtension(const std::string& path) { return path.ends_with(".xtc"); }
++}
++struct Xtc {
++  Xtc(const std::string&, const std::string&) {}
++  std::string getThumbBmpPath(int, int) { return "/xtc.bmp"; }
++};
++#include "CoverIdentity.inc"
++TEST(CoverIdentity, LibraryRequestsExactlyTheVersionedFileProducedByEpub) {
++  for (const auto& name : {"/Books/One.epub", "/Books/Other author/Two.epub"}) {
++    const RecentBook book{name};
++    const auto cache = Epub::cachePathForFilePath(name, "/.crosspoint");
++    for (const auto size : {std::pair{120, 180}, std::pair{142, 222}, std::pair{220, 320}}) {
++      const auto produced = getThumbBmpPathForDimensions(cache, size.first, size.second);
++      EXPECT_EQ(gridThumbPath(book, size.first, size.second), produced);
++      EXPECT_TRUE(produced.ends_with("_v2.bmp"));
++    }
++  }
++}
++TEST(CoverIdentity, FixedAndAdaptiveCachesRemainDistinct) {
++  EXPECT_NE(EpubThumbnailPath::fixed("/cache", 120, 180), EpubThumbnailPath::adaptive("/cache", 120, 180));
++  EXPECT_EQ(EpubThumbnailPath::pattern("/cache"), "/cache/thumb_[WIDTH]x[HEIGHT]_v2.bmp");
++  EXPECT_TRUE(gridThumbPath({"/Books/file.txt"}, 120, 180).empty());
++}
+diff --git a/test/library_thumbnails/ExtractCoverIdentity.py b/test/library_thumbnails/ExtractCoverIdentity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d247837d96e476bc53f63a32642bc4e0bc589e7f
+--- /dev/null
++++ b/test/library_thumbnails/ExtractCoverIdentity.py
+@@ -0,0 +1,15 @@
++from pathlib import Path
++import sys
++root, output = map(Path, sys.argv[1:])
++def function(path, signature):
++    text = (root / path).read_text()
++    start = text.index(signature)
++    brace = text.index('{', start)
++    depth = 1
++    end = brace + 1
++    while depth:
++        depth += (text[end] == '{') - (text[end] == '}')
++        end += 1
++    return text[start:end]
++output.write_text(function('lib/Epub/Epub.cpp', 'std::string getThumbBmpPathForDimensions(') + '\n' +
++                  function('src/components/BookCoverCache.cpp', 'std::string gridThumbPath('))
 diff --git a/test/library_thumbnails/ExtractLibraryFilter.py b/test/library_thumbnails/ExtractLibraryFilter.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..8296df4605cd99e080bfa3a467c151f0b889c497

@@ -788,77 +788,6 @@ index 2365a0b977d748ffa220140843332b5fee4f3034..06dfc8b998c8f6439ead03a35b67c5f3
    // PUT streaming state (raw() is called in chunks)
    HalFile _putFile;
    String _putPath;
-diff --git a/src/util/SleepWakePolicy.h b/src/util/SleepWakePolicy.h
-index af2d3dbf2f7b10ed96be949aca2729ad41c29328..c8b2df9a5d6e30bb678b6049decaa466b29780d2 100644
---- a/src/util/SleepWakePolicy.h
-+++ b/src/util/SleepWakePolicy.h
-@@ -12,14 +12,6 @@ enum class Resume : uint8_t {
-   SplashlessWake,
- };
-
--constexpr bool hasValidSavedFrame(const bool exists, const size_t actualSize, const size_t expectedSize) {
--  return exists && actualSize == expectedSize;
--}
--
--// A UC8279 X3 can skip its initial resync only after a saved Quick Resume frame
--// has been verified. Other resume paths retain their existing behavior.
--constexpr bool shouldInitializeSeamlessly(const Resume resume, const bool isUc8279X3, const bool hasValidFrame) {
--  return resume != Resume::Splash && !(resume == Resume::SplashlessWake && isUc8279X3 && !hasValidFrame);
--}
-+constexpr bool shouldInitializeSeamlessly(const Resume resume) { return resume != Resume::Splash; }
-
- }  // namespace SleepWakePolicy
-diff --git a/test/sleep_wake_policy/SleepWakePolicyTest.cpp b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
-index 027d0179a3b9880b500f5506c0522f81c5c04abd..c9f8e26f1829e0d447bdcd339b6b84bc31408269 100644
---- a/test/sleep_wake_policy/SleepWakePolicyTest.cpp
-+++ b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
-@@ -2,40 +2,12 @@
-
- #include "SleepWakePolicy.h"
-
--namespace {
--constexpr size_t kExpectedFrameBytes = 52272;
-+TEST(SleepWakePolicy, X4ProColdBootUsesNormalInitialization) {
-+  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash));
- }
-
--TEST(SleepWakePolicy, Uc8279X3OrdinaryWakeWithoutFrameIsNotSeamless) {
--  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
--                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/false));
--}
--
--TEST(SleepWakePolicy, Uc8279X3QuickResumeWithValidFrameIsSeamless) {
--  const bool validFrame =
--      SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes, kExpectedFrameBytes);
--  EXPECT_TRUE(validFrame);
--  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
--                                                          /*isUc8279X3=*/true, validFrame));
--}
--
--TEST(SleepWakePolicy, ColdBootIsNotSeamless) {
--  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash,
--                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/true));
--}
--
--TEST(SleepWakePolicy, SilentRestartRetainsExistingSeamlessBehavior) {
--  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent,
--                                                          /*isUc8279X3=*/true, /*hasValidFrame=*/false));
--}
--
--TEST(SleepWakePolicy, OtherProfilesRetainExistingSplashlessBehavior) {
--  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
--                                                          /*isUc8279X3=*/false, /*hasValidFrame=*/false));
--}
--
--TEST(SleepWakePolicy, MissingOrWrongSizedFrameIsInvalid) {
--  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/false, kExpectedFrameBytes, kExpectedFrameBytes));
--  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes - 1, kExpectedFrameBytes));
--  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes + 1, kExpectedFrameBytes));
-+TEST(SleepWakePolicy, X4ProResumePathsUseSeamlessInitialization) {
-+  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent));
-+  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Network));
-+  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake));
- }
 diff --git a/scripts/patch_animatedgif.py b/scripts/patch_animatedgif.py
 index ab1dd67880e7b0bc9aad1642234f7c2c543da1a8..c440a294fd4ca1c97804199c6905e457e92cfa6f 100644
 --- a/scripts/patch_animatedgif.py
@@ -1074,7 +1003,7 @@ index c98b7b42021f08c5147b7e4c8f3e740bad65b4f8..685171a5dc5a87e104c1913d26c893a5
 
  void SleepActivity::renderBlankSleepScreen() const {
 diff --git a/src/main.cpp b/src/main.cpp
-index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c6ee23085 100644
+index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010cdbe36d52 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1142,41 +1142,6 @@ static bool loadSleepFrameBuffer() {
@@ -1119,7 +1048,17 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
  // Wake validation runs before the SD card and its settings file are available.
  // Mirror the one setting that changes its behavior while entering sleep, so a
  // permitted short wake press can pass verification even after the button has
-@@ -1629,17 +1594,10 @@ void setup() {
+@@ -1590,7 +1555,8 @@ void setup() {
+
+   const auto wakeupReason = usbSleepWake ? HalGPIO::WakeupReason::PowerButton : gpio.getWakeupReason();
+ #ifndef SIMULATOR
+-  const bool shortPressWakes = readWakeShortPressFromNvs();
++  const bool shortPressWakes =
++      SleepWakePolicy::acceptsReleasedPowerWake(BoardConfig::isX4Pro(), readWakeShortPressFromNvs());
+   if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !usbSleepWake &&
+       !(FREEINK_DEVICE_PICCO && gpio.isUsbConnected()) &&
+       !gpio.verifyPowerButtonWakeup(shortPressWakes, CrossPointSettings::POWER_BUTTON_LONG_PRESS_MS)) {
+@@ -1629,17 +1595,10 @@ void setup() {
  #endif
    trustedtime::init();
 
@@ -1137,7 +1076,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
  #endif
 
    LOG_INF("BOOT", "Wake route: %s", wakeupRouteName(wakeupReason));
-@@ -1837,20 +1795,14 @@ void setup() {
+@@ -1837,20 +1796,14 @@ void setup() {
                              : isSilentReboot   ? BootResume::Silent
                              : skipSplashOnWake ? BootResume::SplashlessWake
                                                 : BootResume::Splash;
@@ -1160,7 +1099,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
                         resume != BootResume::Network, useReaderRenderStack);
    logBootHeap("display and font resolver ready");
 
-@@ -1882,32 +1834,9 @@ void setup() {
+@@ -1882,32 +1835,9 @@ void setup() {
            x3WakeNeedsRefresh = false;
          }
  #ifndef SIMULATOR
@@ -1195,7 +1134,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
        }
        break;
      case BootResume::Splash:
-@@ -2047,17 +1976,13 @@ void setup() {
+@@ -2047,17 +1977,13 @@ void setup() {
      // target == home (or reader with no open book): land on home — don't fall
      // through to the sleep-wake "resume reader" logic, which fires on stale
      // openEpubPath + lastSleepFromReader from a prior session.
@@ -1215,7 +1154,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
                                       ? HalDisplay::HALF_REFRESH
                                       : HalDisplay::FAST_REFRESH;
      activityManager.goHome(HomeMenuItem::NONE, homeRefreshMode);
-@@ -2133,6 +2058,23 @@ static void idleDisplayWhileAwake() {
+@@ -2133,6 +2059,23 @@ static void idleDisplayWhileAwake() {
  #endif
  }
 
@@ -1239,7 +1178,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
  void loop() {
    static unsigned long maxLoopDuration = 0;
    const unsigned long loopStartTime = millis();
-@@ -2213,11 +2155,40 @@ void loop() {
+@@ -2213,11 +2156,40 @@ void loop() {
      logSerial.printf("SCREENSHOT_END\n");
    }
 
@@ -1282,7 +1221,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
  #endif
  #if FREEINK_DEVICE_PICCO
                                   || slideSwitchChanged
-@@ -2227,7 +2198,7 @@ void loop() {
+@@ -2227,7 +2199,7 @@ void loop() {
    idleDisplayWhileAwake();
 
    // Check for any user activity (button press or release) or active background work
@@ -1291,7 +1230,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
    const bool transitionWasAborted = storageTransitionAborted.exchange(false, std::memory_order_relaxed);
    if (userInputReceived || activityManager.preventAutoSleep() || transitionWasAborted ||
        usbResult == UsbSerialFileTransfer::ProcessResult::SyncActivity) {
-@@ -2246,6 +2217,17 @@ void loop() {
+@@ -2246,6 +2218,17 @@ void loop() {
      return;
    }
 
@@ -1309,7 +1248,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
    const bool modalOwnsInput = activityManager.blocksGlobalInput();
 
    // Keep Power + Down screenshot-only. The configurable chord below uses Up,
-@@ -2336,7 +2318,6 @@ void loop() {
+@@ -2336,7 +2319,6 @@ void loop() {
        lastActivityTime = millis();
        return;
      }
@@ -1317,7 +1256,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
      if (sleepTimeoutMs > 0 && buttonShortcutController.shouldQuickLockSleep(millis(), sleepTimeoutMs)) {
        LOG_DBG("SLP", "Quick Lock timeout triggered after %lu ms", sleepTimeoutMs);
        APP_STATE.quickLockResumePending = true;
-@@ -2349,6 +2330,12 @@ void loop() {
+@@ -2349,6 +2331,12 @@ void loop() {
        lastActivityTime = millis();
      }
      mappedInputManager.clearInjectedReleases();
@@ -1330,7 +1269,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
      return;
    }
 
-@@ -2371,17 +2358,6 @@ void loop() {
+@@ -2371,17 +2359,6 @@ void loop() {
      return;
    }
 
@@ -1348,6 +1287,88 @@ index ffea86789aada98071fa6e56fe3508335d78575f..c986133e796afd70d4929e930b15f72c
    // Do not feed the wake gesture into getPowerButtonAction(). In particular,
    // the release edge can otherwise run the configured short/long Power action
    // in the same loop that arms the post-wake guard.
+diff --git a/src/util/SleepWakePolicy.h b/src/util/SleepWakePolicy.h
+index af2d3dbf2f7b10ed96be949aca2729ad41c29328..7d0dbb534cc72550931e68cdff67dd4ae6532189 100644
+--- a/src/util/SleepWakePolicy.h
++++ b/src/util/SleepWakePolicy.h
+@@ -12,14 +12,13 @@ enum class Resume : uint8_t {
+   SplashlessWake,
+ };
+
+-constexpr bool hasValidSavedFrame(const bool exists, const size_t actualSize, const size_t expectedSize) {
+-  return exists && actualSize == expectedSize;
++// A dedicated X4 Pro power-button wake is already authenticated by the GPIO
++// wake source. The awake short-press shortcut must not require a second hold
++// after SD/display initialization, by which time the user may have released it.
++constexpr bool acceptsReleasedPowerWake(bool isX4Pro, bool shortPressConfigured) {
++  return isX4Pro || shortPressConfigured;
+ }
+
+-// A UC8279 X3 can skip its initial resync only after a saved Quick Resume frame
+-// has been verified. Other resume paths retain their existing behavior.
+-constexpr bool shouldInitializeSeamlessly(const Resume resume, const bool isUc8279X3, const bool hasValidFrame) {
+-  return resume != Resume::Splash && !(resume == Resume::SplashlessWake && isUc8279X3 && !hasValidFrame);
+-}
++constexpr bool shouldInitializeSeamlessly(const Resume resume) { return resume != Resume::Splash; }
+
+ }  // namespace SleepWakePolicy
+diff --git a/test/sleep_wake_policy/SleepWakePolicyTest.cpp b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
+index 027d0179a3b9880b500f5506c0522f81c5c04abd..2390b5e1f5abfc8276f666d1339ab86452b63c53 100644
+--- a/test/sleep_wake_policy/SleepWakePolicyTest.cpp
++++ b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
+@@ -2,40 +2,22 @@
+
+ #include "SleepWakePolicy.h"
+
+-namespace {
+-constexpr size_t kExpectedFrameBytes = 52272;
++TEST(SleepWakePolicy, X4ProColdBootUsesNormalInitialization) {
++  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash));
+ }
+
+-TEST(SleepWakePolicy, Uc8279X3OrdinaryWakeWithoutFrameIsNotSeamless) {
+-  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/false));
++TEST(SleepWakePolicy, X4ProResumePathsUseSeamlessInitialization) {
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent));
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Network));
++  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake));
+ }
+
+-TEST(SleepWakePolicy, Uc8279X3QuickResumeWithValidFrameIsSeamless) {
+-  const bool validFrame =
+-      SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes, kExpectedFrameBytes);
+-  EXPECT_TRUE(validFrame);
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                          /*isUc8279X3=*/true, validFrame));
++TEST(SleepWakePolicy, ReleasedX4ProPowerWakeDoesNotDependOnAwakeShortcut) {
++  EXPECT_TRUE(SleepWakePolicy::acceptsReleasedPowerWake(true, false));
++  EXPECT_TRUE(SleepWakePolicy::acceptsReleasedPowerWake(true, true));
+ }
+
+-TEST(SleepWakePolicy, ColdBootIsNotSeamless) {
+-  EXPECT_FALSE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Splash,
+-                                                           /*isUc8279X3=*/true, /*hasValidFrame=*/true));
+-}
+-
+-TEST(SleepWakePolicy, SilentRestartRetainsExistingSeamlessBehavior) {
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::Silent,
+-                                                          /*isUc8279X3=*/true, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, OtherProfilesRetainExistingSplashlessBehavior) {
+-  EXPECT_TRUE(SleepWakePolicy::shouldInitializeSeamlessly(SleepWakePolicy::Resume::SplashlessWake,
+-                                                          /*isUc8279X3=*/false, /*hasValidFrame=*/false));
+-}
+-
+-TEST(SleepWakePolicy, MissingOrWrongSizedFrameIsInvalid) {
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/false, kExpectedFrameBytes, kExpectedFrameBytes));
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes - 1, kExpectedFrameBytes));
+-  EXPECT_FALSE(SleepWakePolicy::hasValidSavedFrame(/*exists=*/true, kExpectedFrameBytes + 1, kExpectedFrameBytes));
++TEST(SleepWakePolicy, OtherBoardsKeepConfiguredHoldPolicy) {
++  EXPECT_FALSE(SleepWakePolicy::acceptsReleasedPowerWake(false, false));
++  EXPECT_TRUE(SleepWakePolicy::acceptsReleasedPowerWake(false, true));
+ }
 diff --git a/test/test_patch_animatedgif.py b/test/test_patch_animatedgif.py
 index d480d1dea26b1c193d6ce53ba84676fd0b0e5252..f555bf165e4eb30d5b463d8960a3de8fa06dc9d0 100644
 --- a/test/test_patch_animatedgif.py

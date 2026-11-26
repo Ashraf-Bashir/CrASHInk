@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 61 selected native regression checks have been
+The X4 Pro firmware build and 67 selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -38,6 +38,11 @@ check after installation.
   while off-screen prefetch waits until filtering finishes. Background refresh
   reuses folder checkpoints and repaints progress only when the phase or percent
   changes. Saved view caches remain reusable on later opens.
+- Library and EPUB generation share versioned thumbnail filenames; valid cached
+  covers recover from transient paint failures without another conversion.
+- A short Power press wakes X4 Pro even when released during initialization,
+  independently of the awake short-press shortcut setting. Wake-release guards
+  still prevent the same gesture from immediately putting it back to sleep.
 - Add a native Plugins entry to the launcher. Seven apps can be held and dragged
   across nine slots, swapping occupied slots or using empty ones. Save the small
   arrangement file under `/.crashink/.launcher.bin` with checksum and backup
