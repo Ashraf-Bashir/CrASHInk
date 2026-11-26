@@ -1,8 +1,17 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 344da6d220d0c87e5588ffa9549d5ea454786dc1..3a3e3cd82d3f0a500a656b2c94af309b5e105a14 100644
+index 8776d0eca63f5db48547d8c2cae086f18f1842d1..faf6c41700ca2081d0a11588b5672cd7bbf4635d 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -116,6 +116,8 @@
+@@ -61,6 +61,8 @@
+
+ ### Fixed
+
++- Group reader image display, monochrome, contrast, transparency and inversion controls under Images.
++
+ - Group Readest account controls and auto-sync together under Readest in System settings.
+
+ - Keep text smoothing outside Red/Blue highlight ribbons while preserving reversed ink inside their exact contours.
+@@ -124,6 +126,8 @@
 
  - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
 
@@ -527,7 +536,7 @@ index 8635e6813b1af76c09ddc1d8e0a8de9e17d9c4cf..d9b2c2a8231cd306b69671bebd7f9719
    uint8_t longPressMenuAction = LONG_MENU_OFF;
    // Long-press Back quick action in reader (defaults to the historical file browser shortcut)
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index 7a40ee5a6ff05f8f7660ea514eded776beffa879..0d929dda21d6a5569ec65ab8791de027d785a8d3 100644
+index ccd9fdeef67bae81f5e67b87484b7c5739fe4557..9a2680d291f8725e7b145a25b99d3e457ce7cc88 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
 @@ -836,7 +836,7 @@ inline void addSettingByName(std::vector<SettingInfo>& target, const std::vector
@@ -539,18 +548,33 @@ index 7a40ee5a6ff05f8f7660ea514eded776beffa879..0d929dda21d6a5569ec65ab8791de027
    readerSettings.push_back(SettingInfo::Submenu(StrId::STR_READER_FONT_OPTIONS, SettingAction::ReaderFontOptions));
    readerSettings.push_back(SettingInfo::Submenu(StrId::STR_READER_PAGE_LAYOUT, SettingAction::ReaderPageLayout));
    readerSettings.push_back(SettingInfo::Action(StrId::STR_STATUS_BARS, SettingAction::CustomiseStatusBar));
-@@ -845,6 +845,11 @@ inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<
+@@ -844,7 +844,9 @@ inline std::vector<SettingInfo> buildReaderSettingsParentList(const std::vector<
+   addSettingByName(readerSettings, allSettings, StrId::STR_DISABLE_TOUCHSCREEN);
    addSettingByName(readerSettings, allSettings, StrId::STR_EMBEDDED_STYLE);
    addSettingByName(readerSettings, allSettings, StrId::STR_HIGHLIGHT_COLOR);
-   addSettingByName(readerSettings, allSettings, StrId::STR_IMAGES);
-+  addSettingByName(readerSettings, allSettings, StrId::STR_IMAGE_CONTRAST);
-+  addSettingByName(readerSettings, allSettings, StrId::STR_TRANSPARENT_IMAGE_BACKGROUND);
-+  addSettingByName(readerSettings, allSettings, StrId::STR_INVERT_IMAGES_DARK);
+-  addSettingByName(readerSettings, allSettings, StrId::STR_IMAGES);
++  readerSettings.push_back(SettingInfo::Submenu(StrId::STR_IMAGES, SettingAction::ReaderImages));
 +  addSettingByName(readerSettings, allSettings, StrId::STR_FOCUS_READING);
 +  addSettingByName(readerSettings, allSettings, StrId::STR_GUIDE_READING);
    addSettingByName(readerSettings, allSettings, StrId::STR_DICTIONARY);
    addSettingByName(readerSettings, allSettings, StrId::STR_INDEXING_METHOD);
    return readerSettings;
+@@ -862,6 +864,15 @@ inline std::vector<SettingInfo> buildBookReaderSettingsParentList(const std::vec
+   return settings;
+ }
+
++inline std::vector<SettingInfo> buildReaderImageSettingsList(const std::vector<SettingInfo>& allSettings) {
++  std::vector<SettingInfo> settings;
++  settings.reserve(5);
++  for (const auto name : {StrId::STR_IMAGES, StrId::STR_MONOCHROME_IMAGES, StrId::STR_IMAGE_CONTRAST,
++                          StrId::STR_TRANSPARENT_IMAGE_BACKGROUND, StrId::STR_INVERT_IMAGES_DARK})
++    addSettingByName(settings, allSettings, name);
++  return settings;
++}
++
+ inline std::vector<SettingInfo> buildReaderFontSettingsList(const std::vector<SettingInfo>& allSettings) {
+   std::vector<SettingInfo> settings;
+   settings.reserve(16);
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
 index c2d6ff49f12f2b5ca7f779b36cbe0ab1af23930e..b30c5f0e8de1318a15d93f09705b6d150a368c54 100644
 --- a/src/activities/ActivityManager.cpp
@@ -677,10 +701,10 @@ index c6aedd6b6b85caea313f32df8847070544cd1fcd..6093e0f7c183a65243265e5dbf1ac2b9
    ReaderRuling::drawSelectionPage(renderer, *page, fontId, marginLeft, marginTop);
    page->renderImages(renderer, fontId, marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
-index 651dcae6efa2bd90f49e8c7cb9e8a21976e45c8e..38f858184fcd43bba0ceab7155453d85b840989b 100644
+index 2aa26db5fdf83755ccccd0adae12f7998886aed8..872eb98e26e5b80ff773ccf7be14edc4c6f4ef2d 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
-@@ -237,7 +237,8 @@ std::string formatSettingValue(const SettingInfo& setting) {
+@@ -236,7 +236,8 @@ std::string formatSettingValue(const SettingInfo& setting) {
               static_cast<unsigned int>(SETTINGS.*(setting.valuePtr)));
      return valueBuffer;
    }
@@ -690,7 +714,34 @@ index 651dcae6efa2bd90f49e8c7cb9e8a21976e45c8e..38f858184fcd43bba0ceab7155453d85
      return std::to_string(SETTINGS.*(setting.valuePtr)) + "%";
    }
    if (setting.valuePtr == &CrossPointSettings::readingIdleTimeThresholdUnits) {
-@@ -1432,6 +1433,23 @@ void SettingsActivity::toggleCurrentSetting() {
+@@ -365,6 +366,7 @@ void SettingsActivity::rebuildSettingsLists() {
+   displayFrontlightSettings = buildDisplayFrontlightSettingsList(allSettings);
+   readerSettings = buildReaderSettingsParentList(allSettings);
+   readerFontSettings = buildReaderFontSettingsList(allSettings);
++  readerImageSettings = buildReaderImageSettingsList(allSettings);
+ #if CROSSINK_SCALABLE_FONTS
+   if (needsFonts && sdFontSystem.isScalableFamily(SETTINGS.sdFontFamilyName)) {
+     const auto fontSize =
+@@ -447,6 +449,9 @@ void SettingsActivity::setCurrentSettingsForCategory() {
+         case SettingAction::ReaderFontOptions:
+           currentSettings = &readerFontSettings;
+           break;
++        case SettingAction::ReaderImages:
++          currentSettings = &readerImageSettings;
++          break;
+         case SettingAction::ReaderPageLayout:
+           currentSettings = &readerPageLayoutSettings;
+           break;
+@@ -528,6 +533,8 @@ StrId SettingsActivity::activeSubmenuTitleId() const {
+       return StrId::STR_FRONTLIGHT;
+     case SettingAction::ReaderFontOptions:
+       return StrId::STR_READER_FONT_OPTIONS;
++    case SettingAction::ReaderImages:
++      return StrId::STR_IMAGES;
+     case SettingAction::ReaderPageLayout:
+       return StrId::STR_READER_PAGE_LAYOUT;
+     case SettingAction::ScreenMargin:
+@@ -1431,6 +1438,23 @@ void SettingsActivity::toggleCurrentSetting() {
      openFrontlightScheduleTimePicker(setting.value16Ptr, setting.nameId);
      return;
    }
@@ -714,6 +765,14 @@ index 651dcae6efa2bd90f49e8c7cb9e8a21976e45c8e..38f858184fcd43bba0ceab7155453d85
    if (setting.valuePtr == &CrossPointSettings::lineHeightPercent) {
      openLineHeightPicker();
      return;
+@@ -1681,6 +1705,7 @@ void SettingsActivity::toggleCurrentSetting() {
+         startActivityForResult(std::make_unique<StatusIconsActivity>(renderer, mappedInput), resultHandler);
+         break;
+       case SettingAction::ReaderFontOptions:
++      case SettingAction::ReaderImages:
+       case SettingAction::ReaderPageLayout:
+       case SettingAction::ScreenMargin:
+       case SettingAction::ControlsPowerButton:
 diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
 index 26e3be6e80ec2868073488f88e326355b6ca98ab..2d548672cf3cae4fd193e647335eb63a4c571b84 100644
 --- a/test/CMakeLists.txt
@@ -1750,3 +1809,23 @@ index 3ab602b17819b3f82543667f066996f825b3e0b1..54c3c363ed6b36064ba384b92e2c1a3b
    uint8_t focusReadingEnabled = 0;
    uint8_t guideReadingEnabled = 0;
    uint8_t hyphenationEnabled = 0;
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index a82a0ab32e0063f0099160adcd2d5c6139bd1398..693d570efcd87b7c64be61e86ff136e840ad7820 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -33,6 +33,7 @@ enum class SettingAction {
+   DisplaySleepScreen,
+   DisplayFrontlight,
+   ReaderFontOptions,
++  ReaderImages,
+   ReaderPageLayout,
+   ScreenMargin,
+   QuickActions,
+@@ -268,6 +269,7 @@ class SettingsActivity final : public Activity {
+   std::vector<SettingInfo> displayFrontlightSettings;
+   std::vector<SettingInfo> readerSettings;
+   std::vector<SettingInfo> readerFontSettings;
++  std::vector<SettingInfo> readerImageSettings;
+   std::vector<SettingInfo> readerPageLayoutSettings;
+   std::vector<SettingInfo> readerScreenMarginSettings;
+   std::vector<SettingInfo> controlsSettings;

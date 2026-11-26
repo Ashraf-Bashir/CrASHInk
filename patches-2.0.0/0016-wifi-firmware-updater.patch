@@ -16,19 +16,19 @@ index bf983666d8bd9483cf9985938aa57d06096f5d72..deb48dfc2380d20e666e4aff88c10273
  STR_NO_BIN_FILES: "No .bin files found"
  STR_VALIDATING_FIRMWARE: "Validating firmware..."
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index 5a5427e7f4bf1f18401db93388720d3bac98acb5..45a465e723d206d2faef1e687c9effd67626ee16 100644
+index 186551ec9c986b7d22bc99e131e8caa3f0ebef51..0e02bf801d519638a48fc50ff570c38e5a2bd93b 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
-@@ -1152,6 +1152,9 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+@@ -1154,6 +1154,9 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+   // Picco retains the vendor recovery slot and has no spare application slot.
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
++#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
++  systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_FIRMWARE_UPDATE, SettingAction::ReceiveFirmwareUpdate));
++#endif
  #endif
    systemSettings.push_back(SettingInfo::Action(StrId::STR_RELEASE_NOTES, SettingAction::ReleaseNotes));
    systemSettings.push_back(SettingInfo::Action(StrId::STR_ABOUT, SettingAction::About));
-+#if !defined(SIMULATOR) && FREEINK_DEVICE_X4PRO
-+  systemSettings.push_back(SettingInfo::Action(StrId::STR_RECEIVE_UPDATES, SettingAction::ReceiveFirmwareUpdate));
-+#endif
-   return systemSettings;
- }
-
 diff --git a/src/activities/network/NetworkModeSelectionActivity.cpp b/src/activities/network/NetworkModeSelectionActivity.cpp
 index a7902e55018856eaca1769191822d5300f3557c9..140bd82f3d25137cab84c487142acd4dfa80dadd 100644
 --- a/src/activities/network/NetworkModeSelectionActivity.cpp
@@ -125,18 +125,18 @@ index 0000000000000000000000000000000000000000..de4d7bea9c0125df5e14fe151f8ca02d
 +  void install();
 +};
 diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
-index 467bd135c3b54ffc00f44f51c1ff3e84d10c0d9a..84128f43b9c89b208e986d9c560892f209dcd662 100644
+index a73cd73ea4f9cf409704cc7534269f32fe256743..c718e2eb3db3b231628894490aa1352e4ad7afc1 100644
 --- a/src/activities/settings/SettingsActivity.cpp
 +++ b/src/activities/settings/SettingsActivity.cpp
-@@ -47,6 +47,7 @@
- #include "readest/ReadestStore.h"
+@@ -46,6 +46,7 @@
+ #include "ReadestSettingsActivity.h"
  #include "SdCardFontSystem.h"
  #include "SdFirmwareUpdateActivity.h"
 +#include "ReceiveFirmwareActivity.h"
  #include "SettingsList.h"
  #include "SilentRestart.h"
  #include "StatusBarSettingsActivity.h"
-@@ -1670,6 +1671,9 @@ void SettingsActivity::toggleCurrentSetting() {
+@@ -1660,6 +1661,9 @@ void SettingsActivity::toggleCurrentSetting() {
        case SettingAction::SdFirmwareUpdate:
          startActivityForResult(std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInput), resultHandler);
          break;
@@ -439,17 +439,25 @@ index 0000000000000000000000000000000000000000..6287bc243f741d8cec70e6bc1977bce5
 + assert(remainingListenSeconds(UINT32_MAX-499,500)==299);
 +}
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index d63ca9ba98689d5b6dd75c4195b2cb57fb1f70b0..c5bc57253f4c19aa148bf19d46fd58610c389ea6 100644
+index 8a0b3bc89efd3b372e07a7a0308c766aaeb565f9..f4639e3c3c753f3994b1b0ecd1abb7953242561d 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -857,3 +857,4 @@
+@@ -5,6 +5,7 @@
+ - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
+ - Group Readest account controls and auto-sync together under Readest in System settings.
+ - Group reader image display, monochrome, contrast, transparency and inversion controls under Images.
++- Name the Wi-Fi firmware receiver clearly and place it immediately after the SD firmware update entry.
+
+ - Keep text smoothing outside Red/Blue highlight ribbons while preserving reversed ink inside their exact contours.
+ - Restore Library Sync Book actions and return to the selected page, sort and search after syncing.
+@@ -861,3 +862,4 @@
  - Keep highlight drags attached through brief contact gaps and between words/lines; defer idle SD preparation during page swipes.
  - Keep chapter headings bold, including normal-weight publisher spans, and use bold chapter labels in navigation.
  - Use Yellow, Green, Red, and Blue highlights with evenly stepped grayscale swatches, named filters, matching Readest colors, and stable saved IDs. Removed Orange highlights and defaults map to Yellow; Red retains contrasting text.
 +- Update receiving and installation progress repaint without repeatedly flashing the whole screen black.
 diff --git a/src/activities/settings/ReceiveFirmwareActivity.cpp b/src/activities/settings/ReceiveFirmwareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c70955baeeabf97ffc871c7bcada5769f78c94a3
+index 0000000000000000000000000000000000000000..574819d231d75bae99103cd4f858ca0a282818f9
 --- /dev/null
 +++ b/src/activities/settings/ReceiveFirmwareActivity.cpp
 @@ -0,0 +1,143 @@
@@ -561,7 +569,7 @@ index 0000000000000000000000000000000000000000..c70955baeeabf97ffc871c7bcada5769
 +  const Rect header{0, metrics.topPadding, renderer.getScreenWidth(),
 +                    TouchHeaderBackButton::height(metrics, mappedInput)};
 +  renderer.clearScreen();
-+  TouchHeaderBackButton::draw(renderer, header, tr(STR_RECEIVE_UPDATES), false);
++  TouchHeaderBackButton::draw(renderer, header, tr(STR_WIFI_FIRMWARE_UPDATE), false);
 +  const auto y = renderer.getScreenHeight() / 2;
 +  switch (state) {
 +    case State::Connecting:

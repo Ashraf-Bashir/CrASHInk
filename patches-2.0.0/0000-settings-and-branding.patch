@@ -1048,3 +1048,146 @@ index df4692aeda31cffb3014821b4c7b2e3beec1c6a9..953c5b811718db93a88e59c2b28e9b47
 
  namespace board_tag {
 
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 3c2770aef49f97229ced199bd8bfe5f0cd63a1b8..103f638c3f3538de485b0e11b447e2f5998a2491 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -37,6 +37,7 @@ target_compile_options(crosspoint_test_common INTERFACE
+ )
+
+ enable_testing()
++add_subdirectory(settings_menus)
+ include(GoogleTest)
+
+ add_subdirectory(streaming_json_parser)
+diff --git a/test/settings_menus/CMakeLists.txt b/test/settings_menus/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..364121911cce7b758031a36eab1178e1d7b44c19
+--- /dev/null
++++ b/test/settings_menus/CMakeLists.txt
+@@ -0,0 +1,13 @@
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(MENU_INCLUDES ${CMAKE_CURRENT_BINARY_DIR}/SettingsActions.inc ${CMAKE_CURRENT_BINARY_DIR}/Menus.inc
++ ${CMAKE_CURRENT_BINARY_DIR}/SettingsFooter.inc ${CMAKE_CURRENT_BINARY_DIR}/ReadestRows.inc ${CMAKE_CURRENT_BINARY_DIR}/ReadestSelection.inc)
++add_custom_command(OUTPUT ${MENU_INCLUDES}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractMenus.py ${REPO_ROOT} ${CMAKE_CURRENT_BINARY_DIR}
++ DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ExtractMenus.py ${REPO_ROOT}/src/SettingsList.h
++ ${REPO_ROOT}/src/activities/settings/SettingsActivity.h ${REPO_ROOT}/src/activities/settings/SettingsActivity.cpp
++ ${REPO_ROOT}/src/activities/settings/ReadestSettingsActivity.cpp VERBATIM)
++add_executable(settings_menus_test SettingsMenusTest.cpp ${MENU_INCLUDES})
++target_include_directories(settings_menus_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/lib/I18n)
++target_compile_features(settings_menus_test PRIVATE cxx_std_20)
++target_compile_options(settings_menus_test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
++add_test(NAME settings_menus COMMAND settings_menus_test)
+diff --git a/test/settings_menus/ExtractMenus.py b/test/settings_menus/ExtractMenus.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e33e4ba16ecc4e9a92456ad62877acd9480ece9d
+--- /dev/null
++++ b/test/settings_menus/ExtractMenus.py
+@@ -0,0 +1,22 @@
++from pathlib import Path
++import sys
++root,out=map(Path,sys.argv[1:])
++def function(text,signature):
++ a=text.index(signature);b=text.index('\n}',a)+2
++ return text[a:b]
++text=(root/'src/SettingsList.h').read_text()
++methods=['inline void addSettingByName(', 'inline std::vector<SettingInfo> buildReaderSettingsParentList(',
++ 'inline std::vector<SettingInfo> buildBookReaderSettingsParentList(', 'inline std::vector<SettingInfo> buildReaderImageSettingsList(',
++ 'inline std::vector<SettingInfo> buildSystemSettingsParentList(']
++header=(root/'src/activities/settings/SettingsActivity.h').read_text()
++a=header.index('enum class SettingAction');b=header.index('\n};',a)+3
++(out/'SettingsActions.inc').write_text(header[a:b])
++(out/'Menus.inc').write_text('\n'.join(function(text,s) for s in methods))
++text=(root/'src/activities/settings/SettingsActivity.cpp').read_text()
++a=text.index('  int top, right, bottom, left;',text.index('void SettingsActivity::buildSettingsScreen'))
++b=text.index('\n\n  if (isFileBrowserView())',a)
++(out/'SettingsFooter.inc').write_text(text[a:b])
++text=(root/'src/activities/settings/ReadestSettingsActivity.cpp').read_text()
++a=text.index('constexpr int MENU_ITEMS');b=text.index('constexpr fui::ActionId',a)
++(out/'ReadestRows.inc').write_text(text[a:b])
++(out/'ReadestSelection.inc').write_text(function(text,'void ReadestSettingsActivity::handleSelection()'))
+diff --git a/test/settings_menus/SettingsMenusTest.cpp b/test/settings_menus/SettingsMenusTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c30b077bf807c8b2dc372382d1c25ea92293106
+--- /dev/null
++++ b/test/settings_menus/SettingsMenusTest.cpp
+@@ -0,0 +1,78 @@
++#include <algorithm>
++#include <cassert>
++#include <string>
++#include <vector>
++#include "I18nKeys.h"
++#define FREEINK_DEVICE_X4PRO 1
++#define FREEINK_DEVICE_PICCO 0
++#include "SettingsActions.inc"
++enum class SettingType {ENUM,ACTION,SUBMENU,TOGGLE};
++struct SettingInfo {
++ StrId nameId;SettingType type=SettingType::ENUM;SettingAction action=SettingAction::None;
++ static SettingInfo Submenu(StrId id,SettingAction action) {return {id,SettingType::SUBMENU,action};}
++ static SettingInfo Action(StrId id,SettingAction action) {return {id,SettingType::ACTION,action};}
++};
++#include "Menus.inc"
++namespace AppNavigation {constexpr int Height=54;enum class View {None,Settings};}
++namespace UITheme {int getButtonHintsReserve(int){return 24;}}
++namespace fui {struct Insets {int16_t top,right,bottom,left;};}
++struct Renderer {int edge=0;void getOrientedViewableTRBL(int* t,int* r,int* b,int* l){*t=*r=*l=0;*b=edge;}};
++struct Screen {int reserve=0;};
++void setUiContentMargin(Screen& s,Renderer&,fui::Insets i) {s.reserve=i.bottom;}
++namespace UITheme {int getButtonHintsReserve(const Renderer&){return 24;}}
++struct SettingsViewport {
++ Renderer renderer;AppNavigation::View view=AppNavigation::View::Settings;
++ AppNavigation::View appNavigationView()const{return view;}
++ void build(Screen& screen) {int tabTop=40;
++#include "SettingsFooter.inc"
++ }
++};
++#include "ReadestRows.inc"
++struct Settings {uint8_t readestAutoSync=0;bool saves=true;bool saveToFile(){return saves;}} settings;
++#define SETTINGS settings
++struct Store {bool credentials=false;bool hasCredentials(){return credentials;}void clear(){credentials=false;}bool saveToFile(){return true;}} store;
++#define READEST_STORE store
++namespace ReadestBookMap {void clearAll(){}}
++namespace ReadestCopies {void clearAll(){}}
++#define LOG_ERR(...) ((void)0)
++struct ReadestSettingsActivity {
++ enum class PendingStep {None,Connect};PendingStep pendingStep=PendingStep::None;
++ size_t selectedIndex=0;bool enableAutoSyncAfterCredentials=false;int emails=0,updates=0;
++ void askEmail(){++emails;}void requestUpdate(){++updates;}void handleSelection();
++};
++#include "ReadestSelection.inc"
++int main() {
++ std::vector<SettingInfo> all;
++ for(auto id:{StrId::STR_IMAGES,StrId::STR_IMAGE_CONTRAST,StrId::STR_INVERT_IMAGES_DARK,
++ StrId::STR_MONOCHROME_IMAGES,StrId::STR_TRANSPARENT_IMAGE_BACKGROUND,StrId::STR_READEST_AUTO_SYNC}) all.push_back({id});
++ const auto reader=buildReaderSettingsParentList(all);
++ assert(std::count_if(reader.begin(),reader.end(),[](auto v){return v.nameId==StrId::STR_IMAGES && v.type==SettingType::SUBMENU && v.action==SettingAction::ReaderImages;})==1);
++ for(auto s:reader) assert(s.nameId!=StrId::STR_IMAGE_CONTRAST && s.nameId!=StrId::STR_INVERT_IMAGES_DARK && s.nameId!=StrId::STR_MONOCHROME_IMAGES && s.nameId!=StrId::STR_TRANSPARENT_IMAGE_BACKGROUND);
++ const auto images=buildReaderImageSettingsList(all);assert(images.size()==5);
++ assert(images[0].nameId==StrId::STR_IMAGES && images[0].type==SettingType::ENUM);
++ const auto book=buildBookReaderSettingsParentList(all);assert(std::count_if(book.begin(),book.end(),[](auto v){return v.action==SettingAction::ReaderImages;})==1);
++ const auto system=buildSystemSettingsParentList(all);
++ size_t sd=system.size(),wifi=system.size();int readest=0;
++ for(size_t i=0;i<system.size();++i) {
++  assert(system[i].nameId!=StrId::STR_READEST_AUTO_SYNC);
++  if(system[i].nameId==StrId::STR_READEST)++readest;
++  if(system[i].action==SettingAction::SdFirmwareUpdate)sd=i;
++  if(system[i].action==SettingAction::ReceiveFirmwareUpdate){wifi=i;assert(system[i].nameId==StrId::STR_WIFI_FIRMWARE_UPDATE);}
++ }
++ assert(readest==1 && wifi==sd+1 && wifi<system.size());
++ for(int edge:{0,1,8,16}) {
++  SettingsViewport viewport;viewport.renderer.edge=edge;Screen screen;viewport.build(screen);
++  assert(screen.reserve==edge+AppNavigation::Height);
++  const int height=800,bodyTop=120,rowHeight=50,rows=(height-bodyTop-screen.reserve)/rowHeight;
++  assert(bodyTop+rows*rowHeight<=height-edge-AppNavigation::Height);
++  viewport.view=AppNavigation::View::None;viewport.build(screen);assert(screen.reserve==24);
++ }
++ ReadestSettingsActivity readestMenu;readestMenu.selectedIndex=ROW_AUTO_SYNC;
++ assert(MENU_ITEMS==5 && menuNames[ROW_AUTO_SYNC]==StrId::STR_READEST_AUTO_SYNC);
++ readestMenu.handleSelection();assert(readestMenu.emails==1 && readestMenu.enableAutoSyncAfterCredentials && !SETTINGS.readestAutoSync);
++ store.credentials=true;readestMenu.handleSelection();assert(SETTINGS.readestAutoSync);
++ readestMenu.handleSelection();assert(!SETTINGS.readestAutoSync);
++ SETTINGS.saves=false;readestMenu.handleSelection();assert(!SETTINGS.readestAutoSync);
++ SETTINGS.saves=true;SETTINGS.readestAutoSync=1;readestMenu.selectedIndex=ROW_DISCONNECT;
++ readestMenu.handleSelection();assert(!SETTINGS.readestAutoSync && !store.credentials);
++}
