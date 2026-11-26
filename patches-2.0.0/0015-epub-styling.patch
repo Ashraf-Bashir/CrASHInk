@@ -194,3 +194,124 @@ index e4a3633bfbdef5fcd20f8986aacfa1ab1c883093..f348d9c62a19b230e6e6297802a25c9d
  TEST_F(ChapterHtmlSlimParserTest, NumbersOrderedListsAndRestartsNestedCounters) {
    ChapterHtmlSlimParser::startElement(&parser, "ol", nullptr);
    ChapterHtmlSlimParser::startElement(&parser, "li", nullptr);
+diff --git a/docs/file-formats.md b/docs/file-formats.md
+index 8ce817fafdd0306eed5d9762805c9146fc60ef56..5e5bec7b1583d8c4eeadf7322909251d22e0dd5d 100644
+--- a/docs/file-formats.md
++++ b/docs/file-formats.md
+@@ -1190,7 +1190,11 @@ and at their exact dimensions; mismatches fall back to the source EPUB image.
+
+ ## `section.bin`
+
+-### Version 118 (current release)
++### Version 119 (current release)
++
++Complete sections use version 119 and partial sections use `0xE8`. Heading words remain bold even when publisher CSS or nested spans specify normal weight. Bold glyph widths can change wrapping, so both complete and suspended layouts rebuild once; reading progress and clippings are preserved.
++
++### Version 118
+
+ Complete sections use version 118 and partial sections use `0xE7`. Block-styled spans can affect pagination. In the optional per-word font-size byte, bits 0–5 store the point size, bit 6 marks a black background on the preceding space, and bit 7 hides the glyphs while retaining their layout width.
+
+diff --git a/lib/Epub/Epub/Section.cpp b/lib/Epub/Epub/Section.cpp
+index d39ac9fa213f08ada4867bfa215c8a85da6beeb0..d8c62410d74ef27147a4c2046145207298d14ca4 100644
+--- a/lib/Epub/Epub/Section.cpp
++++ b/lib/Epub/Epub/Section.cpp
+@@ -52,11 +52,12 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
+ // v114: Lower ruled text by a pixel while preserving descender clearance.
+ // v115: Center the main letter body between rules independently of descenders.
+ // v118: Block spans affect pagination and word sizes carry inline paint flags.
+-constexpr uint8_t SECTION_FILE_VERSION = 118;
++// v119: Heading words remain bold even under publisher normal-weight overrides.
++constexpr uint8_t SECTION_FILE_VERSION = 119;
+ // Suspended incremental build: valid pages plus LUTs and a parse-watermark trailer.
+ // Change this with layout or payload changes so stale partial pages cannot resume
+ // under a different layout contract.
+-constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xE7;
++constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xE8;
+ constexpr uint32_t HEADER_SIZE =
+     sizeof(bool) + 4 * sizeof(uint32_t) + sizeof(PublisherFonts) + sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_t) +
+     sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(bool) + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint16_t) +
+diff --git a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
+index 61a2fb01e46d0457e34e248dd5286acb323ec7e4..631403eab60b291a90e4586e5b66598d104ded2b 100644
+--- a/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
++++ b/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
+@@ -1131,7 +1131,7 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
+   }
+
+   // Determine font style from depth-based tracking and CSS effective style
+-  const bool isBold = boldUntilDepth < depth || effectiveBold;
++  const bool isBold = headingDepth >= 0 || boldUntilDepth < depth || effectiveBold;
+   const bool isItalic = italicUntilDepth < depth || effectiveItalic;
+   const bool isUnderline = underlineUntilDepth < depth || effectiveUnderline;
+   const bool isStrikethrough = strikethroughUntilDepth < depth || effectiveStrikethrough;
+diff --git a/test/chapter_html_slim_parser/CMakeLists.txt b/test/chapter_html_slim_parser/CMakeLists.txt
+index fc079149e34d6a002ba5a609dd1966a28ffd8753..341c450354f32e4deff7f9f6ad515b308da78df2 100644
+--- a/test/chapter_html_slim_parser/CMakeLists.txt
++++ b/test/chapter_html_slim_parser/CMakeLists.txt
+@@ -19,6 +19,7 @@ target_include_directories(ChapterHtmlSlimParserTest PRIVATE
+   ${REPO_ROOT}/lib/Epub/Epub/css
+   ${REPO_ROOT}/lib/EpdFont
+   ${REPO_ROOT}/lib/Memory
++  ${REPO_ROOT}/lib/GfxRenderer
+   ${REPO_ROOT}/lib/MiniBidi
+   ${REPO_ROOT}/lib/Utf8
+   ${REPO_ROOT}/lib/XmlParserUtils
+@@ -32,3 +33,12 @@ target_link_libraries(ChapterHtmlSlimParserTest PRIVATE
+ )
+
+ gtest_discover_tests(ChapterHtmlSlimParserTest)
++
++# Focused heading check uses the real parser and existing lightweight backends.
++get_target_property(HEADING_SOURCES ChapterHtmlSlimParserTest SOURCES)
++list(REMOVE_ITEM HEADING_SOURCES ChapterHtmlSlimParserTest.cpp)
++add_executable(ChapterHeadingBoldTest ChapterHeadingBoldTest.cpp ${HEADING_SOURCES})
++get_target_property(HEADING_INCLUDES ChapterHtmlSlimParserTest INCLUDE_DIRECTORIES)
++target_include_directories(ChapterHeadingBoldTest PRIVATE ${HEADING_INCLUDES})
++target_link_libraries(ChapterHeadingBoldTest PRIVATE crosspoint_test_common GTest::gtest_main expat)
++gtest_discover_tests(ChapterHeadingBoldTest)
+diff --git a/test/chapter_html_slim_parser/ChapterHeadingBoldTest.cpp b/test/chapter_html_slim_parser/ChapterHeadingBoldTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f35882899240fd20b1f833da8e6a2f793053e70c
+--- /dev/null
++++ b/test/chapter_html_slim_parser/ChapterHeadingBoldTest.cpp
+@@ -0,0 +1,41 @@
++#include <Epub/Page.h>
++#include <GfxRenderer.h>
++#include <gtest/gtest.h>
++#include <array>
++#include <string>
++#define class struct
++#define private public
++#include "Epub/parsers/ChapterHtmlSlimParser.h"
++#undef private
++#undef class
++#include <Epub.h>
++#include <MemoryBudget.h>
++class ChapterHeadingBoldTest : public ::testing::Test {
++ protected:
++  std::string filepath="unused.xhtml";
++  Epub epub;GfxRenderer renderer;CssParser cssParser{"/tmp"};
++  ChapterHtmlSlimParser parser{epub,filepath,renderer,0,1.0f,false,false,0,480,800,false,
++    false,false,0,{},true,"","",0,{},nullptr,&cssParser};
++  std::array<ChapterHtmlSlimParser::StyleStackEntry,ChapterHtmlSlimParser::MAX_INLINE_STYLE_DEPTH> inlineStyles{};
++  std::array<BlockStyle,ChapterHtmlSlimParser::MAX_BLOCK_STYLE_DEPTH> blockStyles{};
++  void SetUp() override {
++    Storage.files.clear();GfxRenderer::loanActive=false;MemoryBudget::imageAllowed=true;
++    parser.currentTextBlock=std::make_unique<ParsedText>(false);
++    parser.inlineStyleBuf_=inlineStyles.data();parser.blockStyleBuf_=blockStyles.data();parser.blockStyleCount_=1;
++  }
++};
++TEST_F(ChapterHeadingBoldTest, HeadingAndNestedNormalWeightSpanStayBoldWithoutAffectingBody) {
++  const XML_Char* normal[] = {"style", "font-weight:normal", nullptr};
++  ChapterHtmlSlimParser::startElement(&parser, "h2", normal);
++  ChapterHtmlSlimParser::startElement(&parser, "span", normal);
++  ChapterHtmlSlimParser::characterData(&parser, "Chapter ", 8);
++  ASSERT_EQ(parser.currentTextBlock->size(), 1u);
++  EXPECT_EQ(parser.currentTextBlock->getWordStyleAt(0) & EpdFontFamily::BOLD, EpdFontFamily::BOLD);
++  ChapterHtmlSlimParser::endElement(&parser, "span");
++  ChapterHtmlSlimParser::endElement(&parser, "h2");
++  ChapterHtmlSlimParser::startElement(&parser, "p", normal);
++  ChapterHtmlSlimParser::characterData(&parser, "Body ", 5);
++  ASSERT_EQ(parser.currentTextBlock->size(), 1u);
++  EXPECT_EQ(parser.currentTextBlock->getWordStyleAt(0), EpdFontFamily::REGULAR);
++}
++

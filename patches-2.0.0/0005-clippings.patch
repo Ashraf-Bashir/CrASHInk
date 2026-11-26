@@ -502,59 +502,6 @@ index d49a988446a1ef1ef82b7dc2ef29622a538d1cef..ca040e98575bf8f3319105bcc4eccc1e
    bool modalContains(int x, int y) const;
  #endif
    int dictionaryTitleHeight() const;
-diff --git a/src/activities/reader/DictionaryWordSelectActivity.h b/src/activities/reader/DictionaryWordSelectActivity.h
-index 2c6c8cd082389bcb3866caa20e72fd45e9b33a09..d5d4ad8e829c4b9a60de9842a6792ffa818509e5 100644
---- a/src/activities/reader/DictionaryWordSelectActivity.h
-+++ b/src/activities/reader/DictionaryWordSelectActivity.h
-@@ -10,6 +10,7 @@
-
- #include "../Activity.h"
- #include "CrossPointSettings.h"
-+#include "TouchDragInput.h"
- #include "util/DictionaryLookupController.h"
- #include "util/WordSelectNavigator.h"
- #if CROSSINK_APP_CAP_TOUCH
-@@ -47,7 +48,7 @@ class DictionaryWordSelectActivity final : public Activity {
-         // DictionaryLookupController borrows this activity-owned path.  Qualify
-         // the member so it cannot instead bind to the constructor parameter,
-         // which is destroyed as soon as construction completes.
--        controller(renderer, mappedInput, *this, this->cachePath, true),
-+        controller(renderer, mappedInput, *this, this->cachePath),
-         framebufferContainsPage_(framebufferContainsPage),
-         reservedBottomHeight_(reservedBottomHeight),
-         initialTouchX_(initialTouchX),
-@@ -74,6 +75,7 @@ class DictionaryWordSelectActivity final : public Activity {
-   void onExit() override;
-   void loop() override;
-   void render(RenderLock&&) override;
-+  bool allowGlobalHomeSwipeGesture() const override { return false; }
-
-  private:
-   std::unique_ptr<Page> page;
-@@ -175,6 +177,12 @@ class DictionaryWordSelectActivity final : public Activity {
-   void drawTouchSelection() const;
-   bool applyWordHoldAction_ = false;
-   bool touchDragLookup_ = false;
-+  TouchDragInput touchDragInput_;
-+  unsigned long touchPageEdgeSince_ = 0;
-+  int touchPageEdgeDirection_ = 0;
-+  bool touchEndpointHit_ = false;
-+  bool touchPageAwaitMotion_ = false;
-+  int touchPageArrivalX_ = 0, touchPageArrivalY_ = 0;
-   bool touchDragHasMoved_ = false;
-   int touchDragStartX_ = 0;
-   int touchDragStartY_ = 0;
-@@ -235,8 +243,10 @@ class DictionaryWordSelectActivity final : public Activity {
-   bool extractWords();
-   bool mergeHyphenatedWords();
-   bool captureCurrentClippingRequest(DictionaryClippingRequest& request) const;
-+  void finishSelectionAsClipping();
-   bool captureClippingRequest();
-   bool continueTouchSelectionOnNextPage();
-+  bool continueTouchSelectionOnPreviousPage();
-   bool selectFirstWordForTouchDrag();
-   void finishTouchLookupOnCurrentPage(const std::string& phrase, size_t wordCount,
-                                       const DictionaryClippingRequest& request);
 diff --git a/src/activities/reader/EpubReaderActivity.h b/src/activities/reader/EpubReaderActivity.h
 index e800f400eac6ecec21c21951114934ef03cd3746..2125bd32c80b5b8b3121346900fd1144b26b8f41 100644
 --- a/src/activities/reader/EpubReaderActivity.h
@@ -2110,89 +2057,6 @@ index 0000000000000000000000000000000000000000..4868527f0379abe151c85e3b0ae64569
 +  }
 +  if (position > firstPosition) emit(firstByte, text.size(), firstPosition, position - 1);
 +}
-diff --git a/src/activities/reader/OnPageHighlightActivity.h b/src/activities/reader/OnPageHighlightActivity.h
-new file mode 100644
-index 0000000000000000000000000000000000000000..3c237b2a255f62a5e78c4361bc53102daf63cfd6
---- /dev/null
-+++ b/src/activities/reader/OnPageHighlightActivity.h
-@@ -0,0 +1,77 @@
-+#pragma once
-+#include <Epub.h>
-+#include <Epub/Page.h>
-+
-+#include <array>
-+#include <atomic>
-+
-+#include "ChapterXPathResolver.h"
-+#include "HighlightDragPaging.h"
-+#include "HighlightToolbar.h"
-+#include "OnPageHighlightModel.h"
-+#include "activities/Activity.h"
-+#include "components/UITheme.h"
-+
-+class OnPageHighlightActivity final : public Activity {
-+ public:
-+  using PageLoader = std::unique_ptr<Page> (*)(void*, int, float&);
-+  OnPageHighlightActivity(GfxRenderer& renderer, MappedInputManager& input, std::shared_ptr<Epub> book,
-+                          std::unique_ptr<Page> page, size_t clippingIndex, int left, int top, float hint,
-+                          void* readerContext = nullptr, PageLoader pageLoader = nullptr);
-+  void onEnter() override;
-+  void loop() override;
-+  void render(RenderLock&&) override;
-+  bool allowGlobalHomeSwipeGesture() const override { return false; }
-+  bool allowFrontlightPanelGesture() const override { return false; }
-+
-+ private:
-+  struct Word {
-+    Rect rect{};
-+    uint32_t start = 0, end = 0;
-+    bool rtl = false;
-+    uint16_t row = 0;
-+  };
-+  std::shared_ptr<Epub> book;
-+  std::unique_ptr<Page> page;
-+  std::unique_ptr<Word[]> words;
-+  size_t wordCount = 0, index;
-+  uint16_t buildRow = 0;
-+  int left, top;
-+  float hint;
-+  void* readerContext = nullptr;
-+  PageLoader pageLoader = nullptr;
-+  int pageOffset = 0;
-+  HighlightDragPaging dragPaging;
-+  std::atomic<bool> waitForPageMotion{false};
-+  std::atomic<int> firstTextY{0}, lastTextBottom{0};
-+  bool turnPage(int direction);
-+  uint16_t spine = 0;
-+  XPathTextLocation original{};
-+  OnPageHighlightRange range{}, saved{};
-+  Rect firstHandle{}, lastHandle{};
-+  HighlightToolbar::Layout toolbar{};
-+  // Two tiny handle regions (512 bytes total), never a full-page snapshot.
-+  struct HandleSnapshot {
-+    std::array<uint8_t, 256> bytes{};
-+    Rect rect{};
-+    bool valid = true;
-+    void capture(GfxRenderer& renderer, const Rect& handle, int stemY);
-+    void restore(GfxRenderer& renderer) const;
-+  } firstSnapshot, lastSnapshot;
-+  bool dragFrameReady = false;
-+  bool closeAfterAdjustment = false;
-+  OnPageHighlightRange paintedRange{};
-+  bool ready = false, failed = false;
-+  bool mapLines = false;
-+  uint32_t originalChapterLength = 0;
-+  int activeEdge = -1;
-+  int firstAnchorY = 0, lastAnchorY = 0, dragOffsetY = 0, dragOffsetX = 0;
-+  std::atomic<bool> dragging{false};
-+  std::atomic<int> dragX{0}, dragY{0};
-+  bool releasePending = false, ignoreOpeningRelease = true;
-+  void updateDrag();
-+  void saveRange();
-+  bool buildWords();
-+  bool visitLine(const PageTextLine& line, bool measure, std::string& text);
-+  void returnAction(bool editor, int x = 0, int y = 0);
-+};
 diff --git a/src/activities/reader/OnPageHighlightModel.h b/src/activities/reader/OnPageHighlightModel.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..1f3b20971dc9e1e4fe4803c9fcf9338eaf65c6b5
@@ -5230,206 +5094,6 @@ index 0000000000000000000000000000000000000000..4c6112e807bb287240684a8122ad74f0
 +  assert(word == longWord);
 +  std::cout << "Highlight word editing checks passed\n";
 +}
-diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..3e7fb35ad43084ebf313a33878b9a32216c9985f
---- /dev/null
-+++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-@@ -0,0 +1,194 @@
-+static unsigned long nowMs=0;
-+static unsigned long millis(){return nowMs;}
-+#include <algorithm>
-+#include <atomic>
-+#include <cassert>
-+#include <climits>
-+#include <iostream>
-+#include <memory>
-+#include "ChapterXPathResolver.h"
-+#include "activities/reader/OnPageHighlightModel.h"
-+#include "activities/reader/HighlightTouchPolicy.h"
-+#include "activities/reader/HighlightToolbar.h"
-+#include "activities/reader/HighlightDragPaging.h"
-+struct Rect { int x=0,y=0,width=0,height=0; };
-+bool contains(const Rect& r,int x,int y,int pad=0) {
-+ return r.width>0&&r.height>0&&x>=r.x-pad&&x<r.x+r.width+pad&&y>=r.y-pad&&y<r.y+r.height+pad;
-+}
-+struct Input {
-+ enum class Button { Back };
-+ int x=0,y=0;bool down=false,held=false,tap=false,back=false;unsigned long duration=0;
-+ bool isScreenTouchHeld(int& a,int& b) const {a=x;b=y;return held;}
-+ bool wasScreenTouchDown(int& a,int& b) const {a=x;b=y;return down;}
-+ bool wasScreenTapped(int& a,int& b) const {a=x;b=y;return tap;}
-+ bool isScreenTouchTapCandidate(int& a,int& b,unsigned long& d) const {a=x;b=y;d=duration;return held;}
-+ bool wasReleased(Button) const {return back;}
-+};
-+using MappedInputManager=Input;
-+struct RenderLock {
-+ static inline bool busy=false;
-+ template<class T> explicit RenderLock(T&) {}
-+ static bool peek() {return busy;}
-+};
-+struct HighlightPageAction {bool editor;uint16_t clippingIndex;int x,y;int pageOffset=0;bool adjusted=false;};
-+enum class ClippingColor { LightGrey, DarkGrey, Solid };
-+struct Store {
-+ ClippingColor color=ClippingColor::LightGrey;
-+ bool setColor(size_t,ClippingColor next) {if(ok)color=next;return ok;}
-+ unsigned writes=0,deletes=0;bool ok=true;std::string text;
-+ bool removeClippingAt(size_t) {++deletes;return ok;}
-+ bool updateClippingText(size_t,const std::string& value) {++writes;if(ok)text=value;return ok;}
-+} CLIPPINGS;
-+namespace HighlightMerge {
-+inline bool save(const std::shared_ptr<Epub>&, uint16_t, size_t& index, XPathTextLocation&, const std::string& text) {
-+ return CLIPPINGS.updateClippingText(index,text);
-+}
-+}
-+namespace workflowy {inline bool shared=false; inline void shareClippings(size_t){shared=true;}}
-+struct ActivityResult {};
-+struct WorkflowyShareActivity {
-+  template <typename... Args>
-+  explicit WorkflowyShareActivity(Args&&...) {}
-+};
-+class OnPageHighlightActivity {
-+ public:
-+ struct Word {Rect rect;uint32_t start,end;bool rtl=false;};
-+ std::shared_ptr<Epub> book=std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>before alpha bravo after tail</p></body></html>"});
-+ Word words[5]={{{0,0,40,20},0,5},{{50,0,40,20},6,10},{{100,0,40,20},11,15},{{150,0,40,20},16,20},{{200,0,40,20},21,24}};
-+ size_t wordCount=5,index=3;uint16_t spine=0;
-+ XPathTextLocation original{6,15,25,false};
-+ OnPageHighlightRange range{6,15},saved{6,15};
-+ Rect firstHandle{40,0,20,20},lastHandle{130,0,20,20};
-+ HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(80,100,480);
-+ bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false,closeAfterAdjustment=false;
-+ int activeEdge=-1,updates=0;
-+ int pageOffset=0;HighlightDragPaging dragPaging;
-+ std::atomic<bool> waitForPageMotion{false};std::atomic<int>firstTextY{0},lastTextBottom{100};
-+ int turnAttempts=0,lastTurnDirection=0;
-+ bool turnPage(int direction) {++turnAttempts;lastTurnDirection=direction;return false;}
-+ struct Renderer {int getScreenHeight() const{return 800;}} renderer;
-+ int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0,dragOffsetX=0;
-+ std::atomic<bool> dragging{false};std::atomic<int> dragX{0},dragY{0};
-+ Input mappedInput;
-+ bool shareOpened=false,dragFrameReady=false;
-+ template <typename Child, typename Handler>
-+ void startActivityForResult(std::unique_ptr<Child>, Handler) {shareOpened=true;}
-+ HighlightPageAction action{};
-+ void requestUpdate() {++updates;}
-+ void finish() {finished=true;}
-+ void setResult(HighlightPageAction a) {action=a;}
-+ void returnAction(bool,int=0,int=0);
-+ void updateDrag();void saveRange();void loop();
-+};
-+#include "OnPageActions.inc"
-+int main() {
-+ const auto future=HighlightToolbar::Layout::place(20,30,136,5);
-+ assert(future.columns==2 && future.area.width==136 && future.area.height==174);
-+ for(size_t i=0;i<5;++i) { const auto b=future.button(i); assert(future.indexAt(b.x+28,b.y+24)==i); }
-+ assert(!future.indexAt(110,170)); // empty final grid cell
-+ assert(!HighlightToolbar::Layout{}.indexAt(0,0));
-+
-+ const HighlightToolbar::Bounds view{16,24,448,752};
-+ const auto top=HighlightToolbar::nearSelection({400,30,60,20},view,{},{});
-+ assert(top.area.y>=50 && top.area.x+top.area.width<=464);
-+ const auto bottom=HighlightToolbar::nearSelection({20,740,100,20},view,{},{});
-+ assert(bottom.area.y+bottom.area.height<740 && bottom.area.y>=24);
-+ for(int y:{24,50,350,740,760}) for(int x:{16,200,450}) {
-+   auto card=HighlightToolbar::nearSelection({x,y,80,20},view,{},{}).area;
-+   assert(card.x>=view.x && card.y>=view.y && card.x+card.width<=view.x+view.width && card.y+card.height<=view.y+view.height);
-+ }
-+ const auto full=HighlightToolbar::nearSelection(view,view,{},{}).area;
-+ assert(full.x>=view.x && full.y>=view.y && full.x+full.width<=464 && full.y+full.height<=776);
-+ const auto centered=HighlightToolbar::nearSelection({100,350,200,20},view,{90,330,20,20},{290,370,20,20});
-+ assert(centered.area.x==16 && centered.area.y==268);
-+ const auto shortCard=HighlightToolbar::nearSelection({100,350,40,20},view,{90,330,20,20},{130,370,20,20});
-+ assert(shortCard.area.x==16 && shortCard.area.y+shortCard.area.height==326);
-+ OnPageHighlightActivity sharing;
-+ const auto shareButton=sharing.toolbar.button(5);
-+ sharing.mappedInput={shareButton.x+20,shareButton.y+20,false,false,true,false,0};
-+ sharing.loop();
-+ assert(workflowy::shared);
-+ // Adjacent pieces share a pixel boundary: grabbing/releasing the end
-+ // handle must not extend the saved selection into the next piece.
-+ OnPageHighlightActivity touching;
-+ touching.words[0].rect={0,0,40,20};touching.words[1].rect={40,0,40,20};
-+ touching.range=touching.saved={0,5};touching.firstHandle={};touching.lastHandle={30,20,20,20};
-+ const auto writesAtTouch=CLIPPINGS.writes;
-+ touching.mappedInput={40,30,true,true,false,false,0};touching.loop();
-+ assert(touching.activeEdge==1 && touching.dragOffsetX==-1);
-+ touching.mappedInput.held=false;touching.mappedInput.down=false;touching.loop();
-+ assert(touching.range.end==5 && CLIPPINGS.writes==writesAtTouch);
-+ // The real held-touch loop starts edge dwell while the panel is busy,
-+ // then performs one bounded attempt when the render lock becomes available.
-+ for(int direction:{-1,1}) {
-+   OnPageHighlightActivity paging;paging.dragging=true;paging.activeEdge=1;
-+   paging.dragPaging.begin(100,200);
-+   paging.mappedInput={100,direction>0?780:20,false,true,false,false,0};
-+   nowMs=10;RenderLock::busy=true;paging.loop();
-+   nowMs=210;paging.loop();assert(paging.turnAttempts==0);
-+   RenderLock::busy=false;paging.loop();
-+   assert(paging.turnAttempts==1&&paging.lastTurnDirection==direction);
-+   nowMs=1000;paging.loop();assert(paging.turnAttempts==1);
-+ }
-+ nowMs=0;
-+ OnPageHighlightActivity a;
-+ a.mappedInput={50,10,true,true,false,false,0};a.loop();
-+ assert(a.dragging && a.activeEdge==0 && CLIPPINGS.writes==0);
-+ a.mappedInput={10,10,false,true,false,false,0};a.loop();a.updateDrag();
-+ assert(a.range.start==0 && a.range.end==15 && CLIPPINGS.writes==0);
-+ // Release is retained while a panel refresh owns the render lock.
-+ RenderLock::busy=true;a.mappedInput.held=false;a.loop();
-+ assert(a.releasePending && CLIPPINGS.writes==0);
-+ const auto beforeReleaseUpdates=a.updates;
-+ RenderLock::busy=false;a.loop();
-+ assert(!a.dragging && CLIPPINGS.writes==1 && CLIPPINGS.text=="before alpha bravo");
-+ assert(a.saved.start==0 && a.saved.end==15);
-+ assert(a.finished && a.closeAfterAdjustment && a.action.adjusted && !a.action.editor && a.updates==beforeReleaseUpdates);
-+ OnPageHighlightActivity unchanged;
-+ const auto writesBefore=CLIPPINGS.writes;
-+ unchanged.mappedInput={50,10,true,true,false,false,0};unchanged.loop();
-+ unchanged.mappedInput.held=false;unchanged.mappedInput.down=false;unchanged.loop();
-+ assert(unchanged.finished && unchanged.closeAfterAdjustment && CLIPPINGS.writes==writesBefore);
-+ OnPageHighlightActivity shortQuote;
-+ shortQuote.firstHandle={40,0,20,20};shortQuote.lastHandle={65,0,20,20};
-+ shortQuote.mappedInput={70,10,true,true,false,false,0};shortQuote.loop();
-+ assert(shortQuote.dragging && shortQuote.activeEdge==1);
-+ OnPageHighlightActivity stem;
-+ for(auto& word:stem.words) word.rect.y=100;
-+ stem.firstHandle={40,70,20,20};stem.firstAnchorY=110;
-+ stem.mappedInput={50,80,true,true,false,false,0};stem.loop();
-+ assert(stem.dragging && stem.dragOffsetY==30);
-+ stem.updateDrag();assert(stem.range.start==6 && stem.range.end==15);
-+ stem.dragX=300;stem.dragY=300;stem.updateDrag();
-+ assert(stem.range.start==6 && stem.range.end==15); // margins cannot grow the quote
-+ OnPageHighlightActivity recolor;
-+ recolor.mappedInput={170,115,false,false,true,false,0};recolor.loop();
-+ assert(recolor.finished && CLIPPINGS.color==ClippingColor::DarkGrey);
-+ OnPageHighlightActivity edit;
-+ edit.mappedInput={301,115,false,false,true,false,0};edit.loop();
-+ assert(edit.finished && edit.action.editor && edit.action.clippingIndex==3);
-+ OnPageHighlightActivity overlap;
-+ overlap.firstHandle={286,100,20,20};
-+ overlap.mappedInput={301,115,true,true,false,false,0};overlap.loop();assert(!overlap.dragging);
-+ overlap.mappedInput={301,115,false,false,true,false,0};overlap.loop();assert(overlap.finished && overlap.action.editor);
-+ OnPageHighlightActivity remove;
-+ remove.mappedInput={368,115,false,false,true,false,0};remove.loop();
-+ assert(remove.finished && CLIPPINGS.deletes==1 && !remove.action.editor);
-+ OnPageHighlightActivity failedDelete;
-+ CLIPPINGS.ok=false;
-+ failedDelete.mappedInput={368,115,false,false,true,false,0};failedDelete.loop();
-+ assert(!failedDelete.finished && failedDelete.failed && CLIPPINGS.deletes==2);
-+ CLIPPINGS.ok=true;
-+ OnPageHighlightActivity holdButton;
-+ holdButton.mappedInput={368,115,false,true,false,false,1000};holdButton.loop();
-+ assert(!holdButton.finished && CLIPPINGS.deletes==2);
-+ OnPageHighlightActivity dictionary;
-+ dictionary.mappedInput={100,10,false,true,false,false,600};dictionary.loop();
-+ assert(dictionary.finished && !dictionary.action.editor && dictionary.action.x==100);
-+ OnPageHighlightActivity outside;
-+ outside.mappedInput={300,300,false,false,true,false,0};outside.loop();assert(outside.finished);
-+ OnPageHighlightActivity failure;
-+ failure.range.start=0;CLIPPINGS.ok=false;failure.saveRange();
-+ assert(failure.failed && failure.range.start==0 && failure.saved.start==6);
-+ std::cout<<"Actual on-page handlers: live drag, one release write, delayed release, Edit, dictionary and failure rollback passed\n";
-+}
 diff --git a/test/highlight_word_edit/OnPageMappingTest.cpp b/test/highlight_word_edit/OnPageMappingTest.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..9cb4fd95f2fbabee449e6f13d1bbde05a08a1276
@@ -5774,7 +5438,7 @@ index 9192c7cd7528276868f5ff77158f688e6d4b6f5a..5f17c96d41f7b70ddeb9af22b1c01c42
        if (itemHref != getSpineItem(spineIndex).href) continue;
        const auto& contents = spineContents[spineIndex];
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..50cde08937c6ce7373ad335fa66b54da96141753 100644
+index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..6c1691883080e4eebd3a444dd72a86a73544c55f 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,3 +1,6 @@
@@ -5851,7 +5515,7 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..50cde08937c6ce7373ad335fa66b54da
  ## [v1.6.0] - 2026-09-21
 
  ### Added
-@@ -737,3 +775,10 @@
+@@ -737,3 +775,11 @@
  - Power-button shortcut conflicts outside the reader so reader-only actions fall back to `Confirm` while Sleep, Refresh, Screenshot, Sync Progress, and File Transfer remain real power actions.
  - Potential crash when using `Go to %` in EPUBs.
  - Potential crash when entering sleep with Page Overlay enabled if the cached EPUB page data is invalid.
@@ -5862,6 +5526,7 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..50cde08937c6ce7373ad335fa66b54da
 +- Cache nearby pages' resolved highlights (including empty results) and prepare them in bounded idle slices; invalidate after clipping edits, sync/reloads, chapter or layout changes. Prepared page turns do no clipping-text reads or matching.
 +- Start touch word selection after a 200 ms stationary hold instead of one second; immediate swipes remain page turns.
 +- Save dragged multiword highlights immediately on release, and open saved quote controls without a flashing refresh.
++- Keep highlight drags attached through brief contact gaps and between words/lines; defer idle SD preparation during page swipes.
 diff --git a/src/ClippingNativeSync.cpp b/src/ClippingNativeSync.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c30186520
@@ -7870,7 +7535,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..bbb05653a85ea453ae2fce3119918e68
 +
  #define CLIPPINGS ClippingStore::getInstance()
 diff --git a/src/activities/reader/DictionaryWordSelectActivity.cpp b/src/activities/reader/DictionaryWordSelectActivity.cpp
-index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c6863110f2a 100644
+index ddb2a92458fdef1296e83ddef607568987d0f489..1ee25221039537a743dba74060afd21b12226d52 100644
 --- a/src/activities/reader/DictionaryWordSelectActivity.cpp
 +++ b/src/activities/reader/DictionaryWordSelectActivity.cpp
 @@ -159,6 +159,8 @@ constexpr uint8_t styleToBitMask(EpdFontFamily::Style style) {
@@ -8056,7 +7721,26 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
  void DictionaryWordSelectActivity::finishWithClippingRequest() {
    if (!hasPendingClippingRequest_) {
      LOG_ERR("CLIP", "Dictionary clipping requested without a selected range");
-@@ -1126,6 +1229,14 @@ void DictionaryWordSelectActivity::updateTouchDrag() {
+@@ -1074,15 +1177,17 @@ void DictionaryWordSelectActivity::resetTouchDragTracking(const int x, const int
+   touchDragStartY_ = touchDragY_ = y;
+   touchDragHasMoved_ = false;
+   touchDragReleased_ = false;
++  dragContact_.reset();
+ }
+
+ void DictionaryWordSelectActivity::sampleTouchDrag() {
+   // Keep the most recent contact even if the finger lifts before the render lock is free.
+   if (touchDragReleased_) return;
+   if (mappedInput.isScreenTouchHeld(touchDragX_, touchDragY_)) {
++    dragContact_.released(true, millis());
+     touchDragHasMoved_ = touchDragHasMoved_ || ClipSelectionPaging::hasDraggedFrom(touchDragStartX_, touchDragStartY_,
+                                                                                    touchDragX_, touchDragY_);
+-  } else {
++  } else if (dragContact_.released(false, millis())) {
+     touchDragReleased_ = true;
+   }
+ }
+@@ -1126,6 +1231,14 @@ void DictionaryWordSelectActivity::updateTouchDrag() {
    hasPendingClippingRequest_ = false;
    captureClippingRequest();
    touchLookupEnabled_ = Dictionary::exists(cachePath.c_str());
@@ -8071,7 +7755,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
    if (applyAction && ((wordHoldAction_ == CrossPointSettings::WORD_HOLD_LOOKUP && touchLookupEnabled_) ||
                        (wordHoldAction_ == CrossPointSettings::WORD_HOLD_CLIP && hasPendingClippingRequest_))) {
      lock.unlock();
-@@ -1304,8 +1415,7 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1304,8 +1417,7 @@ void DictionaryWordSelectActivity::loop() {
              controller.getRecordHistory(), controller.getLookupWord(),
              DictionaryLookupController::toHistStatus(controller.getFoundStatus()), this,
              &DictionaryWordSelectActivity::renderDefinitionBackgroundCallback, dictionaryFontFamilyName_,
@@ -8081,7 +7765,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
          if (!definition) {
            LOG_ERR("DICT", "OOM allocating DictionaryDefinitionActivity (%u bytes)",
                    static_cast<unsigned>(sizeof(DictionaryDefinitionActivity)));
-@@ -1314,12 +1424,7 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1314,12 +1426,7 @@ void DictionaryWordSelectActivity::loop() {
            break;
          }
          suspendWorkingSet();
@@ -8095,7 +7779,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
            // A definition is the terminal screen of reader-page lookup. Its
            // dismiss paths (Back and an outside tap) must return to the reader,
            // rather than restoring the word-selection highlight beneath it.
-@@ -1332,9 +1437,6 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1332,9 +1439,6 @@ void DictionaryWordSelectActivity::loop() {
          setResult(ActivityResult{});
          finish();
          break;
@@ -8105,7 +7789,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
        case DictionaryLookupController::LookupEvent::NotFoundDismissedDone:
          setResult(ActivityResult{});
          finish();
-@@ -1364,10 +1466,137 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1364,10 +1468,137 @@ void DictionaryWordSelectActivity::loop() {
      return;
    }
 
@@ -8244,7 +7928,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
    // Check Back early when not in multi-select mode. This allows exit even when
    // confirmReleaseConsumed is stuck true (menu-triggered entry has no Confirm release).
    if (!navigator.isMultiSelecting() && mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-@@ -1376,6 +1605,10 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1376,6 +1607,10 @@ void DictionaryWordSelectActivity::loop() {
    }
 
    if (controller.handleMultiSelect(navigator)) {
@@ -8255,7 +7939,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1383,6 +1616,10 @@ void DictionaryWordSelectActivity::loop() {
+@@ -1383,6 +1618,10 @@ void DictionaryWordSelectActivity::loop() {
    if (navigator.isMultiSelecting()) return;
 
    if (controller.handleConfirmLookup(navigator)) {
@@ -8266,7 +7950,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
      if (controller.isLookingUp()) captureClippingRequest();
      return;
    }
-@@ -1403,7 +1640,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+@@ -1403,7 +1642,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
    //   - the controller has nothing pending to draw,
    //   - we have a current selection.
    if (nextRenderMode_ == RenderMode::Differential && !controller.isActive() && currIdx >= 0) {
@@ -8275,7 +7959,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
      auto dirty =
          navigator.renderHighlightDifferential(renderer, lineHeight, prevHighlightIdx_, currIdx, foregroundBlack);
      if (dirty.has_value()) {
-@@ -1444,7 +1681,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+@@ -1444,7 +1683,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
          renderer.fillRect(bezelLeft, clearY, clearW, reservedBottomHeight_, false);
        }
 
@@ -8284,7 +7968,7 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
 
        auto setup =
            navigator.renderHighlightDifferential(renderer, lineHeight, /*prevWordIdx=*/-1, currIdx, foregroundBlack);
-@@ -1499,6 +1736,8 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
+@@ -1499,6 +1738,8 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
    // Without this, every cold codepoint cold-misses the 8-slot SD glyph
    // overflow ring and the page render serializes ~100+ individual SD reads.
    // Same pattern as EpubReaderActivity::renderContents().
@@ -8293,8 +7977,69 @@ index ddb2a92458fdef1296e83ddef607568987d0f489..1361f0df7ec8af0f143a1f5bf1bd7c68
    auto* fcm = renderer.getFontCacheManager();
    auto scope = fcm->createPrewarmScope();
    page->render(renderer, SETTINGS.getReaderFontId(), marginLeft, marginTop, foregroundBlack);  // scan pass
+diff --git a/src/activities/reader/DictionaryWordSelectActivity.h b/src/activities/reader/DictionaryWordSelectActivity.h
+index 2c6c8cd082389bcb3866caa20e72fd45e9b33a09..eb3b9dd3e8520d3f196b96f62a31e2de6d3dfced 100644
+--- a/src/activities/reader/DictionaryWordSelectActivity.h
++++ b/src/activities/reader/DictionaryWordSelectActivity.h
+@@ -10,6 +10,8 @@
+
+ #include "../Activity.h"
+ #include "CrossPointSettings.h"
++#include "TouchDragInput.h"
++#include "HighlightDragContact.h"
+ #include "util/DictionaryLookupController.h"
+ #include "util/WordSelectNavigator.h"
+ #if CROSSINK_APP_CAP_TOUCH
+@@ -47,7 +49,7 @@ class DictionaryWordSelectActivity final : public Activity {
+         // DictionaryLookupController borrows this activity-owned path.  Qualify
+         // the member so it cannot instead bind to the constructor parameter,
+         // which is destroyed as soon as construction completes.
+-        controller(renderer, mappedInput, *this, this->cachePath, true),
++        controller(renderer, mappedInput, *this, this->cachePath),
+         framebufferContainsPage_(framebufferContainsPage),
+         reservedBottomHeight_(reservedBottomHeight),
+         initialTouchX_(initialTouchX),
+@@ -74,6 +76,7 @@ class DictionaryWordSelectActivity final : public Activity {
+   void onExit() override;
+   void loop() override;
+   void render(RenderLock&&) override;
++  bool allowGlobalHomeSwipeGesture() const override { return false; }
+
+  private:
+   std::unique_ptr<Page> page;
+@@ -175,12 +178,19 @@ class DictionaryWordSelectActivity final : public Activity {
+   void drawTouchSelection() const;
+   bool applyWordHoldAction_ = false;
+   bool touchDragLookup_ = false;
++  TouchDragInput touchDragInput_;
++  unsigned long touchPageEdgeSince_ = 0;
++  int touchPageEdgeDirection_ = 0;
++  bool touchEndpointHit_ = false;
++  bool touchPageAwaitMotion_ = false;
++  int touchPageArrivalX_ = 0, touchPageArrivalY_ = 0;
+   bool touchDragHasMoved_ = false;
+   int touchDragStartX_ = 0;
+   int touchDragStartY_ = 0;
+   int touchDragX_ = 0;
+   int touchDragY_ = 0;
+   bool touchDragReleased_ = false;
++  HighlightDragContact dragContact_;
+   bool touchPressPending_ = false;
+   bool touchTapPending_ = false;
+ #endif
+@@ -235,8 +245,10 @@ class DictionaryWordSelectActivity final : public Activity {
+   bool extractWords();
+   bool mergeHyphenatedWords();
+   bool captureCurrentClippingRequest(DictionaryClippingRequest& request) const;
++  void finishSelectionAsClipping();
+   bool captureClippingRequest();
+   bool continueTouchSelectionOnNextPage();
++  bool continueTouchSelectionOnPreviousPage();
+   bool selectFirstWordForTouchDrag();
+   void finishTouchLookupOnCurrentPage(const std::string& phrase, size_t wordCount,
+                                       const DictionaryClippingRequest& request);
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0084e6bbb 100644
+index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d020be14ed1be297bc728c541055bc4ccd36c08d 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -1,3 +1,6 @@
@@ -8717,9 +8462,14 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
  #endif
 
    // Long-press Confirm: execute the configured reader action without opening the menu.
-@@ -3956,7 +4094,8 @@ void EpubReaderActivity::loop() {
+@@ -3955,8 +4093,13 @@ void EpubReaderActivity::loop() {
+     if (drainPendingManualPageTurn()) {
        return;
      }
++    // A swipe has not become a page-turn action until release. Leave the input
++    // loop free during contact instead of starting SD scans or glyph prewarm.
++    int idleTouchX = 0, idleTouchY = 0;
++    if (mappedInput.isScreenTouchHeld(idleTouchX, idleTouchY)) return;
      checkpointReadingStatsWhenIdle();
 -    idlePrewarmNextPage();
 +    idlePrepareClippingMatches();
@@ -8727,7 +8477,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
      return;
    }
 
-@@ -4198,7 +4337,7 @@ bool EpubReaderActivity::handleTouchDictionaryLookup() {
+@@ -4198,7 +4341,7 @@ bool EpubReaderActivity::handleTouchDictionaryLookup() {
      touchDictionaryLookupHandled = false;
      return false;
    }
@@ -8736,7 +8486,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
      return false;
    }
 
-@@ -4924,7 +5063,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
+@@ -4924,7 +5067,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
      }
      case EpubReaderMenuAction::VIEW_CLIPPINGS: {
        pauseReadingPaceTimer("clipping_list");
@@ -8745,7 +8495,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
                               [this, returnToReaderMenu](const ActivityResult& result) {
                                 if (!result.isCancelled) {
                                   const auto& clipping = std::get<ClippingJumpResult>(result.data);
-@@ -5243,8 +5382,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -5243,8 +5386,14 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
        }
      }
      const int lineHeight = renderer.getLineHeight(readerFontId);
@@ -8762,7 +8512,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
      static constexpr uint32_t CLIP_SELECTION_WORD_RESERVE_HEADROOM = 16U * 1024U;
      static constexpr size_t CLIP_SELECTION_INITIAL_TEXT_RESERVE = 4U * 1024U;
      // Page density varies with font size and layout. Keep the fixed memory cap,
-@@ -5252,7 +5397,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -5252,7 +5401,10 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      const size_t maxSelectableWords = pagesToLoad > 0 ? MAX_CLIP_SELECTION_WORDS : 0;
      const uint32_t wordReserveBytes = static_cast<uint32_t>(maxSelectableWords * sizeof(WordRef));
      const auto heapBeforeWords = MemoryBudget::snapshot();
@@ -8774,7 +8524,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
        LOG_ERR("CLIP", "Low heap for clipping selection (%u free, %u max alloc, need block %u); skipping",
                heapBeforeWords.freeHeap, heapBeforeWords.maxAllocHeap,
                wordReserveBytes + CLIP_SELECTION_WORD_RESERVE_HEADROOM);
-@@ -5510,28 +5658,41 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -5510,28 +5662,41 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
                                                      clippingLayoutSignature](const ActivityResult& result) {
      MemoryBudget::logHeapShape("clip.child_destroyed");
      const char* clippingFeedback = nullptr;
@@ -8825,7 +8575,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
                                                                                 : tr(STR_CLIPPING_FAILED);
        }
      }
-@@ -5540,11 +5701,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
+@@ -5540,11 +5705,6 @@ void EpubReaderActivity::startClipSelection(const DictionaryClippingRequest* dic
      MemoryBudget::logHeapShape("clip.after_font_release");
      pendingHeapShapeReaderRedrawStages.fetch_or(HEAP_SHAPE_REDRAW_CLIP, std::memory_order_relaxed);
      if (clippingFeedback) {
@@ -8837,7 +8587,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
        {
          RenderLock lock(*this);
          drawToast(renderer, clippingFeedback);
-@@ -7234,7 +7390,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -7234,7 +7394,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -8846,7 +8596,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -7283,7 +7439,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -7283,7 +7443,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
          const Clipping* clipping = CLIPPINGS.clippingAt(pendingClippingIndex);
          const uint16_t fallbackPage = static_cast<uint16_t>(std::max(0, section->currentPage));
          std::string clippingText;
@@ -8855,7 +8605,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
          if (clipping) CLIPPINGS.readClippingText(*clipping, clippingText);
          section->currentPage =
              clipping ? resolveClippingJumpPage(*section, *clipping, clippingText, fallbackPage) : fallbackPage;
-@@ -8117,7 +8273,11 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -8117,7 +8277,11 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    }
 
    const auto finalizeBufferComposition = [&]() {
@@ -8868,7 +8618,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
      drawPublisherPageMarkers(renderer, *page, orientedMarginTop, contentBottom, foregroundBlack);
  #if CROSSINK_APP_CAP_TOUCH
      if (activeFootnotePreview) {
-@@ -8242,6 +8402,10 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -8242,6 +8406,10 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      }
    };
    drawPageFeedback(false);
@@ -8879,7 +8629,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
    if (!updatePanel) {
      return true;
    }
-@@ -8483,84 +8647,470 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
+@@ -8483,84 +8651,470 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
    navigateToHref(currentPageFootnotes[bestIndex].href, true, /*preferFootnotePreview=*/true);
    return true;
  }
@@ -9401,7 +9151,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
        hasPreviousHighlight = false;
        return true;
      }
-@@ -8574,16 +9124,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8574,16 +9128,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const bool hasEmSpace = hasEmSpacePrefix(wordText);
      const int lineFontId = block.wordFontId(renderer, fontId, wordIndex);
      const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
@@ -9426,7 +9176,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
      if (wordIndex + 1 < block.wordCount()) {
        const uint16_t nextIndex = static_cast<uint16_t>(wordIndex + 1);
        const char* nextWordText = block.wordText(nextIndex);
-@@ -8593,12 +9144,35 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8593,12 +9148,35 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", nextTextStyle) : 0;
        const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
        const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
@@ -9463,7 +9213,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
      if (wordW > 0) {
        const bool clipped = line.clipWidth > 0 && line.clipHeight > 0;
        if (clipped) {
-@@ -8610,12 +9184,61 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8610,12 +9188,61 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        // No-break spaces are stored as hidden layout words. Bridge to the next
        // visible word in the same line even when that hidden token interrupted
        // the immediate-word lookahead above.
@@ -9529,7 +9279,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
        previousHighlight = currentHighlight;
        previousHighlightBlock = &block;
        hasPreviousHighlight = true;
-@@ -8624,6 +9247,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8624,6 +9251,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      }
      return true;
    });
@@ -9547,7 +9297,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
  }
 
  void EpubReaderActivity::renderStatusBar() const {
-@@ -9267,6 +9901,10 @@ bool EpubReaderActivity::saveProgressBeforeRestart() {
+@@ -9267,6 +9905,10 @@ bool EpubReaderActivity::saveProgressBeforeRestart() {
    // Silent network-mode restarts skip onExit(); coordinate with the render task.
    RenderLock lock(*this);
    bool saved = checkpointReadingStatsBeforeRestart();
@@ -9558,12 +9308,34 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..d880f1fec2a84f587b5fec335efd22d0
    if (!saveReadingProgress()) {
      LOG_ERR("READER", "Failed to save progress before restart");
      saved = false;
+diff --git a/src/activities/reader/HighlightDragContact.h b/src/activities/reader/HighlightDragContact.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..40b657bddfd4cbef043b2d1c82de720b43abf1ef
+--- /dev/null
++++ b/src/activities/reader/HighlightDragContact.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <cstdint>
++
++// A single missing contact frame must not commit a quote halfway through a
++// drag. Main-loop only; keep the last endpoint until lift persists for 50 ms.
++struct HighlightDragContact {
++  static constexpr uint32_t ReleaseGraceMs = 50;
++  uint32_t missingSince = 0;
++  bool missing = false;
++  void reset() { missing = false; }
++  bool released(bool held, uint32_t now) {
++    if (held) { reset(); return false; }
++    if (!missing) { missing = true; missingSince = now; }
++    return static_cast<uint32_t>(now - missingSince) >= ReleaseGraceMs;
++  }
++};
 diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f4ebd160ab8fa7331581ef67376fe6e81bf2d4d7
+index 0000000000000000000000000000000000000000..bf7dade1afa602a20836070e449b3c2020fd7ff7
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -0,0 +1,591 @@
+@@ -0,0 +1,601 @@
 +#include "clippings/HighlightMerge.h"
 +#include "OnPageHighlightActivity.h"
 +
@@ -9866,18 +9638,25 @@ index 0000000000000000000000000000000000000000..f4ebd160ab8fa7331581ef67376fe6e8
 +void OnPageHighlightActivity::updateDrag() {
 +  if (!ready || activeEdge < 0 || waitForPageMotion.load()) return;
 +  const int x = dragX.load() + dragOffsetX, y = dragY.load() + dragOffsetY;
-+  size_t best = wordCount;
-+  int64_t distance = INT64_MAX;
++  size_t nearestRowWord = wordCount;
++  int nearestY = INT_MAX, minY = INT_MAX, maxY = INT_MIN;
 +  for (size_t i = 0; i < wordCount; ++i) {
 +    const auto& r = words[i].rect;
-+    if (!contains(r, x, y)) continue;
-+    const int dx = x - r.x - r.width / 2;
-+    const int dy = y < r.y ? r.y - y : y > r.y + r.height ? y - r.y - r.height : 0;
-+    const int64_t d = static_cast<int64_t>(dy) * dy * 16 + static_cast<int64_t>(dx) * dx;
-+    if (d < distance) {
-+      distance = d;
-+      best = i;
-+    }
++    minY = std::min(minY, static_cast<int>(r.y));
++    maxY = std::max(maxY, r.y + r.height);
++    const int distance = std::abs(y - (r.y + r.height / 2));
++    if (distance < nearestY) { nearestY = distance; nearestRowWord = i; }
++  }
++  // Follow gaps within the text, without extending a quote into page margins
++  // while the edge-dwell page turn is waiting.
++  if (nearestRowWord == wordCount || y < minY - 8 || y > maxY + 8) return;
++  size_t best = wordCount;
++  int nearestX = INT_MAX;
++  for (size_t i = 0; i < wordCount; ++i) {
++    if (words[i].row != words[nearestRowWord].row) continue;
++    const auto& r = words[i].rect;
++    const int distance = std::max({r.x - x, 0, x - (r.x + std::max(0, r.width - 1))});
++    if (distance < nearestX) { nearestX = distance; best = i; }
 +  }
 +  if (best < wordCount) range.move(activeEdge == 0, words[best].start, words[best].end);
 +}
@@ -9904,6 +9683,7 @@ index 0000000000000000000000000000000000000000..f4ebd160ab8fa7331581ef67376fe6e8
 +  int x = 0, y = 0;
 +  if (dragging.load()) {
 +    if (mappedInput.isScreenTouchHeld(x, y)) {
++      dragContact.released(true, millis());
 +      if (x != dragX.load() || y != dragY.load()) {
 +        waitForPageMotion.store(false);
 +        dragX.store(x);
@@ -9919,6 +9699,7 @@ index 0000000000000000000000000000000000000000..f4ebd160ab8fa7331581ef67376fe6e8
 +      }
 +      return;
 +    }
++    if (!dragContact.released(false, millis())) return;
 +    releasePending = true;
 +  }
 +  if (releasePending) {
@@ -9968,6 +9749,7 @@ index 0000000000000000000000000000000000000000..f4ebd160ab8fa7331581ef67376fe6e8
 +      dragX.store(x);
 +      dragY.store(y);
 +      dragPaging.begin(x, y);
++      dragContact.reset();
 +      waitForPageMotion.store(false);
 +      dragging.store(true);
 +      requestUpdate();  // hide Edit as soon as a handle is touched
@@ -10155,6 +9937,91 @@ index 0000000000000000000000000000000000000000..f4ebd160ab8fa7331581ef67376fe6e8
 +  // page waveform. The framebuffer is rebuilt above whenever needed.
 +  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}
+diff --git a/src/activities/reader/OnPageHighlightActivity.h b/src/activities/reader/OnPageHighlightActivity.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..96bc02b221b244fc8bac8a836b5bab8e52ea098c
+--- /dev/null
++++ b/src/activities/reader/OnPageHighlightActivity.h
+@@ -0,0 +1,79 @@
++#pragma once
++#include <Epub.h>
++#include <Epub/Page.h>
++
++#include <array>
++#include <atomic>
++
++#include "ChapterXPathResolver.h"
++#include "HighlightDragPaging.h"
++#include "HighlightDragContact.h"
++#include "HighlightToolbar.h"
++#include "OnPageHighlightModel.h"
++#include "activities/Activity.h"
++#include "components/UITheme.h"
++
++class OnPageHighlightActivity final : public Activity {
++ public:
++  using PageLoader = std::unique_ptr<Page> (*)(void*, int, float&);
++  OnPageHighlightActivity(GfxRenderer& renderer, MappedInputManager& input, std::shared_ptr<Epub> book,
++                          std::unique_ptr<Page> page, size_t clippingIndex, int left, int top, float hint,
++                          void* readerContext = nullptr, PageLoader pageLoader = nullptr);
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++  bool allowGlobalHomeSwipeGesture() const override { return false; }
++  bool allowFrontlightPanelGesture() const override { return false; }
++
++ private:
++  struct Word {
++    Rect rect{};
++    uint32_t start = 0, end = 0;
++    bool rtl = false;
++    uint16_t row = 0;
++  };
++  std::shared_ptr<Epub> book;
++  std::unique_ptr<Page> page;
++  std::unique_ptr<Word[]> words;
++  size_t wordCount = 0, index;
++  uint16_t buildRow = 0;
++  int left, top;
++  float hint;
++  void* readerContext = nullptr;
++  PageLoader pageLoader = nullptr;
++  int pageOffset = 0;
++  HighlightDragPaging dragPaging;
++  HighlightDragContact dragContact;
++  std::atomic<bool> waitForPageMotion{false};
++  std::atomic<int> firstTextY{0}, lastTextBottom{0};
++  bool turnPage(int direction);
++  uint16_t spine = 0;
++  XPathTextLocation original{};
++  OnPageHighlightRange range{}, saved{};
++  Rect firstHandle{}, lastHandle{};
++  HighlightToolbar::Layout toolbar{};
++  // Two tiny handle regions (512 bytes total), never a full-page snapshot.
++  struct HandleSnapshot {
++    std::array<uint8_t, 256> bytes{};
++    Rect rect{};
++    bool valid = true;
++    void capture(GfxRenderer& renderer, const Rect& handle, int stemY);
++    void restore(GfxRenderer& renderer) const;
++  } firstSnapshot, lastSnapshot;
++  bool dragFrameReady = false;
++  bool closeAfterAdjustment = false;
++  OnPageHighlightRange paintedRange{};
++  bool ready = false, failed = false;
++  bool mapLines = false;
++  uint32_t originalChapterLength = 0;
++  int activeEdge = -1;
++  int firstAnchorY = 0, lastAnchorY = 0, dragOffsetY = 0, dragOffsetX = 0;
++  std::atomic<bool> dragging{false};
++  std::atomic<int> dragX{0}, dragY{0};
++  bool releasePending = false, ignoreOpeningRelease = true;
++  void updateDrag();
++  void saveRange();
++  bool buildWords();
++  bool visitLine(const PageTextLine& line, bool measure, std::string& text);
++  void returnAction(bool editor, int x = 0, int y = 0);
++};
 diff --git a/src/clippings/ClippingPageMatchCache.h b/src/clippings/ClippingPageMatchCache.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..5357e5ebd46cbdd51e1e8942d5226d38cc7a636f
@@ -11270,13 +11137,14 @@ index 0000000000000000000000000000000000000000..6fc189482f3f4011112c45af67c19f11
 +}
 diff --git a/test/highlight_word_edit/AutoHighlightReleaseTest.cpp b/test/highlight_word_edit/AutoHighlightReleaseTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..cd806d39a6814125821e0052f850f893a000772b
+index 0000000000000000000000000000000000000000..8fa285fb3118950d2bc56c17e2b6403639ae6aeb
 --- /dev/null
 +++ b/test/highlight_word_edit/AutoHighlightReleaseTest.cpp
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,78 @@
 +#include <gtest/gtest.h>
 +#include <cstdint>
 +#include <string>
++#include "activities/reader/HighlightDragContact.h"
 +struct RenderLock {
 + enum class Mode {Try};
 + template<class T> RenderLock(T&,Mode) {}
@@ -11286,8 +11154,10 @@ index 0000000000000000000000000000000000000000..cd806d39a6814125821e0052f850f893
 +namespace CrossPointSettings {enum {WORD_HOLD_LOOKUP,WORD_HOLD_CLIP,WORD_HOLD_ASK};}
 +namespace TextSelectionOverlay {enum {lookupAction,clipAction};}
 +namespace Dictionary {bool exists(const char*) {return true;}}
-+namespace ClipSelectionPaging {bool hasHeldPageEndLongEnough(uint32_t,uint32_t) {return false;}}
-+unsigned long millis() {return 0;}
++namespace ClipSelectionPaging {
++bool hasDraggedFrom(int x,int y,int nx,int ny) {return x!=nx || y!=ny;}bool hasHeldPageEndLongEnough(uint32_t,uint32_t) {return false;}}
++static unsigned long nowMs=0;
++unsigned long millis() {return nowMs;}
 +struct {int getReaderFontId() {return 0;}} SETTINGS;
 +class DictionaryWordSelectActivity {
 + public:
@@ -11298,6 +11168,9 @@ index 0000000000000000000000000000000000000000..cd806d39a6814125821e0052f850f893
 +  size_t getLookupSelectionWordCount() {return count;}
 + } navigator;
 + struct {int getLineHeight(int) {return 20;}} renderer;
++ struct {bool held=true;int x=0,y=0;bool isScreenTouchHeld(int& px,int& py) {if(!held)return false;px=x;py=y;return true;}} mappedInput;
++ HighlightDragContact dragContact_;
++ int touchDragStartX_=0,touchDragStartY_=0;
 + int touchDragX_=0,touchDragY_=0,touchDragOffsetX_=0,touchDragOffsetY_=0,touchPageEndIndex_=-1;
 + uint32_t touchPageEndHeldSince_=0;
 + bool touchDragHasMoved_=true,touchDragReleased_=true,touchDragLookup_=true;
@@ -11311,6 +11184,8 @@ index 0000000000000000000000000000000000000000..cd806d39a6814125821e0052f850f893
 + void captureClippingRequest() {hasPendingClippingRequest_=canCapture;}
 + void performTouchSelectionAction(int value) {action=value;}
 + void forceFullRepaintOnNextRender() {}
++ void resetTouchDragTracking(int,int);
++ void sampleTouchDrag();
 + void updateTouchDrag();
 +};
 +#include "AutoHighlightRelease.inc"
@@ -11330,9 +11205,23 @@ index 0000000000000000000000000000000000000000..cd806d39a6814125821e0052f850f893
 + DictionaryWordSelectActivity failed;failed.canCapture=false;failed.navigator.count=3;
 + failed.updateTouchDrag();EXPECT_EQ(failed.action,-1);EXPECT_EQ(failed.updates,1);
 +}
++
++TEST(AutoHighlightRelease, ATransientMissingTouchDoesNotCommitTheQuote) {
++ DictionaryWordSelectActivity view;view.resetTouchDragTracking(10,20);
++ nowMs=0;view.mappedInput.held=false;view.sampleTouchDrag();
++ EXPECT_FALSE(view.touchDragReleased_);
++ nowMs=30;view.mappedInput={true,80,90};view.sampleTouchDrag();
++ EXPECT_FALSE(view.touchDragReleased_);EXPECT_EQ(view.touchDragX_,80);EXPECT_EQ(view.touchDragY_,90);
++ nowMs=40;view.mappedInput.held=false;view.sampleTouchDrag();
++ nowMs=89;view.sampleTouchDrag();EXPECT_FALSE(view.touchDragReleased_);
++ nowMs=90;view.sampleTouchDrag();EXPECT_TRUE(view.touchDragReleased_);
++ EXPECT_EQ(view.touchDragX_,80);EXPECT_EQ(view.touchDragY_,90);
++ HighlightDragContact wrap;EXPECT_FALSE(wrap.released(false,UINT32_MAX-20));
++ EXPECT_TRUE(wrap.released(false,30));
++}
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..521c7d577cf6d5e2001d371e3632bbde8e6ee309
+index 0000000000000000000000000000000000000000..a4a74c43c950d107bf4a6d52d29933f6cfdfca8a
 --- /dev/null
 +++ b/test/highlight_word_edit/CMakeLists.txt
 @@ -0,0 +1,166 @@
@@ -11355,7 +11244,7 @@ index 0000000000000000000000000000000000000000..521c7d577cf6d5e2001d371e3632bbde
 + COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractAutoHighlightRelease.py ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp ${AUTO_HIGHLIGHT_RELEASE_INC}
 + DEPENDS ExtractAutoHighlightRelease.py ${REPO_ROOT}/src/activities/reader/DictionaryWordSelectActivity.cpp)
 +add_executable(AutoHighlightReleaseTest AutoHighlightReleaseTest.cpp ${AUTO_HIGHLIGHT_RELEASE_INC})
-+target_include_directories(AutoHighlightReleaseTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_include_directories(AutoHighlightReleaseTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
 +target_link_libraries(AutoHighlightReleaseTest PRIVATE GTest::gtest_main)
 +gtest_discover_tests(AutoHighlightReleaseTest)
 +
@@ -11845,14 +11734,14 @@ index 0000000000000000000000000000000000000000..b7f7d93ac7135d887e4bf3da8e015450
 +}
 diff --git a/test/highlight_word_edit/ExtractAutoHighlightRelease.py b/test/highlight_word_edit/ExtractAutoHighlightRelease.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..87e265bb8e1d736344bc4b1cd64e874303efa68e
+index 0000000000000000000000000000000000000000..3584dbcd24ead957dfe1cbe487ab40f1eac500fe
 --- /dev/null
 +++ b/test/highlight_word_edit/ExtractAutoHighlightRelease.py
 @@ -0,0 +1,6 @@
 +from pathlib import Path
 +import sys
 +text=Path(sys.argv[1]).read_text()
-+a=text.index('void DictionaryWordSelectActivity::updateTouchDrag()')
++a=text.index('void DictionaryWordSelectActivity::resetTouchDragTracking(')
 +b=text.index('bool DictionaryWordSelectActivity::handleTouchSelection()', a)
 +Path(sys.argv[2]).write_text(text[a:b])
 diff --git a/test/highlight_word_edit/ExtractMergeStore.py b/test/highlight_word_edit/ExtractMergeStore.py
@@ -12094,6 +11983,220 @@ index 0000000000000000000000000000000000000000..2635308ac338cc037b4fba7ce019fd37
 +    EXPECT_EQ(CLIPPINGS.adds, 0u);
 +  }
 +  failExport = false;
++}
+diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbbfd5399a4830988d7faf1b2cd0077c5049b57a
+--- /dev/null
++++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
+@@ -0,0 +1,208 @@
++static unsigned long nowMs=0;
++static unsigned long millis(){return nowMs;}
++#include <algorithm>
++#include <atomic>
++#include <cassert>
++#include <climits>
++#include <iostream>
++#include <memory>
++#include "ChapterXPathResolver.h"
++#include "activities/reader/OnPageHighlightModel.h"
++#include "activities/reader/HighlightTouchPolicy.h"
++#include "activities/reader/HighlightToolbar.h"
++#include "activities/reader/HighlightDragPaging.h"
++#include "activities/reader/HighlightDragContact.h"
++struct Rect { int x=0,y=0,width=0,height=0; };
++bool contains(const Rect& r,int x,int y,int pad=0) {
++ return r.width>0&&r.height>0&&x>=r.x-pad&&x<r.x+r.width+pad&&y>=r.y-pad&&y<r.y+r.height+pad;
++}
++struct Input {
++ enum class Button { Back };
++ int x=0,y=0;bool down=false,held=false,tap=false,back=false;unsigned long duration=0;
++ bool isScreenTouchHeld(int& a,int& b) const {a=x;b=y;return held;}
++ bool wasScreenTouchDown(int& a,int& b) const {a=x;b=y;return down;}
++ bool wasScreenTapped(int& a,int& b) const {a=x;b=y;return tap;}
++ bool isScreenTouchTapCandidate(int& a,int& b,unsigned long& d) const {a=x;b=y;d=duration;return held;}
++ bool wasReleased(Button) const {return back;}
++};
++using MappedInputManager=Input;
++struct RenderLock {
++ static inline bool busy=false;
++ template<class T> explicit RenderLock(T&) {}
++ static bool peek() {return busy;}
++};
++struct HighlightPageAction {bool editor;uint16_t clippingIndex;int x,y;int pageOffset=0;bool adjusted=false;};
++enum class ClippingColor { LightGrey, DarkGrey, Solid };
++struct Store {
++ ClippingColor color=ClippingColor::LightGrey;
++ bool setColor(size_t,ClippingColor next) {if(ok)color=next;return ok;}
++ unsigned writes=0,deletes=0;bool ok=true;std::string text;
++ bool removeClippingAt(size_t) {++deletes;return ok;}
++ bool updateClippingText(size_t,const std::string& value) {++writes;if(ok)text=value;return ok;}
++} CLIPPINGS;
++namespace HighlightMerge {
++inline bool save(const std::shared_ptr<Epub>&, uint16_t, size_t& index, XPathTextLocation&, const std::string& text) {
++ return CLIPPINGS.updateClippingText(index,text);
++}
++}
++namespace workflowy {inline bool shared=false; inline void shareClippings(size_t){shared=true;}}
++struct ActivityResult {};
++struct WorkflowyShareActivity {
++  template <typename... Args>
++  explicit WorkflowyShareActivity(Args&&...) {}
++};
++class OnPageHighlightActivity {
++ public:
++ struct Word {Rect rect;uint32_t start,end;bool rtl=false;uint16_t row=0;};
++ std::shared_ptr<Epub> book=std::make_shared<Epub>(std::vector<std::string>{"<html><body><p>before alpha bravo after tail</p></body></html>"});
++ Word words[5]={{{0,0,40,20},0,5},{{50,0,40,20},6,10},{{100,0,40,20},11,15},{{150,0,40,20},16,20},{{200,0,40,20},21,24}};
++ size_t wordCount=5,index=3;uint16_t spine=0;
++ XPathTextLocation original{6,15,25,false};
++ OnPageHighlightRange range{6,15},saved{6,15};
++ Rect firstHandle{40,0,20,20},lastHandle{130,0,20,20};
++ HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(80,100,480);
++ bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false,closeAfterAdjustment=false;
++ int activeEdge=-1,updates=0;
++ int pageOffset=0;HighlightDragPaging dragPaging;HighlightDragContact dragContact;
++ std::atomic<bool> waitForPageMotion{false};std::atomic<int>firstTextY{0},lastTextBottom{100};
++ int turnAttempts=0,lastTurnDirection=0;
++ bool turnPage(int direction) {++turnAttempts;lastTurnDirection=direction;return false;}
++ struct Renderer {int getScreenHeight() const{return 800;}} renderer;
++ int firstAnchorY=10,lastAnchorY=10,dragOffsetY=0,dragOffsetX=0;
++ std::atomic<bool> dragging{false};std::atomic<int> dragX{0},dragY{0};
++ Input mappedInput;
++ bool shareOpened=false,dragFrameReady=false;
++ template <typename Child, typename Handler>
++ void startActivityForResult(std::unique_ptr<Child>, Handler) {shareOpened=true;}
++ HighlightPageAction action{};
++ void requestUpdate() {++updates;}
++ void finish() {finished=true;}
++ void setResult(HighlightPageAction a) {action=a;}
++ void returnAction(bool,int=0,int=0);
++ void updateDrag();void saveRange();void loop();
++};
++#include "OnPageActions.inc"
++int main() {
++ const auto future=HighlightToolbar::Layout::place(20,30,136,5);
++ assert(future.columns==2 && future.area.width==136 && future.area.height==174);
++ for(size_t i=0;i<5;++i) { const auto b=future.button(i); assert(future.indexAt(b.x+28,b.y+24)==i); }
++ assert(!future.indexAt(110,170)); // empty final grid cell
++ assert(!HighlightToolbar::Layout{}.indexAt(0,0));
++
++ const HighlightToolbar::Bounds view{16,24,448,752};
++ const auto top=HighlightToolbar::nearSelection({400,30,60,20},view,{},{});
++ assert(top.area.y>=50 && top.area.x+top.area.width<=464);
++ const auto bottom=HighlightToolbar::nearSelection({20,740,100,20},view,{},{});
++ assert(bottom.area.y+bottom.area.height<740 && bottom.area.y>=24);
++ for(int y:{24,50,350,740,760}) for(int x:{16,200,450}) {
++   auto card=HighlightToolbar::nearSelection({x,y,80,20},view,{},{}).area;
++   assert(card.x>=view.x && card.y>=view.y && card.x+card.width<=view.x+view.width && card.y+card.height<=view.y+view.height);
++ }
++ const auto full=HighlightToolbar::nearSelection(view,view,{},{}).area;
++ assert(full.x>=view.x && full.y>=view.y && full.x+full.width<=464 && full.y+full.height<=776);
++ const auto centered=HighlightToolbar::nearSelection({100,350,200,20},view,{90,330,20,20},{290,370,20,20});
++ assert(centered.area.x==16 && centered.area.y==268);
++ const auto shortCard=HighlightToolbar::nearSelection({100,350,40,20},view,{90,330,20,20},{130,370,20,20});
++ assert(shortCard.area.x==16 && shortCard.area.y+shortCard.area.height==326);
++ OnPageHighlightActivity sharing;
++ const auto shareButton=sharing.toolbar.button(5);
++ sharing.mappedInput={shareButton.x+20,shareButton.y+20,false,false,true,false,0};
++ sharing.loop();
++ assert(workflowy::shared);
++ // Adjacent pieces share a pixel boundary: grabbing/releasing the end
++ // handle must not extend the saved selection into the next piece.
++ OnPageHighlightActivity touching;
++ touching.words[0].rect={0,0,40,20};touching.words[1].rect={40,0,40,20};
++ touching.range=touching.saved={0,5};touching.firstHandle={};touching.lastHandle={30,20,20,20};
++ const auto writesAtTouch=CLIPPINGS.writes;
++ touching.mappedInput={40,30,true,true,false,false,0};touching.loop();
++ assert(touching.activeEdge==1 && touching.dragOffsetX==-1);
++ touching.mappedInput.held=false;touching.mappedInput.down=false;touching.loop();nowMs+=51;touching.loop();
++ assert(touching.range.end==5 && CLIPPINGS.writes==writesAtTouch);
++ // The real held-touch loop starts edge dwell while the panel is busy,
++ // then performs one bounded attempt when the render lock becomes available.
++ for(int direction:{-1,1}) {
++   OnPageHighlightActivity paging;paging.dragging=true;paging.activeEdge=1;
++   paging.dragPaging.begin(100,200);
++   paging.mappedInput={100,direction>0?780:20,false,true,false,false,0};
++   nowMs=10;RenderLock::busy=true;paging.loop();
++   nowMs=210;paging.loop();assert(paging.turnAttempts==0);
++   RenderLock::busy=false;paging.loop();
++   assert(paging.turnAttempts==1&&paging.lastTurnDirection==direction);
++   nowMs=1000;paging.loop();assert(paging.turnAttempts==1);
++ }
++ nowMs=0;
++ OnPageHighlightActivity a;
++ a.mappedInput={50,10,true,true,false,false,0};a.loop();
++ assert(a.dragging && a.activeEdge==0 && CLIPPINGS.writes==0);
++ a.mappedInput={10,10,false,true,false,false,0};a.loop();a.updateDrag();
++ assert(a.range.start==0 && a.range.end==15 && CLIPPINGS.writes==0);
++ // Release is retained while a panel refresh owns the render lock.
++ RenderLock::busy=true;a.mappedInput.held=false;a.loop();nowMs+=51;a.loop();
++ assert(a.releasePending && CLIPPINGS.writes==0);
++ const auto beforeReleaseUpdates=a.updates;
++ RenderLock::busy=false;a.loop();
++ assert(!a.dragging && CLIPPINGS.writes==1 && CLIPPINGS.text=="before alpha bravo");
++ assert(a.saved.start==0 && a.saved.end==15);
++ assert(a.finished && a.closeAfterAdjustment && a.action.adjusted && !a.action.editor && a.updates==beforeReleaseUpdates);
++ OnPageHighlightActivity unchanged;
++ const auto writesBefore=CLIPPINGS.writes;
++ unchanged.mappedInput={50,10,true,true,false,false,0};unchanged.loop();
++ unchanged.mappedInput.held=false;unchanged.mappedInput.down=false;unchanged.loop();nowMs+=51;unchanged.loop();
++ assert(unchanged.finished && unchanged.closeAfterAdjustment && CLIPPINGS.writes==writesBefore);
++ OnPageHighlightActivity shortQuote;
++ shortQuote.firstHandle={40,0,20,20};shortQuote.lastHandle={65,0,20,20};
++ shortQuote.mappedInput={70,10,true,true,false,false,0};shortQuote.loop();
++ assert(shortQuote.dragging && shortQuote.activeEdge==1);
++ OnPageHighlightActivity stem;
++ for(auto& word:stem.words) word.rect.y=100;
++ stem.firstHandle={40,70,20,20};stem.firstAnchorY=110;
++ stem.mappedInput={50,80,true,true,false,false,0};stem.loop();
++ assert(stem.dragging && stem.dragOffsetY==30);
++ stem.updateDrag();assert(stem.range.start==6 && stem.range.end==15);
++ stem.dragX=300;stem.dragY=300;stem.updateDrag();
++ assert(stem.range.start==6 && stem.range.end==15); // margins cannot grow the quote
++ OnPageHighlightActivity gaps;gaps.activeEdge=1;
++ gaps.dragX=95;gaps.dragY=10;gaps.updateDrag();
++ assert(gaps.range.end==15); // a point between alpha and bravo follows bravo
++ gaps.words[3].row=gaps.words[4].row=1;
++ gaps.words[3].rect.y=gaps.words[4].rect.y=40;
++ gaps.dragX=210;gaps.dragY=31;gaps.updateDrag();
++ assert(gaps.range.end==24); // inter-line space follows the nearest row
++ OnPageHighlightActivity dropout;dropout.dragging=true;dropout.activeEdge=1;
++ const auto beforeDropout=CLIPPINGS.writes;
++ nowMs=0;dropout.mappedInput.held=false;dropout.loop();
++ assert(dropout.dragging&&!dropout.releasePending);
++ nowMs=30;dropout.mappedInput.held=true;dropout.loop();
++ assert(dropout.dragging&&CLIPPINGS.writes==beforeDropout);
++ OnPageHighlightActivity recolor;
++ recolor.mappedInput={170,115,false,false,true,false,0};recolor.loop();
++ assert(recolor.finished && CLIPPINGS.color==ClippingColor::DarkGrey);
++ OnPageHighlightActivity edit;
++ edit.mappedInput={301,115,false,false,true,false,0};edit.loop();
++ assert(edit.finished && edit.action.editor && edit.action.clippingIndex==3);
++ OnPageHighlightActivity overlap;
++ overlap.firstHandle={286,100,20,20};
++ overlap.mappedInput={301,115,true,true,false,false,0};overlap.loop();assert(!overlap.dragging);
++ overlap.mappedInput={301,115,false,false,true,false,0};overlap.loop();assert(overlap.finished && overlap.action.editor);
++ OnPageHighlightActivity remove;
++ remove.mappedInput={368,115,false,false,true,false,0};remove.loop();
++ assert(remove.finished && CLIPPINGS.deletes==1 && !remove.action.editor);
++ OnPageHighlightActivity failedDelete;
++ CLIPPINGS.ok=false;
++ failedDelete.mappedInput={368,115,false,false,true,false,0};failedDelete.loop();
++ assert(!failedDelete.finished && failedDelete.failed && CLIPPINGS.deletes==2);
++ CLIPPINGS.ok=true;
++ OnPageHighlightActivity holdButton;
++ holdButton.mappedInput={368,115,false,true,false,false,1000};holdButton.loop();
++ assert(!holdButton.finished && CLIPPINGS.deletes==2);
++ OnPageHighlightActivity dictionary;
++ dictionary.mappedInput={100,10,false,true,false,false,600};dictionary.loop();
++ assert(dictionary.finished && !dictionary.action.editor && dictionary.action.x==100);
++ OnPageHighlightActivity outside;
++ outside.mappedInput={300,300,false,false,true,false,0};outside.loop();assert(outside.finished);
++ OnPageHighlightActivity failure;
++ failure.range.start=0;CLIPPINGS.ok=false;failure.saveRange();
++ assert(failure.failed && failure.range.start==0 && failure.saved.start==6);
++ std::cout<<"Actual on-page handlers: live drag, one release write, delayed release, Edit, dictionary and failure rollback passed\n";
 +}
 diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word_edit/OnPageRenderTest.cpp
 new file mode 100644

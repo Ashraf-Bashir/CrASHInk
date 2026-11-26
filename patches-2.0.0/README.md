@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 73 selected native regression checks have been
+The X4 Pro firmware build and 75 selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -24,6 +24,10 @@ check after installation.
   after their positions are verified. Ambiguous repeated text remains on the
   fallback matcher. Edits invalidate old anchors and partial UTF-8 selections
   retain their byte boundaries.
+- Highlight dragging follows word/line gaps and tolerates a missing contact frame
+  for 50 ms before committing. Reader idle scans/prewarming pause during touch.
+- Chapter headings and navigation labels stay bold; full/partial chapter layouts
+  rebuild once under cache version 119 / `0xE8` to apply the new glyph widths.
 - Multiword touch selections save on release without a Lookup/Clip prompt.
   Single-word holds retain lookup; saved quote controls use non-flashing refreshes.
 - Clipping rewrites use checked scratch allocation and atomic publication.
