@@ -1,12 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3827720948222411b0f6f2b59c69efaf7be0b65e..509f63328ff62e539d688c614504810644f7375f 100644
+index 3827720948222411b0f6f2b59c69efaf7be0b65e..f18f2d914aabbe8327a6b85f624f18ff32dcd03e 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -5,6 +5,7 @@
  - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
  - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
-+- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
 
  - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
  - Group Readest account controls and auto-sync together under Readest in System settings.
@@ -1226,10 +1226,10 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477278455b4
+index 0000000000000000000000000000000000000000..24da7fb79c1f724490d92a423dbaf6c248b098e1
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5293 @@
+@@ -0,0 +1,5317 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -5451,11 +5451,25 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +  return {bounds.x + timeWidth, y, bounds.width - timeWidth, height, calendarHourHeight};
 +}
 +
-+// Called while the UI render lock is held. Manual panning disables following
-+// until Today or a new calendar view is opened; background refresh must not snap
-+// a user's chosen time range back to the clock.
-+void WorkflowyDailyActivity::positionCalendarNow() {
-+  if (!calendarFollowNow || calendarSchedule) return;
++// Called with the render lock. Fit timed events across the displayed day/week.
++// Manual panning/zooming keeps its range until a new period/view is opened.
++void WorkflowyDailyActivity::fitCalendarViewport() {
++  if (!calendarAutoFit || calendarSchedule || calendarDrag.tracking) return;
++  int first = 1440, last = 0;
++  for (const auto& day : calendarDays) for (const auto& node : day.items) {
++    if (const auto range = workflowy::parseTimeRange(node.title)) {
++      first = std::min(first, range->start);
++      last = std::max(last, range->end);
++    }
++  }
++  if (const auto fit = workflowy::fitScheduleViewport(first, last, calendarGrid().height)) {
++    calendarHourHeight = fit->hourHeight;
++    calendarScroll = fit->scroll;
++    return;
++  }
++  // Empty days still have a useful scale and follow the clock when relevant.
++  calendarHourHeight = 96;
++  calendarScroll = 8 * 60;
 +  const auto today = isoDate(0);
 +  const auto utc = halClock.utcNowMs();
 +  if (today.empty() || !utc) return;
@@ -5476,7 +5490,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +  {
 +    RenderLock lock(*this);
 +    calendarVisible = true;
-+    calendarFollowNow = true;
++    calendarAutoFit = true;
 +    calendarWeek = week;
 +    calendarSchedule = false;
 +    schedulingItem.reset();
@@ -5531,7 +5545,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +      if(static_cast<int32_t>(static_cast<uint32_t>(millis()+remaining)-calendarRefreshAt)<0)calendarRefreshAt=millis()+remaining;
 +    }
 +    calendarHits.clear();
-+    positionCalendarNow();
++    fitCalendarViewport();
 +    message = nullptr;
 +  }
 +  requestUpdate();
@@ -5556,7 +5570,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +      RenderLock lock(*this);
 +      for (auto& day : calendarDays) if (!day.date.empty()) day.loaded = false;
 +      calendarRefreshAt = millis() + CALENDAR_REFRESH_MS;
-+      positionCalendarNow();
++      fitCalendarViewport();
 +    }
 +    requestUpdate();
 +  }
@@ -5583,6 +5597,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +              else if (old.id.starts_with("pending:")) completed->items.push_back(old);
 +            }
 +            day->items = std::move(completed->items);
++            fitCalendarViewport();
 +          }
 +        }
 +        if (completed->status != 200) {
@@ -6051,6 +6066,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +    {
 +      RenderLock lock(*this);
 +      calendarAnchor = shifted;
++      calendarAutoFit = true;
 +      calendarDrag = {};
 +    }
 +    reloadCalendar();
@@ -6073,6 +6089,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +    {
 +      RenderLock lock(*this);
 +      calendarAnchor = calendarDays[column].date;
++      calendarAutoFit = true;
 +      calendarWeek = false;
 +      calendarSchedule = false;
 +    }
@@ -6088,6 +6105,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +        {
 +          RenderLock lock(*this);
 +          calendarAnchor = std::get<KeyboardResult>(result.data).text;
++          calendarAutoFit = true;
 +        }
 +        reloadCalendar();
 +      }
@@ -6131,7 +6149,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +      {
 +        RenderLock lock(*this);
 +        calendarAnchor = today;
-+        calendarFollowNow = true;
++        calendarAutoFit = true;
 +        scheduleOffset = 0;
 +      }
 +    }
@@ -6148,7 +6166,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +        const auto now = millis();
 +        if (now - calendarDrag.scrollAt >= 650) {
 +          const int scrollDelta = y < grid.y + 20 ? -30 : y >= grid.y + grid.height - 20 ? 30 : 0;
-+          if (scrollDelta) calendarFollowNow = false;
++          if (scrollDelta) calendarAutoFit = false;
 +          calendarScroll = std::clamp(calendarScroll + scrollDelta, 0,
 +                                      std::max(0, 1440 - grid.height * 60 / grid.hourHeight));
 +          if (!calendarDrag.edge && (x < grid.x || x >= grid.x + grid.width)) {
@@ -6261,10 +6279,17 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +                        grid.y - 21, number.c_str(), true, EpdFontFamily::BOLD);
 +    }
 +  }
-+  for (int minute = (calendarScroll / 60) * 60; minute <= calendarScroll + minutes; minute += 30) {
++  // Auto-fit may show an entire day; keep hour labels from colliding.
++  const int labelHeight = renderer.getLineHeight(SMALL_FONT_ID) + 4;
++  int labelHours = std::max(1, (labelHeight + grid.hourHeight - 1) / grid.hourHeight);
++  if (labelHours > 12) labelHours = 24;
++  else if (labelHours > 6) labelHours = 12;
++  else if (labelHours > 4) labelHours = 6;
++  const int gridStep = grid.hourHeight >= 48 ? 30 : 60;
++  for (int minute = (calendarScroll / gridStep) * gridStep; minute <= calendarScroll + minutes; minute += gridStep) {
 +    const int y = grid.y + (minute - calendarScroll) * grid.hourHeight / 60;
 +    if (y < grid.y || y >= grid.y + grid.height) continue;
-+    if (minute % 60 == 0 && (grid.hourHeight >= 48 || minute % 120 == 0)) {
++    if (minute % (labelHours * 60) == 0) {
 +      const auto hour = workflowy::scheduleClock(minute);
 +      renderer.drawText(SMALL_FONT_ID, bounds.x, y, hour.c_str());
 +      renderer.drawLine(grid.x, y, right - 1, y);
@@ -6379,7 +6404,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +    const auto mode = std::get<OptionSelectionResult>(result.data).index;
 +    {
 +      RenderLock lock(*this);
-+      calendarFollowNow = true;
++      calendarAutoFit = true;
 +      calendarWeek = mode == 1;
 +      calendarSchedule = mode == 2;
 +      scheduleOffset = 0;
@@ -6393,13 +6418,12 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +  if (calendarSchedule) return;
 +  {
 +    RenderLock lock(*this);
-+    constexpr int scales[] = {28, 40, 64, 96, 144, 192};
-+    auto found = std::lower_bound(std::begin(scales), std::end(scales), calendarHourHeight);
-+    const int index = found - std::begin(scales);
-+    calendarHourHeight = scales[std::clamp(index + direction, 0, static_cast<int>(std::size(scales)) - 1)];
++    calendarAutoFit = false;
++    const int step = std::max(1, calendarHourHeight / 3);
++    const int minimum = std::max(1, calendarGrid().height * 60 / 1440);
++    calendarHourHeight = std::clamp(calendarHourHeight + direction * step, minimum, 1440);
 +    const auto grid = calendarGrid();
 +    calendarScroll = std::clamp(calendarScroll, 0, std::max(0, 1440 - grid.height * 60 / grid.hourHeight));
-+    positionCalendarNow();
 +    calendarDrag = {};
 +  }
 +  requestUpdate();
@@ -6408,7 +6432,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +void WorkflowyDailyActivity::scrollCalendar(int direction) {
 +  {
 +    RenderLock lock(*this);
-+    calendarFollowNow = false;
++    calendarAutoFit = false;
 +    const auto grid = calendarGrid();
 +    if (calendarSchedule) {
 +      const int rows = std::max(1, grid.height / 72);
@@ -6525,7 +6549,7 @@ index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477
 +}
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.h b/src/activities/workflowy/WorkflowyDailyActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f23acf6be1a16ed208cb801b31b07fdf2488e34a
+index 0000000000000000000000000000000000000000..c05d7215c3f19c337c5b7da10c77f14c9f4397ca
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.h
 @@ -0,0 +1,353 @@
@@ -6602,7 +6626,7 @@ index 0000000000000000000000000000000000000000..f23acf6be1a16ed208cb801b31b07fdf
 +  size_t scheduleOffset = 0;
 +  unsigned long calendarRefreshAt = 0;
 +  int calendarScroll = 8 * 60;
-+  bool calendarFollowNow = true;
++  bool calendarAutoFit = true;
 +  std::array<CalendarDay, 7> calendarDays;
 +  std::shared_ptr<CalendarFetch> calendarFetch;
 +  std::string calendarAnchor, calendarFocus;
@@ -6630,7 +6654,7 @@ index 0000000000000000000000000000000000000000..f23acf6be1a16ed208cb801b31b07fdf
 +    int minuteAt(int pixel) const;
 +  };
 +  CalendarGrid calendarGrid() const;
-+  void positionCalendarNow();
++  void fitCalendarViewport();
 +  void openCalendar(bool week);
 +  void reloadCalendar();
 +  void pollCalendar();
@@ -7527,10 +7551,10 @@ index 0000000000000000000000000000000000000000..893bd971022b576509bff1f12bf9592c
 +}  // namespace workflowy
 diff --git a/src/workflowy/WorkflowySchedule.h b/src/workflowy/WorkflowySchedule.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..9bbc7f940ddf5201b898f4174852b34a5a91e596
+index 0000000000000000000000000000000000000000..054369c828f38ad10f842687c168c8597896699e
 --- /dev/null
 +++ b/src/workflowy/WorkflowySchedule.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,213 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -7547,6 +7571,18 @@ index 0000000000000000000000000000000000000000..9bbc7f940ddf5201b898f4174852b34a
 +  if (viewportHeight <= 0 || hourHeight <= 0) return 0;
 +  const int visible = std::max(1, viewportHeight * 60 / hourHeight);
 +  return std::clamp(minute - visible / 3, 0, std::max(0, 1440 - visible));
++}
++
++// Fit the complete event range with a small margin; no event list or allocation.
++struct ScheduleViewport { int scroll, hourHeight; };
++inline std::optional<ScheduleViewport> fitScheduleViewport(int first, int last, int pixels) {
++  if (pixels <= 0 || first < 0 || last > 1440 || last <= first) return std::nullopt;
++  int start = std::max(0, first - 15), end = std::min(1440, last + 15);
++  const int span = std::max(60, end - start);
++  start = std::clamp(start - (span - (end - start)) / 2, 0, 1440 - span);
++  const int scale = std::max(1, pixels * 60 / span);
++  const int visible = pixels * 60 / scale;
++  return ScheduleViewport{std::clamp(start, 0, std::max(0, 1440 - visible)), scale};
 +}
 +
 +struct TimeRange {
@@ -8104,21 +8140,33 @@ index 0000000000000000000000000000000000000000..aa5caf0395dfd88c5733455a6cf88c3c
 +}
 diff --git a/test/workflowy_schedule/CMakeLists.txt b/test/workflowy_schedule/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14a785a641
+index 0000000000000000000000000000000000000000..8923deaf9223ff9ad4c9e620808b71f0372e5247
 --- /dev/null
 +++ b/test/workflowy_schedule/CMakeLists.txt
-@@ -0,0 +1,5 @@
+@@ -0,0 +1,17 @@
 +add_executable(workflowy_schedule_test WorkflowyScheduleTest.cpp)
 +target_include_directories(workflowy_schedule_test PRIVATE ${REPO_ROOT}/src/workflowy)
 +target_compile_features(workflowy_schedule_test PRIVATE cxx_std_20)
 +add_test(NAME workflowy_schedule COMMAND workflowy_schedule_test)
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
++
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(VIEWPORT_INC ${CMAKE_CURRENT_BINARY_DIR}/Viewport.inc)
++add_custom_command(OUTPUT ${VIEWPORT_INC}
++  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractViewport.py
++    ${REPO_ROOT}/src/activities/workflowy/WorkflowyDailyActivity.cpp ${VIEWPORT_INC}
++  DEPENDS ExtractViewport.py ${REPO_ROOT}/src/activities/workflowy/WorkflowyDailyActivity.cpp)
++add_executable(workflowy_viewport_test ViewportTest.cpp ${VIEWPORT_INC})
++target_include_directories(workflowy_viewport_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src/workflowy)
++target_compile_features(workflowy_viewport_test PRIVATE cxx_std_20)
++target_compile_options(workflowy_viewport_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
++add_test(NAME workflowy_viewport COMMAND workflowy_viewport_test)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..adc3bf44b46fdd08443e07aa4d1a4b0e6cc216d8
+index 0000000000000000000000000000000000000000..d7216d01a793bbe0d3e5d95f03d75dac49fdb0b5
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,164 @@
 +#include "WorkflowySchedule.h"
 +#include "WorkflowyOutlineLayout.h"
 +#include "WorkflowySettings.h"
@@ -8126,6 +8174,26 @@ index 0000000000000000000000000000000000000000..adc3bf44b46fdd08443e07aa4d1a4b0e
 +#include <random>
 +int main() {
 +  using namespace workflowy;
++  // Short, long, overnight-boundary and week-union ranges must fit fully.
++  for (const auto bounds : {std::pair{480, 540}, {360, 1380}, {0, 30}, {1410, 1440}, {0, 1440}}) {
++    for (int height : {120, 480, 720}) {
++      const auto fit = fitScheduleViewport(bounds.first, bounds.second, height);
++      assert(fit && fit->hourHeight > 0 && fit->scroll <= bounds.first);
++      assert(fit->scroll + height * 60 / fit->hourHeight >= bounds.second);
++    }
++  }
++  assert(fitScheduleViewport(480, 540, 720)->hourHeight > fitScheduleViewport(360, 1380, 720)->hourHeight);
++  assert(!fitScheduleViewport(1440, 0, 720));
++  assert(!fitScheduleViewport(480, 540, 0));
++  std::mt19937 fitRandom(73);
++  for (int trial = 0; trial < 10000; ++trial) {
++    const int first = fitRandom() % 1440;
++    const int last = first + 1 + fitRandom() % (1440 - first);
++    const int height = 120 + fitRandom() % 800;
++    const auto fit = fitScheduleViewport(first, last, height);
++    assert(fit && fit->scroll <= first);
++    assert(fit->scroll + height * 60 / fit->hourHeight >= last);
++  }
 +  assert(scheduleScrollForNow(720, 720, 72) == 520);
 +  assert(scheduleScrollForNow(720, 720, 144) == 620);
 +  assert(scheduleScrollForNow(0, 720, 72) == 0);
@@ -9613,3 +9681,64 @@ index 0000000000000000000000000000000000000000..5b5eb56ac3f11ed1b516b9c3a6323885
 +inline size_t internalFree=256*1024, internalLargest=128*1024;
 +inline ByteHeapSnapshot byteHeapSnapshot(MemoryPool){return {320*1024,internalFree,internalLargest};}
 +namespace MemoryBudget {inline void logEpubHeapPools(const char*){}}
+diff --git a/test/workflowy_schedule/ExtractViewport.py b/test/workflowy_schedule/ExtractViewport.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..40c5679b150f7621d044858672b16a0806dbb8f1
+--- /dev/null
++++ b/test/workflowy_schedule/ExtractViewport.py
+@@ -0,0 +1,8 @@
++import sys
++from pathlib import Path
++source=Path(sys.argv[1]).read_text()
++start=source.index("void WorkflowyDailyActivity::fitCalendarViewport() {")
++brace=source.index("{",start); depth=1;end=brace+1
++while depth:
++    depth+=(source[end]=="{")-(source[end]=="}");end+=1
++Path(sys.argv[2]).write_text(source[start:end]+"\n")
+diff --git a/test/workflowy_schedule/ViewportTest.cpp b/test/workflowy_schedule/ViewportTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c42eadf1a8c08db1d3982212bf950483e904c8be
+--- /dev/null
++++ b/test/workflowy_schedule/ViewportTest.cpp
+@@ -0,0 +1,41 @@
++#include "WorkflowySchedule.h"
++#include <array>
++#include <cassert>
++#include <cstdint>
++struct { uint64_t utcNowMs() const { return 0; } } halClock;
++struct { int clockUtcOffsetQ=48; } SETTINGS;
++std::string isoDate(int) { return "2026-11-26"; }
++struct WorkflowyDailyActivity {
++  struct Node { std::string title; };
++  struct Day { std::vector<Node> items; };
++  struct Grid { int height=720, hourHeight=96; };
++  std::array<Day,7> calendarDays;
++  bool calendarAutoFit=true,calendarSchedule=false,calendarWeek=false;
++  struct { bool tracking=false; } calendarDrag;
++  int calendarHourHeight=96,calendarScroll=480;
++  std::string calendarAnchor="2026-11-26";
++  Grid calendarGrid() const { return {720,calendarHourHeight}; }
++  void fitCalendarViewport();
++};
++#include "Viewport.inc"
++int main() {
++  WorkflowyDailyActivity view;
++  view.calendarDays[0].items={{"9:00am - 10:00am Work"}};
++  view.fitCalendarViewport();
++  const auto shortFit=workflowy::fitScheduleViewport(540,600,720);
++  assert(view.calendarScroll==shortFit->scroll&&view.calendarHourHeight==shortFit->hourHeight);
++  // A later asynchronous day result extends the common week time axis.
++  view.calendarWeek=true;
++  view.calendarDays[6].items={{"6:00am - 7:00am Early"},{"10:00pm - 11:00pm Late"}};
++  view.fitCalendarViewport();
++  const auto weekFit=workflowy::fitScheduleViewport(360,1380,720);
++  assert(view.calendarScroll==weekFit->scroll&&view.calendarHourHeight==weekFit->hourHeight);
++  for(int mode=0;mode<3;++mode) {
++    view.calendarAutoFit=mode!=0;view.calendarSchedule=mode==1;view.calendarDrag.tracking=mode==2;
++    view.calendarScroll=123;view.calendarHourHeight=77;view.fitCalendarViewport();
++    assert(view.calendarScroll==123&&view.calendarHourHeight==77);
++  }
++  view.calendarAutoFit=true;view.calendarSchedule=false;view.calendarDrag.tracking=false;
++  for(auto& day:view.calendarDays)day.items.clear();
++  view.fitCalendarViewport();assert(view.calendarScroll==480&&view.calendarHourHeight==96);
++}
