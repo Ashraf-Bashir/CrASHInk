@@ -941,14 +941,14 @@ index e996ff03ca5f2ad909069f071e44133340a348bc..ea065bc21b0c6a428e7a24777c597a64
      return renderer.getSpaceAdvance(fontId, leftCodepoint, GUIDE_DOT_CODEPOINT, left.style) +
             renderer.getTextAdvanceX(fontId, GUIDE_DOT_UTF8, EpdFontFamily::REGULAR, 0, characterSpacing) +
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 39bdf04565e67094d7c49b092d63f444b70d41bb..ee44bd5c841e3693baa964e8887f5cadfa982ad5 100644
+index 39bdf04565e67094d7c49b092d63f444b70d41bb..9342eff6951baf19539905c693f8d2b09721cde3 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -57,6 +57,9 @@
  ### Fixed
 
  - Offer a tappable, configurable RAM used/total and percentage indicator with bounded memory diagnostics.
-+- Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available.
++- Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
 +
 +- Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
 
@@ -956,10 +956,10 @@ index 39bdf04565e67094d7c49b092d63f444b70d41bb..ee44bd5c841e3693baa964e8887f5cad
  - Index EPUBs faster when many table-of-contents entries point to the same chapter file or chapter files are stored out of reading order.
 diff --git a/docs/crashink-memory-review.md b/docs/crashink-memory-review.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..2623d3b5f06214e5c22da35e43032509f193989e
+index 0000000000000000000000000000000000000000..4de6a33df6a9a92024b67208c04bbc09d9cfb680
 --- /dev/null
 +++ b/docs/crashink-memory-review.md
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,52 @@
 +# Memory review: patched 1.6.1 versus patched 2.0.0
 +
 +The archived 1.6.1 patch stack was replayed from its pinned commit
@@ -995,6 +995,23 @@ index 0000000000000000000000000000000000000000..2623d3b5f06214e5c22da35e43032509
 +Test new and existing highlight endpoint drags at both screen edges, in both
 +orientations. Brief contact gaps must not save early; deliberate edge dwell
 +must turn one page without skipping pages while the finger is stationary.
++
++## Arabic dictionary follow-up
++
++A different Arabic dictionary font must be restored after painting the Latin
++reader background. Bitmap-font admission now permits PSRAM-backed loading
++without demanding an unrelated 32 KiB internal block, while retaining internal
++headroom checks. Definition rendering prewarms scalable fonts as well as
++bitmap SD fonts, detects an Arabic page backed by a Latin-only family, and
++tries one clean reload of the requested family. Failures no longer silently
++show replacement boxes; a retry is available, and one automatic retry follows
++completion of an overlapping quote share. The activity owns its font-family
++name and its lookup controller borrows the activity-owned cache path.
++
++Regression tests reproduce the Latin-only Arabic fallback using real Arabic
++shaping, exercise successful/failed family reload and one-shot post-share
++retry, and cover fragmented internal RAM with and without PSRAM. They do not
++replace testing the user's installed Arabic font and SD card on hardware.
 diff --git a/lib/EpdFont/FontDecompressor.cpp b/lib/EpdFont/FontDecompressor.cpp
 index 13ab102a9627c9eb2732cbd10b5446c2c3cc9a9c..bc20eeae9890ec83b3418fc0cac29e5735eecce3 100644
 --- a/lib/EpdFont/FontDecompressor.cpp
@@ -1047,17 +1064,163 @@ index 13ab102a9627c9eb2732cbd10b5446c2c3cc9a9c..bc20eeae9890ec83b3418fc0cac29e57
      }
      if (!tempBuf) {
 diff --git a/src/activities/reader/DictionaryDefinitionActivity.cpp b/src/activities/reader/DictionaryDefinitionActivity.cpp
-index 2637d0681c58f1a3cef9cb20ebcbd7a1bcbf07ae..0ce9c97783349a87b01c098d20fc74cf4b68143d 100644
+index 2637d0681c58f1a3cef9cb20ebcbd7a1bcbf07ae..2847651389f9a6e24a7f6781783ee31d0f2c0df2 100644
 --- a/src/activities/reader/DictionaryDefinitionActivity.cpp
 +++ b/src/activities/reader/DictionaryDefinitionActivity.cpp
-@@ -1631,12 +1631,13 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
+@@ -1,4 +1,5 @@
+ #include "DictionaryDefinitionActivity.h"
++#include "WorkflowyShareActivity.h"
+
+ #include <BidiUtils.h>
+ #include <DictHtmlRenderer.h>
+@@ -23,6 +24,7 @@
+ #include "Memory.h"
+ #include "SdCardFontSystem.h"
+ #include "components/UITheme.h"
++#include "components/TouchHeaderBackButton.h"
+ #if CROSSINK_APP_CAP_TOUCH
+ #include "components/UiAppHelpers.h"
+ #include "components/icons/touchHeaderIcons.h"
+@@ -344,8 +346,65 @@ static EpdFontFamily::Style styleForSpan(const StyledSpan& span) {
+   return EpdFontFamily::REGULAR;
+ }
+
++bool DictionaryDefinitionActivity::visibleArabicFontMissing() const {
++  if (!dictionaryFontFamilyName_[0]) return false; // preserve ordinary reader-font dictionary fallback
++  const auto found = renderer.getFontMap().find(getDefinitionFontId());
++  std::string visual;
++  bool hasArabic = false;
++  for (const auto& segment : layoutSegments) {
++    const char* text = pagePool_.data() + segment.offset;
++    visual.clear();
++    if (BidiUtils::applyBidiVisual(text, visual, static_cast<int>(BidiUtils::BidiBaseDir::AUTO)) && !visual.empty())
++      text = visual.c_str();
++    const auto* cursor = reinterpret_cast<const uint8_t*>(text);
++    while (const uint32_t cp = utf8NextCodepoint(&cursor)) {
++      const bool arabic = (cp >= 0x0600 && cp <= 0x08ff) || (cp >= 0xfb50 && cp <= 0xfdff) ||
++                          (cp >= 0xfe70 && cp <= 0xfeff);
++      if (arabic) {
++        hasArabic = true;
++        if (found != renderer.getFontMap().end() && found->second.hasCodepoint(cp, segment.style)) return false;
++      }
++    }
++  }
++  return hasArabic;
++}
++
++bool DictionaryDefinitionActivity::reloadRequestedDictionaryFont() {
++  if (dictionaryFontReloadAttempted_ || !dictionaryFontFamilyName_[0]) return false;
++  dictionaryFontReloadAttempted_ = true;
++  LOG_ERR("DICT", "Reloading requested dictionary font %s after unavailable glyphs", dictionaryFontFamilyName_);
++  sdFontSystem.releaseLoadedFont(renderer);
++  const auto activation = sdFontSystem.activateDictionaryFont(renderer, dictionaryFontFamilyName_, dictionaryFontPointSize_);
++  definitionFontId_ = activation.fontId;
++  definitionFontSource_ = activation.usingDictionaryFont ? DefinitionFontSource::Dictionary : DefinitionFontSource::Reader;
++  if (!activation.usingDictionaryFont) return false;
++  reflowForDefinitionFontChange();
++  return !visibleArabicFontMissing();
++}
++
++void DictionaryDefinitionActivity::renderDictionaryFontError() {
++  if (workflowy::shareInProgress()) dictionaryFontRetryAfterShare_ = true;
++  if (hasModalBackground()) drawModalFrame();
++  const int y = hasModalBackground() ? modalY_ + 20 : TouchHeaderBackButton::contentTop(renderer, mappedInput);
++  char title[96];
++  snprintf(title, sizeof(title), "%s: %s", tr(STR_DICTIONARY_FONT), tr(STR_FAILED_LOWER));
++#if CROSSINK_APP_CAP_TOUCH
++  if (mappedInput.hasTouch()) {
++    const auto close = closeButtonRect();
++    drawLucideIcon(renderer, icon_close_32, close.x + (close.width - icon_close_32.w) / 2,
++                   close.y + (close.height - icon_close_32.h) / 2);
++  }
++#endif
++  renderer.drawCenteredText(UI_10_FONT_ID, y, title);
++  renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) + 8, tr(STR_RETRY));
++  if (hasModalBackground()) displayModalBuffer();
++  else renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++}
++
+ void DictionaryDefinitionActivity::onEnter() {
+   Activity::onEnter();
++  if (!dictionaryFontFamilyName_[0] && SETTINGS.dictionarySdFontFamilyName[0])
++    snprintf(dictionaryFontFamilyName_, sizeof(dictionaryFontFamilyName_), "%s", SETTINGS.dictionarySdFontFamilyName);
+   const DictionaryFontActivation activation =
+       sdFontSystem.activateDictionaryFont(renderer, dictionaryFontFamilyName_, dictionaryFontPointSize_);
+   definitionFontId_ = activation.fontId;
+@@ -444,6 +503,10 @@ void DictionaryDefinitionActivity::redrawModalBackground() {
+     reflowForDefinitionFontChange();
+   } else {
+     backgroundRender_(backgroundContext_);
++    if (definitionFontSource_ == DefinitionFontSource::Reader) {
++      definitionFontId_ = sdFontSystem.restoreReaderFont(renderer);
++      reflowForDefinitionFontChange();
++    }
+   }
+   modalBackgroundNeedsRedraw_ = false;
+ }
+@@ -1244,6 +1307,19 @@ bool DictionaryDefinitionActivity::handleHomeGesture() {
+ }
+
+ void DictionaryDefinitionActivity::loop() {
++  // Network teardown may release the block that prevented the Arabic font
++  // from opening. Retry once on that transition, never on every repaint.
++  if (dictionaryFontUnavailable_ && dictionaryFontRetryAfterShare_ && !workflowy::shareInProgress()) {
++    RenderLock lock(*this, RenderLock::Mode::Try);
++    if (lock.ownsLock()) {
++      dictionaryFontRetryAfterShare_ = false;
++      dictionaryFontUnavailable_ = false;
++      dictionaryFontReloadAttempted_ = false;
++      requestUpdate();
++      return;
++    }
++  }
++
+   // Own the complete long-press gesture. Returning to the reader while Back is
+   // still held would let the reader fire its configured long-press shortcut.
+   if (handleLongPressExitAll(showLookupButton)) return;
+@@ -1260,6 +1336,15 @@ void DictionaryDefinitionActivity::loop() {
+   }
+   int modalTouchX = 0;
+   int modalTouchY = 0;
++  if (dictionaryFontUnavailable_ && mappedInput.wasScreenTapped(modalTouchX, modalTouchY) &&
++      (!hasModalBackground() || modalContains(modalTouchX, modalTouchY))) {
++    RenderLock lock(*this);
++    dictionaryFontUnavailable_ = false;
++    dictionaryFontRetryAfterShare_ = false;
++    dictionaryFontReloadAttempted_ = false;
++    requestUpdate();
++    return;
++  }
+   if (hasModalBackground() && mappedInput.hasTouch() && !controller.requiresBackgroundRedrawAfterOverlay() &&
+       mappedInput.wasScreenTapped(modalTouchX, modalTouchY) && !modalContains(modalTouchX, modalTouchY)) {
+     DictUtils::cancelAndFinish(*this);
+@@ -1549,6 +1634,13 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
+     prevHighlightIdx_ = -1;
+     return;
+   }
++  if (dictionaryFontUnavailable_) { renderDictionaryFontError(); return; }
++  if (visibleArabicFontMissing()) {
++    if (reloadRequestedDictionaryFont()) { requestUpdate(); return; }
++    dictionaryFontUnavailable_ = true;
++    renderDictionaryFontError();
++    return;
++  }
+   const bool inlineFailureFeedback = hasModalBackground() && controller.hasFailureFeedback();
+   if (!inlineFailureFeedback && controller.render()) {
+     // Controller drew an overlay; framebuffer state is unknown.
+@@ -1631,12 +1723,17 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
    // reader background above may have replaced that cache, so scan the visible
    // title and definition page before drawing them. The .dict reader was closed
    // by loadPage(), keeping font and dictionary SD access serialized.
 +  // Keep glyph owners alive until the word-selection overlay has also drawn.
 +  std::optional<FontCacheManager::PrewarmScope> definitionRenderScope;
    bool definitionTextRendered = false;
-   if (renderer.isSdCardFont(bodyFontId)) {
+-  if (renderer.isSdCardFont(bodyFontId)) {
++  bool prepareDefinitionFont = renderer.isSdCardFont(bodyFontId);
++#if CROSSINK_SCALABLE_FONTS
++  if (auto* cache = renderer.getFontCacheManager()) prepareDefinitionFont |= cache->isScalableFont(bodyFontId);
++#endif
++  if (prepareDefinitionFont) {
      if (auto* fcm = renderer.getFontCacheManager()) {
        // Keep this alive through the word-select overlay below. Its destructor
        // clears SD glyph bitmaps, and that overlay redraws the selected word.
@@ -1065,11 +1228,23 @@ index 2637d0681c58f1a3cef9cb20ebcbd7a1bcbf07ae..0ce9c97783349a87b01c098d20fc74cf
        const auto prewarmAndRender = [&]() {
          definitionRenderScope.emplace(*fcm, FontCacheManager::PreparationPolicy::DictionaryLean);
          renderTitle();
+@@ -1659,7 +1756,10 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
+         renderer.releaseSdCardFontForLowMemory(bodyFontId, /*preserveAdvanceTable=*/true);
+         definitionTextRendered = prewarmAndRender();
+         if (!definitionTextRendered) {
+-          useBuiltInDefinitionFontFallback();
++          definitionRenderScope.reset();
++          if (dictionaryFontFamilyName_[0]) {
++            if (!reloadRequestedDictionaryFont()) dictionaryFontUnavailable_ = true;
++          } else useBuiltInDefinitionFontFallback();
+           requestUpdate();
+           return;
+         }
 diff --git a/test/font_cache_manager/CMakeLists.txt b/test/font_cache_manager/CMakeLists.txt
-index 5d4f09402d569ceadf2696a40668196e21f3fec6..5132cf752c357c8d1469fd0e4c7a13dba429df68 100644
+index 5d4f09402d569ceadf2696a40668196e21f3fec6..89bb2ea8031f0ff48a21584cf55f254992bb897e 100644
 --- a/test/font_cache_manager/CMakeLists.txt
 +++ b/test/font_cache_manager/CMakeLists.txt
-@@ -26,3 +26,14 @@ target_include_directories(IdleScalablePrewarmTest PRIVATE
+@@ -26,3 +26,26 @@ target_include_directories(IdleScalablePrewarmTest PRIVATE
    ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${REPO_ROOT}/lib/GfxRenderer ${REPO_ROOT}/lib/Utf8)
  target_link_libraries(IdleScalablePrewarmTest PRIVATE crosspoint_test_common GTest::gtest_main)
  gtest_discover_tests(IdleScalablePrewarmTest)
@@ -1084,17 +1259,31 @@ index 5d4f09402d569ceadf2696a40668196e21f3fec6..5132cf752c357c8d1469fd0e4c7a13db
 +target_include_directories(definition_scope_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 +target_compile_options(definition_scope_test PRIVATE -UNDEBUG)
 +add_test(NAME definition_scope COMMAND definition_scope_test)
++
++set(DICTIONARY_FONT_RECOVERY ${CMAKE_CURRENT_BINARY_DIR}/DictionaryFontRecovery.inc ${CMAKE_CURRENT_BINARY_DIR}/DictionaryFontRetry.inc)
++add_custom_command(OUTPUT ${DICTIONARY_FONT_RECOVERY}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractDictionaryFontRecovery.py
++ ${REPO_ROOT}/src/activities/reader/DictionaryDefinitionActivity.cpp ${CMAKE_CURRENT_BINARY_DIR}/DictionaryFontRecovery.inc
++ DEPENDS ExtractDictionaryFontRecovery.py ${REPO_ROOT}/src/activities/reader/DictionaryDefinitionActivity.cpp)
++add_executable(dictionary_font_recovery_test DictionaryFontRecoveryTest.cpp ${DICTIONARY_FONT_RECOVERY}
++ ${REPO_ROOT}/lib/MiniBidi/minibidi.c ${REPO_ROOT}/lib/MiniBidi/BidiUtils.cpp ${REPO_ROOT}/lib/Utf8/Utf8.cpp)
++target_include_directories(dictionary_font_recovery_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
++ ${REPO_ROOT}/src ${REPO_ROOT}/lib/Memory ${REPO_ROOT}/lib/MiniBidi ${REPO_ROOT}/lib/Utf8 ${REPO_ROOT}/test/minibidi_arabic/stubs)
++target_compile_options(dictionary_font_recovery_test PRIVATE -UNDEBUG)
++add_test(NAME dictionary_font_recovery COMMAND dictionary_font_recovery_test)
 diff --git a/test/font_cache_manager/DefinitionScopeTest.cpp b/test/font_cache_manager/DefinitionScopeTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e1f78d57b81e6b62dd9320c2d586b225b1c77573
+index 0000000000000000000000000000000000000000..2fe811746977824febaf29b0c2086159944d67f1
 --- /dev/null
 +++ b/test/font_cache_manager/DefinitionScopeTest.cpp
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,31 @@
 +#include <cassert>
 +#include <optional>
++#define CROSSINK_SCALABLE_FONTS 1
 +#define LOG_ERR(...) ((void)0)
-+static bool prepared=false;
++static bool prepared=false, sdFont=false;
 +struct FontCacheManager {
++ bool isScalableFont(int){return !sdFont;}
 + enum class PreparationPolicy {DictionaryLean};
 + struct PrewarmScope {
 +  PrewarmScope(FontCacheManager&,PreparationPolicy){prepared=false;}
@@ -1104,19 +1293,21 @@ index 0000000000000000000000000000000000000000..e1f78d57b81e6b62dd9320c2d586b225
 +};
 +struct Renderer {
 + FontCacheManager manager;
-+ bool isSdCardFont(int){return true;}
++ bool isSdCardFont(int){return sdFont;}
 + FontCacheManager* getFontCacheManager(){return &manager;}
 + void releaseSdCardFontForLowMemory(int,bool){prepared=false;}
 +};
 +void renderDefinition() {
 + Renderer renderer;int bodyFontId=1;
++ char dictionaryFontFamilyName_[64]{};bool dictionaryFontUnavailable_=false;
++ auto reloadRequestedDictionaryFont=[](){return true;};
 + auto renderTitle=[]{};auto renderBody=[]{};
 + auto useBuiltInDefinitionFontFallback=[]{};auto requestUpdate=[]{};
 +#include "DefinitionScope.inc"
 + // The later selected-word overlay still needs these same glyph owners.
 + assert(prepared);
 +}
-+int main(){renderDefinition();assert(!prepared);}
++int main(){for(bool sd:{false,true}){sdFont=sd;renderDefinition();assert(!prepared);}}
 diff --git a/test/font_cache_manager/ExtractDefinitionScope.py b/test/font_cache_manager/ExtractDefinitionScope.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..1f10e43187c9089ba7ef5384567404946cf8778f
@@ -1129,3 +1320,239 @@ index 0000000000000000000000000000000000000000..1f10e43187c9089ba7ef538456740494
 +a=s.index('  std::optional<FontCacheManager::PrewarmScope> definitionRenderScope;')
 +b=s.index('  const char* inlineStatusMessage',a)
 +Path(sys.argv[2]).write_text(s[a:b])
+diff --git a/src/DictionaryFontAdmission.h b/src/DictionaryFontAdmission.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d515a35b69356380c2e0b7fe2083486562ed20e
+--- /dev/null
++++ b/src/DictionaryFontAdmission.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <Memory.h>
++namespace DictionaryFontAdmission {
++// Metadata allocations remain fallible in the font loader. PSRAM-capable
++// devices need small internal blocks, not a contiguous 32 KiB font buffer.
++inline bool allows(const ByteHeapSnapshot& internal, const ByteHeapSnapshot& external) {
++  const bool externalReady = external.total && external.free >= 256U * 1024U && external.largest >= 128U * 1024U;
++  return internal.free >= 64U * 1024U && internal.largest >= (externalReady ? 8U * 1024U : 32U * 1024U);
++}
++}
+diff --git a/src/SdCardFontSystem.cpp b/src/SdCardFontSystem.cpp
+index 0f37ef95207e15d0840a84a65e85e6073f8456d2..5dee016eac7c1e19c3e2f11c4d3ae41bb1317029 100644
+--- a/src/SdCardFontSystem.cpp
++++ b/src/SdCardFontSystem.cpp
+@@ -1,4 +1,5 @@
+ #include "SdCardFontSystem.h"
++#include "DictionaryFontAdmission.h"
+ #if CROSSINK_SCALABLE_FONTS
+ #include <HalScalableFont.h>
+ #include <ScalableBuiltins.h>
+@@ -453,7 +454,7 @@ DictionaryFontActivation SdCardFontSystem::activateDictionaryFont(GfxRenderer& r
+   }
+
+   auto heap = MemoryBudget::snapshot();
+-  if (!MemoryBudget::hasHeapForDictionarySdFont(heap)) {
++  if (!DictionaryFontAdmission::allows({0, heap.freeHeap, heap.maxAllocHeap}, byteHeapSnapshot(MemoryPool::Psram))) {
+     // The reader family itself is also disposable for a dictionary swap. Retry
+     // after releasing it so its font data does not cause a false low-memory
+     // fallback.
+@@ -464,10 +465,10 @@ DictionaryFontActivation SdCardFontSystem::activateDictionaryFont(GfxRenderer& r
+     LOG_DBG("SDFS", "Released reader font before dictionary swap retry: free=%u->%u maxAlloc=%u->%u",
+             beforeReaderUnload.freeHeap, heap.freeHeap, beforeReaderUnload.maxAllocHeap, heap.maxAllocHeap);
+   }
+-  if (!MemoryBudget::hasHeapForDictionarySdFont(heap)) {
+-    LOG_ERR("SDFS", "Low heap for dictionary font swap (%u free, %u max alloc, need %u/%u); using reader font",
+-            heap.freeHeap, heap.maxAllocHeap, MemoryBudget::DICTIONARY_SD_FONT_MIN_FREE,
+-            MemoryBudget::DICTIONARY_SD_FONT_MIN_MAX_ALLOC);
++  if (!DictionaryFontAdmission::allows({0, heap.freeHeap, heap.maxAllocHeap}, byteHeapSnapshot(MemoryPool::Psram))) {
++    const auto external = MemoryBudget::psramSnapshot();
++    LOG_ERR("SDFS", "Dictionary font admission failed (internal free=%u max=%u, PSRAM free=%u max=%u)",
++            heap.freeHeap, heap.maxAllocHeap, external.freeHeap, external.maxAllocHeap);
+     const int readerFontId = restoreReaderFont(renderer);
+     MemoryBudget::logHeapShape("dict.font_heap_fallback");
+     return {readerFontId, false};
+diff --git a/src/activities/reader/DictionaryDefinitionActivity.h b/src/activities/reader/DictionaryDefinitionActivity.h
+index d49a988446a1ef1ef82b7dc2ef29622a538d1cef..adb2e12e481b96e04957014ea96d32e99d8fba16 100644
+--- a/src/activities/reader/DictionaryDefinitionActivity.h
++++ b/src/activities/reader/DictionaryDefinitionActivity.h
+@@ -4,7 +4,9 @@
+ #include <freertos/task.h>
+
+ #include <array>
++#include <atomic>
+ #include <cstdint>
++#include <cstdio>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -54,13 +56,13 @@ class DictionaryDefinitionActivity final : public Activity {
+         historyStatus(historyStatus),
+         backgroundContext_(backgroundContext),
+         backgroundRender_(backgroundRender),
+-        dictionaryFontFamilyName_(dictionaryFontFamilyName),
+         dictionaryFontPointSize_(dictionaryFontPointSize),
+         skipInitialModalBackgroundRedraw_(modalBackgroundAlreadyPrepared),
+         hasClippingRequest_(clippingRequest != nullptr),
+         clippingRequest_(clippingRequest ? *clippingRequest : DictionaryClippingRequest{}),
+         hasSharedHighlightSnapshotStorage_(sharedHighlightSnapshotStorage != nullptr),
+-        controller(renderer, mappedInput, *this, cachePath) {
++        controller(renderer, mappedInput, *this, this->cachePath) {
++    if (dictionaryFontFamilyName) std::snprintf(dictionaryFontFamilyName_, sizeof(dictionaryFontFamilyName_), "%s", dictionaryFontFamilyName);
+     navigator.setHighlightSnapshotStorage(sharedHighlightSnapshotStorage);
+     controller.setLookupToastEnabled(!backgroundRender);
+   }
+@@ -93,8 +95,14 @@ class DictionaryDefinitionActivity final : public Activity {
+   // framebuffer while dictionary parsing is active.
+   void* backgroundContext_ = nullptr;
+   BackgroundRenderFn backgroundRender_ = nullptr;
+-  // Non-owning pointer to EpubReaderActivity's fixed per-book settings.
+-  const char* dictionaryFontFamilyName_ = nullptr;
++  // Own the requested family independently of temporary settings/callers.
++  char dictionaryFontFamilyName_[64]{};
++  bool dictionaryFontReloadAttempted_ = false;
++  std::atomic<bool> dictionaryFontUnavailable_{false};
++  std::atomic<bool> dictionaryFontRetryAfterShare_{false};
++  bool visibleArabicFontMissing() const;
++  bool reloadRequestedDictionaryFont();
++  void renderDictionaryFontError();
+   // Zero keeps the dictionary at the reader's active physical point size.
+   uint8_t dictionaryFontPointSize_ = 0;
+   bool skipInitialModalBackgroundRedraw_ = false;
+diff --git a/test/font_cache_manager/DictionaryFontRecoveryTest.cpp b/test/font_cache_manager/DictionaryFontRecoveryTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..939660298b71200c515aa1f9cde4334cc0c378e7
+--- /dev/null
++++ b/test/font_cache_manager/DictionaryFontRecoveryTest.cpp
+@@ -0,0 +1,62 @@
++#include <cassert>
++#include <map>
++#include <string>
++#include <vector>
++#include <cstring>
++#include <atomic>
++#include <BidiUtils.h>
++#include <Utf8.h>
++#include "DictionaryFontAdmission.h"
++namespace BidiUtils {enum class BidiBaseDir {AUTO=-1};}
++#define LOG_ERR(...) ((void)0)
++struct Family {bool arabic=false;bool hasCodepoint(uint32_t cp,int)const{return cp<128||arabic;}};
++struct Renderer {std::map<int,Family> fonts{{1,{false}}};const auto&getFontMap()const{return fonts;}};
++namespace workflowy {bool sharing=false;bool shareInProgress(){return sharing;}}
++struct RenderLock {enum class Mode{Try};template<class T>RenderLock(T&,Mode){}bool ownsLock(){return true;}};
++struct Activation{int fontId;bool usingDictionaryFont;};
++struct System {
++ bool succeed=true;int releases=0,loads=0;
++ void releaseLoadedFont(Renderer& r){++releases;r.fonts.clear();}
++ Activation activateDictionaryFont(Renderer& r,const char* name,int){assert(!strcmp(name,"Arabic"));++loads;r.fonts[1]={succeed};return {1,succeed};}
++} sdFontSystem;
++class DictionaryDefinitionActivity {
++ public:
++ Renderer renderer;
++ std::string pagePool_="n. مشكلة، صعوبة";
++ struct Segment{unsigned offset=0;int style=0;};std::vector<Segment>layoutSegments{{}};
++ char dictionaryFontFamilyName_[64]="Arabic";bool dictionaryFontReloadAttempted_=false;
++ std::atomic<bool> dictionaryFontUnavailable_{false},dictionaryFontRetryAfterShare_{false};int updates=0;
++ void requestUpdate(){++updates;}
++ void retryAfterShare(){
++#include "DictionaryFontRetry.inc"
++ }
++ int dictionaryFontPointSize_=16,definitionFontId_=1,reflows=0;
++ enum class DefinitionFontSource{Dictionary,Reader};DefinitionFontSource definitionFontSource_=DefinitionFontSource::Reader;
++ int getDefinitionFontId()const{return definitionFontId_;}
++ void reflowForDefinitionFontChange(){++reflows;}
++ bool visibleArabicFontMissing()const;
++ bool reloadRequestedDictionaryFont();
++};
++#include "DictionaryFontRecovery.inc"
++int main(){
++ // Reproduce the screenshot: readable Latin, every Arabic letter falls back.
++ DictionaryDefinitionActivity d;assert(d.visibleArabicFontMissing());
++ assert(d.reloadRequestedDictionaryFont());assert(!d.visibleArabicFontMissing());assert(d.reflows==1);
++ assert(d.definitionFontSource_==DictionaryDefinitionActivity::DefinitionFontSource::Dictionary);
++ assert(!d.reloadRequestedDictionaryFont());assert(sdFontSystem.loads==1); // bounded retry
++ DictionaryDefinitionActivity failed;sdFontSystem.succeed=false;
++ assert(!failed.reloadRequestedDictionaryFont());assert(failed.visibleArabicFontMissing());
++ DictionaryDefinitionActivity waiting;waiting.dictionaryFontUnavailable_=true;waiting.dictionaryFontRetryAfterShare_=true;
++ waiting.dictionaryFontReloadAttempted_=true;workflowy::sharing=true;
++ waiting.retryAfterShare();assert(waiting.updates==0&&waiting.dictionaryFontUnavailable_);
++ workflowy::sharing=false;waiting.retryAfterShare();assert(waiting.updates==1&&!waiting.dictionaryFontUnavailable_&&!waiting.dictionaryFontReloadAttempted_);
++ waiting.retryAfterShare();assert(waiting.updates==1); // once, not a retry loop
++ DictionaryDefinitionActivity unconfigured;unconfigured.dictionaryFontFamilyName_[0]=0;assert(!unconfigured.visibleArabicFontMissing());
++ DictionaryDefinitionActivity latin;latin.pagePool_="English only";assert(!latin.visibleArabicFontMissing());
++ DictionaryDefinitionActivity removed;removed.renderer.fonts.clear();assert(removed.visibleArabicFontMissing());
++ // 60% used can still leave <32 KiB contiguous. X4 Pro must use PSRAM.
++ assert(DictionaryFontAdmission::allows({320*1024,128*1024,16*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
++ assert(!DictionaryFontAdmission::allows({320*1024,128*1024,16*1024},{0,0,0}));
++ assert(!DictionaryFontAdmission::allows({320*1024,40*1024,16*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
++ assert(!DictionaryFontAdmission::allows({320*1024,128*1024,4*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
++}
+diff --git a/test/font_cache_manager/ExtractDictionaryFontRecovery.py b/test/font_cache_manager/ExtractDictionaryFontRecovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b95061420dacff91e1c24a33fc558073775f060f
+--- /dev/null
++++ b/test/font_cache_manager/ExtractDictionaryFontRecovery.py
+@@ -0,0 +1,9 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++a=s.index('bool DictionaryDefinitionActivity::visibleArabicFontMissing() const')
++b=s.index('void DictionaryDefinitionActivity::renderDictionaryFontError()',a)
++Path(sys.argv[2]).write_text(s[a:b])
++a=s.index('  // Network teardown may release',s.index('void DictionaryDefinitionActivity::loop()'))
++b=s.index('  // Own the complete',a)
++Path(sys.argv[2]).with_name('DictionaryFontRetry.inc').write_text(s[a:b])
+diff --git a/test/scalable_fonts/CMakeLists.txt b/test/scalable_fonts/CMakeLists.txt
+index 0358f0ef6e38afff77af796ee72175e7d0ae1ee4..a6d462deee0dff8e0158fcef9a2b707d7b905046 100644
+--- a/test/scalable_fonts/CMakeLists.txt
++++ b/test/scalable_fonts/CMakeLists.txt
+@@ -96,3 +96,21 @@ if(SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+   target_link_options(font_byte_digest_test PRIVATE -fsanitize=address,undefined)
+ endif()
+ add_test(NAME font_byte_digest COMMAND font_byte_digest_test)
++
++add_executable(dictionary_arabic_swap_test DictionaryArabicSwapTest.cpp
++ ../../lib/ScalableFont/HalScalableFont.cpp ${SOURCES})
++set_property(TARGET dictionary_arabic_swap_test PROPERTY CXX_STANDARD 20)
++target_compile_options(dictionary_arabic_swap_test PRIVATE -UNDEBUG)
++target_include_directories(dictionary_arabic_swap_test PRIVATE
++ stubs ../../lib/ScalableFont ../../lib/EpdFont ../../lib/Memory
++ ${SDK}/include ${SDK}/third_party/freetype/include ${SDK}/third_party/stb)
++target_compile_definitions(dictionary_arabic_swap_test PRIVATE
++ CROSSINK_SCALABLE_FONTS=1 SIMULATOR=1 FREEINK_FONT_ENABLE_AUTOHINT=1
++ FREEINK_FONT_ENABLE_NATIVE_HINTING=1 FREEINK_FONT_ENABLE_MONOCHROME=1)
++if(SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
++ target_compile_options(dictionary_arabic_swap_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
++ target_link_options(dictionary_arabic_swap_test PRIVATE -fsanitize=address,undefined)
++endif()
++add_test(NAME dictionary_arabic_swap COMMAND dictionary_arabic_swap_test
++ ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/EpdFont/scalableFonts/bitter_regular.ttf
++ ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/EpdFont/builtinFonts/source/NotoSansArabic/NotoSansArabic-Regular.ttf)
+diff --git a/test/scalable_fonts/DictionaryArabicSwapTest.cpp b/test/scalable_fonts/DictionaryArabicSwapTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea24ba11f65d3d7dbb555ae1f47c323d0bce2711
+--- /dev/null
++++ b/test/scalable_fonts/DictionaryArabicSwapTest.cpp
+@@ -0,0 +1,24 @@
++#include <HalScalableFont.h>
++#include <cassert>
++#include <vector>
++int main(int argc,char**argv) {
++ assert(argc==3);
++ for(unsigned iteration=0;iteration<12;++iteration) {
++  {
++   HalScalableFont reader;
++   assert(reader.openFile(argv[1],HalScalableFont::MaxFileBytes,{},HalScalableFont::FileMode::Stream));
++   assert(reader.probeGlyph('T',16));
++   assert(!reader.hasCodepoint(0x0645)); // the screenshot's Latin fallback cannot render Arabic
++  }
++  {
++   // Real, separate Arabic face opened with the dictionary's temporary mode.
++   HalScalableFont dictionary;
++   assert(dictionary.openFile(argv[2],HalScalableFont::MaxFileBytes,{},HalScalableFont::FileMode::Temporary));
++   assert(dictionary.hasCodepoint(0x0645)); // meem
++   assert(dictionary.probeGlyph(0x0645,16));
++   {std::vector<unsigned char> transient(512*1024,0xa5);} // freed sharing-sized payload
++   for(auto cp:{0x0645u,0x0634u,0x0643u,0x0644u,0x0629u,0xfee3u})
++    if(dictionary.hasCodepoint(cp)) assert(dictionary.probeGlyph(cp,16));
++  }
++ }
++}
