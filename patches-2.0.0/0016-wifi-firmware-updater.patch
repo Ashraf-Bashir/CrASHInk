@@ -89,153 +89,6 @@ index 4e00885ed89a2dd0c047391a75770ec67dbdd590..d6119d141a5898d78a96a965b9f38b83
  };
 
  /**
-diff --git a/src/activities/settings/ReceiveFirmwareActivity.cpp b/src/activities/settings/ReceiveFirmwareActivity.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..cff5fb9badf0a02e3b2e3dec050485a47da12a89
---- /dev/null
-+++ b/src/activities/settings/ReceiveFirmwareActivity.cpp
-@@ -0,0 +1,141 @@
-+#include "ReceiveFirmwareActivity.h"
-+
-+#include <Arduino.h>
-+#include <GfxRenderer.h>
-+#include <I18n.h>
-+#include <WiFi.h>
-+
-+#include "MappedInputManager.h"
-+#include "activities/network/WifiSelectionActivity.h"
-+#include "components/TouchHeaderBackButton.h"
-+#include "components/UITheme.h"
-+#include "fontIds.h"
-+#include "network/WifiFirmwareUpdate.h"
-+
-+namespace {
-+using wifi_firmware_update::LISTEN_TIMEOUT_MS;
-+}
-+
-+void ReceiveFirmwareActivity::onEnter() {
-+  Activity::onEnter();
-+  if (WiFi.status() == WL_CONNECTED && (WiFi.getMode() & WIFI_STA)) {
-+    onConnected();
-+    return;
-+  }
-+
-+  ownsWifi = true;
-+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
-+                         [this](const ActivityResult& result) {
-+                           if (result.isCancelled) finish();
-+                           else onConnected();
-+                         });
-+}
-+
-+void ReceiveFirmwareActivity::onConnected() {
-+  const bool listening = wifi_firmware_update::start();
-+  snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
-+  {
-+    RenderLock lock(*this);
-+    startedAt = millis();
-+    remainingSeconds.store(LISTEN_TIMEOUT_MS / 1000);
-+    state = listening ? State::Waiting : State::Unavailable;
-+  }
-+  requestUpdate();
-+}
-+
-+void ReceiveFirmwareActivity::onExit() {
-+  wifi_firmware_update::stop();
-+  if (ownsWifi && WiFi.getMode() != WIFI_OFF) {
-+    WiFi.disconnect(false);
-+    WiFi.mode(WIFI_OFF);
-+  }
-+  Activity::onExit();
-+}
-+
-+void ReceiveFirmwareActivity::loop() {
-+  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
-+      mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-+    finish();
-+    return;
-+  }
-+  if (state != State::Waiting) return;
-+  if (millis() - startedAt >= LISTEN_TIMEOUT_MS || WiFi.status() != WL_CONNECTED) {
-+    finish();
-+    return;
-+  }
-+  const auto left = wifi_firmware_update::remainingListenSeconds(startedAt, millis());
-+  if (remainingSeconds.exchange(left) != left) requestUpdate();
-+  if (!wifi_firmware_update::poll()) return;
-+  delay(250);
-+  wifi_firmware_update::stopListening();
-+  WiFi.disconnect(false);
-+  WiFi.mode(WIFI_OFF);
-+  install();
-+}
-+
-+void ReceiveFirmwareActivity::install() {
-+  {
-+    RenderLock lock(*this);
-+    state = State::Installing;
-+  }
-+  requestUpdateAndWait();
-+  const auto updateProgress = +[](size_t written, size_t total, void* context) {
-+    auto* activity = static_cast<ReceiveFirmwareActivity*>(context);
-+    const auto percent = static_cast<unsigned int>(written * 100 / total);
-+    const auto previous = activity->progress.load();
-+    if (percent == 100 || percent >= previous + 5) {
-+      activity->progress.store(percent);
-+      activity->requestUpdate(true);
-+    }
-+  };
-+  if (!wifi_firmware_update::installReceived(updateProgress, this)) {
-+    wifi_firmware_update::stop();
-+    {
-+      RenderLock lock(*this);
-+      state = State::Failed;
-+    }
-+    requestUpdate();
-+    return;
-+  }
-+  delay(350);
-+  ESP.restart();
-+}
-+
-+void ReceiveFirmwareActivity::render(RenderLock&&) {
-+  const auto& metrics = UITheme::getInstance().getMetrics();
-+  const Rect header{0, metrics.topPadding, renderer.getScreenWidth(),
-+                    TouchHeaderBackButton::height(metrics, mappedInput)};
-+  renderer.clearScreen();
-+  TouchHeaderBackButton::draw(renderer, header, tr(STR_RECEIVE_UPDATES), false);
-+  const auto y = renderer.getScreenHeight() / 2;
-+  switch (state) {
-+    case State::Connecting:
-+      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_CONNECTING));
-+      break;
-+    case State::Waiting: {
-+      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_WAITING));
-+      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
-+                                tr(STR_RECEIVE_UPDATES_WINDOW));
-+      char countdown[12];
-+      const auto seconds = remainingSeconds.load();
-+      snprintf(countdown, sizeof(countdown), "%u:%02u", static_cast<unsigned>(seconds / 60), static_cast<unsigned>(seconds % 60));
-+      renderer.drawCenteredText(UI_12_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 3, countdown, true, EpdFontFamily::BOLD);
-+      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 5, address);
-+      break;
-+    }
-+    case State::Installing:
-+      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
-+      GUI.drawProgressBar(renderer,
-+                          Rect{metrics.contentSidePadding, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
-+                               renderer.getScreenWidth() - metrics.contentSidePadding * 2, metrics.progressBarHeight},
-+                          static_cast<int>(progress.load()), 100);
-+      break;
-+    case State::Failed:
-+      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_WRITE_FAILED));
-+      break;
-+    case State::Unavailable:
-+      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_UNAVAILABLE));
-+      break;
-+  }
-+  renderer.displayBuffer(state == State::Waiting ? HalDisplay::FAST_REFRESH : HalDisplay::HALF_REFRESH);
-+}
 diff --git a/src/activities/settings/ReceiveFirmwareActivity.h b/src/activities/settings/ReceiveFirmwareActivity.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..de4d7bea9c0125df5e14fe151f8ca02d6fee7a36
@@ -584,4 +437,162 @@ index 0000000000000000000000000000000000000000..6287bc243f741d8cec70e6bc1977bce5
 + assert(remainingListenSeconds(100,300100)==0);
 + assert(remainingListenSeconds(100,400100)==0);
 + assert(remainingListenSeconds(UINT32_MAX-499,500)==299);
++}
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1c2558a0b5955bbd87ef457e4744f818740f99b5..570bb14451f81f3c9cc67301636741fcfafea57a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -844,3 +844,4 @@
+ - Cache nearby pages' resolved highlights (including empty results) and prepare them in bounded idle slices; invalidate after clipping edits, sync/reloads, chapter or layout changes. Prepared page turns do no clipping-text reads or matching.
+ - Start touch word selection after a 200 ms stationary hold instead of one second; immediate swipes remain page turns.
+ - Save dragged multiword highlights immediately on release, and open saved quote controls without a flashing refresh.
++- Update receiving and installation progress repaint without repeatedly flashing the whole screen black.
+diff --git a/src/activities/settings/ReceiveFirmwareActivity.cpp b/src/activities/settings/ReceiveFirmwareActivity.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c70955baeeabf97ffc871c7bcada5769f78c94a3
+--- /dev/null
++++ b/src/activities/settings/ReceiveFirmwareActivity.cpp
+@@ -0,0 +1,143 @@
++#include "ReceiveFirmwareActivity.h"
++
++#include <Arduino.h>
++#include <GfxRenderer.h>
++#include <I18n.h>
++#include <WiFi.h>
++
++#include "MappedInputManager.h"
++#include "activities/network/WifiSelectionActivity.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++#include "network/WifiFirmwareUpdate.h"
++
++namespace {
++using wifi_firmware_update::LISTEN_TIMEOUT_MS;
++}
++
++void ReceiveFirmwareActivity::onEnter() {
++  Activity::onEnter();
++  if (WiFi.status() == WL_CONNECTED && (WiFi.getMode() & WIFI_STA)) {
++    onConnected();
++    return;
++  }
++
++  ownsWifi = true;
++  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
++                         [this](const ActivityResult& result) {
++                           if (result.isCancelled) finish();
++                           else onConnected();
++                         });
++}
++
++void ReceiveFirmwareActivity::onConnected() {
++  const bool listening = wifi_firmware_update::start();
++  snprintf(address, sizeof(address), "%s", WiFi.localIP().toString().c_str());
++  {
++    RenderLock lock(*this);
++    startedAt = millis();
++    remainingSeconds.store(LISTEN_TIMEOUT_MS / 1000);
++    state = listening ? State::Waiting : State::Unavailable;
++  }
++  requestUpdate();
++}
++
++void ReceiveFirmwareActivity::onExit() {
++  wifi_firmware_update::stop();
++  if (ownsWifi && WiFi.getMode() != WIFI_OFF) {
++    WiFi.disconnect(false);
++    WiFi.mode(WIFI_OFF);
++  }
++  Activity::onExit();
++}
++
++void ReceiveFirmwareActivity::loop() {
++  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
++      mappedInput.wasPressed(MappedInputManager::Button::Back)) {
++    finish();
++    return;
++  }
++  if (state != State::Waiting) return;
++  if (millis() - startedAt >= LISTEN_TIMEOUT_MS || WiFi.status() != WL_CONNECTED) {
++    finish();
++    return;
++  }
++  const auto left = wifi_firmware_update::remainingListenSeconds(startedAt, millis());
++  if (remainingSeconds.exchange(left) != left) requestUpdate();
++  if (!wifi_firmware_update::poll()) return;
++  delay(250);
++  wifi_firmware_update::stopListening();
++  WiFi.disconnect(false);
++  WiFi.mode(WIFI_OFF);
++  install();
++}
++
++void ReceiveFirmwareActivity::install() {
++  {
++    RenderLock lock(*this);
++    state = State::Installing;
++  }
++  requestUpdateAndWait();
++  const auto updateProgress = +[](size_t written, size_t total, void* context) {
++    auto* activity = static_cast<ReceiveFirmwareActivity*>(context);
++    const auto percent = static_cast<unsigned int>(written * 100 / total);
++    const auto previous = activity->progress.load();
++    if (percent == 100 || percent >= previous + 5) {
++      activity->progress.store(percent);
++      activity->requestUpdate(true);
++    }
++  };
++  if (!wifi_firmware_update::installReceived(updateProgress, this)) {
++    wifi_firmware_update::stop();
++    {
++      RenderLock lock(*this);
++      state = State::Failed;
++    }
++    requestUpdate();
++    return;
++  }
++  delay(350);
++  ESP.restart();
++}
++
++void ReceiveFirmwareActivity::render(RenderLock&&) {
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const Rect header{0, metrics.topPadding, renderer.getScreenWidth(),
++                    TouchHeaderBackButton::height(metrics, mappedInput)};
++  renderer.clearScreen();
++  TouchHeaderBackButton::draw(renderer, header, tr(STR_RECEIVE_UPDATES), false);
++  const auto y = renderer.getScreenHeight() / 2;
++  switch (state) {
++    case State::Connecting:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_CONNECTING));
++      break;
++    case State::Waiting: {
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_WAITING));
++      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
++                                tr(STR_RECEIVE_UPDATES_WINDOW));
++      char countdown[12];
++      const auto seconds = remainingSeconds.load();
++      snprintf(countdown, sizeof(countdown), "%u:%02u", static_cast<unsigned>(seconds / 60), static_cast<unsigned>(seconds % 60));
++      renderer.drawCenteredText(UI_12_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 3, countdown, true, EpdFontFamily::BOLD);
++      renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_10_FONT_ID) * 5, address);
++      break;
++    }
++    case State::Installing:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
++      GUI.drawProgressBar(renderer,
++                          Rect{metrics.contentSidePadding, y + renderer.getLineHeight(UI_10_FONT_ID) * 2,
++                               renderer.getScreenWidth() - metrics.contentSidePadding * 2, metrics.progressBarHeight},
++                          static_cast<int>(progress.load()), 100);
++      break;
++    case State::Failed:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_WRITE_FAILED));
++      break;
++    case State::Unavailable:
++      renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_RECEIVE_UPDATES_UNAVAILABLE));
++      break;
++  }
++  // Progress updates repaint frequently while flash is written. A flashing
++  // waveform here would black out the entire screen at every five percent.
++  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 +}

@@ -53,6 +53,7 @@ check after installation.
   arrangement file under `/.crashink/.launcher.bin` with checksum and backup
   recovery. Physical selection follows the saved visual order. The bottom
   ribbon remains unchanged; disabled plugins ask for confirmation on first use.
+- Receive-updates progress uses non-flashing refreshes, including during installation.
 - Retain image-only regional grayscale, the custom launcher/Library, frontlight
   borders, Workflowy, and power policy. No other board build environments are
   exposed.
