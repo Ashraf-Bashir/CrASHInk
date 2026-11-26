@@ -1,20 +1,41 @@
 diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
-index 1fb72d079752176c87390ee9a8e3d5f61e595246..347a307158bd2a963c34177e4628305a4c05935e 100644
+index 1fb72d079752176c87390ee9a8e3d5f61e595246..bb59c57b501ebeff5df98f4c96b342bd15e1e371 100644
 --- a/lib/GfxRenderer/GfxRenderer.cpp
 +++ b/lib/GfxRenderer/GfxRenderer.cpp
-@@ -1845,10 +1845,23 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
+@@ -1,4 +1,5 @@
+ #include "GfxRenderer.h"
++#include "HighlightDither.h"
+ #if CROSSINK_SCALABLE_FONTS
+ #include <HalScalableFont.h>
+ #endif
+@@ -1845,10 +1846,38 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
      case Color::DarkGray:
        fillRectImpl<Color::DarkGray>(x, y, width, height);
        break;
 +    case Color::DeepGray:
 +      fillRectImpl<Color::DeepGray>(x, y, width, height);
 +      break;
++    case Color::HighlightGreen:
++      fillRectImpl<Color::HighlightGreen>(x, y, width, height);
++      break;
++    case Color::HighlightOrange:
++      fillRectImpl<Color::HighlightOrange>(x, y, width, height);
++      break;
 +  }
 +}
 +
 +void GfxRenderer::shadeRect(int x, int y, int width, int height, Color shade) const {
++  if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
 +  if (shade == Color::DeepGray) {
-+    fillRectImpl<Color::DeepGray, true>(x, y, width, height);
++    // Invert the complementary pattern over the original text: black glyphs
++    // become white, with Red's configured dark background. Preserve all ink first,
++    // including descenders and antialiased black glyph pixels.
++    fillRectImpl<Color::DeepGray, true, -highlightDither::Red>(x, y, width, height);
++    invertRect(x, y, width, height);
++  } else if (shade == Color::HighlightGreen) {
++    fillRectImpl<Color::HighlightGreen, true>(x, y, width, height);
++  } else if (shade == Color::HighlightOrange) {
++    fillRectImpl<Color::HighlightOrange, true>(x, y, width, height);
 +  } else if (shade == Color::DarkGray) {
 +    fillRectImpl<Color::DarkGray, true>(x, y, width, height);
 +  } else {
@@ -23,23 +44,58 @@ index 1fb72d079752176c87390ee9a8e3d5f61e595246..347a307158bd2a963c34177e4628305a
  }
 
 -template <Color C>
-+template <Color C, bool PreserveInk>
++template <Color C, bool PreserveInk, int Coverage>
  void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const int height) const {
    if constexpr (C == Color::Clear) return;
    if (width <= 0 || height <= 0) return;
-@@ -1989,7 +2002,9 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const
+@@ -1955,13 +1984,16 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const
+         break;
+     }
+
+-    // The dither pattern has period 2 in logical space, and each orientation
++    // The dither pattern has period 2 or 4 in logical space, and each orientation
+     // maps py to logical coords with a fixed parity relationship. The
+-    // blackMask byte therefore repeats with period 2 in py. Precompute both
++    // blackMask byte therefore repeats with the same period in py. Precompute both
+     // variants outside the row loop to eliminate the per-row switch + 8-bit
+     // construction loop.
+-    uint8_t blackMasks[2];
+-    for (int parityIdx = 0; parityIdx < 2; ++parityIdx) {
++    constexpr bool detailed = Coverage != -1 || C == Color::HighlightGreen ||
++                              C == Color::HighlightOrange || C == Color::DeepGray;
++    constexpr int period = detailed ? 4 : 2;
++    uint8_t blackMasks[period];
++    for (int parityIdx = 0; parityIdx < period; ++parityIdx) {
+       const int samplePy = phyY0 + parityIdx;
+       int lxBase = 0, lyBase = 0;
+       switch (orientation) {
+@@ -1987,32 +2019,45 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const
+         const int lx = lxBase + b * dlxPerPhyX;
+         const int ly = lyBase + b * dlyPerPhyX;
          bool isBlack;
-         if constexpr (C == Color::LightGray) {
+-        if constexpr (C == Color::LightGray) {
++        if constexpr (detailed) {
++          constexpr int coverage = Coverage >= 0 ? Coverage : C == Color::HighlightGreen ? highlightDither::Green
++                                  : C == Color::HighlightOrange ? highlightDither::Orange : highlightDither::Red;
++          if constexpr (Coverage < -1)
++            isBlack = !highlightDither::black(-Coverage, lx, ly);  // inverse mask for light ink
++          else
++            isBlack = highlightDither::black(coverage, lx, ly);
++        } else if constexpr (C == Color::LightGray) {
            isBlack = ((lx & 1) == 0) && ((ly & 1) == 0);
 -        } else {  // DarkGray
-+        } else if constexpr (C == Color::DeepGray) {
-+          isBlack = ((lx & 1) == 0) || ((ly & 1) == 0);
 +        } else {  // DarkGray: half black
            isBlack = (((lx + ly) & 1) == 0);
          }
          if (isBlack) mask |= static_cast<uint8_t>(1u << (7 - b));
-@@ -2001,12 +2016,18 @@ void GfxRenderer::fillRectImpl(const int x, const int y, const int width, const
-       const uint8_t blackMask = blackMasks[py & 1];
+       }
+-      blackMasks[samplePy & 1] = mask;
++      blackMasks[samplePy & (period - 1)] = mask;
+     }
+
+     for (int py = phyY0; py <= phyY1; ++py) {
+-      const uint8_t blackMask = blackMasks[py & 1];
++      const uint8_t blackMask = blackMasks[py & (period - 1)];
        const uint8_t whiteMask = static_cast<uint8_t>(~blackMask);
 
 -      // Dither writes BOTH inks (the slow path called drawPixel for every
@@ -62,7 +118,14 @@ index 1fb72d079752176c87390ee9a8e3d5f61e595246..347a307158bd2a963c34177e4628305a
          const uint8_t rectMask = headMask & tailMask;
          row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~rectMask) | (rectMask & whiteMask));
        } else {
-@@ -2663,7 +2684,8 @@ void GfxRenderer::invertScreen() const {
+         row[byteStart] = static_cast<uint8_t>((row[byteStart] & ~headMask) | (headMask & whiteMask));
+         if (byteEnd > byteStart + 1) {
+-          // Period 2, so every full byte in this row is exactly whiteMask.
++          // Each pattern divides eight pixels, so full bytes repeat whiteMask.
+           memset(row + byteStart + 1, whiteMask, byteEnd - byteStart - 1);
+         }
+         row[byteEnd] = static_cast<uint8_t>((row[byteEnd] & ~tailMask) | (tailMask & whiteMask));
+@@ -2663,7 +2708,8 @@ void GfxRenderer::invertScreen() const {
    }
  }
 
@@ -72,7 +135,7 @@ index 1fb72d079752176c87390ee9a8e3d5f61e595246..347a307158bd2a963c34177e4628305a
    if (frameBuffer == nullptr || width <= 0 || height <= 0) return;
 
    const int lx0 = std::max(0, x);
-@@ -2694,6 +2716,14 @@ void GfxRenderer::invertRect(const int x, const int y, const int width, const in
+@@ -2694,6 +2740,14 @@ void GfxRenderer::invertRect(const int x, const int y, const int width, const in
 
    for (int py = phyY0; py <= phyY1; ++py) {
      uint8_t* row = target + static_cast<int32_t>(py - originY) * panelWidthBytes;
@@ -87,7 +150,7 @@ index 1fb72d079752176c87390ee9a8e3d5f61e595246..347a307158bd2a963c34177e4628305a
      if (byteStart == byteEnd) {
        row[byteStart] ^= headMask & tailMask;
        continue;
-@@ -3362,6 +3392,20 @@ int GfxRenderer::drawScaledCodepoint(int fontId, const uint32_t cp, const EpdFon
+@@ -3362,6 +3416,20 @@ int GfxRenderer::drawScaledCodepoint(int fontId, const uint32_t cp, const EpdFon
    return advance;
  }
 
@@ -109,7 +172,7 @@ index 1fb72d079752176c87390ee9a8e3d5f61e595246..347a307158bd2a963c34177e4628305a
  #if CROSSINK_SCALABLE_FONTS
    ScalableFontAccess access;
 diff --git a/lib/GfxRenderer/GfxRenderer.h b/lib/GfxRenderer/GfxRenderer.h
-index b47d7c519ff66640076dfa94b339093cf73a0711..b4b1b0de8f8508badb4978d51982ffdaf5229b14 100644
+index b47d7c519ff66640076dfa94b339093cf73a0711..287b74fa8a2109f6c43478f746f06325513c298b 100644
 --- a/lib/GfxRenderer/GfxRenderer.h
 +++ b/lib/GfxRenderer/GfxRenderer.h
 @@ -34,7 +34,7 @@ struct Frame;
@@ -117,7 +180,7 @@ index b47d7c519ff66640076dfa94b339093cf73a0711..b4b1b0de8f8508badb4978d51982ffda
  // Color representation: uint8_t mapped to 4x4 Bayer matrix dithering levels
  // 0 = transparent, 1-16 = gray levels (white to black)
 -enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 0x0A, Black = 0x10 };
-+enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 0x0A, DeepGray = 0x0C, Black = 0x10 };
++enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 0x0A, HighlightGreen = 0x07, HighlightOrange = 0x0B, DeepGray = 0x0C, Black = 0x10 };
 
  class GfxRenderer {
  #ifdef SIMULATOR
@@ -126,7 +189,7 @@ index b47d7c519ff66640076dfa94b339093cf73a0711..b4b1b0de8f8508badb4978d51982ffda
    // physical row with head-mask / middle memset / tail-mask byte writes — no
    // per-pixel rotation, no per-pixel RMW.
 -  template <Color color>
-+  template <Color color, bool PreserveInk = false>
++  template <Color color, bool PreserveInk = false, int Coverage = -1>
    void fillRectImpl(int x, int y, int width, int height) const;
 
   public:
@@ -158,7 +221,7 @@ index b47d7c519ff66640076dfa94b339093cf73a0711..b4b1b0de8f8508badb4978d51982ffda
    // Zero means the font has no reader point-size registration.
    uint8_t getFontPointSize(int fontId) const;
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index cd0d55525b9e95cd00065d0fbdbc3032d14aeef2..875244412c71597893cfabe003ed2a045b5b4bdb 100644
+index cd0d55525b9e95cd00065d0fbdbc3032d14aeef2..5b20ec75358c6c4ce13485718c7fb5f2c1a3d64e 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
 @@ -1,6 +1,15 @@
@@ -177,7 +240,7 @@ index cd0d55525b9e95cd00065d0fbdbc3032d14aeef2..875244412c71597893cfabe003ed2a04
  STR_CROSSINK: "CrossInk"
  STR_BOOTING: "BOOTING"
  STR_AM: "AM"
-@@ -138,6 +147,15 @@ STR_EXTRA_SPACING: "Extra Paragraph Spacing"
+@@ -138,6 +147,16 @@ STR_EXTRA_SPACING: "Extra Paragraph Spacing"
  STR_FORCE_PARAGRAPH_INDENTS: "Force Paragraph Indents"
  STR_TEXT_AA: "Text Anti-Aliasing"
  STR_READER_DARK_MODE: "Dark Mode"
@@ -187,13 +250,14 @@ index cd0d55525b9e95cd00065d0fbdbc3032d14aeef2..875244412c71597893cfabe003ed2a04
 +STR_CLIPPING_ALL_COLORS: "All Colors"
 +STR_HIGHLIGHT_LIGHT_GREY: "Yellow"
 +STR_HIGHLIGHT_GREEN: "Green"
++STR_HIGHLIGHT_ORANGE: "Orange"
 +STR_HIGHLIGHT_DARK_GREY: "Red"
 +STR_HIGHLIGHT_BLACK: "Blue"
 +STR_HIGHLIGHT_WHITE: "Blue"
  STR_IMAGES: "Images"
  STR_IMAGES_DISPLAY: "Display"
  STR_IMAGES_DISPLAY_BW: "Display (B&W)"
-@@ -1091,3 +1109,11 @@ STR_TWO_TONE_TEXT_AA: "Two-tone Text AA"
+@@ -1091,3 +1110,11 @@ STR_TWO_TONE_TEXT_AA: "Two-tone Text AA"
  STR_RULED_LINES: "Ruled Lines"
  STR_WORD_HOLD_ACTION: "Long-press Text"
  STR_ASK: "Ask"
@@ -206,14 +270,14 @@ index cd0d55525b9e95cd00065d0fbdbc3032d14aeef2..875244412c71597893cfabe003ed2a04
 +
 +STR_CLIPPING_PREVIEW_UNAVAILABLE_FORMAT: "Highlight %u (preview unavailable)"
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
-index 9ef6a8495b8f670ada9b8af8fac2ee449d222277..613cd4781d964850ab0fa7c32f9a5a46f66a66f3 100644
+index 9ef6a8495b8f670ada9b8af8fac2ee449d222277..b2dd97f261e021b1db47a84b53a692bdfe3210f3 100644
 --- a/src/CrossPointSettings.h
 +++ b/src/CrossPointSettings.h
 @@ -463,6 +463,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
    // Night mode: inverted output polarity, applied to every activity per render
    // by ActivityManager. Quick Resume preserves it; other sleep screens remain normal.
    uint8_t screenInverted = 0;
-+  enum HIGHLIGHT_COLOR : uint8_t { HIGHLIGHT_LIGHT_GREY, HIGHLIGHT_DARK_GREY, HIGHLIGHT_SOLID, HIGHLIGHT_GREEN };
++  enum HIGHLIGHT_COLOR : uint8_t { HIGHLIGHT_LIGHT_GREY, HIGHLIGHT_DARK_GREY, HIGHLIGHT_SOLID, HIGHLIGHT_GREEN, HIGHLIGHT_ORANGE };
 +  uint8_t highlightColor = HIGHLIGHT_LIGHT_GREY;
    // Sleep screen cover mode settings
    uint8_t sleepScreenCoverMode = FIT;
@@ -616,7 +680,7 @@ index e800f400eac6ecec21c21951114934ef03cd3746..2125bd32c80b5b8b3121346900fd1144
    bool isReaderActivity() const override { return true; }
    bool isBookReaderActivity() const override { return true; }
 diff --git a/src/activities/reader/EpubReaderClippingListActivity.cpp b/src/activities/reader/EpubReaderClippingListActivity.cpp
-index 3b1de92514a0231d088012dd9eb04dd5cf756568..c6647200edeeeff3e23e9e52452f13bf5ac50ef0 100644
+index 3b1de92514a0231d088012dd9eb04dd5cf756568..4bc3a049902bf24bfd03147c9178a3100990428f 100644
 --- a/src/activities/reader/EpubReaderClippingListActivity.cpp
 +++ b/src/activities/reader/EpubReaderClippingListActivity.cpp
 @@ -1,21 +1,27 @@
@@ -927,13 +991,13 @@ index 3b1de92514a0231d088012dd9eb04dd5cf756568..c6647200edeeeff3e23e9e52452f13bf
 +
 +void EpubReaderClippingListActivity::openColorFilter() {
 +  const StrId choices[] = {StrId::STR_CLIPPING_ALL_COLORS, StrId::STR_HIGHLIGHT_LIGHT_GREY,
-+                           StrId::STR_HIGHLIGHT_GREEN, StrId::STR_HIGHLIGHT_DARK_GREY, StrId::STR_HIGHLIGHT_BLACK};
-+  // Filtering/export already use persisted color ID + 1; display order is Y G R B.
-+  static constexpr int values[] = {0, 1, 4, 2, 3};
++                           StrId::STR_HIGHLIGHT_GREEN, StrId::STR_HIGHLIGHT_ORANGE, StrId::STR_HIGHLIGHT_DARK_GREY, StrId::STR_HIGHLIGHT_BLACK};
++  // Filtering/export already use persisted color ID + 1; display order is Y G O R B.
++  static constexpr int values[] = {0, 1, 4, 5, 2, 3};
 +  int choice = 0;
-+  for (int i = 0; i < 5; ++i) if (values[i] == colorFilter) choice = i;
-+  colorFilterPopup.show(StrId::STR_CLIPPING_COLOR_FILTER, choices, 5, choice, [this](int selected) {
-+    if (selected < 0 || selected >= 5 || colorFilter == values[selected]) return;
++  for (int i = 0; i < 6; ++i) if (values[i] == colorFilter) choice = i;
++  colorFilterPopup.show(StrId::STR_CLIPPING_COLOR_FILTER, choices, 6, choice, [this](int selected) {
++    if (selected < 0 || selected >= 6 || colorFilter == values[selected]) return;
 +    RenderLock lock(*this);
 +    colorFilter = values[selected];
 +    listNav.reset(0);
@@ -1959,7 +2023,7 @@ index 0000000000000000000000000000000000000000..00e0828ad1b1ecc44c980308242a9442
 +};
 diff --git a/src/activities/reader/HighlightToolbar.h b/src/activities/reader/HighlightToolbar.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f78a759ae76e64d373b5eb8f768e58c2c81cb1ec
+index 0000000000000000000000000000000000000000..5ea5435a07d3b5cd7816345975fa0adfbf3f2b6f
 --- /dev/null
 +++ b/src/activities/reader/HighlightToolbar.h
 @@ -0,0 +1,83 @@
@@ -1970,11 +2034,11 @@ index 0000000000000000000000000000000000000000..f78a759ae76e64d373b5eb8f768e58c2
 +#include <optional>
 +
 +namespace HighlightToolbar {
-+enum class Action { LightGrey = 0, DarkGrey = 1, Solid = 2, Green = 3, Edit, Delete, Share };
++enum class Action { LightGrey = 0, DarkGrey = 1, Solid = 2, Green = 3, Orange = 4, Edit, Delete, Share };
 +// Add future actions here; layout, drawing iteration and hit testing share it.
-+inline constexpr std::array Actions{Action::LightGrey, Action::Green, Action::DarkGrey, Action::Solid, Action::Edit, Action::Delete,
++inline constexpr std::array Actions{Action::LightGrey, Action::Green, Action::Orange, Action::DarkGrey, Action::Solid, Action::Edit, Action::Delete,
 +                                    Action::Share};
-+constexpr int CellWidth = 60, CellHeight = 58;
++constexpr int CellWidth = 54, CellHeight = 58;
 +struct Bounds {
 +  int x = 0, y = 0, width = 0, height = 0;
 +  bool contains(int px, int py) const {
@@ -5470,7 +5534,7 @@ index 9192c7cd7528276868f5ff77158f688e6d4b6f5a..5f17c96d41f7b70ddeb9af22b1c01c42
        if (itemHref != getSpineItem(spineIndex).href) continue;
        const auto& contents = spineContents[spineIndex];
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..0235d9a2a429e4f4dec301bbde565356240b10a7 100644
+index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..c53ce464b76065d249617c3470f80559b7858450 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,3 +1,6 @@
@@ -5559,7 +5623,7 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..0235d9a2a429e4f4dec301bbde565356
 +- Start touch word selection after a 200 ms stationary hold instead of one second; immediate swipes remain page turns.
 +- Save dragged multiword highlights immediately on release, and open saved quote controls without a flashing refresh.
 +- Keep highlight drags attached through brief contact gaps and between words/lines; defer idle SD preparation during page swipes.
-+- Add Yellow, Green, Red, and Blue highlight colors with labeled grayscale swatches, named filters, and matching Readest colors while preserving saved color IDs.
++- Add Yellow, Green, Orange, Red, and Blue highlight colors with evenly stepped grayscale swatches, named filters, matching Readest colors, and stable saved IDs. Red uses contrasting text; Orange follows the theme.
 diff --git a/src/ClippingNativeSync.cpp b/src/ClippingNativeSync.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c30186520
@@ -5729,7 +5793,7 @@ index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c
 +  if (!bookFilePath.empty()) SyncPending::mark(bookFilePath, SyncPending::CLIPPINGS_BIT);
 +}
 diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
-index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8d40d67f4 100644
+index 8a993f48cce9e4b68577b69d1edc688e207a3912..b01d3d70c77e149f8140e22c487b4c2301843713 100644
 --- a/src/ClippingStore.cpp
 +++ b/src/ClippingStore.cpp
 @@ -1,10 +1,10 @@
@@ -6478,7 +6542,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
  }
 
 +bool ClippingStore::setColor(const size_t index, const ClippingColor color) {
-+  if (loadFailed_ || index >= clippings.size() || color > ClippingColor::Green) return false;
++  if (loadFailed_ || index >= clippings.size() || color > ClippingColor::Orange) return false;
 +  const auto previous = clippings[index].color;
 +  if (previous == color) return true;
 +  const bool previousDirty = dirty;
@@ -6695,7 +6759,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +    if (clipping.sourceEnd != UINT32_MAX && clipping.sourceStart != UINT32_MAX && clipping.sourceStart >= clipping.sourceEnd) {
 +      f.close(); return false;
 +    }
-+    if (clipping.color > ClippingColor::Green) clipping.color = ClippingColor::LightGrey;
++    if (clipping.color > ClippingColor::Orange) clipping.color = ClippingColor::LightGrey;
 +    if (!f.seekCur(CLIPPING_CHAPTER_TITLE_MAX)) {
        f.close();
        LOG_ERR("CLIP", "Clipping file truncated at chapter title, record %u: %s", i, path.c_str());
@@ -7267,7 +7331,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +
 +std::string ClippingStore::syncStorePathForBook(const std::string& path) { return storeFilePathForBook(path, "epub"); }
 diff --git a/src/ClippingStore.h b/src/ClippingStore.h
-index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..b233a086a1f01289d83dc2547e742d08237d7d1c 100644
+index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..29ad03bf79c85bb7b67c38933e8b1be1926042b6 100644
 --- a/src/ClippingStore.h
 +++ b/src/ClippingStore.h
 @@ -1,23 +1,27 @@
@@ -7311,8 +7375,8 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..b233a086a1f01289d83dc2547e742d08
 
 -// Legacy values were millis()/1000 (at most one 32-bit millisecond wrap).
 -// Zero is the wire/storage sentinel for an unknown calendar creation date.
-+// IDs 0..2 keep existing Yellow/Red/Blue records unchanged; Green is appended.
-+enum class ClippingColor : uint8_t { LightGrey = 0, DarkGrey = 1, Solid = 2, Green = 3 };
++// IDs 0..2 keep existing Yellow/Red/Blue records unchanged; Green and Orange are appended.
++enum class ClippingColor : uint8_t { LightGrey = 0, DarkGrey = 1, Solid = 2, Green = 3, Orange = 4 };
 +
  inline constexpr uint32_t clippingUnixTimestamp(uint32_t saved) { return saved >= 946684800U ? saved : 0; }
 
@@ -8073,7 +8137,7 @@ index 2c6c8cd082389bcb3866caa20e72fd45e9b33a09..eb3b9dd3e8520d3f196b96f62a31e2de
    void finishTouchLookupOnCurrentPage(const std::string& phrase, size_t wordCount,
                                        const DictionaryClippingRequest& request);
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb727105249de4 100644
+index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..f1528efcc96c8a0411ad8b69a727ee6478f6a38f 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -1,3 +1,6 @@
@@ -8663,7 +8727,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
    if (!updatePanel) {
      return true;
    }
-@@ -8483,84 +8651,471 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
+@@ -8483,84 +8651,478 @@ bool EpubReaderActivity::handleTouchFootnoteLink(const int touchX, const int tou
    navigateToHref(currentPageFootnotes[bestIndex].href, true, /*preferFootnotePreview=*/true);
    return true;
  }
@@ -9043,16 +9107,16 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
 +  if (matchCount == 0) return false;
 +
 +  std::array<ClippingColor, CLIPPING_MAX_PAGE_MATCHES> colors{};
-+  bool hasSolid = false;
++  bool needsLightInk = false;
 +  for (uint16_t i = 0; i < matchCount; ++i) {
 +    if (const auto* clip = CLIPPINGS.clippingAt(matchClippingIndices[i])) {
 +      colors[i] = clip->color;
-+      hasSolid |= clip->color == ClippingColor::Solid;
++      needsLightInk |= clip->color == ClippingColor::Solid || clip->color == ClippingColor::DarkGrey;
 +      denseClippingCleanupPending |= clip->color != ClippingColor::LightGrey;
 +    }
 +  }
 +  HeapByteBuffer original;
-+  if (hasSolid) {
++  if (needsLightInk) {
 +    const size_t bytes = renderer.getBufferSize();
 +    original = makePsramByteBufferNoThrow(bytes);
 +    if (!original) original = makeHeapByteBufferNoThrow(bytes);
@@ -9162,9 +9226,16 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
 +          const auto color = colors[owner];
 +          if (color == ClippingColor::Solid && original) {
 +            renderer.invertRect(piece.x, piece.y, piece.width, piece.height, original.get());
++          } else if (color == ClippingColor::DarkGrey && original) {
++            // Restore the clean source before shading: ribbon pieces can
++            // overlap, and applying inversion twice must not darken the text.
++            renderer.invertRect(piece.x, piece.y, piece.width, piece.height, original.get());
++            renderer.invertRect(piece.x, piece.y, piece.width, piece.height);
++            renderer.shadeRect(piece.x, piece.y, piece.width, piece.height, Color::DeepGray);
 +          } else {
 +            const Color shade = color == ClippingColor::LightGrey ? Color::LightGray
-+                                : color == ClippingColor::Green ? Color::DarkGray : Color::DeepGray;
++                                : color == ClippingColor::Green ? Color::HighlightGreen
++                                : color == ClippingColor::Orange ? Color::HighlightOrange : Color::DarkGray;
 +            renderer.shadeRect(piece.x, piece.y, piece.width, piece.height, shade);
 +          }
 +        });
@@ -9186,7 +9257,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
        hasPreviousHighlight = false;
        return true;
      }
-@@ -8574,16 +9129,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8574,16 +9136,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      const bool hasEmSpace = hasEmSpacePrefix(wordText);
      const int lineFontId = block.wordFontId(renderer, fontId, wordIndex);
      const auto textStyle = static_cast<EpdFontFamily::Style>(block.wordStyle(wordIndex) & ~EpdFontFamily::UNDERLINE);
@@ -9211,7 +9282,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
      if (wordIndex + 1 < block.wordCount()) {
        const uint16_t nextIndex = static_cast<uint16_t>(wordIndex + 1);
        const char* nextWordText = block.wordText(nextIndex);
-@@ -8593,12 +9149,35 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8593,12 +9156,35 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        const int nextSkipX = nextHasEmSpace ? renderer.getTextAdvanceX(lineFontId, "\xe2\x80\x83", nextTextStyle) : 0;
        const PageWordGeometry nextGeometry = pageWordGeometry(renderer, fontId, line, block, nextIndex);
        const int nextWordX = orientedMarginLeft + line.xPos + nextGeometry.xOffset + nextSkipX;
@@ -9248,7 +9319,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
      if (wordW > 0) {
        const bool clipped = line.clipWidth > 0 && line.clipHeight > 0;
        if (clipped) {
-@@ -8610,12 +9189,61 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8610,12 +9196,61 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
        // No-break spaces are stored as hidden layout words. Bridge to the next
        // visible word in the same line even when that hidden token interrupted
        // the immediate-word lookahead above.
@@ -9314,7 +9385,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
        previousHighlight = currentHighlight;
        previousHighlightBlock = &block;
        hasPreviousHighlight = true;
-@@ -8624,6 +9252,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
+@@ -8624,6 +9259,17 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
      }
      return true;
    });
@@ -9332,7 +9403,7 @@ index cafa1e8c6b4e25f9cc3d6568565c523ca54a02ba..2b5b249bc96deb22f13828a4b6fb7271
  }
 
  void EpubReaderActivity::renderStatusBar() const {
-@@ -9267,6 +9906,10 @@ bool EpubReaderActivity::saveProgressBeforeRestart() {
+@@ -9267,6 +9913,10 @@ bool EpubReaderActivity::saveProgressBeforeRestart() {
    // Silent network-mode restarts skip onExit(); coordinate with the render task.
    RenderLock lock(*this);
    bool saved = checkpointReadingStatsBeforeRestart();
@@ -9367,10 +9438,10 @@ index 0000000000000000000000000000000000000000..40b657bddfd4cbef043b2d1c82de720b
 +};
 diff --git a/src/activities/reader/OnPageHighlightActivity.cpp b/src/activities/reader/OnPageHighlightActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f73b80f986d01fb4fdb54088deac77b2dd0ca0f5
+index 0000000000000000000000000000000000000000..68b7ee3ee51488807bbefaf99a4ca4fbc8e20878
 --- /dev/null
 +++ b/src/activities/reader/OnPageHighlightActivity.cpp
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,610 @@
 +#include "clippings/HighlightMerge.h"
 +#include "OnPageHighlightActivity.h"
 +
@@ -9406,13 +9477,15 @@ index 0000000000000000000000000000000000000000..f73b80f986d01fb4fdb54088deac77b2
 +void toolbarIcon(const GfxRenderer& renderer, const HighlightToolbar::Bounds& button, HighlightToolbar::Action action, int selectedColor = -1) {
 +  const int x = button.x + (button.width - 24) / 2;
 +  const int y = button.y + (button.height - 24) / 2;
-+  if (action <= HighlightToolbar::Action::Green) {
++  if (action <= HighlightToolbar::Action::Orange) {
 +    const bool whiteLetter = action == HighlightToolbar::Action::DarkGrey || action == HighlightToolbar::Action::Solid;
 +    const Color fill = action == HighlightToolbar::Action::LightGrey ? Color::LightGray
-+                       : action == HighlightToolbar::Action::Green ? Color::DarkGray
++                       : action == HighlightToolbar::Action::Green ? Color::HighlightGreen
++                       : action == HighlightToolbar::Action::Orange ? Color::HighlightOrange
 +                       : action == HighlightToolbar::Action::DarkGrey ? Color::DeepGray : Color::Black;
 +    const char* label = action == HighlightToolbar::Action::LightGrey ? "Y"
 +                        : action == HighlightToolbar::Action::Green ? "G"
++                        : action == HighlightToolbar::Action::Orange ? "O"
 +                        : action == HighlightToolbar::Action::DarkGrey ? "R" : "B";
 +    renderer.fillRectDither(x + 2, y + 2, 20, 20, fill);
 +    renderer.drawRect(x + 2, y + 2, 20, 20, true);
@@ -9812,6 +9885,7 @@ index 0000000000000000000000000000000000000000..f73b80f986d01fb4fdb54088deac77b2
 +      switch (action) {
 +        case HighlightToolbar::Action::LightGrey:
 +        case HighlightToolbar::Action::DarkGrey:
++        case HighlightToolbar::Action::Orange:
 +        case HighlightToolbar::Action::Green:
 +        case HighlightToolbar::Action::Solid: {
 +          RenderLock lock(*this);
@@ -11265,10 +11339,10 @@ index 0000000000000000000000000000000000000000..8fa285fb3118950d2bc56c17e2b64036
 +}
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..ce56e27bfc446e8c4dea0d635ed44f12b628dd86
+index 0000000000000000000000000000000000000000..4a52aa33ce0f3c241860fdd368d6bf6b9466eb4a
 --- /dev/null
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,186 @@
 +add_executable(highlight_word_edit_test HighlightWordEditTest.cpp
 +  ${REPO_ROOT}/lib/KOReaderSync/ChapterXPathResolver.cpp
 +  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
@@ -11282,6 +11356,17 @@ index 0000000000000000000000000000000000000000..ce56e27bfc446e8c4dea0d635ed44f12
 +target_compile_options(highlight_word_edit_test PRIVATE -UNDEBUG)
 +add_test(NAME highlight_word_edit COMMAND highlight_word_edit_test)
 +find_package(Python3 COMPONENTS Interpreter REQUIRED)
++
++set(RED_SHADE_INC ${CMAKE_CURRENT_BINARY_DIR}/RedShade.inc)
++set(RED_PAINT_INC ${CMAKE_CURRENT_BINARY_DIR}/RedPaint.inc)
++set(DITHER_FILL_INC ${CMAKE_CURRENT_BINARY_DIR}/DitherFill.inc)
++add_custom_command(OUTPUT ${RED_SHADE_INC} ${RED_PAINT_INC} ${DITHER_FILL_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractRedHighlightInk.py ${REPO_ROOT} ${CMAKE_CURRENT_BINARY_DIR}
++ DEPENDS ExtractRedHighlightInk.py ${REPO_ROOT}/lib/GfxRenderer/GfxRenderer.cpp ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp)
++add_executable(RedHighlightInkTest RedHighlightInkTest.cpp ${RED_SHADE_INC} ${RED_PAINT_INC} ${DITHER_FILL_INC})
++target_include_directories(RedHighlightInkTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/lib/GfxRenderer)
++target_link_libraries(RedHighlightInkTest PRIVATE GTest::gtest_main)
++gtest_discover_tests(RedHighlightInkTest)
 +
 +set(COLOR_FILTER_INC ${CMAKE_CURRENT_BINARY_DIR}/ColorFilter.inc)
 +add_custom_command(OUTPUT ${COLOR_FILTER_INC}
@@ -11446,10 +11531,10 @@ index 0000000000000000000000000000000000000000..ce56e27bfc446e8c4dea0d635ed44f12
 +add_test(NAME onpage_highlight_mapping COMMAND onpage_highlight_mapping_test)
 diff --git a/test/highlight_word_edit/ClippingMergeStoreTest.cpp b/test/highlight_word_edit/ClippingMergeStoreTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e2e50de14b7fbc010ad40ee8b1df3e3ed87b8cd3
+index 0000000000000000000000000000000000000000..522149c3b701736f85e5941abe389f11c3af5b93
 --- /dev/null
 +++ b/test/highlight_word_edit/ClippingMergeStoreTest.cpp
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,237 @@
 +#include <HalStorage.h>
 +#include <gtest/gtest.h>
 +
@@ -11681,10 +11766,11 @@ index 0000000000000000000000000000000000000000..e2e50de14b7fbc010ad40ee8b1df3e3e
 +  static_assert(static_cast<uint8_t>(ClippingColor::LightGrey)==0);
 +  static_assert(static_cast<uint8_t>(ClippingColor::DarkGrey)==1);
 +  static_assert(static_cast<uint8_t>(ClippingColor::Solid)==2);
-+  auto store=seed();store.clippings[1].color=ClippingColor::Green;
++  auto store=seed();store.clippings[1].color=ClippingColor::Green;store.clippings[2].color=ClippingColor::Orange;
 +  ASSERT_TRUE(store.writeToFile());
 +  ClippingRecords loaded;ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
 +  EXPECT_EQ(loaded[1].color,ClippingColor::Green);
++  EXPECT_EQ(loaded[2].color,ClippingColor::Orange);
 +}
 diff --git a/test/highlight_word_edit/DictionaryPageRenderTest.cpp b/test/highlight_word_edit/DictionaryPageRenderTest.cpp
 new file mode 100644
@@ -12049,10 +12135,10 @@ index 0000000000000000000000000000000000000000..2635308ac338cc037b4fba7ce019fd37
 +}
 diff --git a/test/highlight_word_edit/OnPageHighlightActionsTest.cpp b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0be61becd
+index 0000000000000000000000000000000000000000..f1d904253a6e03657a67f341a44d35ee5870e6b5
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageHighlightActionsTest.cpp
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,218 @@
 +static unsigned long nowMs=0;
 +static unsigned long millis(){return nowMs;}
 +#include <algorithm>
@@ -12087,7 +12173,7 @@ index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0
 + static bool peek() {return busy;}
 +};
 +struct HighlightPageAction {bool editor;uint16_t clippingIndex;int x,y;int pageOffset=0;bool adjusted=false;};
-+enum class ClippingColor { LightGrey, DarkGrey, Solid, Green };
++enum class ClippingColor { LightGrey, DarkGrey, Solid, Green, Orange };
 +struct Store {
 + ClippingColor color=ClippingColor::LightGrey;
 + bool setColor(size_t,ClippingColor next) {if(ok)color=next;return ok;}
@@ -12115,7 +12201,7 @@ index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0
 + XPathTextLocation original{6,15,25,false};
 + OnPageHighlightRange range{6,15},saved{6,15};
 + Rect firstHandle{40,0,20,20},lastHandle{130,0,20,20};
-+ HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(80,100,480);
++ HighlightToolbar::Layout toolbar=HighlightToolbar::Layout::place(16,100,448);
 + bool ready=true,failed=false,releasePending=false,ignoreOpeningRelease=false,finished=false,closeAfterAdjustment=false;
 + int activeEdge=-1,updates=0;
 + int pageOffset=0;HighlightDragPaging dragPaging;HighlightDragContact dragContact;
@@ -12133,13 +12219,17 @@ index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0
 + void requestUpdate() {++updates;}
 + void finish() {finished=true;}
 + void setResult(HighlightPageAction a) {action=a;}
++ void touchAction(HighlightToolbar::Action action,bool down=false,bool held=false,bool tap=true,unsigned long duration=0) {
++   const auto i=std::find(HighlightToolbar::Actions.begin(),HighlightToolbar::Actions.end(),action)-HighlightToolbar::Actions.begin();
++   const auto b=toolbar.button(i);mappedInput={b.x+b.width/2,b.y+b.height/2,down,held,tap,false,duration};
++ }
 + void returnAction(bool,int=0,int=0);
 + void updateDrag();void saveRange();void loop();
 +};
 +#include "OnPageActions.inc"
 +int main() {
 + const auto future=HighlightToolbar::Layout::place(20,30,136,5);
-+ assert(future.columns==2 && future.area.width==120 && future.area.height==174);
++ assert(future.columns==2 && future.area.width==2*HighlightToolbar::CellWidth && future.area.height==174);
 + for(size_t i=0;i<5;++i) { const auto b=future.button(i); assert(future.indexAt(b.x+28,b.y+24)==i); }
 + assert(!future.indexAt(110,170)); // empty final grid cell
 + assert(!HighlightToolbar::Layout{}.indexAt(0,0));
@@ -12160,7 +12250,7 @@ index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0
 + const auto shortCard=HighlightToolbar::nearSelection({100,350,40,20},view,{90,330,20,20},{130,370,20,20});
 + assert(shortCard.area.x==16 && shortCard.area.y+shortCard.area.height==326);
 + OnPageHighlightActivity sharing;
-+ const auto shareButton=sharing.toolbar.button(6);
++ const auto shareButton=sharing.toolbar.button(HighlightToolbar::Actions.size()-1);
 + sharing.mappedInput={shareButton.x+20,shareButton.y+20,false,false,true,false,0};
 + sharing.loop();
 + assert(workflowy::shared);
@@ -12231,25 +12321,25 @@ index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0
 + nowMs=30;dropout.mappedInput.held=true;dropout.loop();
 + assert(dropout.dragging&&CLIPPINGS.writes==beforeDropout);
 + OnPageHighlightActivity recolor;
-+ recolor.mappedInput={230,115,false,false,true,false,0};recolor.loop();
++ recolor.touchAction(HighlightToolbar::Action::DarkGrey);recolor.loop();
 + assert(recolor.finished && CLIPPINGS.color==ClippingColor::DarkGrey);
 + OnPageHighlightActivity edit;
-+ edit.mappedInput={350,115,false,false,true,false,0};edit.loop();
++ edit.touchAction(HighlightToolbar::Action::Edit);edit.loop();
 + assert(edit.finished && edit.action.editor && edit.action.clippingIndex==3);
 + OnPageHighlightActivity overlap;
-+ overlap.firstHandle={336,100,20,20};
-+ overlap.mappedInput={350,115,true,true,false,false,0};overlap.loop();assert(!overlap.dragging);
-+ overlap.mappedInput={350,115,false,false,true,false,0};overlap.loop();assert(overlap.finished && overlap.action.editor);
++ const auto overlapping=overlap.toolbar.button(5);overlap.firstHandle={overlapping.x+17,overlapping.y+19,20,20};
++ overlap.touchAction(HighlightToolbar::Action::Edit,true,true,false);overlap.loop();assert(!overlap.dragging);
++ overlap.touchAction(HighlightToolbar::Action::Edit);overlap.loop();assert(overlap.finished && overlap.action.editor);
 + OnPageHighlightActivity remove;
-+ remove.mappedInput={410,115,false,false,true,false,0};remove.loop();
++ remove.touchAction(HighlightToolbar::Action::Delete);remove.loop();
 + assert(remove.finished && CLIPPINGS.deletes==1 && !remove.action.editor);
 + OnPageHighlightActivity failedDelete;
 + CLIPPINGS.ok=false;
-+ failedDelete.mappedInput={410,115,false,false,true,false,0};failedDelete.loop();
++ failedDelete.touchAction(HighlightToolbar::Action::Delete);failedDelete.loop();
 + assert(!failedDelete.finished && failedDelete.failed && CLIPPINGS.deletes==2);
 + CLIPPINGS.ok=true;
 + OnPageHighlightActivity holdButton;
-+ holdButton.mappedInput={410,115,false,true,false,false,1000};holdButton.loop();
++ holdButton.touchAction(HighlightToolbar::Action::Delete,false,true,false,1000);holdButton.loop();
 + assert(!holdButton.finished && CLIPPINGS.deletes==2);
 + OnPageHighlightActivity dictionary;
 + dictionary.mappedInput={100,10,false,true,false,false,600};dictionary.loop();
@@ -12259,11 +12349,17 @@ index 0000000000000000000000000000000000000000..b9c9a9e012106b1c16b2684af089e0d0
 + OnPageHighlightActivity failure;
 + failure.range.start=0;CLIPPINGS.ok=false;failure.saveRange();
 + assert(failure.failed && failure.range.start==0 && failure.saved.start==6);
++ CLIPPINGS.ok=true;
++ for(const auto action:{HighlightToolbar::Action::LightGrey,HighlightToolbar::Action::Green,
++                        HighlightToolbar::Action::Orange,HighlightToolbar::Action::DarkGrey,HighlightToolbar::Action::Solid}) {
++   OnPageHighlightActivity palette;palette.touchAction(action);palette.loop();
++   assert(palette.finished && static_cast<int>(CLIPPINGS.color)==static_cast<int>(action));
++ }
 + std::cout<<"Actual on-page handlers: live drag, one release write, delayed release, Edit, dictionary and failure rollback passed\n";
 +}
 diff --git a/test/highlight_word_edit/OnPageRenderTest.cpp b/test/highlight_word_edit/OnPageRenderTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..36b4186fcd27ad9a35ba28e233d9d2029b0cd833
+index 0000000000000000000000000000000000000000..4c07d2c740a2779e431ee2de247509a14de742fe
 --- /dev/null
 +++ b/test/highlight_word_edit/OnPageRenderTest.cpp
 @@ -0,0 +1,148 @@
@@ -12281,7 +12377,7 @@ index 0000000000000000000000000000000000000000..36b4186fcd27ad9a35ba28e233d9d202
 +#include "clippings/SelectionRibbon.h"
 +#include "activities/reader/OnPageHighlightModel.h"
 +struct Rect {int x=0,y=0,width=0,height=0;};
-+enum class Color {White,LightGray,DarkGray,DeepGray,Black};
++enum class Color {White,LightGray,DarkGray,HighlightGreen,HighlightOrange,DeepGray,Black};
 +namespace EpdFontFamily {enum Style {BOLD};}
 +namespace HalDisplay {constexpr int FAST_REFRESH=0,HALF_REFRESH=1;}
 +constexpr int UI_10_FONT_ID=0,SMALL_FONT_ID=0;
@@ -12366,7 +12462,7 @@ index 0000000000000000000000000000000000000000..36b4186fcd27ad9a35ba28e233d9d202
 +  assert(actual.page->renders==2); // no page/glyph render during subsequent moves
 + }
 + actual.dragging=false;actual.render(RenderLock{});
-+ assert((actual.renderer.labels==std::vector<std::string>{"Y","G","R","B"}));
++ assert((actual.renderer.labels==std::vector<std::string>{"Y","G","O","R","B"}));
 + assert(actual.page->renders==4 && actual.toolbar.count==HighlightToolbar::Actions.size());
 + assert(actual.toolbar.area.x>=6 && actual.toolbar.area.y>=6);
 + assert(actual.toolbar.area.x+actual.toolbar.area.width<=234);
@@ -12417,7 +12513,7 @@ index 0000000000000000000000000000000000000000..36b4186fcd27ad9a35ba28e233d9d202
 +}
 diff --git a/test/highlight_word_edit/merge_stubs/ClippingStore.h b/test/highlight_word_edit/merge_stubs/ClippingStore.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0408f9243d66f0aa994f58afbcbe0aeeae69d17a
+index 0000000000000000000000000000000000000000..492d6df5e22df2ccd3ad05aebe68613340752440
 --- /dev/null
 +++ b/test/highlight_word_edit/merge_stubs/ClippingStore.h
 @@ -0,0 +1,84 @@
@@ -12430,7 +12526,7 @@ index 0000000000000000000000000000000000000000..0408f9243d66f0aa994f58afbcbe0aee
 +struct ClippingStore {
 +  enum class AddResult { Added, LimitReached, SaveFailed };
 +};
-+enum class ClippingColor : uint8_t { LightGrey, DarkGrey, Solid, Green };
++enum class ClippingColor : uint8_t { LightGrey, DarkGrey, Solid, Green, Orange };
 +struct Clipping {
 +  ClippingColor color = ClippingColor::LightGrey;
 +  uint16_t spineIndex = 0, startPage = 0, endPage = 0, pageCount = 100, tableSelection = UINT16_MAX;
@@ -12527,14 +12623,14 @@ index ee3bf95e201bc966d757fbcee0fa041b7a4a5012..3126507e0c06a91dc9a8ff88b648ffec
      if (size == 0) return 0;
 diff --git a/test/highlight_word_edit/ColorFilterTest.cpp b/test/highlight_word_edit/ColorFilterTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..55b324f1c906bc557174cef503bfb19fe2d102d6
+index 0000000000000000000000000000000000000000..cdbde31353a760599478965e4bfed0fad325976e
 --- /dev/null
 +++ b/test/highlight_word_edit/ColorFilterTest.cpp
 @@ -0,0 +1,30 @@
 +#include <gtest/gtest.h>
 +#include <functional>
 +#include <vector>
-+enum class StrId {STR_CLIPPING_ALL_COLORS,STR_HIGHLIGHT_LIGHT_GREY,STR_HIGHLIGHT_GREEN,STR_HIGHLIGHT_DARK_GREY,STR_HIGHLIGHT_BLACK,STR_CLIPPING_COLOR_FILTER};
++enum class StrId {STR_CLIPPING_ALL_COLORS,STR_HIGHLIGHT_LIGHT_GREY,STR_HIGHLIGHT_GREEN,STR_HIGHLIGHT_ORANGE,STR_HIGHLIGHT_DARK_GREY,STR_HIGHLIGHT_BLACK,STR_CLIPPING_COLOR_FILTER};
 +struct RenderLock {template<class T>explicit RenderLock(T&) {}};
 +class EpubReaderClippingListActivity {
 + public:
@@ -12552,10 +12648,10 @@ index 0000000000000000000000000000000000000000..55b324f1c906bc557174cef503bfb19f
 +};
 +#include "ColorFilter.inc"
 +TEST(ColorFilter, DisplayOrderAndReopeningPreservePersistedShadeIds) {
-+ for(const auto pair : {std::pair{0,0},std::pair{1,1},std::pair{4,2},std::pair{2,3},std::pair{3,4}}) {
++ for(const auto pair : {std::pair{0,0},std::pair{1,1},std::pair{4,2},std::pair{5,3},std::pair{2,4},std::pair{3,5}}) {
 +  EpubReaderClippingListActivity view;view.colorFilter=pair.first;view.openColorFilter();
 +  EXPECT_EQ(view.colorFilterPopup.selected,pair.second);
-+  EXPECT_EQ(view.colorFilterPopup.labels,(std::vector<StrId>{StrId::STR_CLIPPING_ALL_COLORS,StrId::STR_HIGHLIGHT_LIGHT_GREY,StrId::STR_HIGHLIGHT_GREEN,StrId::STR_HIGHLIGHT_DARK_GREY,StrId::STR_HIGHLIGHT_BLACK}));
++  EXPECT_EQ(view.colorFilterPopup.labels,(std::vector<StrId>{StrId::STR_CLIPPING_ALL_COLORS,StrId::STR_HIGHLIGHT_LIGHT_GREY,StrId::STR_HIGHLIGHT_GREEN,StrId::STR_HIGHLIGHT_ORANGE,StrId::STR_HIGHLIGHT_DARK_GREY,StrId::STR_HIGHLIGHT_BLACK}));
 +  view.colorFilterPopup.select(pair.second);EXPECT_EQ(view.rebuilds,0);
 +  view.colorFilter=99;view.colorFilterPopup.select(pair.second);
 +  EXPECT_EQ(view.colorFilter,pair.first);EXPECT_EQ(view.rebuilds,1);
@@ -12573,3 +12669,173 @@ index 0000000000000000000000000000000000000000..695843b87c1f5467cd11ee992f6d8239
 +a=text.index('void EpubReaderClippingListActivity::openColorFilter()')
 +b=text.index('\nvoid EpubReaderClippingListActivity::',a+5)
 +Path(sys.argv[2]).write_text(text[a:b])
+diff --git a/lib/GfxRenderer/HighlightDither.h b/lib/GfxRenderer/HighlightDither.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8bf12f96aec4dfdf7baec228896beae26bec2126
+--- /dev/null
++++ b/lib/GfxRenderer/HighlightDither.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include <cstdint>
++
++namespace highlightDither {
++// Coverage out of 16: keep Yellow's existing 25% pattern, then distribute
++// the remaining colors evenly toward solid black.
++inline constexpr int Yellow = 4, Green = 7, Orange = 10, Red = 13, Blue = 16;
++inline constexpr uint8_t Bayer[4][4] = {{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
++constexpr bool black(int coverage, int x, int y) {
++  return Bayer[static_cast<unsigned>(y)&3][static_cast<unsigned>(x)&3] < coverage;
++}
++}
+diff --git a/test/highlight_word_edit/ExtractRedHighlightInk.py b/test/highlight_word_edit/ExtractRedHighlightInk.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb941e3221db118f04fdb4629956fdb1b953c403
+--- /dev/null
++++ b/test/highlight_word_edit/ExtractRedHighlightInk.py
+@@ -0,0 +1,14 @@
++from pathlib import Path
++import sys
++root,out=map(Path,sys.argv[1:])
++text=(root/'lib/GfxRenderer/GfxRenderer.cpp').read_text()
++a=text.index('void GfxRenderer::shadeRect(')
++b=text.index('\ntemplate <Color C',a)
++(out/'RedShade.inc').write_text(text[a:b])
++a=text.index('template <Color C, bool PreserveInk, int Coverage>')
++b=text.index('\ntemplate void GfxRenderer::fillRectImpl',a)
++(out/'DitherFill.inc').write_text(text[a:b])
++text=(root/'src/activities/reader/EpubReaderActivity.cpp').read_text()
++a=text.index('  const auto paintMarker =')
++b=text.index('  int bezelTop =',a)
++(out/'RedPaint.inc').write_text(text[a:b])
+diff --git a/test/highlight_word_edit/RedHighlightInkTest.cpp b/test/highlight_word_edit/RedHighlightInkTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0680e6e5a296d40e9ee97c594066d4d72c5925e1
+--- /dev/null
++++ b/test/highlight_word_edit/RedHighlightInkTest.cpp
+@@ -0,0 +1,126 @@
++#include <gtest/gtest.h>
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <memory>
++#include <cstring>
++#include "HighlightDither.h"
++enum class Color {Clear,White,Black,LightGray,DarkGray,HighlightGreen,HighlightOrange,DeepGray};
++enum class ClippingColor {LightGrey,DarkGrey,Solid,Green,Orange};
++namespace ClippingHighlightGeometry {
++struct GapRect {int x,y,width,height;};
++template<class Callback> void paintSeparated(GapRect r,int,int,Callback callback) {callback(r);}
++}
++struct GfxRenderer {
++  std::array<uint8_t,16> pixels{};
++  enum Orientation {Portrait,PortraitInverted,LandscapeClockwise,LandscapeCounterClockwise};
++  Orientation orientation=LandscapeCounterClockwise;
++  int panelWidth=8,panelHeight=4,panelWidthBytes=1;
++  bool textClipActive_=false;int textClipLeft_=0,textClipTop_=0,textClipRight_=0,textClipBottom_=0;
++  void recordTextBounds(int,int,int,int) const {}
++  int getScreenWidth() const {return orientation==Portrait||orientation==PortraitInverted?panelHeight:panelWidth;}
++  int getScreenHeight() const {return orientation==Portrait||orientation==PortraitInverted?panelWidth:panelHeight;}
++  uint8_t* getWriteTarget() const {return const_cast<uint8_t*>(pixels.data());}
++  int getWriteOriginY() const {return 0;}int getWriteRows() const {return panelHeight;}
++  void screenToPanel(int x,int y,int& px,int& py) const {
++    switch(orientation) {
++      case Portrait:px=y;py=panelHeight-1-x;break;
++      case PortraitInverted:px=panelWidth-1-y;py=x;break;
++      case LandscapeClockwise:px=panelWidth-1-x;py=panelHeight-1-y;break;
++      case LandscapeCounterClockwise:px=x;py=y;break;
++    }
++  }
++
++  struct Cache {bool scanning=false;bool isScanning() {return scanning;}} cache;
++  Cache* fontCacheManager_=&cache;
++  bool get(int x,int y) const {return pixels[y*panelWidthBytes+x/8] & (0x80>>(x&7));}
++  void put(int x,int y,bool white) {if(white)pixels[y*panelWidthBytes+x/8]|=0x80>>(x&7);else pixels[y*panelWidthBytes+x/8]&=~(0x80>>(x&7));}
++  template<Color C,bool PreserveInk=false,int Coverage=-1>
++  void fillRectImpl(int,int,int,int) const;
++  void invertRect(int x,int y,int width,int height,const uint8_t* source=nullptr) const {
++    auto& self=const_cast<GfxRenderer&>(*this);
++    for(int py=std::max(0,y);py<std::min(4,y+height);++py)
++      for(int px=std::max(0,x);px<std::min(8,x+width);++px)
++        self.put(px,py,source ? !(source[py]&(0x80>>px)) : !get(px,py));
++  }
++  void shadeRect(int,int,int,int,Color) const;
++};
++#include "DitherFill.inc"
++#include "RedShade.inc"
++struct PagePaint {
++ GfxRenderer renderer;
++ std::unique_ptr<uint8_t[]> original=std::make_unique<uint8_t[]>(16);
++ std::array<ClippingColor,2> colors{ClippingColor::DarkGrey,ClippingColor::Solid};
++ int contourSeams=0;
++ PagePaint() {
++   renderer.pixels.fill(0xff);
++   // Thin strokes and a descender cover different dither phases.
++   renderer.put(3,0,false);renderer.put(2,1,false);
++   renderer.put(4,2,false);renderer.put(3,3,false);
++   std::copy(renderer.pixels.begin(),renderer.pixels.end(),original.get());
++ }
++ bool ink(int x,int y) const {return !(original[y]&(0x80>>x));}
++ void paint(ClippingHighlightGeometry::GapRect rect,int owner) {
++#include "RedPaint.inc"
++   paintMarker(rect,owner);
++ }
++};
++TEST(RedHighlightInk, RedHasWhiteGlyphsAndDescendersOnItsDarkBackground) {
++ PagePaint page;page.paint({0,0,8,4},0);
++ for(int y=0;y<4;++y)for(int x=0;x<8;++x)
++   EXPECT_EQ(page.renderer.get(x,y),page.ink(x,y)||!highlightDither::black(highlightDither::Red,x,y));
++}
++TEST(RedHighlightInk, OverlappingRibbonPiecesDoNotInvertTheLettersTwice) {
++ PagePaint page;page.paint({0,0,8,4},0);const auto once=page.renderer.pixels;
++ page.paint({1,0,5,4},0);EXPECT_EQ(page.renderer.pixels,once);
++ page.paint({4,0,4,4},1);
++ for(int y=0;y<4;++y)for(int x=4;x<8;++x)EXPECT_EQ(page.renderer.get(x,y),page.ink(x,y));
++}
++TEST(RedHighlightInk, DarkThemeAndFontScanKeepTheirContrastContracts) {
++ PagePaint page;page.paint({0,0,8,4},0);page.renderer.invertRect(0,0,8,4);
++ EXPECT_FALSE(page.renderer.get(3,0));EXPECT_TRUE(page.renderer.get(1,0));
++ PagePaint scanning;scanning.renderer.cache.scanning=true;
++ const auto before=scanning.renderer.pixels;scanning.renderer.shadeRect(0,0,8,4,Color::DeepGray);
++ EXPECT_EQ(scanning.renderer.pixels,before);
++}
++
++TEST(RedHighlightInk, FiveShadesAreEvenlySpacedAndYellowPatternIsUnchanged) {
++ for(int coverage:{highlightDither::Yellow,highlightDither::Green,highlightDither::Orange,highlightDither::Red,highlightDither::Blue}) {
++   int count=0;for(int y=0;y<4;++y)for(int x=0;x<4;++x)count+=highlightDither::black(coverage,x,y);
++   EXPECT_EQ(count,coverage);
++ }
++ for(int y=0;y<4;++y)for(int x=0;x<4;++x)
++   EXPECT_EQ(highlightDither::black(highlightDither::Yellow,x,y),(!(x&1)&&!(y&1)));
++ EXPECT_EQ(highlightDither::Green-highlightDither::Yellow,3);
++ EXPECT_EQ(highlightDither::Orange-highlightDither::Green,3);
++ EXPECT_EQ(highlightDither::Red-highlightDither::Orange,3);
++ EXPECT_EQ(highlightDither::Blue-highlightDither::Red,3);
++}
++TEST(RedHighlightInk, OrangeUsesBlackTextInLightThemeAndWhiteTextInDarkTheme) {
++ PagePaint page;page.colors[0]=ClippingColor::Orange;page.paint({0,0,8,4},0);
++ for(int y=0;y<4;++y)for(int x=0;x<8;++x)
++   EXPECT_EQ(page.renderer.get(x,y),!page.ink(x,y)&&!highlightDither::black(highlightDither::Orange,x,y));
++ page.renderer.invertRect(0,0,8,4);
++ EXPECT_TRUE(page.renderer.get(3,0));EXPECT_TRUE(page.renderer.get(3,3));
++}
++
++TEST(RedHighlightInk, ActualByteFillerPreservesFiveShadePatternsInEveryRotation) {
++ for(auto orientation:{GfxRenderer::Portrait,GfxRenderer::PortraitInverted,GfxRenderer::LandscapeClockwise,GfxRenderer::LandscapeCounterClockwise}) {
++   GfxRenderer renderer;renderer.orientation=orientation;
++   renderer.panelWidth=16;renderer.panelHeight=8;renderer.panelWidthBytes=2;
++   const int w=renderer.getScreenWidth(),h=renderer.getScreenHeight();
++   const auto check=[&]<Color C>(int coverage) {
++     renderer.pixels.fill(0xff);renderer.fillRectImpl<C>(1,1,w-2,h-2);
++     for(int y=0;y<h;++y)for(int x=0;x<w;++x) {
++       int px=0,py=0;renderer.screenToPanel(x,y,px,py);
++       const bool inside=x>=1&&x<w-1&&y>=1&&y<h-1;
++       EXPECT_EQ(renderer.get(px,py),!inside||!highlightDither::black(coverage,x,y));
++     }
++   };
++   check.template operator()<Color::LightGray>(highlightDither::Yellow);
++   check.template operator()<Color::HighlightGreen>(highlightDither::Green);
++   check.template operator()<Color::HighlightOrange>(highlightDither::Orange);
++   check.template operator()<Color::DeepGray>(highlightDither::Red);
++   check.template operator()<Color::Black>(highlightDither::Blue);
++ }
++}

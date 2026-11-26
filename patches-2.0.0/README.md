@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 77 selected native regression checks have been
+The X4 Pro firmware build and 83 selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -28,10 +28,13 @@ check after installation.
   for 50 ms before committing. Reader idle scans/prewarming pause during touch.
 - Chapter headings and navigation labels stay bold; full/partial chapter layouts
   rebuild once under cache version 119 / `0xE8` to apply the new glyph widths.
-- Highlight colors are Yellow, Green, Red, and Blue. Y/G/R/B swatches use
-  25%, 50%, 75%, and 100% black; filters use the color names. Readest sync maps
-  each named color both ways. Stored IDs 0/1/2 remain Yellow/Red/Blue; Green is
-  appended as ID 3 so existing highlights keep their colors.
+- Highlight colors are Yellow, Green, Orange, Red, and Blue. Y/G/O/R/B swatches
+  use 4/16, 7/16, 10/16, 13/16, and 16/16 black; Yellow retains its exact pattern.
+  Orange text follows the theme; Red uses light ink in light mode and contrasting
+  dark ink in dark mode. Filters use color names and Readest sync maps all five
+  both ways. Stored IDs 0/1/2 remain Yellow/Red/Blue; Green=3 and Orange=4 preserve
+  existing assignments. One checked page snapshot is shared by Red/Blue ribbons
+  so overlapping pieces cannot invert glyphs twice.
 - Multiword touch selections save on release without a Lookup/Clip prompt.
   Single-word holds retain lookup; saved quote controls use non-flashing refreshes.
 - Clipping rewrites use checked scratch allocation and atomic publication.
