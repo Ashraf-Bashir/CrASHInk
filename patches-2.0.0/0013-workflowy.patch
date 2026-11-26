@@ -1,8 +1,16 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index ff211d6d9d445ba7c557e86bf2373993e4baf1d3..126008693721fc46227f0597f430c31f008cb2ef 100644
+index 09959e7538af5b5c9ecefba256645c794ca34b53..d99ee3ce729b5fd81882a93cdac1c16184dbe346 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -2,6 +2,8 @@
+@@ -2,6 +2,7 @@
+
+ ### Fixed
+
++- Show leading Workflowy tags below Calendar event titles without modifying saved task text.
+
+ - Hide the redundant File Transfer header arrow even when opened from a book; keep the shared Home ribbon and physical Back navigation.
+ - Keep the complete Plugins puzzle icon visible, including its top tab.
+@@ -10,6 +11,8 @@
 
  ### Added
 
@@ -1180,10 +1188,10 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff97cefc6deb60e919a40ef546e1bfb7878133e4
+index 0000000000000000000000000000000000000000..f6dec9a039843073c20b30d2d9b1ec9f8febaea5
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5288 @@
+@@ -0,0 +1,5297 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -6252,12 +6260,12 @@ index 0000000000000000000000000000000000000000..ff97cefc6deb60e919a40ef546e1bfb7
 +    renderer.drawRoundedRect(x, y, width, height, preview ? 2 : 1, 4, true);
 +    renderer.fillRect(x, y + 3, std::min(3, width), std::max(1, height - 6), true);
 +    if (width > 22 && height >= renderer.getLineHeight(SMALL_FONT_ID)) {
-+      auto title = node.title;
-+      if (const auto range = workflowy::parseTimeRange(title)) title.erase(range->begin, range->finish - range->begin);
-+      title=workflowy::trimTaskText(title);
-+      while (!title.empty() && title.front() == ' ') title.erase(0, 1);
++      const workflowy::CalendarTextProjection display(node.title);
++      const auto& title = display.title;
 +      const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
-+      const int capacity = std::max(0, (height - 6) / lineHeight);
++      const int tagHeight = renderer.getLineHeight(SMALL_FONT_ID);
++      const bool showTags = !display.tags.empty() && height - 6 >= lineHeight + tagHeight;
++      const int capacity = std::max(0, (height - 6 - (showTags ? tagHeight : 0)) / lineHeight);
 +      calendarTextLines.clear();
 +      workflowy::wrapOutlineText(std::string_view(title), width - 10,
 +                                [&](std::string_view value) {
@@ -6271,6 +6279,10 @@ index 0000000000000000000000000000000000000000..ff97cefc6deb60e919a40ef546e1bfb7
 +        if (node.done) renderer.drawLine(x + 6, textY + lineHeight / 2,
 +                                         x + 6 + renderer.getTextWidth(SMALL_FONT_ID, text.c_str()),
 +                                         textY + lineHeight / 2);
++      }
++      if (showTags) {
++        const auto tags = renderer.truncatedText(SMALL_FONT_ID, display.tags.c_str(), width - 10);
++        renderer.drawText(SMALL_FONT_ID, x + 6, y + height - 3 - tagHeight, tags.c_str());
 +      }
 +    }
 +    if (height > 18 && width > 20) {
@@ -6450,15 +6462,16 @@ index 0000000000000000000000000000000000000000..ff97cefc6deb60e919a40ef546e1bfb7
 +    if (!node.done) renderer.fillRectDither(x, y + 2, width, rowHeight - 7,
 +                                           itemPending(node.id) ? Color::DarkGray : Color::LightGray);
 +    renderer.drawRoundedRect(x, y + 2, width, rowHeight - 7, 1, 5, true);
-+    auto title = node.title;
-+    const auto range = workflowy::parseTimeRange(title);
-+    title.erase(range->begin, range->finish - range->begin);
++    const workflowy::CalendarTextProjection display(node.title);
++    const auto& title = display.title;
 +    calendarTextLines.clear();
 +    workflowy::wrapOutlineText(std::string_view(title), width - 16, [&](std::string_view value) {
 +      return renderer.getTextWidth(UI_12_FONT_ID, std::string(value).c_str());
 +    }, calendarTextLines);
 +    const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
-+    const int capacity = std::max(1, (rowHeight - 14) / lineHeight);
++    const int tagHeight = renderer.getLineHeight(SMALL_FONT_ID);
++    const bool showTags = !display.tags.empty() && rowHeight - 14 >= lineHeight + tagHeight;
++    const int capacity = std::max(1, (rowHeight - 14 - (showTags ? tagHeight : 0)) / lineHeight);
 +    for (size_t line = 0; line < calendarTextLines.size() && line < static_cast<size_t>(capacity); ++line) {
 +      const auto span = calendarTextLines[line];
 +      const auto text = title.substr(span.begin, span.end - span.begin);
@@ -6467,6 +6480,10 @@ index 0000000000000000000000000000000000000000..ff97cefc6deb60e919a40ef546e1bfb7
 +      if (node.done) renderer.drawLine(x + 8, textY + lineHeight / 2,
 +                                      x + 8 + renderer.getTextWidth(UI_12_FONT_ID, text.c_str()),
 +                                      textY + lineHeight / 2);
++    }
++    if (showTags) {
++      const auto tags = renderer.truncatedText(SMALL_FONT_ID, display.tags.c_str(), width - 16);
++      renderer.drawText(SMALL_FONT_ID, x + 8, y + rowHeight - 7 - tagHeight, tags.c_str());
 +    }
 +    calendarHits.push_back({node.id, 0, bounds.x, y, bounds.width, rowHeight,
 +                           block.start, block.end});
@@ -7073,10 +7090,10 @@ index 0000000000000000000000000000000000000000..be85ab98da0c693c07c446bd60bc8bcc
 +inline constexpr freeink::Icon workflowyActionAddIcon{24,24,12,workflowyActionAddBits};
 diff --git a/src/workflowy/WorkflowyOutlineLayout.h b/src/workflowy/WorkflowyOutlineLayout.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..a1f78fa20cef79f52dd2a69d4f1ccfc391ab27d9
+index 0000000000000000000000000000000000000000..b5be087d9905231696703225174bbe30d0441938
 --- /dev/null
 +++ b/src/workflowy/WorkflowyOutlineLayout.h
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,295 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -7296,6 +7313,18 @@ index 0000000000000000000000000000000000000000..a1f78fa20cef79f52dd2a69d4f1ccfc3
 +      drawn += length;
 +    });
 +    return result;
++  }
++};
++
++// Calendar presentation only: keep the stored title and scheduling text intact.
++struct CalendarTextProjection {
++  std::string title;
++  std::string tags;
++  explicit CalendarTextProjection(std::string text) {
++    if (const auto range = parseTimeRange(text)) text.erase(range->begin, range->finish - range->begin);
++    const TaskTextProjection projection(trimTaskText(text), false);
++    title = projection.text(false);
++    tags = projection.text(true);
 +  }
 +};
 +
@@ -8062,10 +8091,10 @@ index 0000000000000000000000000000000000000000..686f08b900d85660d8b4e75b7ed69a14
 +target_compile_options(workflowy_schedule_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 diff --git a/test/workflowy_schedule/WorkflowyScheduleTest.cpp b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..58c24df55c717b51bd452d2a0ad62590fa90c673
+index 0000000000000000000000000000000000000000..adc3bf44b46fdd08443e07aa4d1a4b0e6cc216d8
 --- /dev/null
 +++ b/test/workflowy_schedule/WorkflowyScheduleTest.cpp
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,144 @@
 +#include "WorkflowySchedule.h"
 +#include "WorkflowyOutlineLayout.h"
 +#include "WorkflowySettings.h"
@@ -8094,6 +8123,10 @@ index 0000000000000000000000000000000000000000..58c24df55c717b51bd452d2a0ad62590
 +  assert(!leadingTaskTimeRange("@INSIDE 8:30am - 12pm Task"));
 +  assert(!leadingTaskTimeRange("Tomorrow 📅 8:30am - 12pm Task"));
 +  const std::string original = "#career 8:30am - 12pm Plan project @INSIDE with team #P0";
++  const CalendarTextProjection event("8:30 to 12:00 #health @OUTSIDE Walk #family");
++  assert(event.title == "Walk #family");
++  assert(event.tags == "#health @OUTSIDE");
++  assert(CalendarTextProjection("#career 8:30 to 12:00 Work @INSIDE").tags == "#career");
 +  TaskTextProjection projected(original);
 +  assert(projected.text(false) == "Plan project @INSIDE with team #P0");
 +  assert(projected.text(true) == "#career 8:30am - 12pm");
