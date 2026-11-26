@@ -30,10 +30,10 @@ check after installation.
   rebuild once under cache version 119 / `0xE8` to apply the new glyph widths.
 - Highlight colors are Yellow, Green, Orange, Red, and Blue. Y/G/O/R/B swatches
   use 4/16, 7/16, 10/16, 13/16, and 16/16 black; Yellow retains its exact pattern.
-  Orange text follows the theme; Red uses light ink in light mode and contrasting
+  Orange text stays white in both themes; Red uses light ink in light mode and contrasting
   dark ink in dark mode. Filters use color names and Readest sync maps all five
   both ways. Stored IDs 0/1/2 remain Yellow/Red/Blue; Green=3 and Orange=4 preserve
-  existing assignments. One checked page snapshot is shared by Red/Blue ribbons
+  existing assignments. One checked page snapshot is shared by light-ink Orange/Red/Blue ribbons
   so overlapping pieces cannot invert glyphs twice.
 - Multiword touch selections save on release without a Lookup/Clip prompt.
   Single-word holds retain lookup; saved quote controls use non-flashing refreshes.
