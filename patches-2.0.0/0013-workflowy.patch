@@ -1,12 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3827720948222411b0f6f2b59c69efaf7be0b65e..f36aaad4bf42e6d647df9b44afa2d45a11ba5515 100644
+index 3827720948222411b0f6f2b59c69efaf7be0b65e..509f63328ff62e539d688c614504810644f7375f 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -5,6 +5,7 @@
  - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
  - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
-+- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
 
  - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
  - Group Readest account controls and auto-sync together under Readest in System settings.
@@ -14,7 +14,7 @@ index 3827720948222411b0f6f2b59c69efaf7be0b65e..f36aaad4bf42e6d647df9b44afa2d45a
 
  - Store quotes in stock-compatible CrossInk v7 files, with checked color/note companions and lossless legacy migration; retain higher quote limits.
 
-+- Show leading Workflowy tags below Calendar event titles without modifying saved task text.
++- Show leading Workflowy tags immediately after the Calendar event title lines, without anchoring them to the bottom or modifying saved task text.
 
  - Hide File Transfer back/Exit controls on every layout pass and retain the shared Home ribbon in reader-launched transfers.
  - Keep the complete Plugins puzzle icon visible, including its top tab.
@@ -40,14 +40,15 @@ index 3bbf4ec079fc5d9b39b21574906c1d4f3e530e9d..2be1c7b569ce9d9539497637584313cd
    -<network/FirmwareFlasher.cpp>
    -<network/OtaBootSwitch.cpp>
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f18731921bf8458 100644
+index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..c3c4b96625c8f48117619dda843ca64ea9f93439 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -59,12 +59,14 @@
+@@ -59,12 +59,15 @@
  #include "reader/EpubReaderActivity.h"
  #include "reader/GlobalReadingStats.h"
  #include "reader/ReaderActivity.h"
 +#include "reader/WorkflowyShareActivity.h"
++#include "network/WifiSelectionActivity.h"
  #include "settings/OpdsServerListActivity.h"
  #include "settings/ReleaseNotesActivity.h"
  #include "settings/SettingsActivity.h"
@@ -58,26 +59,38 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f187319
  #include "util/SwipeAdjustment.h"
  #include "util/TwoFingerSwipe.h"
 
-@@ -672,6 +674,27 @@ void ActivityManager::loop() {
+@@ -672,6 +675,39 @@ void ActivityManager::loop() {
      mappedInput.setPowerAsConfirmInReaderMode(false);
    }
 
 +  if (pendingAction == PendingAction::None) {
-+    if (workflowyNoticeVisible && millis() - workflowyNoticeShownAt >= 1000u) {
++    if (workflowyNoticeVisible && millis() - workflowyNoticeShownAt >= workflowyNoticeDuration) {
 +      workflowyNoticeVisible = false;
 +      requestUpdate();
 +    }
-+    if (!RenderLock::peek()) {
++    if (!workflowy::shareInProgress() && !RenderLock::peek()) {
 +      RenderLock lock(RenderLock::Mode::Try);
 +      if (lock.ownsLock()) {
 +        if (const auto error = workflowy::takeShareError()) {
-+          char feedback[160];
-+          const int status = workflowy::shareHttpStatus();
-+          if (status >= 400) snprintf(feedback, sizeof(feedback), "%s (HTTP %d)", I18n::getInstance().get(*error), status);
-+          else snprintf(feedback, sizeof(feedback), "%s", I18n::getInstance().get(*error));
-+          GUI.drawPopup(renderer, feedback, true);
-+          workflowyNoticeShownAt = millis();
-+          workflowyNoticeVisible = true;
++          if (workflowy::shareNeedsWifiPicker() && currentActivity) {
++            auto picker = makeUniqueNoThrow<WifiSelectionActivity>(renderer, mappedInput, false);
++            if (picker) currentActivity->startActivityForResult(std::move(picker), [](const ActivityResult& result) {
++              const auto* wifi = std::get_if<WifiResult>(&result.data);
++              if (!result.isCancelled && wifi && wifi->connected) workflowy::retryQueuedSharesAfterWifi();
++            });
++          } else {
++            char feedback[160];
++            const int status = workflowy::shareHttpStatus();
++            if (status >= 400) snprintf(feedback, sizeof(feedback), "%s (HTTP %d)", I18n::getInstance().get(*error), status);
++            else if (workflowy::shareTransportError())
++              snprintf(feedback, sizeof(feedback), "%s: %s (0x%x)", I18n::getInstance().get(*error),
++                  workflowy::shareFailureDetail(), unsigned(workflowy::shareTransportError()));
++            else snprintf(feedback, sizeof(feedback), "%s: %s", I18n::getInstance().get(*error), workflowy::shareFailureDetail());
++            GUI.drawPopup(renderer, feedback, true);
++            workflowyNoticeDuration = 6000;
++            workflowyNoticeShownAt = millis();
++            workflowyNoticeVisible = true;
++          }
 +        }
 +      }
 +    }
@@ -86,7 +99,7 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f187319
    processPendingActivities();
  }
 
-@@ -841,6 +864,26 @@ void ActivityManager::processPendingActivities() {
+@@ -841,6 +877,27 @@ void ActivityManager::processPendingActivities() {
      }
    }
 
@@ -102,6 +115,7 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f187319
 +      if (lock.ownsLock()) {
 +        if (const auto message = workflowy::takeShareNotice()) {
 +          GUI.drawPopup(renderer, I18n::getInstance().get(*message), true);
++          workflowyNoticeDuration = 1000;
 +          workflowyNoticeShownAt = millis();
 +          workflowyNoticeVisible = true;
 +        }
@@ -113,7 +127,7 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f187319
    if (APP_STATE.hasPendingAlert.load(std::memory_order_acquire) && pendingAction == PendingAction::None) {
      APP_STATE.hasPendingAlert.store(false, std::memory_order_relaxed);
      pushActivity(std::make_unique<AlertActivity>(renderer, mappedInput));
-@@ -1312,7 +1355,9 @@ void ActivityManager::popActivity() {
+@@ -1312,7 +1369,9 @@ void ActivityManager::popActivity() {
    pendingAction = PendingAction::Pop;
  }
 
@@ -125,15 +139,16 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f187319
  bool ActivityManager::requiresExclusiveStorageLoop() const {
    return currentActivity && currentActivity->requiresExclusiveStorageLoop();
 diff --git a/src/activities/ActivityManager.h b/src/activities/ActivityManager.h
-index 9e700a102e257458791c950286114fe2c1c7ffd3..c8feabc6de1be38d9972c577db0d22dba54dbd13 100644
+index 9e700a102e257458791c950286114fe2c1c7ffd3..2b937f1fed37762a4bc1a9f76aeafc903e29ac13 100644
 --- a/src/activities/ActivityManager.h
 +++ b/src/activities/ActivityManager.h
-@@ -92,6 +92,8 @@ class ActivityManager {
+@@ -92,6 +92,9 @@ class ActivityManager {
    PendingAction pendingAction = PendingAction::None;
    // Set once What's New has entered this boot, so a dismissal whose save failed doesn't re-show it.
    bool releaseNotesShown = false;
 +  bool workflowyNoticeVisible = false;
 +  uint32_t workflowyNoticeShownAt = 0;
++  uint32_t workflowyNoticeDuration = 1000;
    // Set when an overlay is closed specifically to hand control back to the
    // reader's menu. It must wait until the reader is current again.
    int16_t pendingReaderMenuAction = -1;
@@ -308,10 +323,10 @@ index 1b38d1497e5b7166b2613b6bb11348b92d5ddfc9..d3160c524b61f771e58160fa724d03f7
            returnAction(true);
 diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8fe44e99b14f7fd4898fd40969e6defbefe1f45
+index 0000000000000000000000000000000000000000..e64c873f9971cf4589418162a2b311f56650d6a3
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.h
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,22 @@
 +#pragma once
 +
 +#include <I18n.h>
@@ -323,7 +338,11 @@ index 0000000000000000000000000000000000000000..d8fe44e99b14f7fd4898fd40969e6def
 +// SIZE_MAX sends all clippings in the current book that match the list filter.
 +void shareClippings(size_t index, int colorFilter = 0);
 +bool shareInProgress();
++bool shareNeedsWifiPicker();
++void retryQueuedSharesAfterWifi();
 +int shareHttpStatus();
++int shareTransportError();
++const char* shareFailureDetail();
 +bool shareNoticePending();
 +// Called only after the queued confirmation has been painted.
 +void startQueuedShares();
@@ -1207,10 +1226,10 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370f2d428b3
+index 0000000000000000000000000000000000000000..aa65bcbb41967ae6100f97dff0d68477278455b4
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5299 @@
+@@ -0,0 +1,5293 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -1293,7 +1312,7 @@ index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370
 +constexpr int COUNT_TARGET = 76;
 +constexpr int CONTENT_TOP = 74;
 +constexpr unsigned long CALENDAR_REFRESH_MS = 60000;
-+enum class TodoControl { Back, Refresh, Sort, ShowDone, Wrap, MoveUnfinished, Undo, Replies, Calendar, Add, Count };
++enum class TodoControl { Back, Refresh, Sort, ShowDone, Wrap, MoveUnfinished, Undo, Replies, Add, Count };
 +enum class CalendarControl { Back, Today, View, ZoomOut, ZoomIn, Refresh, Add, Count };
 +constexpr int FOOTER_CONTROLS = static_cast<int>(TodoControl::Count);
 +constexpr size_t MAX_CALENDAR_ITEMS = MAX_ROWS;
@@ -4896,7 +4915,6 @@ index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370
 +    const workflowy::ActionBar actions{FOOTER_CONTROLS, viewStack.empty() ? 1 : 0};
 +    const auto control = static_cast<TodoControl>(actions.controlAt(x, bounds.x, bounds.width));
 +    if (control == TodoControl::Back) return back();
-+    if (control == TodoControl::Calendar) { calendarReturnHome = false; return openCalendar(false); }
 +    if (control == TodoControl::Refresh) return refresh(held);
 +    if (control == TodoControl::Sort) return sortTimedItems();
 +    if (control == TodoControl::Replies) return toggleReplyFilter();
@@ -5389,11 +5407,6 @@ index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370
 +    renderer.drawLine(x - 10, iconY - 3, x - 4, iconY + 3, undoWidth, true);
 +    x = iconX(TodoControl::Wrap);
 +    drawTaskSizeToggle(renderer, x, iconY, wrapItems);
-+    const int calendarX = iconX(TodoControl::Calendar);
-+    renderer.drawRect(calendarX - 11, iconY - 10, 23, 22);
-+    renderer.drawLine(calendarX - 10, iconY - 3, calendarX + 10, iconY - 3, ICON_STROKE, true);
-+    renderer.drawLine(calendarX - 5, iconY - 13, calendarX - 5, iconY - 7, ICON_STROKE, true);
-+    renderer.drawLine(calendarX + 5, iconY - 13, calendarX + 5, iconY - 7, ICON_STROKE, true);
 +    const int sortX = iconX(TodoControl::Sort);
 +    renderer.drawRoundedRect(sortX - 12, iconY - 11, 17, 20, 1, 3, true);
 +    renderer.drawLine(sortX - 4, iconY - 6, sortX - 4, iconY, 2, true);
@@ -6303,7 +6316,7 @@ index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370
 +      }
 +      if (showTags) {
 +        const auto tags = renderer.truncatedText(SMALL_FONT_ID, display.tags.c_str(), width - 10);
-+        renderer.drawText(SMALL_FONT_ID, x + 6, y + height - 3 - tagHeight, tags.c_str());
++        renderer.drawText(SMALL_FONT_ID, x + 6, y + 3 + std::min(capacity, static_cast<int>(calendarTextLines.size())) * lineHeight, tags.c_str());
 +      }
 +    }
 +    if (height > 18 && width > 20) {
@@ -6504,7 +6517,7 @@ index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370
 +    }
 +    if (showTags) {
 +      const auto tags = renderer.truncatedText(SMALL_FONT_ID, display.tags.c_str(), width - 16);
-+      renderer.drawText(SMALL_FONT_ID, x + 8, y + rowHeight - 7 - tagHeight, tags.c_str());
++      renderer.drawText(SMALL_FONT_ID, x + 8, y + 7 + std::min(capacity, static_cast<int>(calendarTextLines.size())) * lineHeight, tags.c_str());
 +    }
 +    calendarHits.push_back({node.id, 0, bounds.x, y, bounds.width, rowHeight,
 +                           block.start, block.end});
@@ -8928,10 +8941,10 @@ index 3ec3dc53ba802dbe8ced61e082812469a34c4eff..a6aec6ca59f691d2cccaaa8c8bb4da09
 +STR_WIFI_CONN_FAILED: "Wi-Fi connection failed"
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d3b077ec2
+index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622314288e1
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,558 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -9010,6 +9023,9 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +std::atomic<int> notice{-1};
 +std::atomic<StrId> error{StrId::STR_WORKFLOWY_SENT};
 +std::atomic<int> lastHttpStatus{0};
++std::atomic<int> lastTransportError{0};
++std::atomic<const char*> failureDetail{""};
++std::atomic<bool> needsWifiPicker{false}, manualWifiOwned{false};
 +
 +std::string oneLine(std::string value) {
 +  for (char& ch : value)
@@ -9052,10 +9068,15 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +    if (millis() - workerStartedAt >= 180000u) return false;
 +    if (hasActiveStationWifiConnection()) return true;
 +    const auto networks = WIFI_STORE.getCredentialSummaries();
-+    if (networks.empty() || WiFi.getMode() != WIFI_OFF) return false;
++    if (networks.empty()) { failureDetail.store("No saved Wi-Fi network"); return false; }
++    // A disconnected station is reusable, not a reason to reject sharing.
++    // Do not disrupt a file-transfer access point.
++    if (WiFi.getMode() != WIFI_OFF && WiFi.getMode() != WIFI_STA) {
++      failureDetail.store("Wi-Fi access point is busy"); return false;
++    }
 +    ownsWifi = true;
 +    WiFi.persistent(false);
-+    if (!WiFi.mode(WIFI_STA)) return false;
++    if (!WiFi.mode(WIFI_STA)) { failureDetail.store("Cannot start Wi-Fi"); return false; }
 +    WiFi.setAutoReconnect(false);
 +    const auto trySaved = [](const std::string& ssid) {
 +      if (millis() - workerStartedAt >= 180000u) return false;
@@ -9064,7 +9085,7 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +      WiFi.disconnect(false, false);
 +      WiFi.begin(saved->ssid.c_str(), saved->password.empty() ? nullptr : saved->password.c_str());
 +      const auto started = millis();
-+      while (!hasActiveStationWifiConnection() && millis() - started < 6500 && millis() - workerStartedAt < 180000u) delay(50);
++      while (!hasActiveStationWifiConnection() && millis() - started < 20000 && millis() - workerStartedAt < 180000u) delay(50);
 +      return hasActiveStationWifiConnection();
 +    };
 +    const auto last = WIFI_STORE.getLastConnectedSsid();
@@ -9080,7 +9101,9 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +      }
 +    }
 +    WiFi.scanDelete();
-+    return std::any_of(visible.begin(), visible.end(), trySaved);
++    const bool connected = std::any_of(visible.begin(), visible.end(), trySaved);
++    if (!connected) failureDetail.store("Saved Wi-Fi connection timed out");
++    return connected;
 +  }
 +
 +  static constexpr const char* RESPONSE_FILE = "/.crashink/.workflowy/share-response.tmp";
@@ -9112,17 +9135,20 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +    // shares. HTTP/TLS report their own fallible allocation/transport errors.
 +    if (heap.free < 24u * 1024u || heap.largest < 4u * 1024u) {
 +      lastHttpStatus.store(0);
++      failureDetail.store("Insufficient internal RAM for TLS");
 +      LOG_ERR("WF", "Share deferred: internal free=%u largest=%u", unsigned(heap.free), unsigned(heap.largest));
 +      return -1;
 +    }
 +    const auto client = esp_http_client_init(&config);
-+    if (!client) return -1;
++    if (!client) { failureDetail.store("Cannot allocate HTTP client"); return -1; }
 +    auto result = esp_http_client_set_header(client, "Authorization", auth.c_str());
 +    if (post && result == ESP_OK) result = esp_http_client_set_header(client, "Content-Type", "application/json");
 +    if (post && result == ESP_OK) result = esp_http_client_set_post_field(client, body.data(), body.size());
 +    if (result == ESP_OK) result = esp_http_client_perform(client);
 +    const int status = esp_http_client_get_status_code(client);
 +    lastHttpStatus.store(result == ESP_OK ? status : 0);
++    lastTransportError.store(result);
++    if (result != ESP_OK) failureDetail.store("HTTPS transport failed");
 +    esp_http_client_cleanup(client);
 +    const bool saved = !capture || response.sync();
 +    response.close();
@@ -9226,7 +9252,7 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +      if (recorded < 0) return StrId::STR_WORKFLOWY_READ_FAILED;
 +      if (recorded) continue;
 +      if (!connected) {
-+        if (!connect()) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
++        if (!connect()) { needsWifiPicker.store(true); return StrId::STR_WORKFLOWY_NETWORK_FAILED; }
 +        if (std::time(nullptr) < 1704067200 && !halClock.syncSystemTimeFromNTP()) return StrId::STR_WORKFLOWY_CLOCK_FAILED;
 +        const auto grouped = resolveBook(); Storage.remove(RESPONSE_FILE);
 +        if (grouped != StrId::STR_WORKFLOWY_SENT) return grouped;
@@ -9395,8 +9421,11 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +  const auto sendTask = [](void*) {
 +    workerStartedAt = millis();
 +    lastHttpStatus.store(0);
++    lastTransportError.store(0);
++    failureDetail.store("");
++    needsWifiPicker.store(false);
 +    MemoryBudget::logEpubHeapPools("share.start");
-+    bool ownsWifi = false;
++    bool ownsWifi = manualWifiOwned.exchange(false);
 +    const auto releaseWorker = [&](uint32_t generation) {
 +      // Finish network cleanup before another Share can start a replacement worker.
 +      if (ownsWifi) { WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); ownsWifi = false; }
@@ -9450,7 +9479,16 @@ index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d
 +  }
 +}
 +
++bool workflowy::shareNeedsWifiPicker() { return needsWifiPicker.load(); }
++void workflowy::retryQueuedSharesAfterWifi() {
++  manualWifiOwned.store(true);
++  shareGeneration.fetch_add(1);
++  pendingKick.store(true);
++}
++
 +int workflowy::shareHttpStatus() { return lastHttpStatus.load(); }
++int workflowy::shareTransportError() { return lastTransportError.load(); }
++const char* workflowy::shareFailureDetail() { return failureDetail.load(); }
 +
 +bool workflowy::shareInProgress() { return sending.load() || pendingKick.load(); }
 +bool workflowy::shareNoticePending() { return notice.load() >= 0; }
@@ -9507,10 +9545,10 @@ index f9a4c85e2fa46f97fc2ced9c422bc631641ae73c..f690b63c1740a302e89c70a9ac1fbf43
    pages.loop();
 diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a99894a49b94f96457d24109b6c24ee67ade683f
+index 0000000000000000000000000000000000000000..39a0eeb4028d905c5a76a34cd0dbe073d14f103a
 --- /dev/null
 +++ b/test/workflowy_share/WorkflowyShareTest.cpp
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,51 @@
 +#include "Harness.h"
 +#include "MemoryBudget.h"
 +#include "activities/reader/WorkflowyShareActivity.h"
@@ -9549,6 +9587,16 @@ index 0000000000000000000000000000000000000000..a99894a49b94f96457d24109b6c24ee6
 + forcedHttpStatus=401;CLIPPINGS.quote="Authentication quote";workflowy::shareClippings(0);runWorker();
 + assert(jobs()==1&&workflowy::shareHttpStatus()==401&&workflowy::takeShareError()==StrId::STR_WORKFLOWY_AUTH_FAILED);
 + forcedHttpStatus=0;workflowy::shareClippings(0);runWorker();assert(jobs()==0);
++ // Enabled-but-disconnected station must reconnect, not fail forever.
++ WiFi.modeValue=WIFI_STA;WiFi.connected=false;CLIPPINGS.quote="Reconnect stale station quote";
++ auto beforeReconnect=remote.size();workflowy::shareClippings(0);runWorker();
++ assert(jobs()==0&&remote.size()==beforeReconnect+1&&!WiFi.connected);
++ // Manual connection retries retained records without staging another quote.
++ online=false;CLIPPINGS.quote="Manual picker queued quote";workflowy::shareClippings(0);runWorker();
++ assert(jobs()==1&&workflowy::shareNeedsWifiPicker());workflowy::takeShareError();
++ online=true;WiFi.modeValue=WIFI_STA;WiFi.connected=true;
++ workflowy::retryQueuedSharesAfterWifi();runWorker();
++ assert(jobs()==0&&!workflowy::shareNeedsWifiPicker()&&!WiFi.connected);
 + assert(liveJsonBlocks==0);
 + assert(!workflowy::takeShareError());std::filesystem::remove_all(sdRoot);std::cout<<"Workflowy durable share tests passed\n";
 +}
