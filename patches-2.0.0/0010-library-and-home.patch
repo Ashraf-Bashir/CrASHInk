@@ -1,5 +1,5 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index b293716a10ed6d7d5fa63c6409487b3f9230b84b..59c6be3236bf96e838d5d23c0a3f1adaa5d2354d 100644
+index edc8f8e456665c7dc1a27f1c482a4fd877989199..3a71b82802af1298cc55996771563d81e88fbcb6 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,7 +1,11 @@
@@ -14,17 +14,18 @@ index b293716a10ed6d7d5fa63c6409487b3f9230b84b..59c6be3236bf96e838d5d23c0a3f1ada
  - The reader’s swipe-down drawer has a Library shortcut. Display → Frontlight offers independent black border widths from 0 to 16 pixels on each edge to mask light leakage.
  - crASHink adds a reader Library shortcut and independent frontlight leakage borders.
 
-@@ -61,6 +65,9 @@
+@@ -61,6 +65,10 @@
 
  ### Fixed
 
++- Restore Library Sync Book actions and return to the selected page, sort and search after syncing.
 +- Hide the redundant File Transfer header arrow even when opened from a book; keep the shared Home ribbon and physical Back navigation.
 +- Keep the complete Plugins puzzle icon visible, including its top tab.
 +
- - Store quotes in stock-compatible CrossInk v7 files, with checked color/note companions and lossless legacy migration; retain higher quote limits.
+ - Keep text smoothing outside Red/Blue highlight ribbons while preserving reversed ink inside their exact contours.
 
- - Fix an occasional reboot when putting an X3 or X4 to sleep with plugins enabled (#973).
-@@ -108,10 +115,18 @@
+ - Store quotes in stock-compatible CrossInk v7 files, with checked color/note companions and lossless legacy migration; retain higher quote limits.
+@@ -110,10 +118,18 @@
  - Show the Back button hint while viewing EPUB footnotes on button-only readers.
  - Releasing Power after starting Picco no longer selects a menu item on the first screen.
 
@@ -43,7 +44,7 @@ index b293716a10ed6d7d5fa63c6409487b3f9230b84b..59c6be3236bf96e838d5d23c0a3f1ada
  - Clippings are stored in reading order. CrASHInk keeps clippings, Readest data, and library indexes together under `/crashink` and migrates the existing data on startup.
 
  ### Fixed
-@@ -120,6 +135,12 @@
+@@ -122,6 +138,12 @@
 
  - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
 
@@ -56,7 +57,7 @@ index b293716a10ed6d7d5fa63c6409487b3f9230b84b..59c6be3236bf96e838d5d23c0a3f1ada
  - Image refresh blanks each image separately, keeping text between inline images visible while images are prepared for display. Pending images use an empty background instead of a temporary box border.
 
  - Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
-@@ -158,6 +179,7 @@
+@@ -160,6 +182,7 @@
  - TTF font support on ESP32-S3 devices. Whole-point sizes from 8pt to 22pt will be automatically available.
  - Separate saved highlights retain clear side/top/bottom gutters, while each highlight stays continuous across its wrapped lines. Extending a saved highlight into another by at least one complete word merges their text and records on commit, including chained overlaps. Drag release and editor Save use the same atomic merge; adjacency, punctuation-only contact, Cancel and unchanged drafts do not merge.
  - Newly created highlights now share the same one-word overlap merge as edited highlights. Saved highlights show same-shade, full-height continuation triangles toward the next/previous page. Separate quotes keep a visible horizontal gap even when tight line spacing overlaps their line boxes; wrapped rows within one quote remain joined.
@@ -5469,7 +5470,7 @@ index 0000000000000000000000000000000000000000..24aee0abf8a2aca0f69ac742954efb8d
 +  void open(int index);
 +};
 diff --git a/src/activities/library/LibraryActivity.cpp b/src/activities/library/LibraryActivity.cpp
-index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc759b1bdfc0 100644
+index 80ae81f005a63fb160f855e33499ccfc94c82b52..204295811bfec4ad37a54ecb8d567563ff10e730 100644
 --- a/src/activities/library/LibraryActivity.cpp
 +++ b/src/activities/library/LibraryActivity.cpp
 @@ -6,62 +6,63 @@
@@ -5572,7 +5573,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
  int headerControlRightInset() {
    const auto& metrics = UITheme::getInstance().getMetrics();
    // Inline battery themes need a separate lane for the options button.
-@@ -90,21 +81,16 @@ int headerControlRightInset() {
+@@ -90,21 +81,21 @@ int headerControlRightInset() {
  LibraryActivity::LibraryActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
      : Activity("Library", renderer, mappedInput),
        uiTarget(makeUiTarget(renderer)),
@@ -5595,10 +5596,15 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 -  const bool restoreSyncReturn = APP_STATE.pendingOverlayResume.origin == PendingOverlayOrigin::Library &&
 -                                 APP_STATE.consumePendingOverlayResume(resume);
 +  touchMoved = false;
++  PendingOverlayResume syncResume;
++  const bool restoreSync = APP_STATE.pendingOverlayResume.origin == PendingOverlayOrigin::Library &&
++                           APP_STATE.consumePendingOverlayResume(syncResume);
++  syncReturnSelection = restoreSync ? syncResume.selectedIndex : -1;
++  syncReturnTop = restoreSync ? syncResume.scrollPosition : 0;
    {
      RenderLock lock;
      Activity::onEnter();
-@@ -112,29 +98,23 @@ void LibraryActivity::onEnter() {
+@@ -112,29 +103,28 @@ void LibraryActivity::onEnter() {
      // The activity can be constructed while a landscape reader is still active.
      // Refresh FreeInkUI's captured screen size and safe area after rotating.
      app.setDevice(uiTarget.deviceContext());
@@ -5617,9 +5623,13 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 -      if (resume.tab <= static_cast<uint8_t>(Sort::Genre)) sort = static_cast<Sort>(resume.tab);
 -      descending = resume.pane != 0;
 -      query = std::move(resume.libraryQuery);
--    }
 +    sort = SETTINGS.librarySortMethod == static_cast<uint8_t>(Sort::DateAdded) ? Sort::DateAdded : Sort::RecentlyRead;
 +    descending = true;
++    if (restoreSync) {
++      sort = syncResume.tab == static_cast<uint8_t>(Sort::DateAdded) ? Sort::DateAdded : Sort::RecentlyRead;
++      descending = syncResume.pane != 0;
++      query = std::move(syncResume.libraryQuery);
+     }
      app.on(ACTION_ROW, &LibraryActivity::onRowEvent, this);
 -    app.on(ACTION_DELETE, &LibraryActivity::onDeleteEvent, this);
      app.on(ACTION_CONTROL, &LibraryActivity::onControlEvent, this);
@@ -5636,7 +5646,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    }
 
    // Paint the scan message before the main task starts reading the card.
-@@ -149,32 +129,31 @@ void LibraryActivity::onEnter() {
+@@ -149,32 +139,32 @@ void LibraryActivity::onEnter() {
      refreshIndexIfNeeded();
      initialScanPending = false;
      resetViewport();
@@ -5651,6 +5661,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 -      gridPageStart = ((selection - CONTROL_COUNT) / GRID_PAGE_SIZE) * GRID_PAGE_SIZE;
 -      loadGridProgress();
 -    }
++    restoreSyncViewport();
      ignoreConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
      requestUpdate();
    }
@@ -5680,7 +5691,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    if (sort == Sort::RecentlyRead) {
      index.close();
      scanFailed = false;
-@@ -191,9 +170,9 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+@@ -191,9 +181,9 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
      applyFilter();
      return;
    }
@@ -5693,7 +5704,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
        index.header().metadataEnabled != static_cast<uint8_t>(SETTINGS.libraryUseMetadata != 0)) {
      rebuildIndex(showScanning);
      return;
-@@ -203,13 +182,12 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
+@@ -203,13 +193,12 @@ void LibraryActivity::refreshIndexIfNeeded(const bool showScanning) {
    applyFilter();
  }
 
@@ -5713,7 +5724,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    uiReady = false;
    index.close();
    if (showScanning) drawScanScreen(tr(STR_LIBRARY_SCANNING));
-@@ -220,7 +198,8 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
+@@ -220,7 +209,8 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
    callbacks.progress = &LibraryActivity::onScanProgress;
    scanCancelledThisVisit = false;
    scanBackHeldAtStart = mappedInput.isPressed(MappedInputManager::Button::Back);
@@ -5723,7 +5734,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    scanFailureText = stats.failure == library::BuildFailure::Cancelled      ? StrId::STR_LIBRARY_SCAN_CANCELLED
                      : stats.failure == library::BuildFailure::TooManyBooks ? StrId::STR_LIBRARY_TOO_MANY_BOOKS
                                                                             : StrId::STR_LIBRARY_SCAN_FAILED;
-@@ -244,7 +223,15 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
+@@ -244,7 +234,15 @@ bool LibraryActivity::rebuildIndex(const bool showScanning) {
        }
      }
    }
@@ -5739,7 +5750,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    return !scanFailed;
  }
 
-@@ -316,24 +303,64 @@ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book)
+@@ -316,24 +314,64 @@ void LibraryActivity::readRecentBook(const size_t historyRow, RecentBook& book)
 
  void LibraryActivity::resolveRecents() {
    recentCount = 0;
@@ -5818,7 +5829,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    }
  }
 
-@@ -357,65 +384,19 @@ library::SortOrder LibraryActivity::indexOrder() const {
+@@ -357,65 +395,19 @@ library::SortOrder LibraryActivity::indexOrder() const {
    return library::SortOrder::RecentDesc;
  }
 
@@ -5889,7 +5900,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
  }
 
  // Position in filterOrder of the row-th match: find its block by the running
-@@ -424,7 +405,8 @@ uint16_t LibraryActivity::filteredSourceRow(const uint16_t row) const {
+@@ -424,7 +416,8 @@ uint16_t LibraryActivity::filteredSourceRow(const uint16_t row) const {
    // Sized when the filter ran: the index may be closed (count 0) while a row
    // is still drawn before the activity swaps out.
    if (!filterBits || !filterRanks || row >= filteredCount || filterSourceCount == 0) return UINT16_MAX;
@@ -5899,7 +5910,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    const uint16_t* ranks = filterRanks.get();
    uint16_t block = static_cast<uint16_t>(std::upper_bound(ranks, ranks + blocks, row) - ranks - 1);
    uint16_t seen = filterRanks[block];
-@@ -457,8 +439,80 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
+@@ -457,8 +450,80 @@ bool LibraryActivity::readBook(const int row, RecentBook& book, const bool fullP
    return true;
  }
 
@@ -5981,7 +5992,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    filteredCount = 0;
    filterFailed = false;
    filterBits.reset();
-@@ -468,7 +522,7 @@ void LibraryActivity::applyFilter() {
+@@ -468,7 +533,7 @@ void LibraryActivity::applyFilter() {
      resolveRecents();
      return;
    }
@@ -5990,7 +6001,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    const uint16_t sourceCount = index.bookCount();
    filterOrder = indexOrder();
    filterSourceCount = sourceCount;
-@@ -481,26 +535,57 @@ void LibraryActivity::applyFilter() {
+@@ -481,26 +546,57 @@ void LibraryActivity::applyFilter() {
      filterFailed = true;
      return;
    }
@@ -6068,7 +6079,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    const auto readIndexedPath = [&](const library::ClixRecord& record) {
      if (!folderOffsets) {
        folderOffsets = makeUniqueNoThrow<uint32_t[]>(library::LibraryIndexFile::FOLDER_CHECKPOINT_COUNT);
-@@ -515,8 +600,9 @@ void LibraryActivity::applyFilter() {
+@@ -515,8 +611,9 @@ void LibraryActivity::applyFilter() {
      }
      return true;
    };
@@ -6080,7 +6091,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      if (row % FILTER_BLOCK_ROWS == 0) filterRanks[row / FILTER_BLOCK_ROWS] = filteredCount;
      const uint16_t ordinal = index.ordinalForRow(filterOrder, row);
      library::ClixRecord record{};
-@@ -526,7 +612,7 @@ void LibraryActivity::applyFilter() {
+@@ -526,7 +623,7 @@ void LibraryActivity::applyFilter() {
        filteredCount = 0;
        break;
      }
@@ -6089,7 +6100,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      if (!needle.empty() && !index.readDisplayText(record, title, author)) {
        LOG_ERR("LIB", "Cannot read Library search text");
        filterFailed = true;
-@@ -542,70 +628,70 @@ void LibraryActivity::applyFilter() {
+@@ -542,70 +639,88 @@ void LibraryActivity::applyFilter() {
      // Only matching books need their completion state read from the SD card.
      if (!needle.empty() && !library::matchesQuery(folded, needle)) continue;
      if (SETTINGS.libraryHideFinishedBooks) {
@@ -6170,6 +6181,24 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    listNav.reset(selection - CONTROL_COUNT);
    uiReady = false;
 -  loadGridProgress();
++}
++
++void LibraryActivity::restoreSyncViewport() {
++  if (syncReturnSelection < 0) return;
++  const int count = rowCount();
++  // Filters resume incrementally; don't clamp a later page to a short prefix.
++  if ((scan || filterWork) && count <= syncReturnSelection - CONTROL_COUNT) return;
++  if (count > 0) {
++    selection = std::clamp(syncReturnSelection, CONTROL_COUNT, CONTROL_COUNT + count - 1);
++    topIndex = std::clamp(syncReturnTop, 0, count - 1);
++    listNav.selected = selection - CONTROL_COUNT;
++    listNav.top = topIndex;
++    listNav.followOnBuild = false;
++    gridPageStart = ((selection - CONTROL_COUNT) / gridPageSize()) * gridPageSize();
++    loadedGridPageStart = -1;
++    requestUpdate();
++  }
++  syncReturnSelection = -1;
  }
 
  void LibraryActivity::reloadAfterBookAction() {
@@ -6192,7 +6221,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    requestUpdate();
  }
 
-@@ -614,17 +700,17 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
+@@ -614,17 +729,17 @@ void LibraryActivity::openDialog(std::unique_ptr<Activity>&& child, ActivityResu
      LOG_ERR("LIB", "Cannot allocate Library dialog");
      return;
    }
@@ -6212,7 +6241,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      requestUpdate();
    });
  }
-@@ -633,58 +719,32 @@ void LibraryActivity::openBook(const int row) {
+@@ -633,58 +748,32 @@ void LibraryActivity::openBook(const int row) {
    RecentBook book;
    if (!readBook(row, book)) return;
    app.clearTapFlash();
@@ -6289,7 +6318,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    });
    requestUpdate();
  }
-@@ -702,50 +762,30 @@ void LibraryActivity::openSearch() {
+@@ -702,50 +791,30 @@ void LibraryActivity::openSearch() {
  }
 
  void LibraryActivity::refreshLibrary() {
@@ -6354,7 +6383,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
  }
 
  void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
-@@ -753,15 +793,18 @@ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
+@@ -753,15 +822,18 @@ void LibraryActivity::onRowEvent(const fui::ActionEvent& event, void* user) {
    if (event.value < 0 || event.value >= self->rowCount()) return;
    self->selection = event.value + CONTROL_COUNT;
    self->showSelection = false;
@@ -6376,7 +6405,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    self->showSelection = false;
    self->activateControl(event.value);
  }
-@@ -783,8 +826,6 @@ void LibraryActivity::queueInput(const LibraryInputBuffer::Type type, const int
+@@ -783,8 +855,6 @@ void LibraryActivity::queueInput(const LibraryInputBuffer::Type type, const int
 
  void LibraryActivity::latchInput() {
    using Type = LibraryInputBuffer::Type;
@@ -6385,7 +6414,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    const bool confirmHeld = mappedInput.isPressed(MappedInputManager::Button::Confirm);
    if (ignoreConfirmRelease || confirmLongPressCaptured) {
      (void)mappedInput.wasReleased(MappedInputManager::Button::Confirm);
-@@ -802,34 +843,73 @@ void LibraryActivity::latchInput() {
+@@ -802,34 +872,73 @@ void LibraryActivity::latchInput() {
    int x = 0;
    int y = 0;
    if (mappedInput.wasScreenTouchDown(x, y)) {
@@ -6473,7 +6502,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    }
    if (released) touchTracking = false;
    switch (swipe) {
-@@ -840,10 +920,10 @@ void LibraryActivity::latchInput() {
+@@ -840,10 +949,10 @@ void LibraryActivity::latchInput() {
        queueInput(Type::SwipeDown);
        break;
      case MappedInputManager::SwipeDir::Left:
@@ -6486,7 +6515,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
        break;
      default:
        break;
-@@ -858,10 +938,10 @@ void LibraryActivity::latchInput() {
+@@ -858,10 +967,10 @@ void LibraryActivity::latchInput() {
      ignoreBackRelease = false;
    }
    if (mappedInput.hasTouchHardware()) {
@@ -6501,7 +6530,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    } else {
      if (mappedInput.wasReleased(MappedInputManager::Button::Left)) queueInput(Type::LeftRelease);
      if (mappedInput.wasReleased(MappedInputManager::Button::Right)) queueInput(Type::RightRelease);
-@@ -898,33 +978,66 @@ void LibraryActivity::loop() {
+@@ -898,33 +1007,68 @@ void LibraryActivity::loop() {
    }
    LibraryInputBuffer::Event input;
    if (pendingInput.pop(input)) {
@@ -6519,6 +6548,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +  if (touchTracking) return;
 +  // One metadata entry per idle input cycle; no ZIP parsing or automatic rebuild.
 +  advanceFilter();
++  restoreSyncViewport();
 +  pollLibraryChanges();
 +  // Prepare at most one cover between input checks.
 +  loadGridPageCovers();
@@ -6550,13 +6580,13 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +        refreshSuggested = true;
 +        requestUpdate();
 +      }
-       return;
-     }
++      return;
++    }
 +    if (!index.isOpen() && !index.open(library::libraryIndexPath())) {
 +      refreshSuggested = true;
 +      requestUpdate();
-+      return;
-+    }
+       return;
+     }
 +    changeProbe.begin(index);
 +  }
 +  if (libraryCheckedThisBoot) return;
@@ -6573,6 +6603,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +}
 +
 +void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
++  syncReturnSelection = -1; // A deliberate new gesture takes precedence over a delayed sync return.
 +  using Type = LibraryInputBuffer::Type;
    if (input.type == Type::ConfirmLongPress) {
      pendingInput.clear();
@@ -6584,7 +6615,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
        showBookActionMenu(selection - CONTROL_COUNT, ignoreConfirmRelease);
      else
        activateControl(selection);
-@@ -938,10 +1051,6 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -938,10 +1082,6 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      snap.longPress = input.type == Type::TouchLongPress;
      snap.touchX = input.x;
      snap.touchY = input.y;
@@ -6595,7 +6626,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      const auto event = app.route(snap);
      if (app.invalidated()) requestUpdate();
      if (event) {
-@@ -953,19 +1062,30 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -953,19 +1093,30 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      pendingInput.clear();
      if (selection < CONTROL_COUNT)
        activateControl(selection);
@@ -6631,7 +6662,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      return;
    }
    const auto swipe = input.type == Type::SwipeUp      ? MappedInputManager::SwipeDir::Up
-@@ -973,37 +1093,14 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -973,37 +1124,14 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
                       : input.type == Type::SwipeLeft  ? MappedInputManager::SwipeDir::Left
                       : input.type == Type::SwipeRight ? MappedInputManager::SwipeDir::Right
                                                        : MappedInputManager::SwipeDir::None;
@@ -6671,7 +6702,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      if (input.type == Type::LeftRelease) {
        pendingInput.clear();
        openSortPicker();
-@@ -1011,31 +1108,31 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -1011,31 +1139,31 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      }
      if (input.type == Type::RightRelease) {
        pendingInput.clear();
@@ -6709,7 +6740,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      } else if (selection >= CONTROL_COUNT) {
        listNav.selected = selection - CONTROL_COUNT;
        listNav.top = topIndex;
-@@ -1047,7 +1144,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -1047,7 +1175,7 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
    if (mappedInput.hasTouchHardware()) {
      if (input.type == Type::Next) move(ButtonNavigator::nextIndex(selection, count));
      if (input.type == Type::Previous) move(ButtonNavigator::previousIndex(selection, count));
@@ -6718,7 +6749,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      if (input.type == Type::NextPage) move(ButtonNavigator::nextPageIndex(selection, count, page));
      if (input.type == Type::PreviousPage) move(ButtonNavigator::previousPageIndex(selection, count, page));
    } else if (rowCount() > 0) {
-@@ -1056,80 +1153,29 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
+@@ -1056,80 +1184,29 @@ void LibraryActivity::handleInput(const LibraryInputBuffer::Event& input) {
      const auto moveBook = [&](const int next) { move(CONTROL_COUNT + next); };
      if (input.type == Type::Next) moveBook(ButtonNavigator::nextIndex(row, bookCount));
      if (input.type == Type::Previous) moveBook(ButtonNavigator::previousIndex(row, bookCount));
@@ -6816,7 +6847,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    }
    requestUpdate();
  }
-@@ -1140,7 +1186,7 @@ void LibraryActivity::listScreen(UiApp::ScreenType& screen, void* user) {
+@@ -1140,7 +1217,7 @@ void LibraryActivity::listScreen(UiApp::ScreenType& screen, void* user) {
 
  void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem& item) {
    auto* self = static_cast<LibraryActivity*>(user);
@@ -6825,7 +6856,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      item.label = tr(STR_LIBRARY_UNAVAILABLE);
      item.enabled = false;
      return;
-@@ -1171,9 +1217,10 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem&
+@@ -1171,9 +1248,10 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem&
        item.subtitle = self->subtitleScratch.c_str();
      }
    }
@@ -6838,7 +6869,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    if (!SETTINGS.libraryListExpanded) return;
    if (self->sort == Sort::DateAdded) {
      const uint16_t date = self->dateGroupForRow(row);
-@@ -1249,68 +1296,38 @@ uint32_t LibraryActivity::groupForRow(const int row) {
+@@ -1249,68 +1327,38 @@ uint32_t LibraryActivity::groupForRow(const int row) {
    return library::foldedGroupInitial(key);
  }
 
@@ -6929,7 +6960,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
      fui::ButtonProps action;
      action.action = ACTION_CONTROL;
      action.inputMask = fui::InputTouch;
-@@ -1320,26 +1337,35 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1320,26 +1368,35 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
      action.value = 0;
      action.state = showSelection && selection == 0 ? fui::StateSelected : fui::StateNormal;
      screen.button(action,
@@ -6976,7 +7007,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    const int16_t statusPadding = static_cast<int16_t>(metrics.contentSidePadding);
    const fui::Insets statusInsets{0, statusPadding, 0, statusPadding};
    if (scanFailed || index.ranksDegraded() || filterFailed) {
-@@ -1351,16 +1377,33 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1351,16 +1408,33 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
                                 : tr(STR_LIBRARY_UNSORTED),
                    screen.theme().smallText);
    }
@@ -7014,7 +7045,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
          message = tr(STR_LIBRARY_NO_RESULTS);
        else if (sort == Sort::RecentlyRead)
          message = tr(STR_NO_RECENT_BOOKS);
-@@ -1377,8 +1420,6 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1377,8 +1451,6 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
    props.rowProviderCtx = this;
    props.count = static_cast<uint16_t>(rowCount());
    props.selectedIndex = showSelection ? static_cast<int16_t>(selection - CONTROL_COUNT) : -1;
@@ -7023,7 +7054,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    props.action = ACTION_ROW;
    props.inputMask = fui::InputTouch | fui::InputLongPress;
    props.iconSize = 28;
-@@ -1387,248 +1428,347 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
+@@ -1387,248 +1459,347 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
    props.labelText.maxLines = 1;
    props.headerText = screen.theme().bodyText;
    props.headerText.bold = true;
@@ -7196,6 +7227,11 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 -          }
 -        }
 -      }
+-    }
+-    if (!drawn) {
+-      renderer.fillRoundedRect(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
+-      if (coverWidth >= 36 && coverHeight >= 36)
+-        drawLucideIcon(renderer, icon_book_marked_32, x + (coverWidth - 32) / 2, y + (coverHeight - 32) / 2);
 +bool LibraryActivity::paintGridCover(fui::DrawTarget& target, const fui::Rect rect, const int slot) {
 +  const auto ink = fui::Paint::solid(fui::Color::Black);
 +  // Same two-pixel shadow and one-pixel square frame as Home.
@@ -7210,11 +7246,6 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +    if (!path.empty() && !(failedCoverSlots & (1u << slot)) && !coverWorker.isWriting(path.c_str())) {
 +      drawn = paintedCovers.paint(rect, slot, path, false);
      }
--    if (!drawn) {
--      renderer.fillRoundedRect(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
--      if (coverWidth >= 36 && coverHeight >= 36)
--        drawLucideIcon(renderer, icon_book_marked_32, x + (coverWidth - 32) / 2, y + (coverHeight - 32) / 2);
--    }
 -    renderer.maskRoundedRectOutsideCorners(x, y, coverWidth, coverHeight, GRID_COVER_CORNER_RADIUS, Color::White);
 -    renderer.drawRoundedRect(x, y, coverWidth, coverHeight, 2, GRID_COVER_CORNER_RADIUS, true);
 -    if (row == selectedRow) {
@@ -7320,7 +7351,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +      dirtyCoverSlots = 0;
 +      requestUpdate();
 +    }
-+  }
+   }
 +  // Visible covers remain interactive; off-screen prefetch waits for membership work.
 +  if (filterWork) return;
 +  // Warm two more pages from the current viewport, then let the SD card
@@ -7338,7 +7369,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +    prefetchFinished = true;
 +    if (!filterWork) warmedCoverView = warmKey;
 +    return;
-   }
++  }
 +  const int row = prefetchCoverRow;
 +  prefetchCoverRow = (prefetchCoverRow + 1) % count;
 +  loadGridCover(row);
@@ -7559,7 +7590,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
  }
 
  void LibraryActivity::promptDeleteBook(const RecentBook& book) {
-@@ -1643,18 +1783,19 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
+@@ -1643,18 +1814,19 @@ void LibraryActivity::promptDeleteBook(const RecentBook& book) {
        LOG_ERR("LIB", "Failed to delete file: %s", path.c_str());
        return;
      }
@@ -7584,7 +7615,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
    openDialog(makeUniqueNoThrow<ConfirmationActivity>(renderer, mappedInput, heading, book.title), std::move(handler));
  }
 
-@@ -1668,8 +1809,7 @@ void LibraryActivity::promptRemoveBook(const std::string& path, const std::strin
+@@ -1668,8 +1840,7 @@ void LibraryActivity::promptRemoveBook(const std::string& path, const std::strin
      }
    };
 
@@ -7594,7 +7625,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
                                                       /*ignoreInitialConfirmRelease=*/false),
               std::move(handler));
  }
-@@ -1682,152 +1822,194 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
+@@ -1682,152 +1853,206 @@ void LibraryActivity::showBookActionMenu(const size_t bookIndex, const bool igno
                                      [&book](const RecentBook& recent) { return recent.path == book.path; });
    std::vector<FileBrowserActionActivity::MenuItem> items =
        BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/isRecent);
@@ -7778,6 +7809,18 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +            reloadAfterBookAction();
 +            return;
 +          }
++          case FileBrowserAction::SyncProgress: {
++            PendingOverlayResume resume;
++            resume.origin = PendingOverlayOrigin::Library;
++            resume.tab = static_cast<uint8_t>(sort);
++            resume.pane = descending;
++            resume.selectedIndex = selection;
++            resume.scrollPosition = topIndex;
++            resume.libraryQuery = query;
++            BookActions::syncProgress(renderer, mappedInput, book.path, std::move(resume));
++            requestUpdate();
++            return;
++          }
 +          case FileBrowserAction::ReadingStats:
 +            openDialog(BookActions::createReadingStatsActivity(renderer, mappedInput, book.path, book.title),
 +                       [this](const ActivityResult&) { requestUpdate(); });
@@ -7934,7 +7977,7 @@ index 80ae81f005a63fb160f855e33499ccfc94c82b52..4e9957fb1219d8dc565c7efec5f9cc75
 +      });
  }
 diff --git a/src/activities/library/LibraryActivity.h b/src/activities/library/LibraryActivity.h
-index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a97618be71 100644
+index d158a6d0f393907d8accd6a763167f40bbf3d8d8..8b11c8798412649f366aa1d30ed8e21ed219dfef 100644
 --- a/src/activities/library/LibraryActivity.h
 +++ b/src/activities/library/LibraryActivity.h
 @@ -3,18 +3,21 @@
@@ -7996,7 +8039,7 @@ index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a9
    bool simulatorReadBook(int row, RecentBook& book) { return readBook(row, book); }
    void simulatorSetView(uint8_t method, bool reverse, const std::string& search = "") {
      sort = static_cast<Sort>(method);
-@@ -54,28 +56,50 @@ class LibraryActivity final : public Activity {
+@@ -54,28 +56,53 @@ class LibraryActivity final : public Activity {
   private:
    enum class Sort : uint8_t { DateAdded, Title, AuthorLast, AuthorFirst, RecentlyRead, Series, Genre };
    // Touch header controls precede the book rows; button-only navigation visits books directly.
@@ -8021,6 +8064,9 @@ index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a9
    int selection = CONTROL_COUNT;
    bool showSelection = true;
    int topIndex = 0;
++  int syncReturnSelection = -1;
++  int syncReturnTop = 0;
++  void restoreSyncViewport();
 +  void pageLibrary(int direction);
    int gridPageStart = 0;
    int loadedGridPageStart = -1;
@@ -8053,7 +8099,7 @@ index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a9
    bool uiReady = false;
    bool initialScanPending = false;
    bool confirmLongPressCaptured = false;
-@@ -111,6 +135,16 @@ class LibraryActivity final : public Activity {
+@@ -111,6 +138,16 @@ class LibraryActivity final : public Activity {
    library::SortOrder filterOrder = library::SortOrder::TitleAsc;
    uint16_t filterSourceCount = 0;
    uint16_t filteredCount = 0;
@@ -8070,7 +8116,7 @@ index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a9
    // Indices into the bounded recent-books history, independent of the Library index.
    uint16_t recentRows[RecentBooksStore::MAX_RECENT_BOOKS]{};
    size_t recentCount = 0;
-@@ -124,18 +158,8 @@ class LibraryActivity final : public Activity {
+@@ -124,18 +161,8 @@ class LibraryActivity final : public Activity {
    std::string seriesScratch;
    std::string genreScratch;
    std::string subtitleScratch;
@@ -8089,7 +8135,7 @@ index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a9
    static void onRowEvent(const freeink::ui::ActionEvent& event, void* user);
    static void onControlEvent(const freeink::ui::ActionEvent& event, void* user);
    static void provideRow(void* user, uint16_t row, freeink::ui::ListItem& item);
-@@ -143,10 +167,8 @@ class LibraryActivity final : public Activity {
+@@ -143,10 +170,8 @@ class LibraryActivity final : public Activity {
    void buildGrid(UiApp::ScreenType& screen);
    void loadGridPageCovers();
    bool loadGridCover(int row);
@@ -8101,7 +8147,7 @@ index d158a6d0f393907d8accd6a763167f40bbf3d8d8..79db63524c9dd971858ee60b7c2c98a9
    library::SortOrder indexOrder() const;
    int rowCount() const;
    uint16_t ordinalForRow(int row);
-@@ -155,28 +177,34 @@ class LibraryActivity final : public Activity {
+@@ -155,28 +180,34 @@ class LibraryActivity final : public Activity {
    uint32_t groupForRow(int row);
    uint16_t dateGroupForRow(int row);
    bool metadataGroupForRow(int row, std::string& out);
@@ -9287,10 +9333,10 @@ index 0000000000000000000000000000000000000000..2da519c380a0c486254d84c83b9dbef2
 +inline const char* tr(StrId id){constexpr const char* words[]={"Library","Workflowy","Calendar","Browse","File Transfer","Settings","Plugins","Save failed"};return words[id];}
 diff --git a/test/library_thumbnails/CMakeLists.txt b/test/library_thumbnails/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..122b09b8e01de949141ec47e0aa4fae863356ae3
+index 0000000000000000000000000000000000000000..25a2c9ed8e051463909d483c9d201ba9d9bd89f7
 --- /dev/null
 +++ b/test/library_thumbnails/CMakeLists.txt
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,87 @@
 +find_package(Python3 REQUIRED COMPONENTS Interpreter)
 +set(EXTRACTED ${CMAKE_CURRENT_BINARY_DIR}/LibraryThumbnailMethods.inc)
 +add_custom_command(OUTPUT ${EXTRACTED}
@@ -9347,6 +9393,37 @@ index 0000000000000000000000000000000000000000..122b09b8e01de949141ec47e0aa4fae8
 +target_include_directories(OpenedBooksTest PRIVATE ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/lib/LibraryIndex)
 +target_link_libraries(OpenedBooksTest PRIVATE crosspoint_test_common GTest::gtest_main)
 +gtest_discover_tests(OpenedBooksTest)
++
++set(LIBRARY_REFRESH_INC ${CMAKE_CURRENT_BINARY_DIR}/LibraryRefresh.inc)
++add_custom_command(OUTPUT ${LIBRARY_REFRESH_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryRefresh.py
++  ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${LIBRARY_REFRESH_INC}
++ DEPENDS ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibraryRefresh.py VERBATIM)
++add_executable(library_refresh_test LibraryRefreshTest.cpp ${LIBRARY_REFRESH_INC})
++target_include_directories(library_refresh_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(library_refresh_test PRIVATE -UNDEBUG)
++add_test(NAME library_refresh COMMAND library_refresh_test)
++
++set(LIBRARY_SNAPSHOT_INC ${CMAKE_CURRENT_BINARY_DIR}/LibrarySnapshot.inc)
++add_custom_command(OUTPUT ${LIBRARY_SNAPSHOT_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySnapshot.py
++  ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${LIBRARY_SNAPSHOT_INC}
++ DEPENDS ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySnapshot.py VERBATIM)
++add_executable(library_snapshot_test LibrarySnapshotTest.cpp ${LIBRARY_SNAPSHOT_INC})
++target_include_directories(library_snapshot_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(library_snapshot_test PRIVATE -UNDEBUG)
++add_test(NAME library_snapshot COMMAND library_snapshot_test)
++
++set(LIBRARY_SYNC_ACTION ${CMAKE_CURRENT_BINARY_DIR}/LibrarySyncAction.inc)
++set(LIBRARY_SYNC_RETURN ${CMAKE_CURRENT_BINARY_DIR}/LibrarySyncReturn.inc)
++add_custom_command(OUTPUT ${LIBRARY_SYNC_ACTION} ${LIBRARY_SYNC_RETURN}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySync.py
++ ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${LIBRARY_SYNC_ACTION} ${LIBRARY_SYNC_RETURN}
++ DEPENDS ${REPO_ROOT}/src/activities/library/LibraryActivity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractLibrarySync.py VERBATIM)
++add_executable(library_sync_test LibrarySyncTest.cpp ${LIBRARY_SYNC_ACTION} ${LIBRARY_SYNC_RETURN})
++target_include_directories(library_sync_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
++target_compile_options(library_sync_test PRIVATE -UNDEBUG)
++add_test(NAME library_sync COMMAND library_sync_test)
 diff --git a/test/library_thumbnails/CoverIdentityTest.cpp b/test/library_thumbnails/CoverIdentityTest.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..3572a9473c93839433515b5477a125ed22a6e997
@@ -9669,3 +9746,68 @@ index f0546e31c502682b6773dae95a0abd9346edf3a9..a811ffee6283f42342111b6e67c87d99
 
    bool exists(const char* path) const { return files_.contains(path); }
    bool remove(const char* path) {
+diff --git a/test/library_thumbnails/ExtractLibrarySync.py b/test/library_thumbnails/ExtractLibrarySync.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba11b9dfe426dbb01ec86c332a00e919c63a0f5d
+--- /dev/null
++++ b/test/library_thumbnails/ExtractLibrarySync.py
+@@ -0,0 +1,10 @@
++from pathlib import Path
++import sys
++source=Path(sys.argv[1]).read_text()
++a=source.index('          case FileBrowserAction::SyncProgress: {',source.index('void LibraryActivity::showBookActionMenu'))
++b=source.index('          case FileBrowserAction::ReadingStats:',a)
++a=source.index('{',a)+1
++Path(sys.argv[2]).write_text(source[a:source.rfind('}',a,b)])
++a=source.index('void LibraryActivity::restoreSyncViewport()')
++b=source.index('\n}',a)+2
++Path(sys.argv[3]).write_text(source[a:b])
+diff --git a/test/library_thumbnails/LibrarySyncTest.cpp b/test/library_thumbnails/LibrarySyncTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ceb68cb2e7dbfdc8a3b2b5cacf0d72865b78f36
+--- /dev/null
++++ b/test/library_thumbnails/LibrarySyncTest.cpp
+@@ -0,0 +1,43 @@
++#include <cassert>
++#include <algorithm>
++#include <string>
++#include "PendingOverlayResume.h"
++struct Book {std::string path;};
++namespace BookActions {
++std::string synced;PendingOverlayResume returned;int calls=0;
++void syncProgress(int,int,const std::string& path,PendingOverlayResume resume) {synced=path;returned=std::move(resume);++calls;}
++}
++struct LibraryActivity {
++ static constexpr int CONTROL_COUNT=5;
++ enum class Sort {DateAdded=0,RecentlyRead=4};
++ Sort sort=Sort::DateAdded;bool descending=true;
++ int selection=27,topIndex=18,renderer=0,mappedInput=0,updates=0,count=40;
++ int syncReturnSelection=-1,syncReturnTop=0,gridPageStart=0,loadedGridPageStart=18;
++ bool scan=false,filterWork=false;
++ struct {int selected=0,top=0;bool followOnBuild=true;} listNav;
++ std::string query="Some book";
++ int rowCount() const {return count;}
++ void requestUpdate() {++updates;}
++ void sync(const Book& book) {
++#include "LibrarySyncAction.inc"
++ }
++ void restoreSyncViewport();
++};
++int gridPageSize(){return 9;}
++#include "LibrarySyncReturn.inc"
++int main() {
++ LibraryActivity library;library.sync({"/selected.epub"});
++ assert(BookActions::calls==1 && BookActions::synced=="/selected.epub");
++ const auto& r=BookActions::returned;
++ assert(r.origin==PendingOverlayOrigin::Library && r.valid());
++ assert(r.tab==0 && r.pane==1 && r.selectedIndex==27 && r.scrollPosition==18 && r.libraryQuery=="Some book");
++ library.syncReturnSelection=r.selectedIndex;library.syncReturnTop=r.scrollPosition;
++ library.count=9;library.filterWork=true;library.restoreSyncViewport();
++ assert(library.syncReturnSelection==27); // Wait for the selected page, not just the first nine.
++ library.count=40;library.restoreSyncViewport();
++ assert(library.selection==27 && library.topIndex==18 && library.gridPageStart==18);
++ assert(!library.listNav.followOnBuild && library.syncReturnSelection==-1);
++ library.syncReturnSelection=500;library.syncReturnTop=500;library.filterWork=false;
++ library.restoreSyncViewport();assert(library.selection==44 && library.topIndex==39);
++ library.syncReturnSelection=20;library.count=0;library.restoreSyncViewport();assert(library.syncReturnSelection==-1);
++}

@@ -39,6 +39,12 @@ check after installation.
   as Yellow, old Orange defaults fall back to Yellow, and Readest Orange notes
   map to Yellow. One checked page snapshot is shared by Red/Blue ribbons so
   overlapping pieces cannot invert glyphs twice.
+- Red/Blue highlight pages keep text anti-aliasing outside the exact ribbon
+  contours. A checked, render-lifetime PSRAM mask protects finished reversed
+  glyphs in overlay/absolute gray planes, including tiled and fallback passes.
+  A failed optional mask allocation retains the previous readable BW fallback.
+- Library Sync Book uses the shared sync flow and restores the chosen sort,
+  search and viewport, waiting for incremental filtering to reach that page.
 - Multiword touch selections save on release without a Lookup/Clip prompt.
   Single-word holds retain lookup; saved quote controls use non-flashing refreshes.
 - Clipping rewrites use checked scratch allocation and publish the matching

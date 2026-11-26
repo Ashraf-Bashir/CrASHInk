@@ -725,7 +725,7 @@ index 26e3be6e80ec2868073488f88e326355b6ca98ab..2d548672cf3cae4fd193e647335eb63a
 +
 +add_subdirectory(image_refresh_regions)
 diff --git a/test/epub_grayscale/EpubGrayscaleTest.cpp b/test/epub_grayscale/EpubGrayscaleTest.cpp
-index ba5564e2a29edd8e57056bfefb2cb0c76a3c4355..ed4ee6b21c02fe884ab73954b9581a63bc706909 100644
+index ba5564e2a29edd8e57056bfefb2cb0c76a3c4355..c3fb18a8eb5d339e7e4d6580322ee4ee125725ba 100644
 --- a/test/epub_grayscale/EpubGrayscaleTest.cpp
 +++ b/test/epub_grayscale/EpubGrayscaleTest.cpp
 @@ -293,6 +293,45 @@ TEST_F(EpubGrayscaleTest, RetentionFailureFallsBackWithoutOverrunningOldBuffer)
@@ -737,7 +737,7 @@ index ba5564e2a29edd8e57056bfefb2cb0c76a3c4355..ed4ee6b21c02fe884ab73954b9581a63
 +  r.orientation = GfxRenderer::LandscapeCounterClockwise;
 +  Page page;
 +  ImageBlock block("combined.jpg", "", 4, 4);
-+  Storage.put("combined.pxc", cache(4, 4));
++  Storage.put("combined_gray_v4.pxc", cache(4, 4));
 +  page.images.push_back({&block, 8, 2});
 +  r.clearScreen(0xff);
 +  r.bw[0] = 0x00;  // Book text or controls outside the illustration.
@@ -774,6 +774,33 @@ index ba5564e2a29edd8e57056bfefb2cb0c76a3c4355..ed4ee6b21c02fe884ab73954b9581a63
  TEST_F(EpubGrayscaleTest, ImageBlockPreservesScanAndFailureFallback) {
    GfxRenderer r;
    ImageBlock block("image.jpg", "", 21, 23);
+@@ -606,3 +645,26 @@ TEST_F(EpubGrayscaleTest, TiledReplayFailureStopsBeforeDisplayingGrayAndSignalsM
+   }
+ }
+ }  // namespace
++
++TEST_F(EpubGrayscaleTest, ProtectionOverlayRunsBeforeUploadingEveryPlaneOrStrip) {
++  for (int path = 0; path < 3; ++path) {
++    fakeheap::reset(path == 2);
++    GfxRenderer r(32,160); Page page;
++    std::vector<uint8_t> scratch(r.stride * (path == 1 ? r.height : 80));
++    const auto baseline = r.bw;
++    struct Context {GfxRenderer* renderer; int calls=0;};
++    Context context{&r};
++    const auto protect = [](void* value) {
++      auto& c=*static_cast<Context*>(value); auto& target=*c.renderer;
++      EXPECT_TRUE(target.active);
++      EXPECT_NE(target.mode,GfxRenderer::BW);
++      target.target[0]=0x5a; ++c.calls;
++    };
++    ASSERT_TRUE(EpubGrayscale::runTiledGrayscalePass(r,page,1,0,0,true,true,false,
++      scratch.data(),scratch.size(),path==2,nullptr,protect,&context));
++    EXPECT_EQ(context.calls,path==0 ? 4 : 2);
++    EXPECT_EQ(r.lsb[0],0x5a); EXPECT_EQ(r.msb[0],0x5a);
++    if(path==0) { EXPECT_EQ(r.lsb[80*r.stride],0x5a); EXPECT_EQ(r.msb[80*r.stride],0x5a); }
++    EXPECT_EQ(r.bw,baseline);
++  }
++}
 diff --git a/test/epub_grayscale/stubs/GfxRenderer.h b/test/epub_grayscale/stubs/GfxRenderer.h
 index f3eecef53aed3401b110cb2768c09379fb5c8527..3af166aa15ff4d510462c1f36533ed9629956410 100644
 --- a/test/epub_grayscale/stubs/GfxRenderer.h
@@ -1120,7 +1147,7 @@ index 0ee58845a3a1c93adc4d28f0342573673b3387df..30872dfb7dcd155e7b0c8abeea1c3a38
 
  TEST(ReaderDrawerModel, ChangeMaskSeparatesPreviewRelayoutAndOrientation) {
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index e355cc24e78e9b8fc396772d5ac765a3627e5664..3c7aefdcc4807f9a9a40be83d81da1d424dee06d 100644
+index ec2528f77d7c1c34f6055f9fbafab293fc2491f4..c08d7a3db057fc91f001a8b1aad6201fda6fbc9c 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -143,13 +143,13 @@ constexpr uint8_t PRE_TEXT_DARKNESS_READER_SETTINGS_FILE_VERSION = 13;
@@ -1264,9 +1291,9 @@ index e355cc24e78e9b8fc396772d5ac765a3627e5664..3c7aefdcc4807f9a9a40be83d81da1d4
 +                              ? makePsramByteBufferNoThrow(renderer.getBufferSize())
 +                              : HeapByteBuffer{};
 
-   const auto finalizeBufferComposition = [&]() {
-     if (drawClippingHighlights(*page, fontId, orientedMarginTop, orientedMarginLeft)) {
-@@ -8369,9 +8400,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+   // Optional, render-lifetime physical mask (~48 KiB on X4 Pro), allocated
+   // only for reversed highlights in PSRAM. Reuse it for all gray passes.
+@@ -8374,9 +8405,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
    const auto composePageBuffer = [&]() {
      const GfxRenderer::TextWeightScope weightScope(renderer, SETTINGS.textWeightOffset());
      drawTextAndRules();
@@ -1278,9 +1305,9 @@ index e355cc24e78e9b8fc396772d5ac765a3627e5664..3c7aefdcc4807f9a9a40be83d81da1d4
      } else {
        page->renderImages(renderer, fontId, orientedMarginLeft, orientedMarginTop, foregroundBlack,
                           SETTINGS.imageGrayscale);
-@@ -8390,19 +8420,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
-     }
+@@ -8396,19 +8426,8 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      finalizeBufferComposition();
+     renderer.protectGrayscaleHighlights(highlightGrayProtection.get());
    };
 -  if (updatePanel && pageHasImagesNeedingDecode) {
 -    drawTextAndRules();
@@ -1300,7 +1327,7 @@ index e355cc24e78e9b8fc396772d5ac765a3627e5664..3c7aefdcc4807f9a9a40be83d81da1d4
      GfxRenderer::FrameBufferLoan loan(renderer);
      page->prepareImageCaches(needsImageGrayscale);
      loan.end();
-@@ -8491,40 +8510,67 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -8497,40 +8516,67 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      pagesUntilFullRefresh = 1;
      return true;
    };
@@ -1400,7 +1427,7 @@ index e355cc24e78e9b8fc396772d5ac765a3627e5664..3c7aefdcc4807f9a9a40be83d81da1d4
    }
    const bool needsAnyGrayscale = needsTextGrayscale || needsImageGrayscale;
    if (needsAnyGrayscale && !pageHasImages &&
-@@ -8535,56 +8581,9 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
+@@ -8541,56 +8587,9 @@ bool EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int fo
      return true;
    const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
    const bool overlapRefresh =
@@ -1460,7 +1487,7 @@ index e355cc24e78e9b8fc396772d5ac765a3627e5664..3c7aefdcc4807f9a9a40be83d81da1d4
        // Cleanup turns still need the stronger HALF pass, but X3 grayscale
        // overlays settle better if the OEM precondition step runs before the
        // gray planes are written.
-@@ -9909,6 +9908,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
+@@ -9929,6 +9928,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
      ImageBlock::setExtractor(nullptr, nullptr, nullptr);
    }
    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
