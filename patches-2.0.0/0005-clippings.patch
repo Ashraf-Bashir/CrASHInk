@@ -5528,7 +5528,7 @@ index 9192c7cd7528276868f5ff77158f688e6d4b6f5a..5f17c96d41f7b70ddeb9af22b1c01c42
        if (itemHref != getSpineItem(spineIndex).href) continue;
        const auto& contents = spineContents[spineIndex];
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..72bb9261ee4a9f76a70c9a5249541a175c6aa71b 100644
+index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..4d61c43683dee01a5323e39636a627d7b4dc81b7 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,3 +1,6 @@
@@ -5538,7 +5538,16 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..72bb9261ee4a9f76a70c9a5249541a17
  - crASHink adds a reader Library shortcut and independent frontlight leakage borders.
 
  ## [v2.0.0] - 2026-11-24
-@@ -109,15 +112,27 @@
+@@ -56,6 +59,8 @@
+
+ ### Fixed
+
++- Store quotes in stock-compatible CrossInk v7 files, with checked color/note companions and lossless legacy migration; retain higher quote limits.
++
+ - Fix an occasional reboot when putting an X3 or X4 to sleep with plugins enabled (#973).
+ - Index EPUBs faster when many table-of-contents entries point to the same chapter file or chapter files are stored out of reading order.
+ - Credit EPUB and XTC reading to the correct local day across midnight. Preserve live stats if a save fails, retry updates after SD errors, and finish pending saves before sleep, reader restart, or USB Drive handoff.
+@@ -109,15 +114,27 @@
  ### Fixed
 
  - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
@@ -5566,7 +5575,7 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..72bb9261ee4a9f76a70c9a5249541a17
  - Library replaces Recent Books with a searchable book list, and adds various book metadata sort options.
  - Assign Library to power, long-press, button-chord, Home-button, or Quick Actions shortcuts to open the book list directly.
  - Customize the top and bottom reader status bars separately, including item positions and progress bars, in EPUB, TXT, and XTC books. Each bar can be previewed where it appears while reading.
-@@ -169,6 +184,7 @@
+@@ -169,6 +186,7 @@
  - Saved clipping lists now show a scrollbar when more clippings are available below the visible rows.
  - EPUB Safe Mode no longer pins inherited fonts and page layout as personal book settings.
  - The X4 Pro Home button now steps back through dictionary lookup, chapter selection, and nested settings instead of jumping to Home.
@@ -5574,7 +5583,7 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..72bb9261ee4a9f76a70c9a5249541a17
  - OPDS downloads now use the first listed author for filename templates when a catalog also lists translators or other contributors.
  - Retain the CSS spacing supplied by empty inline spans.
  - Improve stability when connecting to Wi-Fi for update checks and KOReader authentication on X4 Pro.
-@@ -239,8 +255,30 @@
+@@ -239,8 +257,30 @@
 
  - OPDS and download logs hide URL tokens, fragments, and embedded credentials.
 
@@ -5605,7 +5614,7 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..72bb9261ee4a9f76a70c9a5249541a17
  ## [v1.6.0] - 2026-09-21
 
  ### Added
-@@ -737,3 +775,12 @@
+@@ -737,3 +777,12 @@
  - Power-button shortcut conflicts outside the reader so reader-only actions fall back to `Confirm` while Sleep, Refresh, Screenshot, Sync Progress, and File Transfer remain real power actions.
  - Potential crash when using `Go to %` in EPUBs.
  - Potential crash when entering sleep with Page Overlay enabled if the cached EPUB page data is invalid.
@@ -5620,13 +5629,14 @@ index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..72bb9261ee4a9f76a70c9a5249541a17
 +- Use Yellow, Green, Red, and Blue highlights with evenly stepped grayscale swatches, named filters, matching Readest colors, and stable saved IDs. Removed Orange highlights and defaults map to Yellow; Red retains contrasting text.
 diff --git a/src/ClippingNativeSync.cpp b/src/ClippingNativeSync.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c30186520
+index 0000000000000000000000000000000000000000..3ee4cd8d68c51ec071e89b1097d10e05a0aa2c0a
 --- /dev/null
 +++ b/src/ClippingNativeSync.cpp
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,205 @@
 +#include "ClippingStore.h"
 +#include <HalStorage.h>
 +#include <Memory.h>
++#include <Serialization.h>
 +#include <algorithm>
 +#include <cstdio>
 +#include <cstring>
@@ -5692,22 +5702,47 @@ index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c
 +  if (scope.size() != 16) return false;
 +  ClippingStore store; NativeBindings bindings;
 +  if (!loadForSync(path, store) || !loadBindings(store.storeFilePath, bindings)) return false;
-+  bool changed = false;
++  bool changed = false, bindCore = false;
++  // One checked, sync-lifetime key table; never retained by the reader.
++  auto coreKeys = store.clippings.empty() ? nullptr : makeUniqueNoThrow<char[]>(store.clippings.size() * 81);
++  if (!store.clippings.empty() && !coreKeys) return false;
 +  for (size_t i = 0; i < store.clippings.size(); ++i) {
 +    std::string text; char fingerprint[17];
 +    if (!store.readClippingText(i, text) || !clippingSyncIdentity(store.clippings[i].timestamp, text, fingerprint)) return false;
-+    bool found = false;
++    size_t found = SIZE_MAX;
 +    for (size_t n = 0; n < bindings.count; ++n)
-+      if (std::strcmp(bindings.data[n].fingerprint, fingerprint) == 0 && std::string_view(bindings.data[n].key).starts_with(scope)) { found = true; break; }
-+    if (found) continue;
-+    if (!bindings.reserve(bindings.count + 1)) return false;
-+    auto& entry = bindings.data[bindings.count++];
-+    std::memcpy(entry.fingerprint, fingerprint, sizeof(fingerprint));
-+    const auto key = scope + newClippingSyncId();
-+    if (key.size() > 80) return false;
-+    std::snprintf(entry.key, sizeof(entry.key), "%s", key.c_str()); changed = true;
++      if (std::strcmp(bindings.data[n].fingerprint, fingerprint) == 0 && std::string_view(bindings.data[n].key).starts_with(scope)) { found = n; break; }
++    if (found == SIZE_MAX) {
++      if (!bindings.reserve(bindings.count + 1)) return false;
++      found = bindings.count++;
++      auto& entry = bindings.data[found]; std::memcpy(entry.fingerprint, fingerprint, sizeof(fingerprint));
++      const auto& clip = store.clippings[i]; std::string nativeKey;
++      if (clip.syncFlags & 2) {
++        FsFile reader;
++        if (!store.openTextReader(reader)) return false;
++        nativeKey.resize(clip.syncKeyLength);
++        const bool ok = reader.seek(clip.syncKeyOffset) && reader.read(nativeKey.data(), nativeKey.size()) == static_cast<int>(nativeKey.size());
++        reader.close(); if (!ok) return false;
++      }
++      const auto key = nativeKey.starts_with(scope) ? nativeKey : scope + newClippingSyncId();
++      if (key.size() > 80) return false;
++      std::snprintf(entry.key, sizeof(entry.key), "%s", key.c_str()); changed = true;
++    }
++    std::snprintf(coreKeys.get() + i * 81, 81, "%s", bindings.data[found].key);
++    const auto& clip = store.clippings[i];
++    if (!(clip.syncFlags & 2) || clip.syncKeyLength != std::strlen(bindings.data[found].key)) bindCore = true;
++    else {
++      FsFile reader; char saved[81]{};
++      if (!store.openTextReader(reader)) return false;
++      const bool ok = reader.seek(clip.syncKeyOffset) && reader.read(saved, clip.syncKeyLength) == clip.syncKeyLength;
++      reader.close(); if (!ok) return false;
++      if (std::strcmp(saved, bindings.data[found].key)) bindCore = true;
++    }
 +  }
-+  return !changed || saveBindings(store.storeFilePath, bindings);
++  if (changed && !saveBindings(store.storeFilePath, bindings)) return false;
++  if (!bindCore) return true;
++  store.pendingSyncKeys = coreKeys.get();
++  return store.writeToFile();
 +}
 +bool ClippingStore::readForUpload(const std::string& path, size_t ordinal, SyncClipping& clip, std::string& text, bool& done, std::string* key) {
 +  ClippingStore store; NativeBindings bindings;
@@ -5729,6 +5764,20 @@ index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c
 +bool ClippingStore::readDeletionForUpload(const std::string& path, size_t ordinal, std::string& id, bool& done) {
 +  ClippingStore store; NativeBindings bindings;
 +  if (!loadForSync(path, store) || !loadBindings(store.storeFilePath, bindings)) return false;
++  FsFile reader;
++  if (!store.openTextReader(reader)) return false;
++  uint8_t version = 0; uint16_t count = 0, nativeDeleted = 0; std::string ignored;
++  const bool header = serialization::tryReadPod(reader, version) && serialization::tryReadPod(reader, count) &&
++    serialization::tryReadString(reader, ignored) && serialization::tryReadString(reader, ignored) &&
++    serialization::tryReadString(reader, ignored) && (version != 7 || serialization::tryReadPod(reader, nativeDeleted));
++  if (!header) { reader.close(); return false; }
++  if (ordinal < nativeDeleted) {
++    for (size_t i = 0; i <= ordinal; ++i) if (!serialization::tryReadString(reader, id) || id.size() <= 16 || id.size() > 80) {
++      reader.close(); return false;
++    }
++    reader.close(); done = false; return true;
++  }
++  reader.close(); ordinal -= nativeDeleted;
 +  size_t deleted = 0; done = true;
 +  for (size_t i = 0; i < bindings.count; ++i) {
 +    if (activeBinding(store, bindings.data[i])) continue;
@@ -5743,8 +5792,11 @@ index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c
 +  for (size_t i = 0; i < bindings.count; ++i)
 +    if (!std::string_view(bindings.data[i].key).starts_with(scope) || activeBinding(store, bindings.data[i]))
 +      bindings.data[kept++] = bindings.data[i];
-+  if (kept == bindings.count) return true;
-+  bindings.count = kept; return saveBindings(store.storeFilePath, bindings);
++  const bool changed = kept != bindings.count;
++  bindings.count = kept;
++  if (changed && !saveBindings(store.storeFilePath, bindings)) return false;
++  store.acknowledgedNativeScope = scope;
++  return store.writeToFile();
 +}
 +bool ClippingStore::mergeFromSync(const std::string& path, const SyncClipping& incoming, const std::string& text, const std::string& key, bool deleted, bool* full) {
 +  if (full) *full = false;
@@ -5787,7 +5839,7 @@ index 0000000000000000000000000000000000000000..af0a0014025e1389fea1b78ff828e86c
 +  if (!bookFilePath.empty()) SyncPending::mark(bookFilePath, SyncPending::CLIPPINGS_BIT);
 +}
 diff --git a/src/ClippingStore.cpp b/src/ClippingStore.cpp
-index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8d40d67f4 100644
+index 8a993f48cce9e4b68577b69d1edc688e207a3912..a939161957fc123c7d82dd7b3089742d205f0d61 100644
 --- a/src/ClippingStore.cpp
 +++ b/src/ClippingStore.cpp
 @@ -1,10 +1,10 @@
@@ -5803,7 +5855,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
  #include <Serialization.h>
  #include <Utf8.h>
  #include <uzlib.h>
-@@ -12,44 +12,35 @@
+@@ -12,44 +12,45 @@
  #include <algorithm>
  #include <array>
  #include <cstring>
@@ -5816,6 +5868,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -#include "clippings/ClippingIdentity.h"
  #include "clippings/ClippingPreview.h"
 -#include "sync/SyncFiles.h"
++#include "clippings/ClippingCompanion.h"
 
  namespace {
  constexpr uint8_t LEGACY_VERSION = 1;
@@ -5824,19 +5877,34 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -constexpr uint8_t SYNC_ID_VERSION = 5;
 -constexpr uint8_t SCOPED_ID_VERSION = 6;
 -constexpr uint8_t SOURCE_RANGE_VERSION = 7;
-+constexpr uint8_t COLOR_VERSION = 5;
-+constexpr uint8_t NOTE_VERSION = 6;
-+// 7 belongs to stock CrossInk; 8 extends the custom color/note format safely.
-+constexpr uint8_t SOURCE_RANGE_VERSION = 8;
- constexpr uint8_t VERSION = SOURCE_RANGE_VERSION;
+-constexpr uint8_t VERSION = SOURCE_RANGE_VERSION;
 -constexpr size_t SCOPE_BYTES = 16;
 -constexpr size_t MAX_ID_BYTES = 64;
 -constexpr size_t MAX_HEADER_FIELD_BYTES = 4096;
 -constexpr char CLIPPINGS_DIR[] = "/.crashink/.clippings";
++constexpr uint8_t COLOR_VERSION = 5;
++constexpr uint8_t NOTE_VERSION = 6;
++// Read the former custom v8 format; all new cores use stock CrossInk v7.
++constexpr uint8_t SOURCE_RANGE_VERSION = 8;
++constexpr uint8_t NATIVE_VERSION = 7;
++constexpr uint8_t VERSION = NATIVE_VERSION;
  constexpr size_t INITIAL_CLIPPING_RESERVE = 4;
 +constexpr char CLIPPINGS_DIR[] = "/.crashink/.clippings";
  constexpr size_t TEXT_COPY_BUFFER_SIZE = 128;
--
++// Internal RAM left free when the clipping list has to grow without PSRAM.
++constexpr uint32_t CLIPPING_LIST_INTERNAL_HEADROOM = 16U * 1024U;
++
++// Keep the persisted records in book order. Compare page fractions so
++// highlights from other font sizes and Readest's virtual pages interleave.
++bool occursBefore(const Clipping& a, const Clipping& b) {
++  if (a.spineIndex != b.spineIndex) return a.spineIndex < b.spineIndex;
++  const uint32_t first = static_cast<uint32_t>(a.startPage) * std::max<uint16_t>(1, b.pageCount);
++  const uint32_t second = static_cast<uint32_t>(b.startPage) * std::max<uint16_t>(1, a.pageCount);
++  if (first != second) return first < second;
++  if (a.paragraphIndex != b.paragraphIndex) return a.paragraphIndex < b.paragraphIndex;
++  return a.startWordIndex < b.startWordIndex;
++}
+
 -uint32_t creationTimeUtc() {
 -  const time_t now = time(nullptr);
 -  if (now >= 946684800LL && static_cast<uint64_t>(now) <= UINT32_MAX) return static_cast<uint32_t>(now);
@@ -5851,22 +5919,16 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    }
 -  }
 -  return 0;  // No clock: preserve an unknown date instead of inventing one.
-+// Internal RAM left free when the clipping list has to grow without PSRAM.
-+constexpr uint32_t CLIPPING_LIST_INTERNAL_HEADROOM = 16U * 1024U;
-+
-+// Keep the persisted records in book order. Compare page fractions so
-+// highlights from other font sizes and Readest's virtual pages interleave.
-+bool occursBefore(const Clipping& a, const Clipping& b) {
-+  if (a.spineIndex != b.spineIndex) return a.spineIndex < b.spineIndex;
-+  const uint32_t first = static_cast<uint32_t>(a.startPage) * std::max<uint16_t>(1, b.pageCount);
-+  const uint32_t second = static_cast<uint32_t>(b.startPage) * std::max<uint16_t>(1, a.pageCount);
-+  if (first != second) return first < second;
-+  if (a.paragraphIndex != b.paragraphIndex) return a.paragraphIndex < b.paragraphIndex;
-+  return a.startWordIndex < b.startWordIndex;
++bool readClippingHeaderString(FsFile& file, std::string& value) {
++  uint32_t length = 0;
++  if (!serialization::tryReadPod(file, length) || length > 4096 || file.position() > file.size() ||
++      length > file.size() - file.position()) return false;
++  value.resize(length);
++  return !length || file.read(value.data(), length) == static_cast<int>(length);
  }
 
  struct ClippingFileHeader {
-@@ -65,10 +56,6 @@ std::string storeFilePathForBook(const std::string& filePath, const std::string&
+@@ -65,10 +66,6 @@ std::string storeFilePathForBook(const std::string& filePath, const std::string&
    return std::string(CLIPPINGS_DIR) + "/" + bookType + "_" + std::to_string(crc) + ".bin";
  }
 
@@ -5877,7 +5939,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
  void copyBounded(char* dst, const size_t dstSize, const char* src) {
    if (dstSize == 0) return;
    if (!src) src = "";
-@@ -76,22 +63,6 @@ void copyBounded(char* dst, const size_t dstSize, const char* src) {
+@@ -76,22 +73,6 @@ void copyBounded(char* dst, const size_t dstSize, const char* src) {
    dst[utf8SafeTruncateBuffer(dst, static_cast<int>(strlen(dst)))] = '\0';
  }
 
@@ -5900,7 +5962,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
  bool readClippingFileHeader(const std::string& fullPath, const char* name, ClippingFileHeader& header) {
    FsFile f;
    if (!Storage.openFileForRead("CLIP", fullPath, f)) {
-@@ -100,9 +71,10 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
+@@ -100,9 +81,10 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
 
    uint8_t version = 0;
    uint16_t count = 0;
@@ -5908,13 +5970,13 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -      !serialization::tryReadPod(f, count) || !readHeaderString(f, &header.title) ||
 -      !readHeaderString(f, &header.author) || !readHeaderString(f, &header.path)) {
 +  if (!serialization::tryReadPod(f, version) ||
-+      (version < LEGACY_VERSION || version > VERSION || version == 7) ||
-+      !serialization::tryReadPod(f, count) || !serialization::tryReadString(f, header.title) ||
-+      !serialization::tryReadString(f, header.author) || !serialization::tryReadString(f, header.path)) {
++      (version < LEGACY_VERSION || version > SOURCE_RANGE_VERSION) ||
++      !serialization::tryReadPod(f, count) || !readClippingHeaderString(f, header.title) ||
++      !readClippingHeaderString(f, header.author) || !readClippingHeaderString(f, header.path)) {
      f.close();
      return false;
    }
-@@ -121,6 +93,31 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
+@@ -121,6 +103,17 @@ bool readClippingFileHeader(const std::string& fullPath, const char* name, Clipp
    return true;
  }
 
@@ -5929,24 +5991,10 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +  return version == LEGACY_VERSION ? sizeof(uint32_t) : sizeof(uint16_t);
 +}
 +
-+// Fixed part of one record, shared by the full rewrite and the append path.
-+bool writeClippingRecord(FsFile& f, const Clipping& clipping, const char* chapterTitle) {
-+  return serialization::tryWritePod(f, clipping.spineIndex) && serialization::tryWritePod(f, clipping.startPage) &&
-+         serialization::tryWritePod(f, clipping.endPage) && serialization::tryWritePod(f, clipping.pageCount) &&
-+         serialization::tryWritePod(f, clipping.startWordIndex) &&
-+         serialization::tryWritePod(f, clipping.endWordIndex) && serialization::tryWritePod(f, clipping.wordCount) &&
-+         serialization::tryWritePod(f, clipping.paragraphIndex) && serialization::tryWritePod(f, clipping.timestamp) &&
-+         serialization::tryWritePod(f, clipping.layoutSignature) &&
-+         serialization::tryWritePod(f, clipping.tableSelection) && serialization::tryWritePod(f, clipping.color) &&
-+         serialization::tryWritePod(f, clipping.sourceStart) && serialization::tryWritePod(f, clipping.sourceEnd) &&
-+         f.write(reinterpret_cast<const uint8_t*>(chapterTitle), CLIPPING_CHAPTER_TITLE_MAX) ==
-+             CLIPPING_CHAPTER_TITLE_MAX;
-+}
-+
  bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
    std::array<uint8_t, TEXT_COPY_BUFFER_SIZE> buffer{};
    while (length > 0) {
-@@ -135,117 +132,164 @@ bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
+@@ -135,126 +128,196 @@ bool copyBytes(FsFile& in, FsFile& out, uint16_t length) {
    }
    return true;
  }
@@ -6134,6 +6182,8 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -  deletedIds.clear();
 +  dirty = false;
 +  fileVersion = 0;
++  noteFilePath.clear();
++  companionAmbiguous = false;
 +  clippings.clear();
 +  if (clippings.capacity() < INITIAL_CLIPPING_RESERVE) {
 +    if (!clippings.reserve(INITIAL_CLIPPING_RESERVE)) {
@@ -6142,6 +6192,10 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +  }
 +
    storeFilePath = storeFilePathForBook(filePath, bookType);
++  if (!Storage.exists(storeFilePath.c_str()) && !Storage.exists((storeFilePath + ".bak").c_str()) &&
++      !Storage.exists((storeFilePath + ".tmp").c_str()) && !importStockForBook()) {
++    clippings.clear(); loadFailed_ = true; return false;
++  }
    const std::string backup = storeFilePath + ".bak";
 +  const std::string temporary = storeFilePath + ".tmp";
    if (!Storage.exists(storeFilePath.c_str()) && Storage.exists(backup.c_str()) &&
@@ -6180,9 +6234,26 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +  return false;
 +}
 +
++bool ClippingStore::importStockForBook() {
++  const auto leaf = storeFilePath.substr(storeFilePath.find_last_of('/') + 1);
++  const auto stock = std::string("/.crosspoint/clippings/") + leaf;
++  if (!Storage.exists(stock.c_str())) return true;
++  FsFile source; uint8_t version = 0;
++  if (!Storage.openFileForRead("CLIP", stock, source)) return false;
++  const bool native = serialization::tryReadPod(source, version) && version == NATIVE_VERSION;
++  source.close();
++  if (!native || !readFromFile(stock, clippings, &fileVersion)) {
++    LOG_ERR("CLIP", "Cannot import stock clipping file: %s", stock.c_str()); return false;
++  }
++  // One book at a time. Never move or overwrite the stock source, and use the
++  // ordinary checked transaction so import failures cannot create a partial book.
++  return writeToFile(nullptr, SIZE_MAX, &stock);
++}
++
 +void ClippingStore::persistOccurrenceOrder() {
-+  if (std::is_sorted(clippings.begin(), clippings.end(), occursBefore)) return;
-+  std::sort(clippings.begin(), clippings.end(), occursBefore);
++  const bool sorted = std::is_sorted(clippings.begin(), clippings.end(), occursBefore);
++  if (sorted && fileVersion == VERSION) return;
++  if (!sorted) std::sort(clippings.begin(), clippings.end(), occursBefore);
 +  dirty = true;
 +  // Offsets still refer to the intact old file until an atomic rewrite succeeds.
 +  if (!saveToFile()) LOG_ERR("CLIP", "Could not persist clipping order");
@@ -6193,16 +6264,18 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    if (dirty) saveToFile();
    clippings.release();
    bookFilePath.clear();
-@@ -253,8 +297,6 @@ void ClippingStore::unload() {
+   bookTitle.clear();
    bookAuthor.clear();
    storeFilePath.clear();
++  noteFilePath.clear();
++  companionAmbiguous = false;
    dirty = false;
 -  std::vector<std::string>().swap(deletedIds);
 -  loaded = false;
  }
 
  ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, const uint16_t startPage,
-@@ -263,17 +305,36 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+@@ -263,17 +326,36 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
                                                      const uint16_t wordCount, const char* chapterTitle,
                                                      const uint16_t paragraphIndex, const std::string& text,
                                                      const uint16_t tableSelection, const uint32_t layoutSignature,
@@ -6242,7 +6315,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    clipping.spineIndex = spineIndex;
    clipping.startPage = startPage;
    clipping.endPage = endPage;
-@@ -282,56 +343,152 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
+@@ -282,56 +364,114 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
    clipping.endWordIndex = endWordIndex;
    clipping.wordCount = wordCount;
    clipping.paragraphIndex = paragraphIndex;
@@ -6288,60 +6361,10 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    return AddResult::Added;
  }
 
--bool ClippingStore::removeClippingAt(const size_t index) {
--  if (!loaded || index >= clippings.size()) return false;
--  const bool needsDeletion = clippings[index].scoped;
--  if (needsDeletion && deletedIds.size() >= CLIPPING_MAX_PER_BOOK) {
--    LOG_ERR("CLIP", "Sync pending deletions before removing more clippings");
-+bool ClippingStore::appendLastToFile(const std::string& text, const char* chapterTitle) {
-+  if (loadFailed_) return false;
-+  // Only an existing current-format file whose records end exactly where memory
-+  // says they do. Everything else takes the atomic full rewrite.
-+  if (clippings.size() < 2 || fileVersion != VERSION || storeFilePath.empty()) return false;
-+  const std::string backupPath = storeFilePath + ".bak";
-+  const std::string tmpPath = storeFilePath + ".tmp";
-+  if (!Storage.exists(storeFilePath.c_str()) || Storage.exists(backupPath.c_str()) ||
-+      Storage.exists(tmpPath.c_str())) {
-     return false;
-   }
--  const bool wasDirty = dirty;
--  if (needsDeletion) {
--    std::string id;
--    if (!readKey(clippings[index], id)) return false;
--    deletedIds.reserve(deletedIds.size() + 1);
--    deletedIds.push_back(id);
-+  const Clipping& previous = clippings[clippings.size() - 2];
-+  const uint32_t recordStart = previous.textOffset + previous.textLength + sizeof(uint16_t) + previous.noteLength;
-+  Clipping& clipping = clippings.back();
-+  const uint16_t count = static_cast<uint16_t>(clippings.size());
-+
-+  FsFile f = Storage.open(storeFilePath.c_str(), O_RDWR);
-+  if (!f) return false;
-+  uint8_t version = 0;
-+  uint16_t storedCount = 0;
-+  if (!serialization::tryReadPod(f, version) || version != VERSION || !serialization::tryReadPod(f, storedCount) ||
-+      storedCount != count - 1 || f.size() < recordStart || !f.seek(recordStart)) {
-+    f.close();
-+    return false;
-+  }
-+  // Bytes past recordStart can only be an earlier append that never reached
-+  // its count update; they are overwritten here.
-+  bool ok = writeClippingRecord(f, clipping, chapterTitle) && serialization::tryWritePod(f, clipping.textLength);
-+  const uint32_t textOffset = static_cast<uint32_t>(f.position());
-+  if (ok && clipping.textLength > 0) {
-+    ok = f.write(reinterpret_cast<const uint8_t*>(text.data()), clipping.textLength) == clipping.textLength;
-   }
-+  ok = ok && serialization::tryWritePod(f, clipping.noteLength) && f.sync();
-+  // Commit point: the record exists for readers once the header counts it.
-+  ok = ok && f.seek(sizeof(uint8_t)) && serialization::tryWritePod(f, count) && f.sync();
-+  f.close();
-+  if (!ok) {
-+    LOG_ERR("CLIP", "Clipping append failed, rewriting store: %s", storeFilePath.c_str());
-+    return false;
-+  }
-+  clipping.textOffset = textOffset;
-+  markChanged();
-+  return true;
++bool ClippingStore::appendLastToFile(const std::string&, const char*) {
++  // Publishing a quote and its companion must be atomic as a pair. The native
++  // writer copies text in 128-byte chunks and commits the core file last.
++  return false;
 +}
 +
 +bool ClippingStore::readClippingNote(const size_t index, std::string& out) const {
@@ -6350,11 +6373,12 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +  if (!clipping) return false;
 +  if (!clipping->noteLength) return true;
 +  FsFile f;
-+  if (!openTextReader(f) || !f.seek(clipping->noteOffset)) return false;
++  if (!(noteFilePath.empty() ? openTextReader(f) : Storage.openFileForRead("CLIP", noteFilePath, f)) || !f.seek(clipping->noteOffset)) return false;
 +  out.resize(clipping->noteLength);
-+  if (f.read(reinterpret_cast<uint8_t*>(out.data()), out.size()) == static_cast<int>(out.size())) return true;
-+  out.clear();
-+  return false;
++  const bool ok = f.read(reinterpret_cast<uint8_t*>(out.data()), out.size()) == static_cast<int>(out.size());
++  f.close();
++  if (!ok) out.clear();
++  return ok;
 +}
 +
 +bool ClippingStore::setClippingNote(const size_t index, const std::string& note) {
@@ -6385,7 +6409,20 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +  return true;
 +}
 +
-+bool ClippingStore::removeClippingAt(const size_t index) {
+ bool ClippingStore::removeClippingAt(const size_t index) {
+-  if (!loaded || index >= clippings.size()) return false;
+-  const bool needsDeletion = clippings[index].scoped;
+-  if (needsDeletion && deletedIds.size() >= CLIPPING_MAX_PER_BOOK) {
+-    LOG_ERR("CLIP", "Sync pending deletions before removing more clippings");
+-    return false;
+-  }
+-  const bool wasDirty = dirty;
+-  if (needsDeletion) {
+-    std::string id;
+-    if (!readKey(clippings[index], id)) return false;
+-    deletedIds.reserve(deletedIds.size() + 1);
+-    deletedIds.push_back(id);
+-  }
 +  if (loadFailed_) return false;
 +  ++contentRevision_;
 +  if (index >= clippings.size()) return false;
@@ -6423,7 +6460,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    return true;
  }
 
-@@ -342,7 +499,7 @@ const Clipping* ClippingStore::clippingAt(const size_t index) const {
+@@ -342,7 +482,7 @@ const Clipping* ClippingStore::clippingAt(const size_t index) const {
 
  bool ClippingStore::cacheResolvedLayoutRange(const size_t index, const uint16_t page, const uint16_t startWord,
                                               const uint16_t endWord, const uint32_t layoutSignature) {
@@ -6432,7 +6469,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    if (!cacheClippingResolvedLayoutRange(clippings[index], page, startWord, endWord, layoutSignature)) {
      return false;
    }
-@@ -350,58 +507,6 @@ bool ClippingStore::cacheResolvedLayoutRange(const size_t index, const uint16_t
+@@ -350,58 +490,6 @@ bool ClippingStore::cacheResolvedLayoutRange(const size_t index, const uint16_t
    return true;
  }
 
@@ -6491,7 +6528,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
  bool ClippingStore::readClippingPreview(const size_t index, std::string& out) const {
    out.clear();
    const Clipping* clipping = clippingAt(index);
-@@ -430,35 +535,55 @@ bool ClippingStore::readClippingText(const size_t index, std::string& out) const
+@@ -430,35 +518,55 @@ bool ClippingStore::readClippingText(const size_t index, std::string& out) const
    return readClippingText(*clipping, out);
  }
 
@@ -6560,7 +6597,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
      dirty = false;
      return true;
    }
-@@ -466,58 +591,29 @@ bool ClippingStore::saveToFile() {
+@@ -466,58 +574,27 @@ bool ClippingStore::saveToFile() {
  }
 
  void ClippingStore::clearAll() {
@@ -6585,40 +6622,37 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -      return;
 -    }
 -    deletedIds.push_back(std::move(id));
-+  ++contentRevision_;
-+  clippings.release();
-+  dirty = false;
-+  loadFailed_ = false;
-+  if (!storeFilePath.empty() && Storage.exists(storeFilePath.c_str())) {
-+    Storage.remove(storeFilePath.c_str());
-   }
+-  }
 -  // One atomic save removes the selections and retains all deletion IDs.
 -  const bool wasDirty = dirty;
 -  auto previous = std::move(clippings);
--  clippings.clear();
++  if (loadFailed_ || clippings.empty()) return;
++  auto remove = makeUniqueNoThrow<uint8_t[]>(clippings.size());
++  if (!remove) { LOG_ERR("CLIP", "Cannot allocate clear-all transaction"); return; }
++  std::fill_n(remove.get(), clippings.size(), uint8_t{1});
++  if (!writeToFile(nullptr, SIZE_MAX, nullptr, nullptr, remove.get())) {
++    LOG_ERR("CLIP", "Could not clear clipping list safely"); return;
++  }
++  clippings.release(); dirty = false; ++contentRevision_;
++}
++
++bool ClippingStore::readFromFile() {
++  if (readFromFile(storeFilePath, clippings, &fileVersion)) return true;
+   clippings.clear();
 -  dirty = true;
 -  if (!saveToFile()) {
 -    clippings = std::move(previous);
 -    deletedIds.resize(previousCount);
 -    dirty = wasDirty;
 -    return;
-+  for (const char* suffix : {".bak", ".tmp"}) {
-+    const std::string leftover = storeFilePath + suffix;
-+    if (!storeFilePath.empty() && Storage.exists(leftover.c_str())) Storage.remove(leftover.c_str());
-   }
+-  }
 -  pendingSync.mark(bookFilePath, SyncPending::CLIPPINGS_BIT);
-+  markChanged();
++  loadFailed_ = true;
++  return false;
  }
 
 -bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out, const size_t onlyIndex,
 -                                 const bool reserveImportSlot) {
-+bool ClippingStore::readFromFile() {
-+  if (readFromFile(storeFilePath, clippings, &fileVersion)) return true;
-+  clippings.clear();
-+  loadFailed_ = true;
-+  return false;
-+}
-+
 +bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out, uint8_t* versionOut) const {
    out.clear();
 -  deletedIds.clear();
@@ -6634,10 +6668,12 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -      }
 -    }
 -  } clearPartial{out, deletedIds, complete};
++  noteFilePath.clear();
++  companionAmbiguous = false;
    FsFile f;
    if (!Storage.openFileForRead("CLIP", path, f)) {
      return false;
-@@ -525,9 +621,13 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
+@@ -525,9 +602,13 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
 
    uint8_t version = 0;
    uint16_t count = 0;
@@ -6648,19 +6684,17 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +  std::string author;
 +  std::string storedPath;
 +  if (!serialization::tryReadPod(f, version) ||
-+      (version < LEGACY_VERSION || version > VERSION || version == 7) ||
-+      !serialization::tryReadPod(f, count) || !serialization::tryReadString(f, title) ||
-+      !serialization::tryReadString(f, author) || !serialization::tryReadString(f, storedPath)) {
++      (version < LEGACY_VERSION || version > SOURCE_RANGE_VERSION) ||
++      !serialization::tryReadPod(f, count) || !readClippingHeaderString(f, title) ||
++      !readClippingHeaderString(f, author) || !readClippingHeaderString(f, storedPath)) {
      f.close();
      LOG_ERR("CLIP", "Failed to read clipping header: %s", path.c_str());
      return false;
-@@ -538,47 +638,13 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
+@@ -538,47 +619,24 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
      f.close();
      return false;
    }
-+  // Title positions are derived from this, so record it before any records.
-+  if (versionOut) *versionOut = version;
-
+-
 -  if (version >= SYNC_ID_VERSION) {
 -    uint16_t deletedCount = 0;
 -    if (!serialization::tryReadPod(f, deletedCount) || deletedCount > CLIPPING_MAX_PER_BOOK) {
@@ -6670,7 +6704,11 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    deletedIds.reserve(deletedCount);
 -    for (uint16_t i = 0; i < deletedCount; ++i) {
 -      std::string id;
--      uint32_t length = 0;
++  if (version == NATIVE_VERSION) {
++    uint16_t deleted = 0;
++    if (!serialization::tryReadPod(f, deleted)) { f.close(); return false; }
++    for (uint16_t i = 0; i < deleted; ++i) {
+       uint32_t length = 0;
 -      if (!serialization::tryReadPod(f, length) || length == 0 ||
 -          length > MAX_ID_BYTES + (version >= SCOPED_ID_VERSION ? SCOPE_BYTES : 0) ||
 -          (version >= SCOPED_ID_VERSION && length <= SCOPE_BYTES)) {
@@ -6681,12 +6719,17 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -      if (f.read(id.data(), length) != static_cast<int>(length)) {
 -        f.close();
 -        return false;
--      }
++      if (!serialization::tryReadPod(f, length) || length <= 16 || length > 80 ||
++          f.position() > f.size() || length > f.size() - f.position() || !f.seekCur(length)) {
++        f.close(); return false;
+       }
 -      // v5 tombstones have no destination. Replaying them under current credentials is unsafe.
 -      if (version >= SCOPED_ID_VERSION) deletedIds.push_back(std::move(id));
--    }
--  }
--
+     }
+   }
++  // Title positions are derived from this, so record it before any records.
++  if (versionOut) *versionOut = version;
+
 -  if (onlyIndex != SIZE_MAX && onlyIndex >= count) {
 -    // The scope guard reads this through its reference on return.
 -    // cppcheck-suppress unreadVariable
@@ -6708,7 +6751,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    }
    for (uint16_t i = 0; i < count; ++i) {
      Clipping clipping;
-@@ -601,45 +667,24 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
+@@ -601,45 +659,33 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
        LOG_ERR("CLIP", "Clipping file truncated at table selection, record %u: %s", i, path.c_str());
        return false;
      }
@@ -6720,13 +6763,21 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -        LOG_ERR("CLIP", "Invalid source range, record %u: %s", i, path.c_str());
 -        return false;
 -      }
-+    if (version >= COLOR_VERSION && !serialization::tryReadPod(f, clipping.color)) {
++    if (version != NATIVE_VERSION && version >= COLOR_VERSION && !serialization::tryReadPod(f, clipping.color)) {
 +      f.close();
 +      LOG_ERR("CLIP", "Clipping file truncated at color, record %u: %s", i, path.c_str());
 +      return false;
      }
 -    if (version >= SYNC_ID_VERSION) {
--      uint32_t length = 0;
++    if ((version == NATIVE_VERSION || version >= SOURCE_RANGE_VERSION) &&
++        (!serialization::tryReadPod(f, clipping.sourceStart) || !serialization::tryReadPod(f, clipping.sourceEnd))) {
++      f.close(); return false;
++    }
++    if (clipping.sourceEnd != UINT32_MAX && clipping.sourceStart != UINT32_MAX && clipping.sourceStart >= clipping.sourceEnd && !(clipping.sourceStart == UINT32_MAX && clipping.sourceEnd == 0)) {
++      f.close(); return false;
++    }
++    if (version == NATIVE_VERSION) {
+       uint32_t length = 0;
 -      if (!serialization::tryReadPod(f, length) || length > MAX_ID_BYTES + SCOPE_BYTES || !skipText(f, length)) {
 -        f.close();
 -        return false;
@@ -6743,16 +6794,16 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -        return false;
 -      }
 -      clipping.syncKeyLength = static_cast<uint8_t>(length);
-+    if (version >= SOURCE_RANGE_VERSION &&
-+        (!serialization::tryReadPod(f, clipping.sourceStart) || !serialization::tryReadPod(f, clipping.sourceEnd))) {
-+      f.close(); return false;
++      if (!serialization::tryReadPod(f, length) || length > 80) { f.close(); return false; }
++      clipping.syncKeyOffset = f.position();
++      clipping.syncKeyLength = length;
++      if (f.position() > f.size() || length > f.size() - f.position() || !f.seekCur(length) ||
++          !serialization::tryReadPod(f, clipping.syncFlags) || clipping.syncFlags > 3 ||
++          ((clipping.syncFlags & 2) ? length <= 16 : length > 64)) { f.close(); return false; }
      }
 -    if (version < SYNC_ID_VERSION) clipping.uploaded = true;
 -    if (f.read(reinterpret_cast<uint8_t*>(clipping.chapterTitle), sizeof(clipping.chapterTitle)) !=
 -        sizeof(clipping.chapterTitle)) {
-+    if (clipping.sourceEnd != UINT32_MAX && clipping.sourceStart != UINT32_MAX && clipping.sourceStart >= clipping.sourceEnd) {
-+      f.close(); return false;
-+    }
 +    if (clipping.color > ClippingColor::Green) clipping.color = ClippingColor::LightGrey;
 +    if (!f.seekCur(CLIPPING_CHAPTER_TITLE_MAX)) {
        f.close();
@@ -6766,7 +6817,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
      if (version == LEGACY_VERSION) {
        uint32_t textLen = 0;
        if (!serialization::tryReadPod(f, textLen)) {
-@@ -649,7 +694,10 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
+@@ -649,7 +695,10 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
        }
        clipping.textOffset = static_cast<uint32_t>(f.position());
        clipping.textLength = static_cast<uint16_t>(std::min<uint32_t>(textLen, CLIPPING_TEXT_MAX));
@@ -6778,7 +6829,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
          f.close();
          LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
          return false;
-@@ -666,173 +714,35 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
+@@ -666,324 +715,322 @@ bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out,
          return false;
        }
        clipping.textOffset = static_cast<uint32_t>(f.position());
@@ -6794,7 +6845,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
      }
 -    if ((onlyIndex == SIZE_MAX || onlyIndex == i) && !out.push_back(clipping)) {
 -      LOG_ERR("CLIP", "OOM: clipping record");
-+    if (version >= NOTE_VERSION &&
++    if (version != NATIVE_VERSION && version >= NOTE_VERSION &&
 +        (!serialization::tryReadPod(f, clipping.noteLength) || clipping.noteLength > CLIPPING_NOTE_MAX ||
 +         f.position() > f.size() || clipping.noteLength > f.size() - f.position() ||
 +         (clipping.noteLength != 0 && !f.seekCur(clipping.noteLength)))) {
@@ -6809,6 +6860,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -  // The scope guard reads this through its reference on return.
 -  // cppcheck-suppress unreadVariable
 -  complete = true;
++  if (version == NATIVE_VERSION && !readCompanion(path, f, out)) { f.close(); return false; }
    f.close();
    return true;
  }
@@ -6823,7 +6875,22 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    if (!Storage.exists(reader.storeFilePath.c_str())) {
 -      done = true;
 -      return true;
--    }
++bool ClippingStore::readCompanion(const std::string& path, HalFile& core, ClippingRecords& out) const {
++  using namespace clippingCompanion;
++  Digest coreHash{};
++  if (core.size() > UINT32_MAX || !digest(core, 0, core.size(), coreHash)) return false;
++  std::string primary = path;
++  if (std::string_view(primary).ends_with(".tmp") || std::string_view(primary).ends_with(".bak")) primary.resize(primary.size() - 4);
++  std::string metadata = clippingCompanion::path(primary, coreHash);
++  if (!Storage.exists(metadata.c_str()) && Storage.exists((metadata + ".bak").c_str()) &&
++      !Storage.rename((metadata + ".bak").c_str(), metadata.c_str())) return false;
++  if (!Storage.exists(metadata.c_str())) {
++    Digest previous{};
++    if (!readPointer(primary, previous)) {
++      // Stock CrossInk files have no companion. A damaged pointer is not an
++      // empty history: keep it intact and refuse a destructive rewrite.
++      return !std::string_view(path).ends_with(".tmp") && !Storage.exists((primary + ".meta").c_str()) && !Storage.exists((primary + ".meta.bak").c_str());
+     }
 -  }
 -  if (!reader.readFromFile(reader.storeFilePath, reader.clippings, ordinal)) return false;
 -  if (reader.clippings.empty()) {
@@ -6921,7 +6988,62 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    if (!local.scoped) {
 -      local.scoped = true;
 -      return store.writeToFile({.index = match, .key = &key});
--    }
++    metadata = clippingCompanion::path(primary, previous);
++  }
++  FsFile extra;
++  if (!Storage.openFileForRead("CLIP", metadata, extra)) return false;
++  Digest checksum{}, calculated{};
++  if (extra.size() < clippingCompanion::HeaderBytes + checksum.size() || extra.size() > UINT32_MAX ||
++      !clippingCompanion::digest(extra, 0, extra.size() - checksum.size(), calculated) ||
++      extra.read(checksum.data(), checksum.size()) != 32 || calculated != checksum || !extra.seek(0)) {
++    extra.close(); return false;
++  }
++  const auto dataSize = extra.size() - checksum.size();
++  uint32_t magic = 0; uint8_t version = 0; uint16_t count = 0; Digest savedHash{};
++  bool ok = serialization::tryReadPod(extra, magic) && magic == Magic &&
++            serialization::tryReadPod(extra, version) && version == clippingCompanion::Version &&
++            serialization::tryReadPod(extra, count) && extra.read(savedHash.data(), savedHash.size()) == 32;
++  const bool paired = savedHash == coreHash;
++  const uint32_t entries = HeaderBytes + static_cast<uint32_t>(count) * sizeof(uint16_t);
++  if (!ok || (paired && count != out.size()) || entries > dataSize ||
++      static_cast<uint32_t>(count) * EntryBytes > dataSize - entries) { extra.close(); return false; }
++  for (size_t i = 0; i < out.size(); ++i) {
++    uint16_t rank = 0;
++    if (paired) {
++      if (!extra.seek(HeaderBytes + i * sizeof(uint16_t)) || !serialization::tryReadPod(extra, rank) || rank >= count) {
++        extra.close(); return false;
++      }
++    } else {
++      // Stock may reorder, delete or add quotes. Match exact text + timestamp
++      // + spine, never a row number or an approximate location.
++      Digest identity{};
++      const auto& clip = out[i];
++      if (!digest(core, clip.textOffset, clip.textLength, identity, &clip.timestamp, clip.spineIndex)) {
++        extra.close(); return false;
++      }
++      size_t left = 0, right = count;
++      while (left < right) {
++        const size_t mid = left + (right - left) / 2;
++        Digest found{};
++        if (!extra.seek(entries + mid * EntryBytes) || extra.read(found.data(), found.size()) != 32) {
++          extra.close(); return false;
++        }
++        if (found < identity) left = mid + 1; else right = mid;
++      }
++      if (left == count) continue;
++      Digest found{}, next{};
++      if (!extra.seek(entries + left * EntryBytes) || extra.read(found.data(), found.size()) != 32) {
++        extra.close(); return false;
++      }
++      if (found != identity) continue;
++      if (left + 1 < count) {
++        if (!extra.seek(entries + (left + 1) * EntryBytes) || extra.read(next.data(), next.size()) != 32) {
++          extra.close(); return false;
++        }
++        if (next == identity) { companionAmbiguous = true; continue; }  // Ambiguous duplicates retain their stored metadata, unapplied.
++      }
++      rank = left;
+     }
 -    if (!deleted) return !sourceUpgrade || store.writeToFile({});
 -    store.clippings.erase(store.clippings.begin() + match);
 -    return store.writeToFile({});
@@ -6950,8 +7072,19 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -  added.layoutSignature = 0;
 -  added.tableSelection = UINT16_MAX;
 -  return store.writeToFile({.index = store.clippings.size() - 1, .text = &text, .key = &key});
--}
--
++    auto& clip = out[i]; uint8_t color = 0; uint16_t noteLength = 0; uint32_t noteOffset = 0;
++    if (!extra.seek(entries + static_cast<uint32_t>(rank) * EntryBytes + 32) ||
++        !serialization::tryReadPod(extra, color) || !serialization::tryReadPod(extra, noteLength) ||
++        !serialization::tryReadPod(extra, noteOffset) || noteLength > CLIPPING_NOTE_MAX ||
++        noteOffset < entries + static_cast<uint32_t>(count) * EntryBytes ||
++        noteOffset > dataSize || noteLength > dataSize - noteOffset) { extra.close(); return false; }
++    clip.color = color <= static_cast<uint8_t>(ClippingColor::Green) ? static_cast<ClippingColor>(color) : ClippingColor::LightGrey;
++    clip.noteLength = noteLength; clip.noteOffset = noteOffset;
++  }
++  extra.close(); noteFilePath = std::move(metadata);
++  return true;
+ }
+
 -bool ClippingStore::writeToFile(const Rewrite& rewrite) {
 -  if (storeFilePath.empty() || bookTitle.size() > MAX_HEADER_FIELD_BYTES ||
 -      bookAuthor.size() > MAX_HEADER_FIELD_BYTES || bookFilePath.size() > MAX_HEADER_FIELD_BYTES) {
@@ -6959,27 +7092,46 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    return false;
 -  }
 -  Storage.mkdir("/.crosspoint");
+-  Storage.mkdir(CLIPPINGS_DIR);
+-
+-  const std::string tmpPath = storeFilePath + ".tmp";
+-  const std::string backupPath = storeFilePath + ".bak";
+-  if (!Storage.exists(storeFilePath.c_str()) && Storage.exists(backupPath.c_str())) {
+-    if (!Storage.rename(backupPath.c_str(), storeFilePath.c_str())) {
+-      LOG_ERR("CLIP", "Failed to recover clipping backup: %s", backupPath.c_str());
+-      return false;
+-    }
+-    LOG_INF("CLIP", "Recovered clipping backup: %s", storeFilePath.c_str());
+-  }
+-  if (Storage.exists(tmpPath.c_str())) Storage.remove(tmpPath.c_str());
+-  if (Storage.exists(backupPath.c_str()) && Storage.exists(storeFilePath.c_str())) Storage.remove(backupPath.c_str());
+-
+-  FsFile source;
+-  const std::string& sourcePath = rewrite.sourcePath ? *rewrite.sourcePath : storeFilePath;
 +bool ClippingStore::writeToFile(const std::string* replacementText, const size_t replacementIndex,
 +                                const std::string* sourcePathOverride, const char* replacementTitle, const uint8_t* remove,
 +                                const std::string* replacementNote) {
++  using clippingCompanion::Digest;
 +  if (loadFailed_) return false;
-+  Storage.mkdir("/.crashink");
-   Storage.mkdir(CLIPPINGS_DIR);
-
-   const std::string tmpPath = storeFilePath + ".tmp";
-@@ -848,7 +758,7 @@ bool ClippingStore::writeToFile(const Rewrite& rewrite) {
-   if (Storage.exists(backupPath.c_str()) && Storage.exists(storeFilePath.c_str())) Storage.remove(backupPath.c_str());
-
-   FsFile source;
--  const std::string& sourcePath = rewrite.sourcePath ? *rewrite.sourcePath : storeFilePath;
++  Storage.mkdir("/.crashink"); Storage.mkdir(CLIPPINGS_DIR);
++  const std::string tmpPath = storeFilePath + ".tmp", backupPath = storeFilePath + ".bak";
 +  const std::string& sourcePath = sourcePathOverride ? *sourcePathOverride : storeFilePath;
++  if (!Storage.exists(storeFilePath.c_str()) && Storage.exists(backupPath.c_str()) &&
++      !Storage.rename(backupPath.c_str(), storeFilePath.c_str())) return false;
++  FsFile source, f, notes;
    const bool hasSource = Storage.exists(sourcePath.c_str());
-   if (hasSource && !Storage.openFileForRead("CLIP", sourcePath, source)) {
-     LOG_ERR("CLIP", "Failed to open clipping source for rewrite: %s", sourcePath.c_str());
-@@ -862,17 +772,18 @@ bool ClippingStore::writeToFile(const Rewrite& rewrite) {
-     return false;
-   }
-
+-  if (hasSource && !Storage.openFileForRead("CLIP", sourcePath, source)) {
+-    LOG_ERR("CLIP", "Failed to open clipping source for rewrite: %s", sourcePath.c_str());
+-    return false;
+-  }
+-
+-  FsFile f = Storage.open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+-  if (!f) {
+-    if (source) source.close();
+-    LOG_ERR("CLIP", "Failed to open clipping temp file for write: %s", tmpPath.c_str());
+-    return false;
+-  }
+-
 -  const uint16_t count = static_cast<uint16_t>(std::min<size_t>(clippings.size(), CLIPPING_MAX_PER_BOOK));
 -  // Up to 1.25 KiB for rewrite offsets and key lengths, too large for the firmware task stack.
 -  auto newTextOffsets = makeUniqueNoThrow<uint32_t[]>(count);
@@ -6988,28 +7140,87 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    LOG_ERR("CLIP", "OOM: clipping rewrite offsets");
 -    f.close();
 -    if (source) source.close();
++  if (hasSource && !Storage.openFileForRead("CLIP", sourcePath, source)) return false;
++  uint16_t count = 0;
++  for (size_t i = 0; i < clippings.size(); ++i) if (!remove || !remove[i]) ++count;
++  // Commit-lifetime index: SHA256 identities and offsets, no quote-sized copies.
++  // Runtime sized (about 56 bytes/quote); checked allocation preserves the source on OOM.
++  struct RewriteOffset {
++    Digest identity{}; uint32_t text = 0, key = 0, note = 0;
++    uint16_t original = 0, ordinal = 0, noteLength = 0; uint8_t keyLength = 0, flags = 0;
++  };
++  auto offsets = count ? makeUniqueNoThrow<RewriteOffset[]>(count) : nullptr;
++  auto ranks = count ? makeUniqueNoThrow<uint16_t[]>(count) : nullptr;
++  if (count && (!offsets || !ranks)) { source.close(); return false; }
++  std::string extraTemporary, publishedMetadata;
++  bool metadataWasNew = false;
++  const auto fail = [&]() {
++    f.close(); source.close(); notes.close();
+     Storage.remove(tmpPath.c_str());
++    if (!extraTemporary.empty()) Storage.remove(extraTemporary.c_str());
++    if (metadataWasNew && !publishedMetadata.empty()) Storage.remove(publishedMetadata.c_str());
++    LOG_ERR("CLIP", "Native clipping transaction failed: %s", storeFilePath.c_str());
+     return false;
+-  }
+-  if (!serialization::tryWritePod(f, VERSION) || !serialization::tryWritePod(f, count) ||
++  };
++  f = Storage.open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
++  if (!f || !serialization::tryWritePod(f, VERSION) || !serialization::tryWritePod(f, count) ||
+       !serialization::tryWriteString(f, bookTitle) || !serialization::tryWriteString(f, bookAuthor) ||
+-      !serialization::tryWriteString(f, bookFilePath)) {
+-    LOG_ERR("CLIP", "Failed to write clipping header: %s", tmpPath.c_str());
+-    f.close();
+-    if (source) source.close();
 -    Storage.remove(tmpPath.c_str());
 -    return false;
--  }
-+  const uint16_t sourceCount = static_cast<uint16_t>(std::min<size_t>(clippings.size(), CLIPPING_MAX_PER_BOOK));
-+  uint16_t count = 0;
-+  for (size_t i = 0; i < sourceCount; ++i) if (!remove || !remove[i]) ++count;
-+  // Commit-lifetime offsets: at most 8 bytes per retained record, too large
-+  // for stack. A failed allocation leaves the original file and offsets intact.
-+  struct RewriteOffset { uint32_t text = 0; uint16_t length = 0; };
-+  auto offsets = count ? makeUniqueNoThrow<RewriteOffset[]>(count) : nullptr;
-+  if (count && !offsets) {
-+    LOG_ERR("CLIP", "Cannot allocate clipping rewrite offsets (%u)", count);
-+    f.close(); if (source) source.close(); Storage.remove(tmpPath.c_str()); return false;
++      !serialization::tryWriteString(f, bookFilePath)) return fail();
++  // Preserve stock scoped deletion IDs byte-for-byte, without retaining a
++  // book-sized string list. Legacy crASHink had a separate sync sidecar.
++  uint16_t deleted = 0, oldCount = 0, keptDeletions = 0;
++  if (hasSource && fileVersion == NATIVE_VERSION) {
++    uint8_t v = 0; std::string ignored;
++    if (!source.seek(0) || !serialization::tryReadPod(source, v) || v != NATIVE_VERSION ||
++        !serialization::tryReadPod(source, oldCount) || !readClippingHeaderString(source, ignored) ||
++        !readClippingHeaderString(source, ignored) || !readClippingHeaderString(source, ignored) ||
++        !serialization::tryReadPod(source, deleted)) return fail();
 +  }
-+  size_t written = 0;
-   if (!serialization::tryWritePod(f, VERSION) || !serialization::tryWritePod(f, count) ||
-       !serialization::tryWriteString(f, bookTitle) || !serialization::tryWriteString(f, bookAuthor) ||
-       !serialization::tryWriteString(f, bookFilePath)) {
-@@ -883,42 +794,23 @@ bool ClippingStore::writeToFile(const Rewrite& rewrite) {
-     return false;
++  const auto deletionCountAt = f.position();
++  if (!serialization::tryWritePod(f, keptDeletions)) return fail();
++  const auto writeDeletion = [&](const char* key, uint32_t length) {
++    if (!acknowledgedNativeScope.empty() && std::string_view(key, length).starts_with(acknowledgedNativeScope)) return true;
++    if (keptDeletions == UINT16_MAX || !serialization::tryWritePod(f, length) || f.write(key, length) != length) return false;
++    ++keptDeletions; return true;
++  };
++  char keyBuffer[80];
++  for (uint16_t i = 0; i < deleted; ++i) {
++    uint32_t length = 0;
++    if (!serialization::tryReadPod(source, length) || length <= 16 || length > sizeof(keyBuffer) ||
++        source.read(keyBuffer, length) != static_cast<int>(length) || !writeDeletion(keyBuffer, length)) return fail();
++  }
++  // Reuse the commit's rank array to find retained source keys in logarithmic
++  // time. Removed and text-replaced quotes become scoped native tombstones.
++  size_t keyCount = 0;
++  for (size_t i = 0; i < clippings.size(); ++i)
++    if ((!remove || !remove[i]) && !(replacementText && replacementIndex == i)) ranks[keyCount++] = i;
++  if (keyCount > 1) std::sort(ranks.get(), ranks.get() + keyCount, [&](uint16_t a, uint16_t b) {
++    return clippings[a].syncKeyOffset < clippings[b].syncKeyOffset;
++  });
++  for (uint16_t i = 0; i < oldCount; ++i) {
++    uint32_t length = 0; uint8_t flags = 0; uint16_t textLength = 0;
++    if (!source.seekCur(34) || !serialization::tryReadPod(source, length) || length > sizeof(keyBuffer)) return fail();
++    const auto keyAt = source.position();
++    if (source.read(keyBuffer, length) != static_cast<int>(length) || !serialization::tryReadPod(source, flags) ||
++        !source.seekCur(CLIPPING_CHAPTER_TITLE_MAX) || !serialization::tryReadPod(source, textLength) ||
++        source.position() > source.size() || textLength > source.size() - source.position() || !source.seekCur(textLength)) return fail();
++    if (!(flags & 2) || length <= 16) continue;
++    size_t left = 0, right = keyCount;
++    while (left < right) {
++      const auto mid = left + (right - left) / 2;
++      if (clippings[ranks[mid]].syncKeyOffset < keyAt) left = mid + 1; else right = mid;
++    }
++    if ((left == keyCount || clippings[ranks[left]].syncKeyOffset != keyAt) && !writeDeletion(keyBuffer, length)) return fail();
    }
-
+-
 -  const uint16_t deletedCount = static_cast<uint16_t>(deletedIds.size());
 -  bool deletedOk = serialization::tryWritePod(f, deletedCount);
 -  for (const auto& id : deletedIds) deletedOk = deletedOk && serialization::tryWriteString(f, id);
@@ -7018,13 +7229,58 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -    if (source) source.close();
 -    Storage.remove(tmpPath.c_str());
 -    return false;
--  }
++  const auto recordsAt = f.position();
++  if (!f.seek(deletionCountAt) || !serialization::tryWritePod(f, keptDeletions) || !f.seek(recordsAt)) return fail();
++  size_t written = 0;
++  for (size_t i = 0; i < clippings.size(); ++i) {
++    if (remove && remove[i]) continue;
++    const auto& clip = clippings[i]; auto& offset = offsets[written];
++    offset.original = i; offset.ordinal = written++;
++    const bool useText = replacementText && replacementIndex == i;
++    char title[CLIPPING_CHAPTER_TITLE_MAX]{};
++    if (useText && replacementTitle) memcpy(title, replacementTitle, sizeof(title));
++    else if (!source || !source.seek(titleOffset(clip)) || source.read(title, sizeof(title)) != sizeof(title)) return fail();
++    sanitizeChapterTitle(title);
++    const uint32_t start = clippingHasSourceRange(clip) ? clip.sourceStart : UINT32_MAX;
++    const uint32_t end = clippingSourceRangeBlocked(clip) ? 0 : (clippingHasSourceRange(clip) ? clip.sourceEnd : UINT32_MAX);
++    offset.keyLength = fileVersion == NATIVE_VERSION && !useText ? clip.syncKeyLength : 0;
++    offset.flags = fileVersion == NATIVE_VERSION && !useText ? clip.syncFlags : 0;
++    const char* boundKey = pendingSyncKeys ? pendingSyncKeys + i * 81 : nullptr;
++    if (boundKey && boundKey[0]) { offset.keyLength = strlen(boundKey); offset.flags = 3; }
++    const uint32_t keyLength = offset.keyLength;
++    if (!serialization::tryWritePod(f, clip.spineIndex) || !serialization::tryWritePod(f, clip.startPage) ||
++        !serialization::tryWritePod(f, clip.endPage) || !serialization::tryWritePod(f, clip.pageCount) ||
++        !serialization::tryWritePod(f, clip.startWordIndex) || !serialization::tryWritePod(f, clip.endWordIndex) ||
++        !serialization::tryWritePod(f, clip.wordCount) || !serialization::tryWritePod(f, clip.paragraphIndex) ||
++        !serialization::tryWritePod(f, clip.timestamp) || !serialization::tryWritePod(f, clip.layoutSignature) ||
++        !serialization::tryWritePod(f, clip.tableSelection) || !serialization::tryWritePod(f, start) ||
++        !serialization::tryWritePod(f, end) || !serialization::tryWritePod(f, keyLength)) return fail();
++    offset.key = f.position();
++    if (keyLength && (boundKey && boundKey[0]
++        ? f.write(boundKey, keyLength) != keyLength
++        : !source.seek(clip.syncKeyOffset) || !copyBytes(source, f, keyLength))) return fail();
++    if (!serialization::tryWritePod(f, offset.flags) || f.write(title, sizeof(title)) != sizeof(title) ||
++        !serialization::tryWritePod(f, clip.textLength)) return fail();
++    offset.text = f.position();
++    const bool textOk = useText ? f.write(replacementText->data(), clip.textLength) == clip.textLength
++                               : source && source.seek(clip.textOffset) && copyBytes(source, f, clip.textLength);
++    if (!textOk) return fail();
++    offset.noteLength = replacementNote && replacementIndex == i ? replacementNote->size() : clip.noteLength;
++  }
++  const bool synced = f.sync(); const bool closed = f.close();
++  if (!synced || !closed) return fail();
++  source.close();
++  if (!Storage.openFileForRead("CLIP", tmpPath, f)) return fail();
++  Digest hash{}, previousHash{};
++  if (f.size() > UINT32_MAX || !clippingCompanion::digest(f, 0, f.size(), hash)) return fail();
++  for (size_t i = 0; i < count; ++i) {
++    auto& offset = offsets[i]; const auto& clip = clippings[offset.original];
++    if (!clippingCompanion::digest(f, offset.text, clip.textLength, offset.identity, &clip.timestamp, clip.spineIndex)) return fail();
+   }
 -
 -  std::string key;
 -  for (uint16_t i = 0; i < count; ++i) {
-+  for (uint16_t i = 0; i < sourceCount; ++i) {
-+    if (remove && remove[i]) continue;
-     const Clipping& clipping = clippings[i];
+-    const Clipping& clipping = clippings[i];
 -    bool keyReady = true;
 -    if (rewrite.key && rewrite.index == i)
 -      key = *rewrite.key;
@@ -7048,107 +7304,147 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 -        !serialization::tryWriteString(f, key) || !serialization::tryWritePod(f, flags) ||
 -        f.write(reinterpret_cast<const uint8_t*>(clipping.chapterTitle), sizeof(clipping.chapterTitle)) !=
 -            sizeof(clipping.chapterTitle)) {
-+    const bool useReplacement = replacementText && i == replacementIndex;
-+    char title[CLIPPING_CHAPTER_TITLE_MAX] = {};
-+    if (useReplacement && replacementTitle) {
-+      memcpy(title, replacementTitle, sizeof(title));
-+    } else if (!source || !source.seek(titleOffset(clipping)) ||
-+               source.read(reinterpret_cast<uint8_t*>(title), sizeof(title)) != static_cast<int>(sizeof(title))) {
-+      LOG_ERR("CLIP", "Failed to read clipping title %u: %s", i, sourcePath.c_str());
-+      f.close();
-+      if (source) source.close();
-+      Storage.remove(tmpPath.c_str());
-+      return false;
-+    }
-+    sanitizeChapterTitle(title);
-+    if (!writeClippingRecord(f, clipping, title)) {
-       LOG_ERR("CLIP", "Failed to write clipping record %u: %s", i, storeFilePath.c_str());
-       f.close();
-       if (source) source.close();
-@@ -926,7 +818,6 @@ bool ClippingStore::writeToFile(const Rewrite& rewrite) {
-       return false;
-     }
-
+-      LOG_ERR("CLIP", "Failed to write clipping record %u: %s", i, storeFilePath.c_str());
+-      f.close();
+-      if (source) source.close();
+-      Storage.remove(tmpPath.c_str());
+-      return false;
+-    }
+-
 -    const bool useReplacement = rewrite.text && i == rewrite.index;
-     const uint16_t textLen = clipping.textLength;
-     if (!serialization::tryWritePod(f, textLen)) {
-       LOG_ERR("CLIP", "Failed to write clipping text length %u: %s", i, tmpPath.c_str());
-@@ -939,29 +830,37 @@ bool ClippingStore::writeToFile(const Rewrite& rewrite) {
-     const uint32_t newTextOffset = static_cast<uint32_t>(f.position());
-     bool wroteText = true;
-     if (textLen > 0 && useReplacement) {
+-    const uint16_t textLen = clipping.textLength;
+-    if (!serialization::tryWritePod(f, textLen)) {
+-      LOG_ERR("CLIP", "Failed to write clipping text length %u: %s", i, tmpPath.c_str());
+-      f.close();
+-      if (source) source.close();
+-      Storage.remove(tmpPath.c_str());
+-      return false;
+-    }
+-
+-    const uint32_t newTextOffset = static_cast<uint32_t>(f.position());
+-    bool wroteText = true;
+-    if (textLen > 0 && useReplacement) {
 -      wroteText = f.write(reinterpret_cast<const uint8_t*>(rewrite.text->data()), textLen) == textLen;
-+      wroteText = f.write(reinterpret_cast<const uint8_t*>(replacementText->data()), textLen) == textLen;
-     } else if (textLen > 0) {
-       wroteText = source && source.seek(clipping.textOffset) && copyBytes(source, f, textLen);
+-    } else if (textLen > 0) {
+-      wroteText = source && source.seek(clipping.textOffset) && copyBytes(source, f, textLen);
++  f.close();
++  const bool hadPointer = clippingCompanion::readPointer(storeFilePath, previousHash);
++  // Same core bytes (color/note-only changes) have one atomic companion commit;
++  // never report a later redundant core rename failure after changing metadata.
++  bool sameCore = false;
++  if (hasSource && sourcePath == storeFilePath) {
++    if (!Storage.openFileForRead("CLIP", sourcePath, source)) return fail();
++    Digest old{}; if (!clippingCompanion::digest(source, 0, source.size(), old)) return fail();
++    sameCore = old == hash; source.close();
++  }
++  if (count > 1) std::sort(offsets.get(), offsets.get() + count,
++            [](const RewriteOffset& a, const RewriteOffset& b) { return a.identity < b.identity; });
++  for (size_t i = 0; i < count; ++i) ranks[offsets[i].ordinal] = i;
++  const auto metadata = clippingCompanion::path(storeFilePath, hash);
++  extraTemporary = metadata + ".tmp";
++  metadataWasNew = !Storage.exists(metadata.c_str());
++  f = Storage.open(extraTemporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
++  if (!f || !serialization::tryWritePod(f, clippingCompanion::Magic) ||
++      !serialization::tryWritePod(f, clippingCompanion::Version) || !serialization::tryWritePod(f, count) ||
++      f.write(hash.data(), hash.size()) != hash.size()) return fail();
++  for (size_t i = 0; i < count; ++i) if (!serialization::tryWritePod(f, ranks[i])) return fail();
++  uint32_t noteAt = clippingCompanion::HeaderBytes + count * (sizeof(uint16_t) + clippingCompanion::EntryBytes);
++  for (size_t i = 0; i < count; ++i) {
++    auto& offset = offsets[i]; const auto& clip = clippings[offset.original]; offset.note = noteAt;
++    noteAt += offset.noteLength;
++    const auto color = clip.color <= ClippingColor::Green ? clip.color : ClippingColor::LightGrey;
++    if (f.write(offset.identity.data(), offset.identity.size()) != offset.identity.size() ||
++        !serialization::tryWritePod(f, color) || !serialization::tryWritePod(f, offset.noteLength) ||
++        !serialization::tryWritePod(f, offset.note)) return fail();
++  }
++  const auto& noteSource = noteFilePath.empty() ? sourcePath : noteFilePath;
++  bool needsNotes = false;
++  for (size_t i = 0; i < count; ++i)
++    if (offsets[i].noteLength && !(replacementNote && replacementIndex == offsets[i].original)) needsNotes = true;
++  if (needsNotes && !Storage.openFileForRead("CLIP", noteSource, notes)) return fail();
++  for (size_t i = 0; i < count; ++i) {
++    const auto& offset = offsets[i]; if (!offset.noteLength) continue;
++    if (replacementNote && replacementIndex == offset.original) {
++      if (f.write(replacementNote->data(), offset.noteLength) != offset.noteLength) return fail();
++    } else if (!notes.seek(clippings[offset.original].noteOffset) || !copyBytes(notes, f, offset.noteLength)) return fail();
++  }
++  notes.close();
++  const bool extraSynced = f.sync(); const bool extraClosed = f.close();
++  if (!extraSynced || !extraClosed || !clippingCompanion::seal(extraTemporary) || !clippingCompanion::publish(extraTemporary, metadata)) return fail();
++  publishedMetadata = metadata;
++  extraTemporary.clear();
++  if (!sameCore) {
++    const bool exists = Storage.exists(storeFilePath.c_str());
++    if (exists && Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) return fail();
++    if (exists && !Storage.rename(storeFilePath.c_str(), backupPath.c_str())) return fail();
++    if (!Storage.rename(tmpPath.c_str(), storeFilePath.c_str())) {
++      if (exists) Storage.rename(backupPath.c_str(), storeFilePath.c_str());
++      return fail();
      }
 -    if (!wroteText) {
-+    const bool useNewNote = replacementNote && i == replacementIndex;
-+    const uint16_t noteLen = useNewNote ? replacementNote->size() : clipping.noteLength;
-+    bool wroteNote = wroteText && serialization::tryWritePod(f, noteLen);
-+    if (wroteNote && noteLen > 0) {
-+      const auto srcNoteOffset = clipping.noteOffset;
-+      wroteNote = useNewNote
-+                      ? f.write(reinterpret_cast<const uint8_t*>(replacementNote->data()), noteLen) == noteLen
-+                      : source && source.seek(srcNoteOffset) && copyBytes(source, f, noteLen);
-+    }
-+    if (!wroteNote) {
-       LOG_ERR("CLIP", "Failed to write clipping text %u: %s", i, tmpPath.c_str());
-       f.close();
-       if (source) source.close();
-       Storage.remove(tmpPath.c_str());
-       return false;
+-      LOG_ERR("CLIP", "Failed to write clipping text %u: %s", i, tmpPath.c_str());
+-      f.close();
+-      if (source) source.close();
+-      Storage.remove(tmpPath.c_str());
+-      return false;
++    if (exists) {
++      const auto legacyBackup = storeFilePath + ".pre-native.bak";
++      if (fileVersion && fileVersion != NATIVE_VERSION && !Storage.exists(legacyBackup.c_str()))
++        Storage.rename(backupPath.c_str(), legacyBackup.c_str());
++      else Storage.remove(backupPath.c_str());
      }
 -    newTextOffsets[i] = newTextOffset;
 -    newKeyLengths[i] = key.size();
-+    offsets[written++] = {newTextOffset, textLen};
-   }
-
+-  }
+-
 -  const bool synced = f.sync();
 -  const bool closed = f.close();
 -  if (!synced || !closed) {
-+  if (!f.sync()) {
-     LOG_ERR("CLIP", "Failed to sync clipping file: %s", tmpPath.c_str());
-+    f.close();
-     if (source) source.close();
-     Storage.remove(tmpPath.c_str());
-     return false;
-   }
-+  f.close();
-   if (source) source.close();
-
-   const bool replacingDestination = Storage.exists(storeFilePath.c_str());
-@@ -977,13 +876,24 @@ bool ClippingStore::writeToFile(const Rewrite& rewrite) {
-     return false;
-   }
-   if (replacingDestination && Storage.exists(backupPath.c_str())) {
+-    LOG_ERR("CLIP", "Failed to sync clipping file: %s", tmpPath.c_str());
+-    if (source) source.close();
+-    Storage.remove(tmpPath.c_str());
+-    return false;
+-  }
+-  if (source) source.close();
+-
+-  const bool replacingDestination = Storage.exists(storeFilePath.c_str());
+-  if (replacingDestination && !Storage.rename(storeFilePath.c_str(), backupPath.c_str())) {
+-    LOG_ERR("CLIP", "Failed to back up clipping file: %s", storeFilePath.c_str());
+-    Storage.remove(tmpPath.c_str());
+-    return false;
+-  }
+-  if (!Storage.rename(tmpPath.c_str(), storeFilePath.c_str())) {
+-    LOG_ERR("CLIP", "Failed to replace clipping file: %s", storeFilePath.c_str());
+-    Storage.remove(tmpPath.c_str());
+-    if (replacingDestination) Storage.rename(backupPath.c_str(), storeFilePath.c_str());
+-    return false;
+-  }
+-  if (replacingDestination && Storage.exists(backupPath.c_str())) {
 -    Storage.remove(backupPath.c_str());
-+    const std::string legacyBackup = storeFilePath + ".pre-v8.bak";
-+    if (fileVersion > 0 && fileVersion < SOURCE_RANGE_VERSION && !Storage.exists(legacyBackup.c_str())) {
-+      if (!Storage.rename(backupPath.c_str(), legacyBackup.c_str()))
-+        LOG_ERR("CLIP", "Could not retain pre-upgrade backup: %s", backupPath.c_str());
-+    } else {
-+      Storage.remove(backupPath.c_str());
-+    }
-   }
+-  }
 -  for (uint16_t i = 0; i < count; ++i) {
 -    clippings[i].textOffset = newTextOffsets[i];
 -    if (rewrite.binding && needsSyncKey(clippings[i])) clippings[i].scoped = clippings[i].uploaded = true;
 -    clippings[i].syncKeyLength = newKeyLengths[i];
-+  fileVersion = VERSION;
-+  size_t kept = 0;
-+  for (size_t i = 0; i < sourceCount; ++i) {
-+    if (remove && remove[i]) continue;
-+    clippings[i].textOffset = offsets[kept].text;
-+    clippings[i].textLength = offsets[kept++].length;
-+    if (replacementNote && i == replacementIndex) clippings[i].noteLength = replacementNote->size();
-+    clippings[i].noteOffset = clippings[i].textOffset + clippings[i].textLength + sizeof(uint16_t);
-   }
-+  markChanged();
+-  }
++  } else Storage.remove(tmpPath.c_str());
++  // The core is now committed. Pointer failure cannot undo it; the exact hash
++  // companion is already durable and is found directly on the next load.
++  const bool pointerSaved = clippingCompanion::writePointer(storeFilePath, hash);
++  if (!pointerSaved) LOG_ERR("CLIP", "Could not update companion pointer: %s", storeFilePath.c_str());
++  if (pointerSaved && hadPointer && previousHash != hash && !companionAmbiguous && !Storage.exists((storeFilePath + ".rename.bak").c_str()))
++    Storage.remove(clippingCompanion::path(storeFilePath, previousHash).c_str());
++  for (size_t i = 0; i < count; ++i) {
++    const auto& offset = offsets[i]; auto& clip = clippings[offset.original];
++    clip.textOffset = offset.text; clip.syncKeyOffset = offset.key;
++    clip.syncKeyLength = offset.keyLength; clip.syncFlags = offset.flags;
++    clip.noteOffset = offset.note; clip.noteLength = offset.noteLength;
++  }
++  fileVersion = NATIVE_VERSION; noteFilePath = metadata; markChanged();
    return true;
  }
 
-@@ -997,6 +907,7 @@ bool ClippingStore::getAllClippedBooks(std::vector<ClippedBookEntry>& out) {
+@@ -997,6 +1044,7 @@ bool ClippingStore::getAllClippedBooks(std::vector<ClippedBookEntry>& out) {
 
    const auto files = Storage.listFiles(CLIPPINGS_DIR);
    for (const auto& name : files) {
@@ -7156,7 +7452,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
      ClippingFileHeader header;
      const std::string fullPath = std::string(CLIPPINGS_DIR) + "/" + name.c_str();
      if (!readClippingFileHeader(fullPath, name.c_str(), header)) continue;
-@@ -1015,47 +926,7 @@ bool ClippingStore::getAllClippedBooks(std::vector<ClippedBookEntry>& out) {
+@@ -1015,47 +1063,7 @@ bool ClippingStore::getAllClippedBooks(std::vector<ClippedBookEntry>& out) {
    return true;
  }
 
@@ -7204,39 +7500,69 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    const std::string path = storeFilePathForBook(filePath, bookType);
    if (Storage.exists(path.c_str())) {
      Storage.remove(path.c_str());
-@@ -1072,18 +943,19 @@ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std
-
-   ClippingStore reader;
-   ClippingRecords migratedClippings;
+@@ -1065,58 +1073,9 @@ void ClippingStore::deleteForFilePath(const std::string& filePath, const std::st
+ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
+                                        const std::string& title, const std::string& author,
+                                        const std::string& bookType) {
+-  const std::string oldStorePath = storeFilePathForBook(oldFilePath, bookType);
+-  if (!Storage.exists(oldStorePath.c_str())) {
+-    return true;
+-  }
+-
+-  ClippingStore reader;
+-  ClippingRecords migratedClippings;
 -  if (!reader.readFromFile(oldStorePath, migratedClippings)) {
-+  uint8_t migratedVersion = 0;
-+  if (!reader.readFromFile(oldStorePath, migratedClippings, &migratedVersion)) {
-     return false;
-   }
-
-   ClippingStore writer;
-+  writer.fileVersion = migratedVersion;
-   writer.bookFilePath = newFilePath;
-   writer.bookTitle = title;
-   writer.bookAuthor = author;
-   writer.storeFilePath = oldStorePath;
-   writer.clippings = std::move(migratedClippings);
+-    return false;
+-  }
+-
+-  ClippingStore writer;
+-  writer.bookFilePath = newFilePath;
+-  writer.bookTitle = title;
+-  writer.bookAuthor = author;
+-  writer.storeFilePath = oldStorePath;
+-  writer.clippings = std::move(migratedClippings);
 -  writer.deletedIds = std::move(reader.deletedIds);
 -  if (!writer.writeToFile({})) {
-+  if (!writer.writeToFile()) {
-     return false;
-   }
-
-@@ -1092,8 +964,6 @@ bool ClippingStore::migrateForFilePath(const std::string& oldFilePath, const std
-     return true;
-   }
-
+-    return false;
+-  }
+-
+-  const std::string newStorePath = storeFilePathForBook(newFilePath, bookType);
+-  if (oldStorePath == newStorePath) {
+-    return true;
+-  }
+-
 -  SyncFiles::removeAll(syncPathForStore(newStorePath).c_str());
 -  SyncFiles::removeAll(syncPathForStore(oldStorePath).c_str());
-   const std::string backupPath = newStorePath + ".bak";
-   const bool hasDestination = Storage.exists(newStorePath.c_str());
-   if (hasDestination) {
-@@ -1155,7 +1025,8 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+-  const std::string backupPath = newStorePath + ".bak";
+-  const bool hasDestination = Storage.exists(newStorePath.c_str());
+-  if (hasDestination) {
+-    if (Storage.exists(backupPath.c_str()) && !Storage.remove(backupPath.c_str())) {
+-      LOG_ERR("CLIP", "Failed to remove stale clipping migration backup: %s", backupPath.c_str());
+-      return false;
+-    }
+-    if (!Storage.rename(newStorePath.c_str(), backupPath.c_str())) {
+-      LOG_ERR("CLIP", "Failed to back up destination clippings: %s", newStorePath.c_str());
+-      return false;
+-    }
+-  }
+-  if (!Storage.rename(oldStorePath.c_str(), newStorePath.c_str())) {
+-    LOG_ERR("CLIP", "Failed to rename migrated clippings: %s -> %s", oldStorePath.c_str(), newStorePath.c_str());
+-    if (hasDestination && !Storage.rename(backupPath.c_str(), newStorePath.c_str())) {
+-      LOG_ERR("CLIP", "Failed to restore destination clipping backup: %s", backupPath.c_str());
+-    }
+-    return false;
+-  }
+-  if (hasDestination && Storage.exists(backupPath.c_str())) {
+-    Storage.remove(backupPath.c_str());
+-  }
+-  return true;
++  RenameMigration migration;
++  return beginRenameMigration(oldFilePath, newFilePath, title, author, bookType, migration) &&
++         commitRenameMigration(migration);
+ }
+
+ bool ClippingStore::hasStoredStateForFilePath(const std::string& filePath, const std::string& bookType) {
+@@ -1155,7 +1114,8 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
 
    ClippingStore reader;
    ClippingRecords migratedClippings;
@@ -7246,7 +7572,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
      LOG_ERR("CLIP", "Failed to load source clippings for rename: %s", migration.sourcePath.c_str());
      return false;
    }
-@@ -1184,16 +1055,15 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+@@ -1184,16 +1144,16 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
      migration.destinationBackedUp = true;
    }
 
@@ -7254,6 +7580,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    migration.active = true;
    ClippingStore writer;
 +  writer.fileVersion = migratedVersion;
++  writer.noteFilePath = reader.noteFilePath;
    writer.bookFilePath = newFilePath;
    writer.bookTitle = title;
    writer.bookAuthor = author;
@@ -7265,7 +7592,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
      LOG_ERR("CLIP", "Failed to write transactional clipping rename: %s", migration.destinationPath.c_str());
      rollbackRenameMigration(migration);
      return false;
-@@ -1203,7 +1073,6 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
+@@ -1203,7 +1163,6 @@ bool ClippingStore::beginRenameMigration(const std::string& oldFilePath, const s
 
  bool ClippingStore::commitRenameMigration(RenameMigration& migration) {
    if (!migration.active) return true;
@@ -7273,7 +7600,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
    bool ok = true;
    if (Storage.exists(migration.sourcePath.c_str()) && !Storage.remove(migration.sourcePath.c_str())) {
      LOG_ERR("CLIP", "Failed to delete renamed clipping source: %s", migration.sourcePath.c_str());
-@@ -1233,3 +1102,50 @@ bool ClippingStore::rollbackRenameMigration(RenameMigration& migration) {
+@@ -1233,3 +1192,50 @@ bool ClippingStore::rollbackRenameMigration(RenameMigration& migration) {
    if (ok) migration.active = false;
    return ok;
  }
@@ -7325,7 +7652,7 @@ index 8a993f48cce9e4b68577b69d1edc688e207a3912..6ea381114627629c24c3d535ff4780a8
 +
 +std::string ClippingStore::syncStorePathForBook(const std::string& path) { return storeFilePathForBook(path, "epub"); }
 diff --git a/src/ClippingStore.h b/src/ClippingStore.h
-index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151cb6d8ca7 100644
+index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..fc7a41b5d480f965c35c6b802ff9138b9fce94c5 100644
 --- a/src/ClippingStore.h
 +++ b/src/ClippingStore.h
 @@ -1,23 +1,27 @@
@@ -7382,7 +7709,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
    uint16_t spineIndex = 0;
    uint16_t startPage = 0;
    uint16_t endPage = 0;
-@@ -46,21 +55,19 @@ struct Clipping {
+@@ -46,21 +55,22 @@ struct Clipping {
    uint16_t endWordIndex = 0;
    uint16_t wordCount = 0;
    uint16_t paragraphIndex = UINT16_MAX;
@@ -7392,6 +7719,9 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
    uint32_t layoutSignature = 0;
    uint32_t textOffset = 0;
 +  uint32_t noteOffset = 0;
++  uint32_t syncKeyOffset = 0;
++  uint8_t syncKeyLength = 0;
++  uint8_t syncFlags = 0;
    uint16_t textLength = 0;
 +  uint16_t noteLength = 0;
    uint16_t tableSelection = UINT16_MAX;
@@ -7409,7 +7739,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
  };
 
  // Checked, bounded index storage: vector::reserve aborts on allocation failure
-@@ -80,7 +87,8 @@ class ClippingRecords {
+@@ -80,7 +90,8 @@ class ClippingRecords {
    bool reserve(size_t capacity) {
      if (capacity <= reserved) return true;
      if (capacity > CLIPPING_MAX_PER_BOOK) return false;
@@ -7419,7 +7749,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
      auto next = makeUniqueNoThrow<Clipping[]>(capacity);
      if (!next) return false;
      if (count) std::copy_n(records.get(), count, next.get());
-@@ -104,14 +112,31 @@ class ClippingRecords {
+@@ -104,14 +115,31 @@ class ClippingRecords {
      std::move(first + index + 1, first + count, first + index);
      --count;
    }
@@ -7443,18 +7773,18 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
 +  }
 +  void resize(size_t size) {
 +    if (size <= count) count = size;
-   }
++  }
 +  void swap(ClippingRecords& other) noexcept {
 +    records.swap(other.records);
 +    std::swap(count, other.count);
 +    std::swap(reserved, other.reserved);
-+  }
+   }
 +  Clipping& back() { return records[count - 1]; }
 +  const Clipping& back() const { return records[count - 1]; }
    void clear() { count = 0; }
    void release() {
      records.reset();
-@@ -148,6 +173,13 @@ struct ClippedBookEntry {
+@@ -148,6 +176,13 @@ struct ClippedBookEntry {
    uint16_t count = 0;
  };
 
@@ -7468,7 +7798,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
  class ClippingStore {
   public:
    enum class AddResult : uint8_t {
-@@ -169,45 +201,60 @@ class ClippingStore {
+@@ -169,45 +204,60 @@ class ClippingStore {
    bool loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
                     const std::string& bookType);
    void unload();
@@ -7544,7 +7874,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
    static void deleteForFilePath(const std::string& filePath, const std::string& bookType);
    static bool migrateForFilePath(const std::string& oldFilePath, const std::string& newFilePath,
                                   const std::string& title, const std::string& author, const std::string& bookType);
-@@ -221,54 +268,37 @@ class ClippingStore {
+@@ -221,54 +271,44 @@ class ClippingStore {
   private:
    static ClippingStore instance;
 
@@ -7566,6 +7896,11 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
 -  SyncPending::SessionMarker pendingSync;
 +  // On-disk format of storeFilePath as last loaded or written; appends need VERSION.
 +  uint8_t fileVersion = 0;
++  // One companion path per loaded book; no metadata scans during page turns.
++  mutable std::string noteFilePath;
++  mutable bool companionAmbiguous = false;
++  std::string acknowledgedNativeScope;
++  const char* pendingSyncKeys = nullptr;
 
 -  bool readKey(const Clipping& clip, std::string& key) const;
 -  bool loadForBook(const std::string& filePath, const std::string& title, const std::string& author,
@@ -7585,6 +7920,8 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
 -    UploadBinding* binding = nullptr;
 -  };
 -  bool writeToFile(const Rewrite& rewrite);
++  bool importStockForBook();
++  bool readCompanion(const std::string& path, HalFile& core, ClippingRecords& out) const;
 +  bool readFromFile();
 +  bool readFromFile(const std::string& path, ClippingRecords& out, uint8_t* versionOut = nullptr) const;
 +  bool appendLastToFile(const std::string& text, const char* chapterTitle);
@@ -7618,7 +7955,7 @@ index fba951e5ea0cd287bc9e448e60141ccf7de6a3f2..5e231e832484be7f20e9edf44ff54151
    return clipping.layoutSignature != 0 && currentLayoutSignature != 0 &&
           clipping.layoutSignature == currentLayoutSignature;
  }
-@@ -324,4 +354,7 @@ inline bool cacheClippingResolvedLayoutRange(Clipping& clipping, const uint16_t
+@@ -324,4 +364,7 @@ inline bool cacheClippingResolvedLayoutRange(Clipping& clipping, const uint16_t
    return changed;
  }
 
@@ -11011,10 +11348,10 @@ index 0000000000000000000000000000000000000000..ef9a083d39d5208a69ab79b255ab76dd
 +add_test(NAME clipping_store_safety COMMAND clipping_store_safety_test)
 diff --git a/test/clipping_store_safety/ClippingStoreSafetyTest.cpp b/test/clipping_store_safety/ClippingStoreSafetyTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..75e663e73e90c57eef7a389a652533acb07ac832
+index 0000000000000000000000000000000000000000..8d317f750b0600dfedb7d0da1148b54b09ac769d
 --- /dev/null
 +++ b/test/clipping_store_safety/ClippingStoreSafetyTest.cpp
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,233 @@
 +#include <algorithm>
 +#include <cassert>
 +#include <cstdint>
@@ -11104,6 +11441,8 @@ index 0000000000000000000000000000000000000000..75e663e73e90c57eef7a389a652533ac
 +void copyBounded(char* out, size_t size, const char* text) { std::snprintf(out, size, "%s", text); }
 +int utf8SafeTruncateBuffer(const char*, int size) { return size; }
 +unsigned long millis() { return 1000; }
++bool ClippingStore::importStockForBook() { return true; }
++bool ClippingStore::readCompanion(const std::string&, HalFile&, ClippingRecords&) const { return true; }
 +bool ClippingStore::writeToFile(const std::string*, size_t, const std::string*, const char*, const uint8_t*, const std::string*) {
 +  ++writes;
 +  return true;
@@ -11239,7 +11578,9 @@ index 0000000000000000000000000000000000000000..75e663e73e90c57eef7a389a652533ac
 +  files["book.bin.bak"] = valid;
 +  files["book.bin.tmp"] = valid;
 +  retried.clearAll();
-+  assert(files.empty() && !retried.hasLoadError());
++  assert(retried.clippingCount() == 0 && !retried.hasLoadError());
++  // Clear retains a native empty core so scoped deletions can still sync.
++  // The stubbed writer is checked separately by the real transaction tests.
 +  std::cout << truncations
 +            << " truncated-file cases blocked destructive writes; v1-v4 loads, backup/temp recovery, and transient "
 +               "read retry passed\n";
@@ -11330,10 +11671,10 @@ index 0000000000000000000000000000000000000000..8fa285fb3118950d2bc56c17e2b64036
 +}
 diff --git a/test/highlight_word_edit/CMakeLists.txt b/test/highlight_word_edit/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..51a55a0b5beaf1e536d1dd3af16e1072f47c587d
+index 0000000000000000000000000000000000000000..6012583bb9716fa5aeb4f8ea823ff27b0f0d5c65
 --- /dev/null
 +++ b/test/highlight_word_edit/CMakeLists.txt
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,208 @@
 +add_executable(highlight_word_edit_test HighlightWordEditTest.cpp
 +  ${REPO_ROOT}/lib/KOReaderSync/ChapterXPathResolver.cpp
 +  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
@@ -11482,7 +11823,13 @@ index 0000000000000000000000000000000000000000..51a55a0b5beaf1e536d1dd3af16e1072
 +add_custom_command(OUTPUT ${MERGE_STORE_INC}
 + COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractMergeStore.py ${REPO_ROOT}/src/ClippingStore.cpp ${MERGE_STORE_INC}
 + DEPENDS ${REPO_ROOT}/src/ClippingStore.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractMergeStore.py VERBATIM)
-+add_executable(ClippingMergeStoreTest ClippingMergeStoreTest.cpp ${MERGE_STORE_INC})
++add_executable(ClippingMergeStoreTest ClippingMergeStoreTest.cpp ${MERGE_STORE_INC}
++  ${REPO_ROOT}/src/clippings/ClippingCompanion.cpp)
++target_compile_definitions(ClippingMergeStoreTest PRIVATE SIMULATOR)
++if(NOT APPLE)
++  find_package(OpenSSL REQUIRED)
++  target_link_libraries(ClippingMergeStoreTest PRIVATE OpenSSL::Crypto)
++endif()
 +target_include_directories(ClippingMergeStoreTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/src ${REPO_ROOT}/lib/Memory)
 +target_link_libraries(ClippingMergeStoreTest PRIVATE crosspoint_test_common GTest::gtest_main)
 +gtest_discover_tests(ClippingMergeStoreTest)
@@ -11520,12 +11867,28 @@ index 0000000000000000000000000000000000000000..51a55a0b5beaf1e536d1dd3af16e1072
 +target_compile_definitions(onpage_highlight_mapping_test PRIVATE XML_CONTEXT_BYTES=1024 XML_GE=0)
 +target_compile_options(onpage_highlight_mapping_test PRIVATE -UNDEBUG)
 +add_test(NAME onpage_highlight_mapping COMMAND onpage_highlight_mapping_test)
++
++target_include_directories(onpage_highlight_render_test PRIVATE ${REPO_ROOT}/freeink-sdk/libs/assets/Icons/include)
++
++add_executable(NativeClippingSyncTest NativeClippingSyncTest.cpp ${MERGE_STORE_INC}
++  ${REPO_ROOT}/src/clippings/ClippingCompanion.cpp ${REPO_ROOT}/src/clippings/ClippingIdentity.cpp
++  ${REPO_ROOT}/src/ClippingNativeSync.cpp ${REPO_ROOT}/src/sync/SyncFiles.cpp
++  ${REPO_ROOT}/lib/uzlib/src/uzlib_checksums.c)
++target_include_directories(NativeClippingSyncTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
++  ${REPO_ROOT}/test/library_builder/stubs ${REPO_ROOT}/src ${REPO_ROOT}/lib/Memory
++  ${REPO_ROOT}/lib/Serialization ${REPO_ROOT}/lib/uzlib/src)
++target_compile_definitions(NativeClippingSyncTest PRIVATE SIMULATOR)
++target_link_libraries(NativeClippingSyncTest PRIVATE crosspoint_test_common GTest::gtest_main)
++if(NOT APPLE)
++  target_link_libraries(NativeClippingSyncTest PRIVATE OpenSSL::Crypto)
++endif()
++gtest_discover_tests(NativeClippingSyncTest TEST_PREFIX NativeSyncHarness.)
 diff --git a/test/highlight_word_edit/ClippingMergeStoreTest.cpp b/test/highlight_word_edit/ClippingMergeStoreTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea45e839c1d
+index 0000000000000000000000000000000000000000..421a730b1479637e082f5ed5721332978ce748f9
 --- /dev/null
 +++ b/test/highlight_word_edit/ClippingMergeStoreTest.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,434 @@
 +#include <HalStorage.h>
 +#include <gtest/gtest.h>
 +
@@ -11537,6 +11900,7 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +#define private public
 +#include "ClippingStore.h"
 +#include "clippings/ClippingSourceRange.h"
++#include "clippings/ClippingCompanion.h"
 +#undef private
 +struct MergeStorage : HalStorage {
 +  using HalStorage::openFileForRead;
@@ -11548,11 +11912,14 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +#define Storage mergeStorage
 +#define LOG_ERR(...) ((void)0)
 +#define LOG_INF(...) ((void)0)
-+constexpr uint8_t VERSION = 8, LEGACY_VERSION = 1, SOURCE_RANGE_VERSION = 8, NOTE_VERSION = 6,
++constexpr uint8_t NATIVE_VERSION = 7, VERSION = 7, LEGACY_VERSION = 1, SOURCE_RANGE_VERSION = 8, NOTE_VERSION = 6,
 + LAYOUT_SIGNATURE_VERSION = 3, TABLE_SELECTION_VERSION = 4, COLOR_VERSION = 5;
 +constexpr size_t TEXT_COPY_BUFFER_SIZE = 128;
++std::string storeFilePathForBook(const std::string& path, const std::string&) { return path == "/book.epub" ? "/clips.bin" : "/moved-clips.bin"; }
 +constexpr const char* CLIPPINGS_DIR = "/.crashink/.clippings";
++#ifndef TEST_NATIVE_SYNC
 +void ClippingStore::markChanged() {}
++#endif
 +int utf8SafeTruncateBuffer(const char*, int size) { return size; }
 +namespace serialization {
 +template <class T> bool tryReadPod(FsFile& f, T& value) { return f.read(&value, sizeof(value)) == sizeof(value); }
@@ -11569,7 +11936,21 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +}  // namespace serialization
 +void sanitizeChapterTitle(char* title) { title[CLIPPING_CHAPTER_TITLE_MAX - 1] = 0; }
 +uint32_t textLengthFieldBytes(uint8_t version) { return version == LEGACY_VERSION ? 4 : 2; }
++bool writeLegacyClippingRecord(FsFile& f, const Clipping& clipping, const char* chapterTitle) {
++  return serialization::tryWritePod(f, clipping.spineIndex) && serialization::tryWritePod(f, clipping.startPage) &&
++         serialization::tryWritePod(f, clipping.endPage) && serialization::tryWritePod(f, clipping.pageCount) &&
++         serialization::tryWritePod(f, clipping.startWordIndex) &&
++         serialization::tryWritePod(f, clipping.endWordIndex) && serialization::tryWritePod(f, clipping.wordCount) &&
++         serialization::tryWritePod(f, clipping.paragraphIndex) && serialization::tryWritePod(f, clipping.timestamp) &&
++         serialization::tryWritePod(f, clipping.layoutSignature) &&
++         serialization::tryWritePod(f, clipping.tableSelection) && serialization::tryWritePod(f, clipping.color) &&
++         serialization::tryWritePod(f, clipping.sourceStart) && serialization::tryWritePod(f, clipping.sourceEnd) &&
++         f.write(reinterpret_cast<const uint8_t*>(chapterTitle), CLIPPING_CHAPTER_TITLE_MAX) ==
++             CLIPPING_CHAPTER_TITLE_MAX;
++}
++
 +#include "ClippingMergeStore.inc"
++#include "StockV7Reader.inc"
 +namespace {
 +ClippingStore seed() {
 +  fake::reset();
@@ -11577,10 +11958,10 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +  store.storeFilePath = "/clips.bin";
 +  store.bookFilePath = "/book.epub";
 +  store.bookTitle = "Book";
-+  store.fileVersion = VERSION;
++  store.fileVersion = 8;
 +  FsFile out = Storage.open("/clips.bin", O_WRONLY | O_CREAT | O_TRUNC);
 +  const uint16_t count = 3;
-+  serialization::tryWritePod(out, VERSION);
++  serialization::tryWritePod<uint8_t>(out, 8);
 +  serialization::tryWritePod(out, count);
 +  serialization::tryWriteString(out, store.bookTitle);
 +  serialization::tryWriteString(out, store.bookAuthor);
@@ -11592,7 +11973,7 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +    clip.pageCount = 10;
 +    clip.layoutSignature = 123;
 +    char title[CLIPPING_CHAPTER_TITLE_MAX] = "Chapter";
-+    writeClippingRecord(out, clip, title);
++    writeLegacyClippingRecord(out, clip, title);
 +    serialization::tryWritePod(out, clip.textLength);
 +    clip.textOffset = out.position();
 +    out.write(text, clip.textLength);
@@ -11709,9 +12090,16 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +}
 +TEST(ClippingMergeStore, VersionSixMigrationRetainsNotesColorsAndOriginalText) {
 +  auto store = seed();
-+  ASSERT_TRUE(store.setClippingNote(1, "My note"));
++  // Build a legacy v6 fixture before invoking the new native writer.
 +  store.clippings[1].color = ClippingColor::Solid;
-+  ASSERT_TRUE(store.writeToFile());
++  auto& original = fake::files["/clips.bin"]->bytes;
++  const size_t colorAt = store.clippings[1].textOffset - 2 - CLIPPING_CHAPTER_TITLE_MAX - 9;
++  original[colorAt] = static_cast<uint8_t>(ClippingColor::Solid);
++  const size_t noteAt = store.clippings[1].textOffset + store.clippings[1].textLength;
++  original[noteAt] = 7;
++  const std::string note = "My note";
++  original.insert(original.begin() + noteAt + 2, note.begin(), note.end());
++  store.clippings[2].textOffset += note.size();
 +  auto& bytes = fake::files["/clips.bin"]->bytes;
 +  for (size_t i = store.clippings.size(); i-- > 0;) {
 +    const size_t at = store.clippings[i].textOffset - 2 - CLIPPING_CHAPTER_TITLE_MAX - 8;
@@ -11724,8 +12112,8 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +  EXPECT_FALSE(clippingHasSourceRange(legacy[0]));
 +  store.clippings = std::move(legacy);
 +  ASSERT_TRUE(store.cacheSourceRange(0, 100, 120)); ASSERT_TRUE(store.saveToFile());
-+  ASSERT_TRUE(Storage.exists("/clips.bin.pre-v8.bak"));
-+  EXPECT_EQ(fake::files["/clips.bin.pre-v8.bak"]->bytes[0], 6);
++  ASSERT_TRUE(Storage.exists("/clips.bin.pre-native.bak"));
++  EXPECT_EQ(fake::files["/clips.bin.pre-native.bak"]->bytes[0], 6);
 +  ClippingRecords reloaded; ASSERT_TRUE(store.readFromFile("/clips.bin", reloaded));
 +  EXPECT_EQ(reloaded[0].sourceStart, 100u); EXPECT_EQ(reloaded[0].sourceEnd, 120u);
 +  EXPECT_EQ(reloaded[1].color, ClippingColor::Solid); EXPECT_EQ(reloaded[1].noteLength, 7);
@@ -11766,6 +12154,174 @@ index 0000000000000000000000000000000000000000..0a2fbc0b1780f9f2003ad7b6f4ba4ea4
 +  store.clippings=std::move(loaded);ASSERT_TRUE(store.writeToFile());
 +  ClippingRecords migrated;ASSERT_TRUE(store.readFromFile("/clips.bin",migrated));
 +  EXPECT_EQ(migrated[2].color,ClippingColor::LightGrey);
++}
++
++TEST(ClippingNativeFormat, ConvertedCoreIsReadableByUnmodifiedStockV7Parser) {
++  auto store = seed();
++  const auto legacy = fake::files["/clips.bin"]->bytes;
++  ASSERT_TRUE(store.setClippingNote(1, "Keep this annotation"));
++  ASSERT_TRUE(Storage.exists("/clips.bin.pre-native.bak"));
++  EXPECT_EQ(fake::files["/clips.bin.pre-native.bak"]->bytes, legacy);
++  EXPECT_EQ(fake::files["/clips.bin"]->bytes[0], 7);
++  stockV7::ClippingStore stock; stockV7::ClippingRecords quotes;
++  ASSERT_TRUE(stock.readFromFile("/clips.bin", quotes));
++  ASSERT_EQ(quotes.size(), 3u);
++  EXPECT_EQ(quotes[1].spineIndex, store.clippings[1].spineIndex);
++  EXPECT_EQ(quotes[1].textLength, store.clippings[1].textLength);
++  EXPECT_EQ(textAt(store, 1), "second quote");
++  EXPECT_FALSE(stock.deletedIds.size());
++}
++TEST(ClippingNativeFormat, ColorOnlySaveDoesNotReplaceCoreAndRetainsNotesAfterReload) {
++  auto store = seed(); ASSERT_TRUE(store.setClippingNote(1,"My note"));
++  const auto before = fake::files["/clips.bin"]->bytes;
++  store.clippings[1].color = ClippingColor::Green;
++  fake::failRenameToPath = "/clips.bin";
++  ASSERT_TRUE(store.writeToFile()); // Recoloring needs no core rename.
++  EXPECT_EQ(fake::files["/clips.bin"]->bytes, before);
++  fake::failRenameToPath.clear();
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++  store.clippings=std::move(loaded);
++  EXPECT_EQ(store.clippings[1].color,ClippingColor::Green);
++  std::string note; ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"My note");
++}
++TEST(ClippingNativeFormat, StockDeletionAndReorderingKeepMetadataOnExactQuote) {
++  auto store = seed(); ASSERT_TRUE(store.setClippingNote(1,"Second quote note"));
++  store.clippings[1].color=ClippingColor::Solid; ASSERT_TRUE(store.writeToFile());
++  // Rewrite only the core exactly as stock does, without touching our companion.
++  const auto old=fake::files["/clips.bin"]->bytes;
++  const auto first=store.clippings[0].syncKeyOffset - 4 - 34;
++  const auto second=store.clippings[1].syncKeyOffset - 4 - 34;
++  const auto third=store.clippings[2].syncKeyOffset - 4 - 34;
++  auto changed=std::vector<uint8_t>(old.begin(),old.begin()+first);
++  const uint16_t two=2; std::memcpy(changed.data()+1,&two,2);
++  changed.insert(changed.end(),old.begin()+third,old.end());
++  changed.insert(changed.end(),old.begin()+second,old.begin()+third);
++  fake::files["/clips.bin"]->bytes=changed;
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++  store.clippings=std::move(loaded);
++  EXPECT_EQ(textAt(store,0),"third quote"); EXPECT_EQ(textAt(store,1),"second quote");
++  EXPECT_EQ(store.clippings[0].noteLength,0); EXPECT_EQ(store.clippings[1].color,ClippingColor::Solid);
++  std::string note; ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"Second quote note");
++}
++TEST(ClippingNativeFormat, CorruptCompanionFailsClosedWithoutLosingOriginalNotes) {
++  auto store=seed(); ASSERT_TRUE(store.setClippingNote(0,"Important"));
++  const auto original=fake::files["/clips.bin"]->bytes;
++  auto& data=fake::files[store.noteFilePath]->bytes; data.back()^=1;
++  ClippingRecords loaded; EXPECT_FALSE(store.readFromFile("/clips.bin",loaded));
++  EXPECT_EQ(fake::files["/clips.bin"]->bytes,original);
++}
++TEST(ClippingNativeFormat, FailedCorePublishLeavesOldCompanionUsable) {
++  auto store=seed(); ASSERT_TRUE(store.setClippingNote(1,"Never lose me"));
++  const auto original=fake::files["/clips.bin"]->bytes;
++  fake::failRenameToPath="/clips.bin";
++  EXPECT_FALSE(store.updateClippingText(1,"Replacement quote"));
++  fake::failRenameToPath.clear();
++  // Recover the saved core backup as loadForBook does after a failed rename.
++  if (!Storage.exists("/clips.bin")) ASSERT_TRUE(Storage.rename("/clips.bin.bak","/clips.bin"));
++  EXPECT_EQ(fake::files["/clips.bin"]->bytes,original);
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++  store.clippings=std::move(loaded); std::string note;
++  ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"Never lose me");
++}
++TEST(ClippingNativeFormat, LargeQuotesRemainCompleteAndKeepHigherLimit) {
++  auto store=seed(); const std::string longQuote(60000,'x');
++  ASSERT_TRUE(store.updateClippingText(0,longQuote));
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++  EXPECT_EQ(loaded[0].textLength,longQuote.size()); EXPECT_EQ(textAt(store,0),longQuote);
++  EXPECT_EQ(CLIPPING_MAX_PER_BOOK,65535);
++}
++TEST(ClippingNativeFormat, NativeKeysAndDeletionIdsSurviveConversion) {
++  auto store = seed(); ASSERT_TRUE(store.writeToFile());
++  auto bytes = fake::files["/clips.bin"]->bytes;
++  const auto record = store.clippings[0].syncKeyOffset - 38;
++  const std::string tombstone = "0123456789abcdefdeleted-quote";
++  // Insert a scoped deletion into the native header.
++  std::vector<uint8_t> encoded; const uint32_t tombLength=tombstone.size();
++  const auto* len=reinterpret_cast<const uint8_t*>(&tombLength);
++  encoded.insert(encoded.end(),len,len+4); encoded.insert(encoded.end(),tombstone.begin(),tombstone.end());
++  bytes[record-2]=1; bytes.insert(bytes.begin()+record,encoded.begin(),encoded.end());
++  const auto keyAt=store.clippings[0].syncKeyOffset+encoded.size();
++  const std::string key="0123456789abcdefactive-quote"; const uint32_t keyLength=key.size();
++  std::memcpy(bytes.data()+keyAt-4,&keyLength,4);
++  bytes.insert(bytes.begin()+keyAt,key.begin(),key.end()); bytes[keyAt+keyLength]=3;
++  // Stock file: no custom companion present.
++  fake::reset(); fake::files["/clips.bin"]=std::make_shared<fake::Node>();
++  fake::files["/clips.bin"]->bytes=bytes;
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded,&store.fileVersion));
++  store.clippings=std::move(loaded); ASSERT_TRUE(store.setClippingNote(0,"My annotation"));
++  stockV7::ClippingStore stock; stockV7::ClippingRecords quotes;
++  ASSERT_TRUE(stock.readFromFile("/clips.bin",quotes)); ASSERT_EQ(quotes.size(),3u);
++  ASSERT_EQ(stock.deletedIds.size(),1u); EXPECT_EQ(stock.deletedIds[0],tombstone);
++  EXPECT_EQ(quotes[0].syncKeyLength,key.size()); EXPECT_TRUE(quotes[0].scoped); EXPECT_TRUE(quotes[0].uploaded);
++  const auto& c=store.clippings[0]; const auto& saved=fake::files["/clips.bin"]->bytes;
++  EXPECT_EQ(std::string(reinterpret_cast<const char*>(saved.data()+c.syncKeyOffset),c.syncKeyLength),key);
++}
++TEST(ClippingNativeFormat, ImportsStockSourceWithoutMovingItOrLosingQuotes) {
++  auto store=seed(); ASSERT_TRUE(store.writeToFile());
++  const auto bytes=fake::files["/clips.bin"]->bytes;
++  fake::reset(); fake::files["/.crosspoint/clippings/clips.bin"]=std::make_shared<fake::Node>();
++  fake::files["/.crosspoint/clippings/clips.bin"]->bytes=bytes;
++  store.clippings.clear(); store.fileVersion=0; store.noteFilePath.clear();
++  ASSERT_TRUE(store.importStockForBook());
++  EXPECT_EQ(fake::files["/.crosspoint/clippings/clips.bin"]->bytes,bytes);
++  ASSERT_EQ(store.clippings.size(),3u); EXPECT_EQ(textAt(store,2),"third quote");
++  stockV7::ClippingStore stock; stockV7::ClippingRecords quotes;
++  EXPECT_TRUE(stock.readFromFile("/clips.bin",quotes));
++}
++
++TEST(ClippingNativeFormat, HigherBookCountIsRetainedWithoutStockArtificialCap) {
++  auto store=seed(); const auto repeated=store.clippings.back();
++  for (unsigned i=3;i<400;++i) { auto clip=repeated; clip.timestamp=i+1000; ASSERT_TRUE(store.clippings.push_back(clip)); }
++  ASSERT_TRUE(store.writeToFile());
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++  ASSERT_EQ(loaded.size(),400u); EXPECT_EQ(loaded.back().timestamp,1399u);
++  stockV7::ClippingStore stock; stockV7::ClippingRecords stockQuotes;
++  EXPECT_FALSE(stock.readFromFile("/clips.bin",stockQuotes)); // Stock's own 256-item guard remains.
++}
++TEST(ClippingNativeFormat, DeletingCoreRecordsNeverResurrectsOrReassignsNotes) {
++  auto store=seed(); ASSERT_TRUE(store.setClippingNote(1,"Second only"));
++  ASSERT_TRUE(store.setClippingNote(2,"Third only"));
++  ASSERT_TRUE(store.removeClippingAt(1));
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++  store.clippings=std::move(loaded); ASSERT_EQ(store.clippings.size(),2u);
++  EXPECT_EQ(textAt(store,1),"third quote"); std::string note;
++  ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"Third only");
++  store.clearAll(); ASSERT_TRUE(store.readFromFile("/clips.bin",loaded)); EXPECT_TRUE(loaded.empty());
++  stockV7::ClippingStore stock; stockV7::ClippingRecords stockQuotes;
++  ASSERT_TRUE(stock.readFromFile("/clips.bin",stockQuotes)); EXPECT_TRUE(stockQuotes.empty());
++}
++TEST(ClippingNativeFormat, EveryInterruptedRenameKeepsOneReadableCompleteGeneration) {
++  for (int step=0;step<9;++step) {
++    auto store=seed(); ASSERT_TRUE(store.setClippingNote(1,"Original note"));
++    const auto before=fake::files["/clips.bin"]->bytes;
++    fake::failRename=step;
++    const bool saved=store.updateClippingText(1,"Edited quote");
++    fake::failRename=-1;
++    if (!Storage.exists("/clips.bin")) ASSERT_TRUE(Storage.rename("/clips.bin.bak","/clips.bin"));
++    ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded));
++    store.clippings=std::move(loaded); std::string note;
++    ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"Original note");
++    EXPECT_EQ(textAt(store,1),saved ? "Edited quote" : "second quote");
++    if (!saved) EXPECT_EQ(fake::files["/clips.bin"]->bytes,before);
++  }
++}
++
++TEST(ClippingNativeFormat, BookRenameMovesNotesAndRollbackPreservesBothHistories) {
++  auto store=seed(); ASSERT_TRUE(store.setClippingNote(1,"Keep through rename"));
++  ClippingStore::RenameMigration migration;
++  ASSERT_TRUE(ClippingStore::beginRenameMigration("/book.epub","/moved.epub","Renamed","Author","epub",migration));
++  ClippingStore moved; moved.storeFilePath="/moved-clips.bin";
++  ASSERT_TRUE(moved.readFromFile(moved.storeFilePath,moved.clippings,&moved.fileVersion));
++  std::string note; ASSERT_TRUE(moved.readClippingNote(1,note)); EXPECT_EQ(note,"Keep through rename");
++  ASSERT_TRUE(ClippingStore::rollbackRenameMigration(migration));
++  EXPECT_FALSE(Storage.exists("/moved-clips.bin"));
++  ClippingRecords original; ASSERT_TRUE(store.readFromFile("/clips.bin",original));
++  store.clippings=std::move(original); ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"Keep through rename");
++  ASSERT_TRUE(ClippingStore::beginRenameMigration("/book.epub","/moved.epub","Renamed","Author","epub",migration));
++  ASSERT_TRUE(ClippingStore::commitRenameMigration(migration));
++  EXPECT_FALSE(Storage.exists("/clips.bin"));
++  ASSERT_TRUE(moved.readFromFile(moved.storeFilePath,moved.clippings,&moved.fileVersion));
++  ASSERT_TRUE(moved.readClippingNote(1,note)); EXPECT_EQ(note,"Keep through rename");
 +}
 diff --git a/test/highlight_word_edit/DictionaryPageRenderTest.cpp b/test/highlight_word_edit/DictionaryPageRenderTest.cpp
 new file mode 100644
@@ -11890,7 +12446,7 @@ index 0000000000000000000000000000000000000000..3584dbcd24ead957dfe1cbe487ab40f1
 +Path(sys.argv[2]).write_text(text[a:b])
 diff --git a/test/highlight_word_edit/ExtractMergeStore.py b/test/highlight_word_edit/ExtractMergeStore.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..36f4ad9837799d80a1662e155e61253b3e673481
+index 0000000000000000000000000000000000000000..98803eb3d2d4cccac23a962416abfb9038d556c6
 --- /dev/null
 +++ b/test/highlight_word_edit/ExtractMergeStore.py
 @@ -0,0 +1,13 @@
@@ -11903,9 +12459,9 @@ index 0000000000000000000000000000000000000000..36f4ad9837799d80a1662e155e61253b
 +  depth+=(source[b]=='{')-(source[b]=='}');b+=1
 + return source[a:b]
 +Path(sys.argv[2]).write_text('\n\n'.join(block(s) for s in [
-+ 'bool ClippingStore::readFromFile(const std::string& path,', 'bool ClippingStore::cacheSourceRange(', 'bool ClippingStore::saveToFile()', 'bool writeClippingRecord(', 'bool copyBytes(', 'uint32_t ClippingStore::titleOffset(',
-+ 'bool ClippingStore::openTextReader(', 'const Clipping* ClippingStore::clippingAt(',
-+ 'bool ClippingStore::readClippingNote(', 'bool ClippingStore::setClippingNote(',
++ 'bool readClippingHeaderString(', 'bool ClippingStore::beginRenameMigration(', 'bool ClippingStore::commitRenameMigration(', 'bool ClippingStore::rollbackRenameMigration(', 'bool ClippingStore::importStockForBook()', 'bool ClippingStore::readCompanion(', 'bool ClippingStore::readFromFile(const std::string& path,', 'bool ClippingStore::cacheSourceRange(', 'bool ClippingStore::saveToFile()', 'bool copyBytes(', 'uint32_t ClippingStore::titleOffset(',
++ 'bool ClippingStore::readChapterTitle(const size_t index, std::string& out) const', 'bool ClippingStore::readChapterTitle(const size_t index, std::string& out, FsFile& reader)', 'bool ClippingStore::openTextReader(', 'const Clipping* ClippingStore::clippingAt(',
++ 'bool ClippingStore::removeClippingAt(', 'bool ClippingStore::removeClippings(', 'void ClippingStore::clearAll()', 'bool ClippingStore::readClippingText(const size_t index,', 'bool ClippingStore::readClippingText(const Clipping& clipping, std::string& out) const', 'bool ClippingStore::readClippingText(const Clipping& clipping, std::string& out, FsFile& reader)', 'bool ClippingStore::readClippingNote(', 'bool ClippingStore::setClippingNote(',
 + 'bool ClippingStore::updateClippingText(', 'bool ClippingStore::mergeClippingText(', 'bool ClippingStore::writeToFile(']))
 diff --git a/test/highlight_word_edit/HighlightMergeTest.cpp b/test/highlight_word_edit/HighlightMergeTest.cpp
 new file mode 100644
@@ -12842,3 +13398,501 @@ index 0000000000000000000000000000000000000000..0b3948171a6cc9192329efcaafd5ebdc
 +   check.template operator()<Color::Black>(highlightDither::Blue);
 + }
 +}
+diff --git a/docs/crashink-clipping-storage.md b/docs/crashink-clipping-storage.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7232989eb220194199ef531cb6eb53d13f8eeb45
+--- /dev/null
++++ b/docs/crashink-clipping-storage.md
+@@ -0,0 +1,89 @@
++# Shared clipping format (CrossInk v2 / crASHink)
++
++## Quote core
++
++crASHink now writes the exact CrossInk v7 binary core documented in
++[file-formats.md](file-formats.md#crosspointclippingsbooktype_crc32pathbin):
++version byte 7, u16 count, title/author/book-path strings, scoped deletion IDs,
++then standard page/word/source positions, timestamps, sync keys/flags, chapter
++labels and u16-length quote text. There are no extra fields or trailing data
++inside the core. A pinned, unmodified stock v7 reader body is used in native
++compatibility tests.
++
++Files stay under `/.crashink/.clippings/epub_<crc32(path)>.bin`, following the
++user's consolidated SD layout. Stock CrossInk discovers files under
++`/.crosspoint/clippings/` instead. To use a crASHink file in stock firmware,
++copy the `.bin` there with its existing filename and keep the EPUB at the same
++path. The format is shared; the two firmware directories are not live mirrors.
++When crASHink has no local file for a book, opening that book validates and
++imports its stock v7 file without changing the stock source. An existing local
++file wins; the importer never silently overwrites a separate crASHink history.
++
++Stock's current implementation limits books to 256 quotes and quotes to 4 KiB.
++crASHink retains 65,535 quotes and 60 KiB per quote, subject to allocation and
++SD capacity. Stock firmware may reject files over its limits; identical bytes
++do not bypass its guards. No claim of literally unlimited storage is made.
++
++## Colors and notes (companion schema 1)
++
++A companion is `core.bin.meta-<64 lowercase SHA256 hex characters>`. The name
++contains the SHA256 of the entire associated core. A 32-byte `core.bin.meta`
++pointer identifies the last committed companion for matching after a stock
++rewrite. Companion files are not clipping `.bin` files and are not listed as
++books or clipping databases.
++
++All numbers are little-endian. The companion contains:
++
++- u32 magic `0x314d4343`, u8 schema 1, u16 record count, 32-byte core SHA256.
++- One u16 sorted-entry rank per core record, in core order.
++- Fixed 39-byte entries sorted by identity: SHA256 identity (32 bytes), color
++  u8, note length u16, absolute note offset u32.
++- Exact UTF-8 note bytes, at most 1,024 bytes per note.
++- A trailing SHA256 of all preceding companion bytes.
++
++Quote identity hashes little-endian timestamp u32, spine u16, then the exact
++UTF-8 quote text. The paired fast path reads metadata by ordinal without
++hashing individual quotes. If stock added, removed or reordered records, the
++reader streams each quote through SHA256 and binary-searches the companion;
++metadata never follows a row number. New or text-changed stock quotes default
++to Yellow with no note. Ambiguous duplicate identities are not assigned a
++possibly incorrect annotation, and the prior companion is retained for recovery.
++Stock firmware neither displays nor modifies these companion files.
++
++Metadata is loaded once with the book index; page turns use cached colors and
++note offsets. Hashing uses a 128-byte streaming buffer, not a whole-quote copy.
++Saves use a checked temporary offset/index allocation, approximately 56 bytes
++plus a two-byte rank per retained quote. A failed allocation leaves the old
++files intact. Full text remains on SD. Native saves use atomic rewrites instead
++of the former custom in-place append path, so quote additions can do more SD
++I/O than before; no hardware latency claim is made.
++
++## Migration, publication and recovery
++
++Legacy crASHink versions 1–6 and 8 remain readable. On the first successful book
++load/save they convert to native v7 with a `.pre-native.bak` copy of the exact
++original file. Existing `.pre-v8.bak` files remain untouched. New v7 cores and
++companions must be kept together when backing up crASHink; stock needs only
++the core but cannot show colors or notes.
++
++For a save, write/sync/close the new core temporary file, write/checksum/sync
++its companion, and publish the companion first. Publish the core through its
++existing `.bak` rotation last. A companion whose core was never published is
++not applied to the old file. On failed core publication the old backup is
++restored; the old hash-named companion is still valid. On a color/note-only
++change the core bytes match and only the companion is atomically replaced.
++
++Update the small companion pointer after core publication. If that pointer
++write fails, the core's exact hash still locates its durable companion. The
++previous normal generation is removed only after a successful pointer update;
++rename transactions and ambiguous stock rewrites retain their recovery copy.
++Corrupt companions block destructive writes rather than dropping annotations.
++
++Native scoped sync IDs and tombstones survive rewrites. Replaced/deleted native
++quotes produce scoped deletion entries. Existing custom sync bindings remain
++readable, and preparing uploads also writes their active keys into the native
++core so stock and crASHink see the same IDs.
++
++The archived `patches-1.6.1` set is unchanged. Older custom firmware cannot read
++the new v7 core: downgrade using the retained legacy backup, keeping all files
++until you verify your highlights on the reader.
+diff --git a/src/clippings/ClippingCompanion.cpp b/src/clippings/ClippingCompanion.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d613a32678e30f4f62c8bf97776edb10c77af596
+--- /dev/null
++++ b/src/clippings/ClippingCompanion.cpp
+@@ -0,0 +1,96 @@
++#include "ClippingCompanion.h"
++#include <HalStorage.h>
++#include <Logging.h>
++#include <cstring>
++#if defined(SIMULATOR) && defined(__APPLE__)
++#include <CommonCrypto/CommonDigest.h>
++#elif defined(SIMULATOR)
++#include <openssl/sha.h>
++#else
++#include <mbedtls/sha256.h>
++#endif
++namespace clippingCompanion {
++bool digest(HalFile& file, const uint32_t offset, uint32_t length, Digest& out,
++            const uint32_t* timestamp, const uint16_t spine) {
++  if (!file || offset > file.size() || length > file.size() - offset || !file.seek(offset)) return false;
++  // SHA context plus 128 streaming bytes are bounded; no quote-sized buffer.
++#if defined(SIMULATOR) && defined(__APPLE__)
++  CC_SHA256_CTX context; CC_SHA256_Init(&context);
++  const auto update = [&](const void* p, size_t n) { return CC_SHA256_Update(&context, p, n) == 1; };
++#elif defined(SIMULATOR)
++  SHA256_CTX context; SHA256_Init(&context);
++  const auto update = [&](const void* p, size_t n) { return SHA256_Update(&context, p, n) == 1; };
++#else
++  mbedtls_sha256_context context; mbedtls_sha256_init(&context);
++  if (mbedtls_sha256_starts(&context, 0)) { mbedtls_sha256_free(&context); return false; }
++  const auto update = [&](const void* p, size_t n) {
++    return mbedtls_sha256_update(&context, static_cast<const uint8_t*>(p), n) == 0;
++  };
++#endif
++  uint8_t prefix[6]{};
++  if (timestamp) {
++    for (unsigned i = 0; i < 4; ++i) prefix[i] = *timestamp >> (8 * i);
++    prefix[4] = spine; prefix[5] = spine >> 8;
++  }
++  bool ok = !timestamp || update(prefix, sizeof(prefix));
++  uint8_t buffer[128];
++  while (ok && length) {
++    const auto n = std::min<uint32_t>(length, sizeof(buffer));
++    ok = file.read(buffer, n) == static_cast<int>(n) && update(buffer, n);
++    length -= n;
++  }
++#if defined(SIMULATOR) && defined(__APPLE__)
++  ok = CC_SHA256_Final(out.data(), &context) == 1 && ok;
++#elif defined(SIMULATOR)
++  ok = SHA256_Final(out.data(), &context) == 1 && ok;
++#else
++  ok = mbedtls_sha256_finish(&context, out.data()) == 0 && ok;
++  mbedtls_sha256_free(&context);
++#endif
++  return ok;
++}
++bool seal(const std::string& path) {
++  FsFile f = Storage.open(path.c_str(), O_RDWR);
++  if (!f || f.size() > UINT32_MAX) { f.close(); return false; }
++  Digest hash{}; const auto size = f.size();
++  const bool ok = digest(f, 0, size, hash) && f.seek(size) && f.write(hash.data(), hash.size()) == hash.size() && f.sync();
++  const bool closed = f.close(); return ok && closed;
++}
++std::string path(const std::string& core, const Digest& hash) {
++  constexpr char hex[] = "0123456789abcdef";
++  std::string result = core + ".meta-"; result.reserve(result.size() + 64);
++  for (auto b : hash) { result += hex[b >> 4]; result += hex[b & 15]; }
++  return result;
++}
++bool publish(const std::string& temporary, const std::string& destination) {
++  const auto backup = destination + ".bak";
++  if (!Storage.exists(destination.c_str()) && Storage.exists(backup.c_str()) &&
++      !Storage.rename(backup.c_str(), destination.c_str())) return false;
++  const bool exists = Storage.exists(destination.c_str());
++  if (exists && Storage.exists(backup.c_str()) && !Storage.remove(backup.c_str())) return false;
++  if (exists && !Storage.rename(destination.c_str(), backup.c_str())) return false;
++  if (!Storage.rename(temporary.c_str(), destination.c_str())) {
++    if (exists) Storage.rename(backup.c_str(), destination.c_str());
++    return false;
++  }
++  if (exists) Storage.remove(backup.c_str());
++  return true;
++}
++bool readPointer(const std::string& core, Digest& hash) {
++  const auto pointer = core + ".meta";
++  if (!Storage.exists(pointer.c_str()) && Storage.exists((pointer + ".bak").c_str()))
++    if (!Storage.rename((pointer + ".bak").c_str(), pointer.c_str())) return false;
++  FsFile f;
++  if (!Storage.openFileForRead("CLIP", pointer, f)) return false;
++  const bool ok = f.size() == hash.size() && f.read(hash.data(), hash.size()) == static_cast<int>(hash.size());
++  return f.close() && ok;
++}
++bool writePointer(const std::string& core, const Digest& hash) {
++  const auto destination = core + ".meta", temporary = destination + ".tmp";
++  FsFile f = Storage.open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
++  if (!f) return false;
++  const bool ok = f.write(hash.data(), hash.size()) == hash.size() && f.sync();
++  const bool closed = f.close();
++  return ok && closed && publish(temporary, destination);
++}
++}  // namespace clippingCompanion
+diff --git a/src/clippings/ClippingCompanion.h b/src/clippings/ClippingCompanion.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9b3417c6cbbcef07f53dddfe958c3a18d141f6b
+--- /dev/null
++++ b/src/clippings/ClippingCompanion.h
+@@ -0,0 +1,21 @@
++#pragma once
++#include <array>
++#include <cstdint>
++#include <string>
++class HalFile;
++namespace clippingCompanion {
++using Digest = std::array<uint8_t, 32>;
++constexpr uint32_t Magic = 0x314d4343;
++constexpr uint8_t Version = 1;
++constexpr uint32_t HeaderBytes = 39;
++constexpr uint32_t EntryBytes = 39;
++// Bounded streaming SHA256, independent of quote size. A domain prefix keeps
++// quote identities distinct from complete-file identities.
++bool digest(HalFile& file, uint32_t offset, uint32_t length, Digest& out,
++            const uint32_t* timestamp = nullptr, uint16_t spine = 0);
++std::string path(const std::string& core, const Digest& hash);
++bool readPointer(const std::string& core, Digest& hash);
++bool writePointer(const std::string& core, const Digest& hash);
++bool seal(const std::string& file);
++bool publish(const std::string& temporary, const std::string& destination);
++}  // namespace clippingCompanion
+diff --git a/test/highlight_word_edit/NativeClippingSyncTest.cpp b/test/highlight_word_edit/NativeClippingSyncTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..04cc88bfd69fa9b722259ac9634a214f242e5eb7
+--- /dev/null
++++ b/test/highlight_word_edit/NativeClippingSyncTest.cpp
+@@ -0,0 +1,50 @@
++// Exercise the real sync adapter against the real v7/companion serializer.
++#define TEST_NATIVE_SYNC
++#include "ClippingMergeStoreTest.cpp"
++#include "sync/SyncPending.h"
++namespace SyncPending { bool mark(const std::string&, uint8_t) { return true; } }
++std::string ClippingStore::syncStorePathForBook(const std::string&) { return "/clips.bin"; }
++bool ClippingStore::loadForSync(const std::string&, ClippingStore& store) {
++  store.storeFilePath="/clips.bin"; store.bookFilePath="/book.epub"; store.bookTitle="Book";
++  return store.readFromFile(store.storeFilePath,store.clippings,&store.fileVersion);
++}
++// Import creation is exercised by the main fixture suite, not this sync harness.
++ClippingStore::AddResult ClippingStore::addClipping(uint16_t,uint16_t,uint16_t,uint16_t,uint16_t,uint16_t,uint16_t,
++ const char*,uint16_t,const std::string&,uint16_t,uint32_t,size_t*,ClippingColor,uint32_t,uint32_t) {
++ return AddResult::SaveFailed;
++}
++TEST(NativeClippingSync, PreparedKeysAreSharedWithStockAndStayStable) {
++  auto store=seed(); ASSERT_TRUE(store.setClippingNote(1,"Preserved note"));
++  const std::string scope="0123456789abcdef";
++  ASSERT_TRUE(ClippingStore::prepareUploads("/book.epub",scope));
++  stockV7::ClippingStore stock; stockV7::ClippingRecords quotes;
++  ASSERT_TRUE(stock.readFromFile("/clips.bin",quotes)); ASSERT_EQ(quotes.size(),3u);
++  for (const auto& q:quotes) { EXPECT_TRUE(q.scoped); EXPECT_TRUE(q.uploaded); EXPECT_GT(q.syncKeyLength,16); }
++  const auto before=fake::files["/clips.bin"]->bytes;
++  ASSERT_TRUE(ClippingStore::prepareUploads("/book.epub",scope));
++  EXPECT_EQ(fake::files["/clips.bin"]->bytes,before);
++  SyncClipping clip; std::string text,key; bool done=false;
++  ASSERT_TRUE(ClippingStore::readForUpload("/book.epub",1,clip,text,done,&key));
++  EXPECT_EQ(text,"second quote"); EXPECT_TRUE(key.starts_with(scope)); EXPECT_FALSE(done);
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded,&store.fileVersion));
++  store.clippings=std::move(loaded); std::string note;
++  ASSERT_TRUE(store.readClippingNote(1,note)); EXPECT_EQ(note,"Preserved note");
++}
++TEST(NativeClippingSync, DeletedAndReplacedKeysBecomeScopedTombstones) {
++  auto store=seed(); ASSERT_TRUE(store.writeToFile());
++  const std::string scope="0123456789abcdef";
++  ASSERT_TRUE(ClippingStore::prepareUploads("/book.epub",scope));
++  ClippingRecords loaded; ASSERT_TRUE(store.readFromFile("/clips.bin",loaded,&store.fileVersion));
++  store.clippings=std::move(loaded);
++  ASSERT_TRUE(store.removeClippingAt(0));
++  ASSERT_TRUE(store.updateClippingText(0,"Replacement"));
++  stockV7::ClippingStore stock; stockV7::ClippingRecords quotes;
++  ASSERT_TRUE(stock.readFromFile("/clips.bin",quotes)); ASSERT_EQ(stock.deletedIds.size(),2u);
++  EXPECT_EQ(quotes[0].syncKeyLength,0); EXPECT_FALSE(quotes[0].uploaded);
++  std::string id; bool done=false;
++  ASSERT_TRUE(ClippingStore::readDeletionForUpload("/book.epub",0,id,done));
++  EXPECT_FALSE(done); EXPECT_TRUE(id.starts_with(scope));
++  ASSERT_TRUE(ClippingStore::acknowledgeDeletions("/book.epub",scope));
++  ASSERT_TRUE(stock.readFromFile("/clips.bin",quotes)); EXPECT_TRUE(stock.deletedIds.empty());
++  ASSERT_TRUE(ClippingStore::readDeletionForUpload("/book.epub",0,id,done)); EXPECT_TRUE(done);
++}
+diff --git a/test/highlight_word_edit/StockV7Reader.inc b/test/highlight_word_edit/StockV7Reader.inc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4e63ace795786a5934f899ad183a076b5b0e5b4
+--- /dev/null
++++ b/test/highlight_word_edit/StockV7Reader.inc
+@@ -0,0 +1,212 @@
++// CrossInk v2.0.0 (2cdd6117), unmodified v7 reader body below.
++// Isolated namespace and host adapters allow a real stock-format compatibility test.
++namespace stockV7 {
++constexpr uint8_t LEGACY_VERSION=1, VERSION=7, SYNC_ID_VERSION=5, SCOPED_ID_VERSION=6,
++ LAYOUT_SIGNATURE_VERSION=3, TABLE_SELECTION_VERSION=4, SOURCE_RANGE_VERSION=7;
++constexpr size_t CLIPPING_MAX_PER_BOOK=256, CLIPPING_TEXT_MAX=4096, SCOPE_BYTES=16, MAX_ID_BYTES=64;
++struct Clipping {
++ uint16_t spineIndex=0,startPage=0,endPage=0,pageCount=0,startWordIndex=0,endWordIndex=0,wordCount=0,paragraphIndex=0;
++ uint32_t timestamp=0,layoutSignature=0,sourceStart=UINT32_MAX,sourceEnd=UINT32_MAX,textOffset=0;
++ uint16_t tableSelection=UINT16_MAX,textLength=0;
++ uint8_t syncKeyLength=0;
++ bool uploaded=false,scoped=false;
++ char chapterTitle[48]{};
++};
++struct ClippingRecords : std::vector<Clipping> {
++ bool reserve(size_t n) { std::vector<Clipping>::reserve(n); return true; }
++ bool push_back(const Clipping& c) { std::vector<Clipping>::push_back(c); return true; }
++ void release() { clear(); }
++};
++bool clippingHasSourceRange(const Clipping& c) { return c.sourceStart != UINT32_MAX && c.sourceEnd != UINT32_MAX && c.sourceStart < c.sourceEnd; }
++bool clippingSourceRangeBlocked(const Clipping& c) { return c.sourceStart==UINT32_MAX && c.sourceEnd==0; }
++bool skipText(FsFile& f, uint32_t n) { return f.position()<=f.size() && n<=f.size()-f.position() && f.seekCur(n); }
++bool readHeaderString(FsFile& f) { std::string value; return serialization::tryReadString(f,value); }
++struct ClippingStore {
++ std::vector<std::string> deletedIds;
++ bool readFromFile(const std::string& path,ClippingRecords& out,size_t onlyIndex=SIZE_MAX,bool reserveImportSlot=false);
++};
++bool ClippingStore::readFromFile(const std::string& path, ClippingRecords& out, const size_t onlyIndex,
++                                 const bool reserveImportSlot) {
++  out.clear();
++  deletedIds.clear();
++  bool complete = false;
++  struct ClearPartial {
++    ClippingRecords& records;
++    std::vector<std::string>& deletions;
++    bool& complete;
++    ~ClearPartial() {
++      if (!complete) {
++        records.release();
++        deletions.clear();
++      }
++    }
++  } clearPartial{out, deletedIds, complete};
++  FsFile f;
++  if (!Storage.openFileForRead("CLIP", path, f)) {
++    return false;
++  }
++
++  uint8_t version = 0;
++  uint16_t count = 0;
++
++  if (!serialization::tryReadPod(f, version) || (version < LEGACY_VERSION || version > VERSION) ||
++      !serialization::tryReadPod(f, count) || !readHeaderString(f) || !readHeaderString(f) || !readHeaderString(f)) {
++    f.close();
++    LOG_ERR("CLIP", "Failed to read clipping header: %s", path.c_str());
++    return false;
++  }
++
++  if (count > CLIPPING_MAX_PER_BOOK) {
++    LOG_ERR("CLIP", "Clipping count %u exceeds max, file may be corrupt: %s", count, path.c_str());
++    f.close();
++    return false;
++  }
++
++  if (version >= SYNC_ID_VERSION) {
++    uint16_t deletedCount = 0;
++    if (!serialization::tryReadPod(f, deletedCount) || deletedCount > CLIPPING_MAX_PER_BOOK) {
++      f.close();
++      return false;
++    }
++    deletedIds.reserve(deletedCount);
++    for (uint16_t i = 0; i < deletedCount; ++i) {
++      std::string id;
++      uint32_t length = 0;
++      if (!serialization::tryReadPod(f, length) || length == 0 ||
++          length > MAX_ID_BYTES + (version >= SCOPED_ID_VERSION ? SCOPE_BYTES : 0) ||
++          (version >= SCOPED_ID_VERSION && length <= SCOPE_BYTES)) {
++        f.close();
++        return false;
++      }
++      id.resize(length);
++      if (f.read(id.data(), length) != static_cast<int>(length)) {
++        f.close();
++        return false;
++      }
++      // v5 tombstones have no destination. Replaying them under current credentials is unsafe.
++      if (version >= SCOPED_ID_VERSION) deletedIds.push_back(std::move(id));
++    }
++  }
++
++  if (onlyIndex != SIZE_MAX && onlyIndex >= count) {
++    // The scope guard reads this through its reference on return.
++    // cppcheck-suppress unreadVariable
++    complete = true;
++    f.close();
++    return true;
++  }
++  // Import needs one additional slot. Reserve it with the initial index so
++  // appending never holds two book-sized arrays at once (up to 256 records).
++  const size_t capacity = reserveImportSlot ? std::min<size_t>(count + 1, CLIPPING_MAX_PER_BOOK) : count;
++  if (!out.reserve(onlyIndex == SIZE_MAX ? capacity : 1)) {
++    LOG_ERR("CLIP", "OOM: %u clipping records", count);
++    f.close();
++    return false;
++  }
++  for (uint16_t i = 0; i < count; ++i) {
++    Clipping clipping;
++    if (!serialization::tryReadPod(f, clipping.spineIndex) || !serialization::tryReadPod(f, clipping.startPage) ||
++        !serialization::tryReadPod(f, clipping.endPage) || !serialization::tryReadPod(f, clipping.pageCount) ||
++        !serialization::tryReadPod(f, clipping.startWordIndex) ||
++        !serialization::tryReadPod(f, clipping.endWordIndex) || !serialization::tryReadPod(f, clipping.wordCount) ||
++        !serialization::tryReadPod(f, clipping.paragraphIndex) || !serialization::tryReadPod(f, clipping.timestamp)) {
++      f.close();
++      LOG_ERR("CLIP", "Clipping file truncated at record %u: %s", i, path.c_str());
++      return false;
++    }
++    if (version >= LAYOUT_SIGNATURE_VERSION && !serialization::tryReadPod(f, clipping.layoutSignature)) {
++      f.close();
++      LOG_ERR("CLIP", "Clipping file truncated at layout signature, record %u: %s", i, path.c_str());
++      return false;
++    }
++    if (version >= TABLE_SELECTION_VERSION && !serialization::tryReadPod(f, clipping.tableSelection)) {
++      f.close();
++      LOG_ERR("CLIP", "Clipping file truncated at table selection, record %u: %s", i, path.c_str());
++      return false;
++    }
++    if (version >= SOURCE_RANGE_VERSION) {
++      if (!serialization::tryReadPod(f, clipping.sourceStart) || !serialization::tryReadPod(f, clipping.sourceEnd) ||
++          (!clippingHasSourceRange(clipping) && !clippingSourceRangeBlocked(clipping) &&
++           (clipping.sourceStart != UINT32_MAX || clipping.sourceEnd != UINT32_MAX))) {
++        f.close();
++        LOG_ERR("CLIP", "Invalid source range, record %u: %s", i, path.c_str());
++        return false;
++      }
++    }
++    if (version >= SYNC_ID_VERSION) {
++      uint32_t length = 0;
++      if (!serialization::tryReadPod(f, length) || length > MAX_ID_BYTES + SCOPE_BYTES || !skipText(f, length)) {
++        f.close();
++        return false;
++      }
++      uint8_t flags = 0;
++      if (!serialization::tryReadPod(f, flags) || flags > (version >= SCOPED_ID_VERSION ? 3 : 1)) {
++        f.close();
++        return false;
++      }
++      clipping.uploaded = (flags & 1) != 0;
++      clipping.scoped = (flags & 2) != 0;
++      if (clipping.scoped ? length <= SCOPE_BYTES : length > MAX_ID_BYTES) {
++        f.close();
++        return false;
++      }
++      clipping.syncKeyLength = static_cast<uint8_t>(length);
++    }
++    if (version < SYNC_ID_VERSION) clipping.uploaded = true;
++    if (f.read(reinterpret_cast<uint8_t*>(clipping.chapterTitle), sizeof(clipping.chapterTitle)) !=
++        sizeof(clipping.chapterTitle)) {
++      f.close();
++      LOG_ERR("CLIP", "Clipping file truncated at chapter title, record %u: %s", i, path.c_str());
++      return false;
++    }
++    clipping.chapterTitle[sizeof(clipping.chapterTitle) - 1] = '\0';
++    const int safeTitleLength =
++        utf8SafeTruncateBuffer(clipping.chapterTitle, static_cast<int>(strlen(clipping.chapterTitle)));
++    clipping.chapterTitle[safeTitleLength] = '\0';
++    if (version == LEGACY_VERSION) {
++      uint32_t textLen = 0;
++      if (!serialization::tryReadPod(f, textLen)) {
++        f.close();
++        LOG_ERR("CLIP", "Clipping file truncated at text length, record %u: %s", i, path.c_str());
++        return false;
++      }
++      clipping.textOffset = static_cast<uint32_t>(f.position());
++      clipping.textLength = static_cast<uint16_t>(std::min<uint32_t>(textLen, CLIPPING_TEXT_MAX));
++      if (textLen > 0 && !skipText(f, textLen)) {
++        f.close();
++        LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
++        return false;
++      }
++    } else {
++      if (!serialization::tryReadPod(f, clipping.textLength)) {
++        f.close();
++        LOG_ERR("CLIP", "Clipping file truncated at text length, record %u: %s", i, path.c_str());
++        return false;
++      }
++      if (clipping.textLength > CLIPPING_TEXT_MAX) {
++        f.close();
++        LOG_ERR("CLIP", "Clipping text length %u exceeds max, record %u: %s", clipping.textLength, i, path.c_str());
++        return false;
++      }
++      clipping.textOffset = static_cast<uint32_t>(f.position());
++      if (clipping.textLength > 0 && !skipText(f, clipping.textLength)) {
++        f.close();
++        LOG_ERR("CLIP", "Clipping file truncated at text, record %u: %s", i, path.c_str());
++        return false;
++      }
++    }
++    if ((onlyIndex == SIZE_MAX || onlyIndex == i) && !out.push_back(clipping)) {
++      LOG_ERR("CLIP", "OOM: clipping record");
++      f.close();
++      return false;
++    }
++    if (onlyIndex == i) break;
++  }
++
++  // The scope guard reads this through its reference on return.
++  // cppcheck-suppress unreadVariable
++  complete = true;
++  f.close();
++  return true;
++}
++} // namespace stockV7

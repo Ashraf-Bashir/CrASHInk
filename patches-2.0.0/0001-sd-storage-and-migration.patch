@@ -269,10 +269,10 @@ index 669d814ddd3d38f6cc6b0da1a009f01e55b7cc7e..3a76d9b86d8eb5a491367f33d43ed49f
 
 diff --git a/src/util/CrASHinkStorage.cpp b/src/util/CrASHinkStorage.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..42a71445f7267fc5d109e82c44311854c1483cdf
+index 0000000000000000000000000000000000000000..4e6612f4b38e1a6dd6103f76aa32562d7a68e46d
 --- /dev/null
 +++ b/src/util/CrASHinkStorage.cpp
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,150 @@
 +#include "CrASHinkStorage.h"
 +
 +#include <Epub.h>
@@ -351,6 +351,16 @@ index 0000000000000000000000000000000000000000..42a71445f7267fc5d109e82c44311854
 +    entry.close();
 +    if (!file || length == 0 || length >= sizeof(name) - 1) continue;
 +    const std::string_view leaf(name, length);
++    if (clippings) {
++      // Stock v2 quote files stay discoverable by stock firmware. They are
++      // copied/validated per book by ClippingStore, never moved at boot.
++      FsFile quote; uint8_t version = 0;
++      const auto quotePath = std::string(source) + "/" + name;
++      if (!Storage.openFileForRead("CRASHINK", quotePath, quote)) { allMoved = false; continue; }
++      const bool read = quote.read(&version, 1) == 1; quote.close();
++      if (!read) { allMoved = false; continue; }
++      if (version == 7) continue;
++    }
 +    const char* target = clippings ? clippingTarget : nullptr;
 +    if (!clippings) {
 +      if (leaf.starts_with("readest.") || leaf.starts_with("readest_")) target = readestTarget;
@@ -400,14 +410,12 @@ index 0000000000000000000000000000000000000000..42a71445f7267fc5d109e82c44311854
 +
 +  bool legacyMoved = Storage.exists(previousMarker) && Storage.exists(clippingTarget);
 +  if (!legacyMoved) {
-+    if (Storage.exists(clippingSource) && !Storage.exists(clippingTarget))
-+      Storage.rename(clippingSource, clippingTarget);
 +    if (!Storage.ensureDirectoryExists(clippingTarget)) {
 +      LOG_ERR("CRASHINK", "Could not prepare clipping folder");
 +      return;
 +    }
 +    const bool clipsMoved = !Storage.exists(clippingSource) ||
-+                            (moveEntries(clippingSource, true) && Storage.rmdir(clippingSource));
++                            moveEntries(clippingSource, true);
 +    const bool filesMoved = !Storage.exists(legacyRoot) || moveEntries(legacyRoot, false);
 +    legacyMoved = clipsMoved && filesMoved;
 +  }

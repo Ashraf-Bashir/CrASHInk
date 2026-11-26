@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 83 selected native regression checks have been
+The X4 Pro firmware build and selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -16,10 +16,14 @@ check after installation.
 - Preserve native language-pack and plugin identities, chapter-cache sharding,
   publisher typography, text darkness, ruled lines, word/character spacing,
   SDK display capabilities, and TLS hostname validation.
-- Adopt persistent source-position anchors and upstream-style checked clipping
-  indexes while retaining custom colors, notes, and large quote support. The
-  custom v8 format reads v1–v6 files and keeps a `.pre-v8.bak` copy on the first
-  successful upgrade. Restoring that copy is a manual step when downgrading.
+- Adopt persistent source-position anchors and stock-compatible v7 clipping cores.
+  Colors and notes use SHA256-checked companion metadata under the consolidated
+  `/.crashink/.clippings` folder. Legacy custom v1–v6/v8 files migrate with an
+  exact `.pre-native.bak`; older `.pre-v8.bak` copies remain untouched. Stock v7
+  files import on book open when no local history exists, without moving the
+  stock source. crASHink keeps its 65,535-quote / 60-KiB limits; stock firmware
+  still applies its own 256-quote / 4-KiB guards. See
+  [storage and recovery details](../docs/crashink-clipping-storage.md).
   Source anchors are captured for new selections; old passages migrate only
   after their positions are verified. Ambiguous repeated text remains on the
   fallback matcher. Edits invalidate old anchors and partial UTF-8 selections
@@ -37,10 +41,11 @@ check after installation.
   overlapping pieces cannot invert glyphs twice.
 - Multiword touch selections save on release without a Lookup/Clip prompt.
   Single-word holds retain lookup; saved quote controls use non-flashing refreshes.
-- Clipping rewrites use checked scratch allocation and atomic publication.
-  Mutations mark the native clipping-sync queue. Native sync identities remain
-  in a separate sidecar; stock v2 clipping files are not imported. This keeps
-  colors/notes compatible without confusing the two on-disk formats.
+- Clipping rewrites use checked scratch allocation and publish the matching
+  companion before the atomic core commit. Notes/colors do not add per-page SD
+  scans. Native sync IDs and scoped deletions survive rewrites; custom sync
+  bindings migrate into prepared native cores. The prior custom append shortcut
+  is replaced by checked native rewrites, so large-book saves can do more I/O.
 - Keep v2 alternating CRC/sequence progress records and add reading timestamps.
   Read old crASHink timestamp records without discarding position freshness.
 - Use `reader_settings.v2.bin` for the new per-book settings schema. Old v1
