@@ -1,16 +1,3 @@
-diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 6a2697aea23eb17eea670f7763a82411921530d5..ff211d6d9d445ba7c557e86bf2373993e4baf1d3 100644
---- a/CHANGELOG.md
-+++ b/CHANGELOG.md
-@@ -6,6 +6,8 @@
-
- - Library and Home cover grids show saved reading percentages in high-contrast badges.
-
-+- Custom sleep-screen rotation accepts JPEG, PNG, and the first frame of GIF images alongside BMPs.
-+
- - The reader’s swipe-down drawer has a Library shortcut. Display → Frontlight offers independent black border widths from 0 to 16 pixels on each edge to mask light leakage.
- - crASHink adds a reader Library shortcut and independent frontlight leakage borders.
-
 diff --git a/docs/user-guide.md b/docs/user-guide.md
 index ccae5ace771fb371c3c4a04dfc4731a1af6211f4..21c30a1edac39048b9a77fabf27455f1385d8480 100644
 --- a/docs/user-guide.md
@@ -788,6 +775,28 @@ index 2365a0b977d748ffa220140843332b5fee4f3034..06dfc8b998c8f6439ead03a35b67c5f3
    // PUT streaming state (raw() is called in chunks)
    HalFile _putFile;
    String _putPath;
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6a2697aea23eb17eea670f7763a82411921530d5..7b0a1eed96722937b47ace8950aec1ea53a80a40 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,11 +1,17 @@
+ ## [Unreleased]
+
++### Fixed
++
++- Enter hardware deep sleep after saving the sleep screen so a single Power press can wake X4 Pro again.
++
+ ### Added
+
+ - Display settings offer light grey, dark grey, and solid saved highlights, with contrasting text and a White option in Dark Mode.
+
+ - Library and Home cover grids show saved reading percentages in high-contrast badges.
+
++- Custom sleep-screen rotation accepts JPEG, PNG, and the first frame of GIF images alongside BMPs.
++
+ - The reader’s swipe-down drawer has a Library shortcut. Display → Frontlight offers independent black border widths from 0 to 16 pixels on each edge to mask light leakage.
+ - crASHink adds a reader Library shortcut and independent frontlight leakage borders.
+
 diff --git a/scripts/patch_animatedgif.py b/scripts/patch_animatedgif.py
 index ab1dd67880e7b0bc9aad1642234f7c2c543da1a8..c440a294fd4ca1c97804199c6905e457e92cfa6f 100644
 --- a/scripts/patch_animatedgif.py
@@ -1003,7 +1012,7 @@ index c98b7b42021f08c5147b7e4c8f3e740bad65b4f8..685171a5dc5a87e104c1913d26c893a5
 
  void SleepActivity::renderBlankSleepScreen() const {
 diff --git a/src/main.cpp b/src/main.cpp
-index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010cdbe36d52 100644
+index ffea86789aada98071fa6e56fe3508335d78575f..c4de0d262a5be101eb06f900f372bba644561a81 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1142,41 +1142,6 @@ static bool loadSleepFrameBuffer() {
@@ -1048,7 +1057,16 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
  // Wake validation runs before the SD card and its settings file are available.
  // Mirror the one setting that changes its behavior while entering sleep, so a
  // permitted short wake press can pass verification even after the button has
-@@ -1590,7 +1555,8 @@ void setup() {
+@@ -1419,6 +1384,8 @@ void enterDeepSleep(bool fromTimeout) {
+     return;
+   }
+ #endif
++  Frontlight.prepareForDeepSleep();
++  powerManager.startDeepSleep(gpio);
+ }
+
+ void silentRestartAfterReadestAutoSync(const bool toReader, const bool discardSleepFrame) {
+@@ -1590,7 +1557,8 @@ void setup() {
 
    const auto wakeupReason = usbSleepWake ? HalGPIO::WakeupReason::PowerButton : gpio.getWakeupReason();
  #ifndef SIMULATOR
@@ -1058,7 +1076,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
    if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !usbSleepWake &&
        !(FREEINK_DEVICE_PICCO && gpio.isUsbConnected()) &&
        !gpio.verifyPowerButtonWakeup(shortPressWakes, CrossPointSettings::POWER_BUTTON_LONG_PRESS_MS)) {
-@@ -1629,17 +1595,10 @@ void setup() {
+@@ -1629,17 +1597,10 @@ void setup() {
  #endif
    trustedtime::init();
 
@@ -1076,7 +1094,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
  #endif
 
    LOG_INF("BOOT", "Wake route: %s", wakeupRouteName(wakeupReason));
-@@ -1837,20 +1796,14 @@ void setup() {
+@@ -1837,20 +1798,14 @@ void setup() {
                              : isSilentReboot   ? BootResume::Silent
                              : skipSplashOnWake ? BootResume::SplashlessWake
                                                 : BootResume::Splash;
@@ -1099,7 +1117,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
                         resume != BootResume::Network, useReaderRenderStack);
    logBootHeap("display and font resolver ready");
 
-@@ -1882,32 +1835,9 @@ void setup() {
+@@ -1882,32 +1837,9 @@ void setup() {
            x3WakeNeedsRefresh = false;
          }
  #ifndef SIMULATOR
@@ -1134,7 +1152,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
        }
        break;
      case BootResume::Splash:
-@@ -2047,17 +1977,13 @@ void setup() {
+@@ -2047,17 +1979,13 @@ void setup() {
      // target == home (or reader with no open book): land on home — don't fall
      // through to the sleep-wake "resume reader" logic, which fires on stale
      // openEpubPath + lastSleepFromReader from a prior session.
@@ -1154,7 +1172,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
                                       ? HalDisplay::HALF_REFRESH
                                       : HalDisplay::FAST_REFRESH;
      activityManager.goHome(HomeMenuItem::NONE, homeRefreshMode);
-@@ -2133,6 +2059,23 @@ static void idleDisplayWhileAwake() {
+@@ -2133,6 +2061,23 @@ static void idleDisplayWhileAwake() {
  #endif
  }
 
@@ -1178,7 +1196,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
  void loop() {
    static unsigned long maxLoopDuration = 0;
    const unsigned long loopStartTime = millis();
-@@ -2213,11 +2156,40 @@ void loop() {
+@@ -2213,11 +2158,40 @@ void loop() {
      logSerial.printf("SCREENSHOT_END\n");
    }
 
@@ -1221,7 +1239,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
  #endif
  #if FREEINK_DEVICE_PICCO
                                   || slideSwitchChanged
-@@ -2227,7 +2199,7 @@ void loop() {
+@@ -2227,7 +2201,7 @@ void loop() {
    idleDisplayWhileAwake();
 
    // Check for any user activity (button press or release) or active background work
@@ -1230,7 +1248,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
    const bool transitionWasAborted = storageTransitionAborted.exchange(false, std::memory_order_relaxed);
    if (userInputReceived || activityManager.preventAutoSleep() || transitionWasAborted ||
        usbResult == UsbSerialFileTransfer::ProcessResult::SyncActivity) {
-@@ -2246,6 +2218,17 @@ void loop() {
+@@ -2246,6 +2220,17 @@ void loop() {
      return;
    }
 
@@ -1248,7 +1266,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
    const bool modalOwnsInput = activityManager.blocksGlobalInput();
 
    // Keep Power + Down screenshot-only. The configurable chord below uses Up,
-@@ -2336,7 +2319,6 @@ void loop() {
+@@ -2336,7 +2321,6 @@ void loop() {
        lastActivityTime = millis();
        return;
      }
@@ -1256,7 +1274,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
      if (sleepTimeoutMs > 0 && buttonShortcutController.shouldQuickLockSleep(millis(), sleepTimeoutMs)) {
        LOG_DBG("SLP", "Quick Lock timeout triggered after %lu ms", sleepTimeoutMs);
        APP_STATE.quickLockResumePending = true;
-@@ -2349,6 +2331,12 @@ void loop() {
+@@ -2349,6 +2333,12 @@ void loop() {
        lastActivityTime = millis();
      }
      mappedInputManager.clearInjectedReleases();
@@ -1269,7 +1287,7 @@ index ffea86789aada98071fa6e56fe3508335d78575f..f89ab8a3fda94e3bfcbc60231e64010c
      return;
    }
 
-@@ -2371,17 +2359,6 @@ void loop() {
+@@ -2371,17 +2361,6 @@ void loop() {
      return;
    }
 
@@ -1312,6 +1330,141 @@ index af2d3dbf2f7b10ed96be949aca2729ad41c29328..7d0dbb534cc72550931e68cdff67dd4a
 +constexpr bool shouldInitializeSeamlessly(const Resume resume) { return resume != Resume::Splash; }
 
  }  // namespace SleepWakePolicy
+diff --git a/test/sleep_wake_policy/CMakeLists.txt b/test/sleep_wake_policy/CMakeLists.txt
+index 07a41b30cd4b5c5b4741a8702e75c309d5e659b3..83f0be79a14e2f32ccb4bf6ac34733f5888dee80 100644
+--- a/test/sleep_wake_policy/CMakeLists.txt
++++ b/test/sleep_wake_policy/CMakeLists.txt
+@@ -12,3 +12,12 @@ target_link_libraries(SleepWakePolicyTest PRIVATE
+ )
+
+ gtest_discover_tests(SleepWakePolicyTest)
++
++set(SLEEP_ENTRY_INC ${CMAKE_CURRENT_BINARY_DIR}/SleepEntry.inc)
++add_custom_command(OUTPUT ${SLEEP_ENTRY_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractSleepEntry.py ${REPO_ROOT}/src/main.cpp ${SLEEP_ENTRY_INC}
++ DEPENDS ExtractSleepEntry.py ${REPO_ROOT}/src/main.cpp)
++add_executable(SleepEntryTest SleepEntryTest.cpp ${SLEEP_ENTRY_INC})
++target_include_directories(SleepEntryTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_link_libraries(SleepEntryTest PRIVATE GTest::gtest_main)
++gtest_discover_tests(SleepEntryTest)
+diff --git a/test/sleep_wake_policy/ExtractSleepEntry.py b/test/sleep_wake_policy/ExtractSleepEntry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..829cac09634f65bca507ac8ec137ddd799845617
+--- /dev/null
++++ b/test/sleep_wake_policy/ExtractSleepEntry.py
+@@ -0,0 +1,7 @@
++from pathlib import Path
++import sys
++source, output = map(Path, sys.argv[1:])
++text = source.read_text()
++start = text.index('void enterDeepSleep(bool fromTimeout) {')
++end = text.index('\nvoid silentRestartAfterReadestAutoSync', start)
++output.write_text(text[start:end])
+diff --git a/test/sleep_wake_policy/SleepEntryTest.cpp b/test/sleep_wake_policy/SleepEntryTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6fea35f75839bc7db1707000ee49dcd65fa20cc
+--- /dev/null
++++ b/test/sleep_wake_policy/SleepEntryTest.cpp
+@@ -0,0 +1,99 @@
++#include <gtest/gtest.h>
++#include <algorithm>
++#include <optional>
++#include <string>
++#include <vector>
++#define FREEINK_DEVICE_PICCO 0
++#define CROSSINK_BATTERY_DIAG_LOG 0
++#define LOG_DBG(...) ((void)0)
++#define LOG_ERR(...) ((void)0)
++namespace {
++std::vector<std::string> events;
++bool storageOk = true, quick = false;
++struct RenderLock { static bool heldByCurrentTask() { return false; } };
++struct HalPowerManager {
++  struct Lock {};
++  void startDeepSleep(auto&) { events.push_back("hardware sleep"); }
++} powerManager;
++struct Gpio {
++  void stopButtonCapture() { events.push_back("stop buttons"); }
++  void startButtonCapture() { events.push_back("restart buttons"); }
++} gpio;
++struct State {
++  bool lastSleepFromReader = false, showBootScreen = true;
++  bool quickLockResumePending = false, quickLockRestoreFrontlight = false;
++  void saveToFile() { events.push_back("save"); }
++} APP_STATE;
++struct Settings {
++  int autoBackupStats = 0;
++  bool usesQuickResumeSleep(bool) { return quick; }
++  bool shouldTrackReadingStats() { return false; }
++} SETTINGS;
++struct ActivityManager {
++  bool isReaderActivity() { return true; }
++  std::string getCurrentBookPath() { return "/book.epub"; }
++  bool requestUpdateAndWait() { return true; }
++  bool goToSleep(bool) { events.push_back("sleep screen"); return false; }
++  void goHome() { events.push_back("home"); }
++} activityManager;
++struct Light {
++  void setOn(bool) { events.push_back("light off"); }
++  void prepareForDeepSleep() { events.push_back("light sleep"); }
++} Frontlight;
++struct Clock { bool isAvailable() { return false; } } halClock;
++struct StorageType {
++  bool exists(const char*) { return false; }
++  void remove(const char*) {}
++  bool shutdown() { events.push_back("storage shutdown"); return storageOk; }
++} Storage;
++struct Display { void deepSleep() { events.push_back("display sleep"); } } display;
++struct Token { void save(bool) {} } libraryScanSleepToken;
++namespace library { bool libraryIndexNeedsRefresh() { return false; } }
++namespace BoardConfig { struct Profile { const char* name = "x4-pro"; }; Profile ACTIVE; }
++namespace trustedtime { void note() {} }
++namespace BatteryDiagnosticLog { enum class Event { Sleep }; void record(Event, const char*) {} }
++namespace ReadestAutoSync { enum Mode { Sleep }; }
++struct Buttons {
++  bool isQuickLocked() { return false; }
++  int quickLockTrigger() { return 0; }
++  void toggleQuickLock(unsigned long, int) {}
++} buttonShortcutController;
++struct ReadingStatsDateTime {};
++bool readestSleepSyncBoot = false, deepSleepInProgress = false;
++constexpr const char* SLEEP_FRAME_FILE = "/sleep";
++unsigned long millis() { return 0; }
++bool updateLightLeakBorders() { return false; }
++void saveSleepFrameBuffer() { events.push_back("save frame"); }
++bool getCurrentLocalReadingStatsDateTime(ReadingStatsDateTime&) { return false; }
++bool backupGlobalStats(bool) { return true; }
++bool shouldReadestAutoSync(const std::string&) { return false; }
++void silentRestartToReadestAutoSync(ReadestAutoSync::Mode, const std::string&, bool) {}
++void queueStorageSaveAlert() { events.push_back("save error"); }
++void putTiltSensorToSleepForDeepSleep() {}
++void mirrorWakeShortPressToNvs() { events.push_back("wake policy saved"); }
++#include "SleepEntry.inc"
++}
++TEST(SleepEntry, NormalSleepActuallyEntersHardwareSleepAfterStorageAndPanel) {
++  for (bool quickResume : {false, true}) {
++    events.clear(); storageOk = true; quick = quickResume;
++    enterDeepSleep(false);
++    auto index = [](const char* event) {
++      return std::find(events.begin(), events.end(), event) - events.begin();
++    };
++    EXPECT_EQ(events.back(), "hardware sleep");
++    EXPECT_LT(index("stop buttons"), index("sleep screen"));
++    EXPECT_LT(index("save"), index("storage shutdown"));
++    EXPECT_LT(index("storage shutdown"), index("display sleep"));
++    EXPECT_LT(index("display sleep"), index("light sleep"));
++    EXPECT_LT(index("wake policy saved"), index("hardware sleep"));
++    EXPECT_LT(index("light sleep"), index("hardware sleep"));
++  }
++}
++TEST(SleepEntry, FailedStorageShutdownRestoresInputInsteadOfSleeping) {
++  events.clear(); storageOk = false; quick = false;
++  enterDeepSleep(true);
++  EXPECT_FALSE(deepSleepInProgress);
++  EXPECT_EQ(std::count(events.begin(), events.end(), "hardware sleep"), 0);
++  EXPECT_EQ(std::count(events.begin(), events.end(), "restart buttons"), 1);
++  EXPECT_EQ(events.back(), "home");
++}
 diff --git a/test/sleep_wake_policy/SleepWakePolicyTest.cpp b/test/sleep_wake_policy/SleepWakePolicyTest.cpp
 index 027d0179a3b9880b500f5506c0522f81c5c04abd..2390b5e1f5abfc8276f666d1339ab86452b63c53 100644
 --- a/test/sleep_wake_policy/SleepWakePolicyTest.cpp

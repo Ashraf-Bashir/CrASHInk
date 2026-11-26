@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 67 selected native regression checks have been
+The X4 Pro firmware build and 69 selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -40,6 +40,9 @@ check after installation.
   changes. Saved view caches remain reusable on later opens.
 - Library and EPUB generation share versioned thumbnail filenames; valid cached
   covers recover from transient paint failures without another conversion.
+- The normal sleep path reaches hardware deep sleep after shutting down storage,
+  display, and frontlight; a storage failure restores input instead. Regression
+  tests execute the real sleep-entry function and check this sequence.
 - A short Power press wakes X4 Pro even when released during initialization,
   independently of the awake short-press shortcut setting. Wake-release guards
   still prevent the same gesture from immediately putting it back to sleep.
