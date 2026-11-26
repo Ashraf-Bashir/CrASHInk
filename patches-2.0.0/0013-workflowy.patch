@@ -1,12 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3827720948222411b0f6f2b59c69efaf7be0b65e..f18f2d914aabbe8327a6b85f624f18ff32dcd03e 100644
+index 3827720948222411b0f6f2b59c69efaf7be0b65e..3ea280ec6f1b35f7fa437a060b5cfa75638e7941 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -5,6 +5,7 @@
  - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
  - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
-+- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Display complete share failures in the reusable scrollable Workflowy error screen, including transport, certificate and internal-RAM diagnostics. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
 
  - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
  - Group Readest account controls and auto-sync together under Readest in System settings.
@@ -40,14 +40,15 @@ index 3bbf4ec079fc5d9b39b21574906c1d4f3e530e9d..2be1c7b569ce9d9539497637584313cd
    -<network/FirmwareFlasher.cpp>
    -<network/OtaBootSwitch.cpp>
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..c3c4b96625c8f48117619dda843ca64ea9f93439 100644
+index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..bf06a489adf63b183a34ffc79aa98e86a32e9ddd 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -59,12 +59,15 @@
+@@ -59,12 +59,16 @@
  #include "reader/EpubReaderActivity.h"
  #include "reader/GlobalReadingStats.h"
  #include "reader/ReaderActivity.h"
 +#include "reader/WorkflowyShareActivity.h"
++#include "workflowy/WorkflowyErrorDetails.h"
 +#include "network/WifiSelectionActivity.h"
  #include "settings/OpdsServerListActivity.h"
  #include "settings/ReleaseNotesActivity.h"
@@ -59,7 +60,7 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..c3c4b96625c8f48117619dda843ca64e
  #include "util/SwipeAdjustment.h"
  #include "util/TwoFingerSwipe.h"
 
-@@ -672,6 +675,39 @@ void ActivityManager::loop() {
+@@ -672,6 +676,32 @@ void ActivityManager::loop() {
      mappedInput.setPowerAsConfirmInReaderMode(false);
    }
 
@@ -79,17 +80,10 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..c3c4b96625c8f48117619dda843ca64e
 +              if (!result.isCancelled && wifi && wifi->connected) workflowy::retryQueuedSharesAfterWifi();
 +            });
 +          } else {
-+            char feedback[160];
-+            const int status = workflowy::shareHttpStatus();
-+            if (status >= 400) snprintf(feedback, sizeof(feedback), "%s (HTTP %d)", I18n::getInstance().get(*error), status);
-+            else if (workflowy::shareTransportError())
-+              snprintf(feedback, sizeof(feedback), "%s: %s (0x%x)", I18n::getInstance().get(*error),
-+                  workflowy::shareFailureDetail(), unsigned(workflowy::shareTransportError()));
-+            else snprintf(feedback, sizeof(feedback), "%s: %s", I18n::getInstance().get(*error), workflowy::shareFailureDetail());
-+            GUI.drawPopup(renderer, feedback, true);
-+            workflowyNoticeDuration = 6000;
-+            workflowyNoticeShownAt = millis();
-+            workflowyNoticeVisible = true;
++            auto details = makeUniqueNoThrow<WorkflowyErrorDetails>(renderer, mappedInput,
++                I18n::getInstance().get(*error), workflowy::shareErrorDetails());
++            if (details) pushActivity(std::move(details));
++            else LOG_ERR("WF", "Cannot allocate share error details screen");
 +          }
 +        }
 +      }
@@ -99,7 +93,7 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..c3c4b96625c8f48117619dda843ca64e
    processPendingActivities();
  }
 
-@@ -841,6 +877,27 @@ void ActivityManager::processPendingActivities() {
+@@ -841,6 +871,27 @@ void ActivityManager::processPendingActivities() {
      }
    }
 
@@ -127,7 +121,7 @@ index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..c3c4b96625c8f48117619dda843ca64e
    if (APP_STATE.hasPendingAlert.load(std::memory_order_acquire) && pendingAction == PendingAction::None) {
      APP_STATE.hasPendingAlert.store(false, std::memory_order_relaxed);
      pushActivity(std::make_unique<AlertActivity>(renderer, mappedInput));
-@@ -1312,7 +1369,9 @@ void ActivityManager::popActivity() {
+@@ -1312,7 +1363,9 @@ void ActivityManager::popActivity() {
    pendingAction = PendingAction::Pop;
  }
 
@@ -323,16 +317,17 @@ index 1b38d1497e5b7166b2613b6bb11348b92d5ddfc9..d3160c524b61f771e58160fa724d03f7
            returnAction(true);
 diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e64c873f9971cf4589418162a2b311f56650d6a3
+index 0000000000000000000000000000000000000000..7876c9f19fcd56977c22ae578aa4349770f4c2d3
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.h
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,24 @@
 +#pragma once
 +
 +#include <I18n.h>
 +
 +#include <cstddef>
 +#include <optional>
++#include <string>
 +
 +namespace workflowy {
 +// SIZE_MAX sends all clippings in the current book that match the list filter.
@@ -340,6 +335,7 @@ index 0000000000000000000000000000000000000000..e64c873f9971cf4589418162a2b311f5
 +bool shareInProgress();
 +bool shareNeedsWifiPicker();
 +void retryQueuedSharesAfterWifi();
++std::string shareErrorDetails();
 +int shareHttpStatus();
 +int shareTransportError();
 +const char* shareFailureDetail();
@@ -1226,11 +1222,12 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..24da7fb79c1f724490d92a423dbaf6c248b098e1
+index 0000000000000000000000000000000000000000..d7f052fdce96698e8840bacaa7323e844cc6612b
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5317 @@
+@@ -0,0 +1,5238 @@
 +#include "WorkflowyDailyActivity.h"
++#include "WorkflowyErrorDetails.h"
 +
 +#include <ArduinoJson.h>
 +#include <FreeInkUIGfxRenderer.h>
@@ -1696,86 +1693,6 @@ index 0000000000000000000000000000000000000000..24da7fb79c1f724490d92a423dbaf6c2
 +  return text && text != tr(STR_WORKFLOWY_CAPTURE_QUEUED) && text != tr(STR_WORKFLOWY_EMPTY);
 +}
 +
-+class WorkflowyErrorDetails final : public Activity {
-+ public:
-+  WorkflowyErrorDetails(GfxRenderer& renderer, MappedInputManager& input, const char* summary, std::string details)
-+      : Activity("WorkflowyErrorDetails", renderer, input), summary(summary), details(std::move(details)) {}
-+
-+  void loop() override {
-+    using Button = MappedInputManager::Button;
-+    using Swipe = MappedInputManager::SwipeDir;
-+    if (mappedInput.wasReleased(Button::Back) || mappedInput.wasReleased(Button::Confirm) ||
-+        TouchHeaderBackButton::wasTapped(mappedInput, renderer)) return finish();
-+    const auto button = doneButton();
-+    if (mappedInput.wasTapInRect(button.x, button.y, button.width, button.height)) return finish();
-+    const auto swipe = mappedInput.wasSwipe();
-+    const bool forward = swipe == Swipe::Up || mappedInput.wasReleased(Button::Down);
-+    const bool backward = swipe == Swipe::Down || mappedInput.wasReleased(Button::Up);
-+    if (!forward && !backward) return;
-+    {
-+      RenderLock lock(*this);
-+      offset = std::clamp(offset + (forward ? pageLines : -pageLines), 0, maxOffset);
-+    }
-+    requestUpdate();
-+  }
-+
-+  void render(RenderLock&&) override {
-+    renderer.clearScreen();
-+    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
-+    TouchHeaderBackButton::draw(renderer, header, tr(STR_WORKFLOWY_ERROR_DETAILS), false);
-+    int top, right, bottom, left;
-+    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+    int y = std::max(top, header.y + header.height) + 14;
-+    std::vector<workflowy::TextSpan> lines;
-+    const int width = renderer.getScreenWidth() - left - right - 24;
-+    const auto draw = [&](std::string_view text, EpdFontFamily::Style style) {
-+      lines.clear();
-+      workflowy::wrapOutlineText(text, width, [&](std::string_view line) {
-+        return renderer.getTextWidth(UI_12_FONT_ID, std::string(line).c_str(), style);
-+      }, lines);
-+      const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID) + 6;
-+      int first = 0, count = static_cast<int>(lines.size());
-+      if (style != EpdFontFamily::BOLD) {
-+        pageLines = std::max(1, (doneButton().y - y - 24) / lineHeight);
-+        maxOffset = std::max(0, count - pageLines);
-+        offset = std::min(offset, maxOffset);
-+        first = offset;
-+        count = std::min(count, first + pageLines);
-+      }
-+      for (int i = first; i < count; ++i) {
-+        const auto begin = lines[i].begin, end = lines[i].end;
-+        renderer.drawText(UI_12_FONT_ID, left + 12, y, std::string(text.substr(begin, end - begin)).c_str(), true, style);
-+        y += lineHeight;
-+      }
-+    };
-+    draw(summary, EpdFontFamily::BOLD);
-+    if (!details.empty()) {
-+      y += 12;
-+      draw(details, EpdFontFamily::REGULAR);
-+      if (maxOffset) {
-+        const char* more = offset == 0 ? "↓" : offset == maxOffset ? "↑" : "↑   ↓";
-+        renderer.drawCenteredText(SMALL_FONT_ID, doneButton().y - 22, more);
-+      }
-+    }
-+    const auto button = doneButton();
-+    renderer.drawRoundedRect(button.x, button.y, button.width, button.height, 1, 4, true);
-+    renderer.drawCenteredText(UI_12_FONT_ID, button.y + (button.height - renderer.getLineHeight(UI_12_FONT_ID)) / 2,
-+                              tr(STR_DONE));
-+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-+  }
-+
-+ private:
-+  Rect doneButton() const {
-+    int top, right, bottom, left;
-+    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-+    const int width = std::min(160, renderer.getScreenWidth() - left - right - 24);
-+    const int x = (renderer.getScreenWidth() + left - right - width) / 2;
-+    return Rect{x, renderer.getScreenHeight() - bottom - 54, width, 44};
-+  }
-+  const char* summary;
-+  std::string details;
-+  int offset = 0, maxOffset = 0, pageLines = 1;
-+};
 +
 +std::string plainTitle(const char* value, std::string* styles = nullptr) {
 +  std::string title;
@@ -8368,10 +8285,10 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#include "Harness.h"
 diff --git a/test/workflowy_share/stubs/Harness.h b/test/workflowy_share/stubs/Harness.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..cf1ac7f0195dad3854a849869429823953fb27b0
+index 0000000000000000000000000000000000000000..498fbc5a42a4ae17efdfc550ce3521eee3383343
 --- /dev/null
 +++ b/test/workflowy_share/stubs/Harness.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,99 @@
 +#pragma once
 +#include <ArduinoJson.h>
 +#include <algorithm>
@@ -8467,6 +8384,9 @@ index 0000000000000000000000000000000000000000..cf1ac7f0195dad3854a8498694298239
 + else {JsonDocument body;assert(!deserializeJson(body,h->body));char id[48];std::snprintf(id,sizeof(id),"aaaaaaaa-aaaa-aaaa-aaaa-%012zu",remote.size()+1);remote.push_back({id,body["parent_id"]|"",body["name"]|""});doc["item_id"]=id;
 + if((loseQuoteResponse||loseQuoteWithStatus)&&remote.back().name.find("quote")!=std::string::npos){h->status=loseQuoteWithStatus?200:0;loseQuoteResponse=loseQuoteWithStatus=false;return ESP_FAIL;}}
 + serializeJson(doc,response);esp_http_client_event_t e{HTTP_EVENT_ON_DATA,h->c.user_data,response.data(),static_cast<int>(response.size())};return h->c.event_handler(&e);}
++inline int esp_http_client_get_errno(Http*){return 111;}
++inline int esp_http_client_get_and_clear_last_tls_error(Http*,int* code,int* flags){*code=-32512;*flags=8;return 0x8010;}
++inline const char* esp_err_to_name(int code){return code==0?"ESP_OK":code==-1?"ESP_FAIL":"TLS_ERROR";}
 +inline int esp_http_client_get_status_code(Http* h){return h->status;}inline void esp_http_client_cleanup(Http* h){delete h;}
 diff --git a/test/workflowy_share/stubs/I18n.h b/test/workflowy_share/stubs/I18n.h
 new file mode 100644
@@ -8657,7 +8577,7 @@ index 0000000000000000000000000000000000000000..cfb600e9bb06c38f38c3a534c0b7365e
 +Path(sys.argv[2]).write_text('\n'.join(parts))
 diff --git a/test/workflowy_ui/ExtractStatus.py b/test/workflowy_ui/ExtractStatus.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..bed4ade73d27017365e3492cb0740948bfadc67c
+index 0000000000000000000000000000000000000000..965623cf92bdb631ef3b6faf0ad8231df83ec8ff
 --- /dev/null
 +++ b/test/workflowy_ui/ExtractStatus.py
 @@ -0,0 +1,28 @@
@@ -8669,7 +8589,7 @@ index 0000000000000000000000000000000000000000..bed4ade73d27017365e3492cb0740948
 +start = source.index('void WorkflowyDailyActivity::drawStatus(')
 +end = source.index('void WorkflowyDailyActivity::render(', start)
 +error_start = source.index('bool isErrorNotice(')
-+error_end = source.index('class WorkflowyErrorDetails', error_start)
++error_end = source.index('std::string plainTitle', error_start)
 +notice_start = source.index('void WorkflowyDailyActivity::showMessage(')
 +notice_end = source.index('std::string WorkflowyDailyActivity::errorDescription()', notice_start)
 +Path(sys.argv[2]).write_text(source[error_start:error_end] + source[notice_start:notice_end] + source[start:end])
@@ -9009,10 +8929,10 @@ index 3ec3dc53ba802dbe8ced61e082812469a34c4eff..a6aec6ca59f691d2cccaaa8c8bb4da09
 +STR_WIFI_CONN_FAILED: "Wi-Fi connection failed"
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622314288e1
+index 0000000000000000000000000000000000000000..9ca6a616532bd40eaef9e77c963853608d170cf2
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,592 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -9092,6 +9012,9 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +std::atomic<StrId> error{StrId::STR_WORKFLOWY_SENT};
 +std::atomic<int> lastHttpStatus{0};
 +std::atomic<int> lastTransportError{0};
++std::atomic<int> lastTlsError{0}, lastTlsCode{0}, lastTlsFlags{0}, lastSocketError{0}, lastResponseStatus{0};
++std::atomic<size_t> requestFree{0}, requestLargest{0};
++std::atomic<const char*> requestStage{"Connect Wi-Fi"};
 +std::atomic<const char*> failureDetail{""};
 +std::atomic<bool> needsWifiPicker{false}, manualWifiOwned{false};
 +
@@ -9198,6 +9121,7 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +      sink.size += event->data_len; return ESP_OK;
 +    };
 +    const auto heap = byteHeapSnapshot(MemoryPool::Internal);
++    requestFree.store(heap.free); requestLargest.store(heap.largest);
 +    // Reject only critical starvation. Wi-Fi has already allocated its
 +    // buffers here; a second 112 KiB/32 KiB gate silently stranded normal
 +    // shares. HTTP/TLS report their own fallible allocation/transport errors.
@@ -9216,6 +9140,11 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +    const int status = esp_http_client_get_status_code(client);
 +    lastHttpStatus.store(result == ESP_OK ? status : 0);
 +    lastTransportError.store(result);
++    lastResponseStatus.store(status);
++    lastSocketError.store(esp_http_client_get_errno(client));
++    int tlsCode = 0, tlsFlags = 0;
++    lastTlsError.store(esp_http_client_get_and_clear_last_tls_error(client, &tlsCode, &tlsFlags));
++    lastTlsCode.store(tlsCode); lastTlsFlags.store(tlsFlags);
 +    if (result != ESP_OK) failureDetail.store("HTTPS transport failed");
 +    esp_http_client_cleanup(client);
 +    const bool saved = !capture || response.sync();
@@ -9234,6 +9163,7 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +      if (std::isalnum(ch) || ch == '-' || ch == '_') encoded += ch;
 +      else { encoded += '%'; encoded += hex[ch >> 4]; encoded += hex[ch & 15]; }
 +    }
++    requestStage.store("Find book group");
 +    int status = request(std::string(API_URL) + "?parent_id=" + encoded, false, {}, true);
 +    const auto failure = [](int status) {
 +      return status == 401 || status == 403 ? StrId::STR_WORKFLOWY_AUTH_FAILED
@@ -9258,6 +9188,7 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +    create["position"] = "bottom";
 +    std::string body;
 +    if (!serializeJson(create, body) || create.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++    requestStage.store("Create book group");
 +    status = request(API_URL, true, body, true);
 +    if (status < 200 || status >= 300) return failure(status);
 +    JsonDocument result(&shareJsonAllocator);
@@ -9332,6 +9263,7 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +      if (checkRemoteQuote) {
 +        // A previous POST may have reached Workflowy before its response was lost.
 +        // Compare actual child text before retrying that first unacknowledged quote.
++        requestStage.store("Check previously sent quote");
 +        const int listed = request(std::string(API_URL) + "?parent_id=" + bookParent, false, {}, true);
 +        if (listed != 200) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
 +        FsFile response;
@@ -9354,6 +9286,7 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +      }
 +      body.clear();
 +      if (!serializeJson(quote, body) || quote.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++      requestStage.store("Send quote");
 +      const int status = request(API_URL, true, body, false);
 +      if (status == 401 || status == 403) return StrId::STR_WORKFLOWY_AUTH_FAILED;
 +      if (status < 200 || status >= 300) return status <= 0 ? StrId::STR_WORKFLOWY_NETWORK_FAILED : StrId::STR_WORKFLOWY_SEND_FAILED;
@@ -9490,6 +9423,10 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +    workerStartedAt = millis();
 +    lastHttpStatus.store(0);
 +    lastTransportError.store(0);
++    lastTlsError.store(0); lastTlsCode.store(0); lastTlsFlags.store(0);
++    lastSocketError.store(0); lastResponseStatus.store(0);
++    requestFree.store(0); requestLargest.store(0);
++    requestStage.store("Connect Wi-Fi");
 +    failureDetail.store("");
 +    needsWifiPicker.store(false);
 +    MemoryBudget::logEpubHeapPools("share.start");
@@ -9554,6 +9491,23 @@ index 0000000000000000000000000000000000000000..d8618a71115c8f82fbd10550e0dd1622
 +  pendingKick.store(true);
 +}
 +
++std::string workflowy::shareErrorDetails() {
++  // Bounded diagnostic snapshot, copied only when opening the failure screen.
++  // Contains no credential, request body, quote, or destination information.
++  char details[512];
++  const int transport = lastTransportError.load(), tls = lastTlsError.load();
++  snprintf(details, sizeof(details),
++      "Step: %s\n%s\nHTTP: %d\nTransport: %s (0x%x)\nTLS: %s (0x%x)\n"
++      "TLS library code: %d\nCertificate flags: 0x%x\nSocket errno: %d\n"
++      "Internal RAM before request: %u KB free; largest block %u KB\n\n"
++      "Quote remains queued on the SD card. Retry Share after resolving the error.",
++      requestStage.load(), failureDetail.load(), lastResponseStatus.load(),
++      esp_err_to_name(transport), unsigned(transport), esp_err_to_name(tls), unsigned(tls),
++      lastTlsCode.load(), unsigned(lastTlsFlags.load()), lastSocketError.load(),
++      unsigned(requestFree.load()/1024), unsigned(requestLargest.load()/1024));
++  return details;
++}
++
 +int workflowy::shareHttpStatus() { return lastHttpStatus.load(); }
 +int workflowy::shareTransportError() { return lastTransportError.load(); }
 +const char* workflowy::shareFailureDetail() { return failureDetail.load(); }
@@ -9613,10 +9567,10 @@ index f9a4c85e2fa46f97fc2ced9c422bc631641ae73c..f690b63c1740a302e89c70a9ac1fbf43
    pages.loop();
 diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..39a0eeb4028d905c5a76a34cd0dbe073d14f103a
+index 0000000000000000000000000000000000000000..a82af5d20c2b5d4790e6d5dff3435896c8d53ce1
 --- /dev/null
 +++ b/test/workflowy_share/WorkflowyShareTest.cpp
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,57 @@
 +#include "Harness.h"
 +#include "MemoryBudget.h"
 +#include "activities/reader/WorkflowyShareActivity.h"
@@ -9651,6 +9605,12 @@ index 0000000000000000000000000000000000000000..39a0eeb4028d905c5a76a34cd0dbe073
 + // A response with status 200 but failed transport must not acknowledge/delete the job.
 + CLIPPINGS.quote="Partial HTTP quote";loseQuoteWithStatus=true;workflowy::shareClippings(0);runWorker();
 + assert(jobs()==1&&workflowy::takeShareError()==StrId::STR_WORKFLOWY_NETWORK_FAILED);auto beforeRetry=remote.size();
++ const auto detail=workflowy::shareErrorDetails();
++ assert(detail.find("Step: Send quote")!=std::string::npos);
++ assert(detail.find("ESP_FAIL")!=std::string::npos&&detail.find("-32512")!=std::string::npos);
++ assert(detail.find("Certificate flags: 0x8")!=std::string::npos);
++ assert(detail.find("Socket errno: 111")!=std::string::npos);
++ assert(detail.find("test-key")==std::string::npos&&detail.find("Partial HTTP quote")==std::string::npos);
 + workflowy::shareClippings(0);runWorker();assert(jobs()==0&&remote.size()==beforeRetry);
 + forcedHttpStatus=401;CLIPPINGS.quote="Authentication quote";workflowy::shareClippings(0);runWorker();
 + assert(jobs()==1&&workflowy::shareHttpStatus()==401&&workflowy::takeShareError()==StrId::STR_WORKFLOWY_AUTH_FAILED);
@@ -9742,3 +9702,100 @@ index 0000000000000000000000000000000000000000..c42eadf1a8c08db1d3982212bf950483
 +  for(auto& day:view.calendarDays)day.items.clear();
 +  view.fitCalendarViewport();assert(view.calendarScroll==480&&view.calendarHourHeight==96);
 +}
+diff --git a/src/activities/workflowy/WorkflowyErrorDetails.h b/src/activities/workflowy/WorkflowyErrorDetails.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..10238825f9359393ccb79e966b06195e72325704
+--- /dev/null
++++ b/src/activities/workflowy/WorkflowyErrorDetails.h
+@@ -0,0 +1,91 @@
++#pragma once
++#include <algorithm>
++#include <string>
++#include <vector>
++#include "activities/Activity.h"
++#include "activities/RenderLock.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++#include "workflowy/WorkflowyOutlineLayout.h"
++
++class WorkflowyErrorDetails final : public Activity {
++ public:
++  WorkflowyErrorDetails(GfxRenderer& renderer, MappedInputManager& input, const char* summary, std::string details)
++      : Activity("WorkflowyErrorDetails", renderer, input), summary(summary), details(std::move(details)) {}
++
++  void loop() override {
++    using Button = MappedInputManager::Button;
++    using Swipe = MappedInputManager::SwipeDir;
++    if (mappedInput.wasReleased(Button::Back) || mappedInput.wasReleased(Button::Confirm) ||
++        TouchHeaderBackButton::wasTapped(mappedInput, renderer)) return finish();
++    const auto button = doneButton();
++    if (mappedInput.wasTapInRect(button.x, button.y, button.width, button.height)) return finish();
++    const auto swipe = mappedInput.wasSwipe();
++    const bool forward = swipe == Swipe::Up || mappedInput.wasReleased(Button::Down);
++    const bool backward = swipe == Swipe::Down || mappedInput.wasReleased(Button::Up);
++    if (!forward && !backward) return;
++    {
++      RenderLock lock(*this);
++      offset = std::clamp(offset + (forward ? pageLines : -pageLines), 0, maxOffset);
++    }
++    requestUpdate();
++  }
++
++  void render(RenderLock&&) override {
++    renderer.clearScreen();
++    const auto header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++    TouchHeaderBackButton::draw(renderer, header, tr(STR_WORKFLOWY_ERROR_DETAILS), false);
++    int top, right, bottom, left;
++    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++    int y = std::max(top, header.y + header.height) + 14;
++    std::vector<workflowy::TextSpan> lines;
++    const int width = renderer.getScreenWidth() - left - right - 24;
++    const auto draw = [&](std::string_view text, EpdFontFamily::Style style) {
++      lines.clear();
++      workflowy::wrapOutlineText(text, width, [&](std::string_view line) {
++        return renderer.getTextWidth(UI_12_FONT_ID, std::string(line).c_str(), style);
++      }, lines);
++      const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID) + 6;
++      int first = 0, count = static_cast<int>(lines.size());
++      if (style != EpdFontFamily::BOLD) {
++        pageLines = std::max(1, (doneButton().y - y - 24) / lineHeight);
++        maxOffset = std::max(0, count - pageLines);
++        offset = std::min(offset, maxOffset);
++        first = offset;
++        count = std::min(count, first + pageLines);
++      }
++      for (int i = first; i < count; ++i) {
++        const auto begin = lines[i].begin, end = lines[i].end;
++        renderer.drawText(UI_12_FONT_ID, left + 12, y, std::string(text.substr(begin, end - begin)).c_str(), true, style);
++        y += lineHeight;
++      }
++    };
++    draw(summary, EpdFontFamily::BOLD);
++    if (!details.empty()) {
++      y += 12;
++      draw(details, EpdFontFamily::REGULAR);
++      if (maxOffset) {
++        const char* more = offset == 0 ? "↓" : offset == maxOffset ? "↑" : "↑   ↓";
++        renderer.drawCenteredText(SMALL_FONT_ID, doneButton().y - 22, more);
++      }
++    }
++    const auto button = doneButton();
++    renderer.drawRoundedRect(button.x, button.y, button.width, button.height, 1, 4, true);
++    renderer.drawCenteredText(UI_12_FONT_ID, button.y + (button.height - renderer.getLineHeight(UI_12_FONT_ID)) / 2,
++                              tr(STR_DONE));
++    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
++  }
++
++ private:
++  Rect doneButton() const {
++    int top, right, bottom, left;
++    renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
++    const int width = std::min(160, renderer.getScreenWidth() - left - right - 24);
++    const int x = (renderer.getScreenWidth() + left - right - width) / 2;
++    return Rect{x, renderer.getScreenHeight() - bottom - 54, width, 44};
++  }
++  const char* summary;
++  std::string details;
++  int offset = 0, maxOffset = 0, pageLines = 1;
++};
