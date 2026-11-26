@@ -1,12 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3827720948222411b0f6f2b59c69efaf7be0b65e..3ea280ec6f1b35f7fa437a060b5cfa75638e7941 100644
+index 3827720948222411b0f6f2b59c69efaf7be0b65e..19841c3220cd8d15441e81c0d05cc25a3bfd329a 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -5,6 +5,7 @@
  - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
  - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
-+- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Display complete share failures in the reusable scrollable Workflowy error screen, including transport, certificate and internal-RAM diagnostics. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Allocate quote-sharing TLS buffers in PSRAM through a boot-installed task-scoped allocator, preserving live fonts and the SDK allocation policy for other clients. Display complete share failures in the reusable scrollable Workflowy error screen, including transport, certificate and internal-RAM diagnostics. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
 
  - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
  - Group Readest account controls and auto-sync together under Readest in System settings.
@@ -8250,15 +8250,23 @@ index 0000000000000000000000000000000000000000..d7216d01a793bbe0d3e5d95f03d75dac
 +}
 diff --git a/test/workflowy_share/CMakeLists.txt b/test/workflowy_share/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..2c5638a9e6e8335ebc40fd82c48fccbdfd5b5761
+index 0000000000000000000000000000000000000000..5d515f8be3494dcec55c9b557cc35fe93242fb45
 --- /dev/null
 +++ b/test/workflowy_share/CMakeLists.txt
-@@ -0,0 +1,5 @@
-+add_executable(workflowy_share_test WorkflowyShareTest.cpp ${REPO_ROOT}/src/activities/reader/WorkflowyShareActivity.cpp)
+@@ -0,0 +1,13 @@
++add_executable(workflowy_share_test WorkflowyShareTest.cpp ${REPO_ROOT}/src/activities/reader/WorkflowyShareActivity.cpp ${REPO_ROOT}/src/network/ShareTlsMemory.cpp)
 +target_include_directories(workflowy_share_test PRIVATE stubs ${REPO_ROOT}/src)
 +target_link_libraries(workflowy_share_test PRIVATE ArduinoJson)
 +target_compile_options(workflowy_share_test PRIVATE -UNDEBUG)
 +add_test(NAME workflowy_share COMMAND workflowy_share_test)
++
++add_executable(workflowy_tls_memory_test TlsMemoryTest.cpp ${REPO_ROOT}/src/network/ShareTlsMemory.cpp)
++target_include_directories(workflowy_tls_memory_test PRIVATE tls_stubs ${REPO_ROOT}/src)
++target_compile_definitions(workflowy_tls_memory_test PRIVATE ARDUINO_ARCH_ESP32=1)
++target_compile_features(workflowy_tls_memory_test PRIVATE cxx_std_20)
++target_compile_options(workflowy_tls_memory_test PRIVATE -Wall -Wextra -Werror -UNDEBUG -fsanitize=address,undefined)
++target_link_options(workflowy_tls_memory_test PRIVATE -fsanitize=address,undefined)
++add_test(NAME workflowy_tls_memory COMMAND workflowy_tls_memory_test)
 diff --git a/test/workflowy_share/stubs/ClippingStore.h b/test/workflowy_share/stubs/ClippingStore.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
@@ -8929,10 +8937,10 @@ index 3ec3dc53ba802dbe8ced61e082812469a34c4eff..a6aec6ca59f691d2cccaaa8c8bb4da09
 +STR_WIFI_CONN_FAILED: "Wi-Fi connection failed"
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9ca6a616532bd40eaef9e77c963853608d170cf2
+index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d460112eb
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,596 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -8960,6 +8968,7 @@ index 0000000000000000000000000000000000000000..9ca6a616532bd40eaef9e77c96385360
 +#include "activities/RenderLock.h"
 +#include "WifiCredentialStore.h"
 +#include "network/WifiUtils.h"
++#include "network/ShareTlsMemory.h"
 +#include "workflowy/WorkflowySettings.h"
 +#include "workflowy/WorkflowyBookGroup.h"
 +
@@ -9014,6 +9023,7 @@ index 0000000000000000000000000000000000000000..9ca6a616532bd40eaef9e77c96385360
 +std::atomic<int> lastTransportError{0};
 +std::atomic<int> lastTlsError{0}, lastTlsCode{0}, lastTlsFlags{0}, lastSocketError{0}, lastResponseStatus{0};
 +std::atomic<size_t> requestFree{0}, requestLargest{0};
++std::atomic<bool> externalTls{false};
 +std::atomic<const char*> requestStage{"Connect Wi-Fi"};
 +std::atomic<const char*> failureDetail{""};
 +std::atomic<bool> needsWifiPicker{false}, manualWifiOwned{false};
@@ -9099,6 +9109,8 @@ index 0000000000000000000000000000000000000000..9ca6a616532bd40eaef9e77c96385360
 +
 +  static constexpr const char* RESPONSE_FILE = "/.crashink/.workflowy/share-response.tmp";
 +  int request(const std::string& url, bool post, const std::string& body, bool capture) {
++    workflowy::tlsmemory::Scope tlsMemory;
++    externalTls.store(tlsMemory.external());
 +    FsFile response;
 +    if (capture && !Storage.openFileForWrite("WF", RESPONSE_FILE, response)) return -3;
 +    struct Sink { FsFile* file; size_t size = 0; bool failed = false; } sink{capture ? &response : nullptr};
@@ -9498,12 +9510,12 @@ index 0000000000000000000000000000000000000000..9ca6a616532bd40eaef9e77c96385360
 +  const int transport = lastTransportError.load(), tls = lastTlsError.load();
 +  snprintf(details, sizeof(details),
 +      "Step: %s\n%s\nHTTP: %d\nTransport: %s (0x%x)\nTLS: %s (0x%x)\n"
-+      "TLS library code: %d\nCertificate flags: 0x%x\nSocket errno: %d\n"
++      "TLS library code: %d\nCertificate flags: 0x%x\nSocket errno: %d\nTLS memory: %s\n"
 +      "Internal RAM before request: %u KB free; largest block %u KB\n\n"
 +      "Quote remains queued on the SD card. Retry Share after resolving the error.",
 +      requestStage.load(), failureDetail.load(), lastResponseStatus.load(),
 +      esp_err_to_name(transport), unsigned(transport), esp_err_to_name(tls), unsigned(tls),
-+      lastTlsCode.load(), unsigned(lastTlsFlags.load()), lastSocketError.load(),
++      lastTlsCode.load(), unsigned(lastTlsFlags.load()), lastSocketError.load(), externalTls.load() ? "PSRAM" : "internal",
 +      unsigned(requestFree.load()/1024), unsigned(requestLargest.load()/1024));
 +  return details;
 +}
@@ -9799,3 +9811,205 @@ index 0000000000000000000000000000000000000000..10238825f9359393ccb79e966b06195e
 +  std::string details;
 +  int offset = 0, maxOffset = 0, pageLines = 1;
 +};
+diff --git a/src/main.cpp b/src/main.cpp
+index c4de0d262a5be101eb06f900f372bba644561a81..2e99a02c30bd50d4b1af766cc18ff045fd35d67c 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,3 +1,4 @@
++#include "network/ShareTlsMemory.h"
+ #include <Arduino.h>
+ #include <BoardConfig.h>
+ #include <CrossInkHalFrontlight.h>
+@@ -1511,6 +1512,7 @@ void setup() {
+ #endif
+
+   HalSystem::begin();
++  workflowy::tlsmemory::install();
+   // checkPanic() clears the watchdog capture marker after a successful SD
+   // dump, so retain the boot classification for the later activity route.
+   const bool rebootedFromPanic = HalSystem::isRebootFromPanic();
+diff --git a/src/network/ShareTlsMemory.cpp b/src/network/ShareTlsMemory.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..29772182e982a78e091e98495dba63b3d84414e0
+--- /dev/null
++++ b/src/network/ShareTlsMemory.cpp
+@@ -0,0 +1,50 @@
++#include "ShareTlsMemory.h"
++
++#if defined(ARDUINO_ARCH_ESP32) && !defined(SIMULATOR)
++// esp_mem.h has no C++ linkage guard; include it before the mbedTLS config.
++extern "C" {
++#include <esp_mem.h>
++}
++#include <mbedtls/platform.h>
++#include <esp_heap_caps.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <atomic>
++#include <cstdint>
++
++namespace {
++std::atomic<bool> installed{false};
++std::atomic<TaskHandle_t> externalTask{nullptr};
++void* allocate(size_t count, size_t size) {
++  const auto owner = externalTask.load(std::memory_order_acquire);
++  if (owner && owner == xTaskGetCurrentTaskHandle()) {
++    if (count && size > SIZE_MAX / count) return nullptr;
++    // TLS owns these runtime-sized blocks and frees them through the SDK's
++    // heap_caps_free-compatible free hook. No live reader/font owner is evicted.
++    return heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++  }
++  return esp_mbedtls_mem_calloc(count, size);
++}
++}
++
++bool workflowy::tlsmemory::install() {
++  if (!heap_caps_get_total_size(MALLOC_CAP_SPIRAM)) return false;
++  // Boot-only installation: never swap allocator function pointers around a
++  // live request. Dispatch is task-scoped; the free function supports all heaps.
++  const bool ok = mbedtls_platform_set_calloc_free(allocate, esp_mbedtls_mem_free) == 0;
++  installed.store(ok, std::memory_order_release);
++  return ok;
++}
++workflowy::tlsmemory::Scope::Scope() {
++  if (!installed.load(std::memory_order_acquire)) return;
++  TaskHandle_t empty = nullptr;
++  active = externalTask.compare_exchange_strong(empty, xTaskGetCurrentTaskHandle(), std::memory_order_acq_rel);
++}
++workflowy::tlsmemory::Scope::~Scope() {
++  if (active) externalTask.store(nullptr, std::memory_order_release);
++}
++#else
++bool workflowy::tlsmemory::install() { return false; }
++workflowy::tlsmemory::Scope::Scope() = default;
++workflowy::tlsmemory::Scope::~Scope() = default;
++#endif
+diff --git a/src/network/ShareTlsMemory.h b/src/network/ShareTlsMemory.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a872fe2ffca37defac7a2a320a100dd21f9faae
+--- /dev/null
++++ b/src/network/ShareTlsMemory.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++namespace workflowy::tlsmemory {
++// Install before network tasks start. Other tasks retain the SDK allocator.
++bool install();
++class Scope {
++ public:
++  Scope();
++  ~Scope();
++  Scope(const Scope&) = delete;
++  Scope& operator=(const Scope&) = delete;
++  bool external() const { return active; }
++ private:
++  bool active = false;
++};
++}
+diff --git a/test/workflowy_share/TlsMemoryTest.cpp b/test/workflowy_share/TlsMemoryTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b91181a6f387d454134ada8132a36ed99254fa8
+--- /dev/null
++++ b/test/workflowy_share/TlsMemoryTest.cpp
+@@ -0,0 +1,54 @@
++#include "network/ShareTlsMemory.h"
++#include <cassert>
++#include <cstdlib>
++#include <cstdint>
++#include <cstring>
++#include <unordered_set>
++#include "esp_heap_caps.h"
++#include "freertos/task.h"
++extern "C" {
++#include "esp_mem.h"
++}
++void*(*tlsCalloc)(size_t,size_t)=nullptr;
++void(*tlsFree)(void*)=nullptr;
++void* currentTask=reinterpret_cast<void*>(1);
++size_t psramTotal=8*1024*1024,defaultCalls=0,psramCalls=0;
++bool failPsram=false;
++std::unordered_set<void*> live;
++TaskHandle_t xTaskGetCurrentTaskHandle(){return currentTask;}
++size_t heap_caps_get_total_size(int caps){assert(caps==MALLOC_CAP_SPIRAM);return psramTotal;}
++void* tracked(size_t n,size_t size){auto* p=std::calloc(n,size);if(p)live.insert(p);return p;}
++extern "C" void* esp_mbedtls_mem_calloc(size_t n,size_t size){++defaultCalls;return tracked(n,size);}
++extern "C" void esp_mbedtls_mem_free(void* p){if(p){assert(live.erase(p)==1);std::free(p);}}
++void* heap_caps_calloc(size_t n,size_t size,int caps){
++ assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));++psramCalls;
++ return failPsram?nullptr:tracked(n,size);
++}
++int mbedtls_platform_set_calloc_free(void*(*alloc)(size_t,size_t),void(*release)(void*)){
++ tlsCalloc=alloc;tlsFree=release;return 0;
++}
++int main(){
++ psramTotal=0;assert(!workflowy::tlsmemory::install());
++ {workflowy::tlsmemory::Scope scope;assert(!scope.external());}
++ psramTotal=8*1024*1024;assert(workflowy::tlsmemory::install());
++ auto* outside=tlsCalloc(1,16);assert(defaultCalls==1&&psramCalls==0);tlsFree(outside);
++ void* late=nullptr;
++ {
++  workflowy::tlsmemory::Scope share;assert(share.external());
++  auto* buffer=static_cast<unsigned char*>(tlsCalloc(1,16384));assert(buffer&&psramCalls==1);
++  for(size_t i=0;i<16384;++i)assert(buffer[i]==0);
++  tlsFree(buffer);
++  currentTask=reinterpret_cast<void*>(2);
++  {workflowy::tlsmemory::Scope other;assert(!other.external());
++   auto* p=tlsCalloc(1,128);assert(defaultCalls==2);tlsFree(p);}
++  currentTask=reinterpret_cast<void*>(1);
++  failPsram=true;auto before=defaultCalls;assert(!tlsCalloc(1,16384));assert(defaultCalls==before);
++  failPsram=false;auto calls=psramCalls;assert(!tlsCalloc(SIZE_MAX,2));assert(psramCalls==calls);
++  late=tlsCalloc(1,128);assert(late);
++ }
++ // Freeing after the scope, on another task, remains safe for PSRAM allocations.
++ currentTask=reinterpret_cast<void*>(2);tlsFree(late);
++ auto* after=tlsCalloc(1,16);assert(defaultCalls==3);tlsFree(after);
++ currentTask=nullptr;after=tlsCalloc(1,16);assert(defaultCalls==4);tlsFree(after);
++ assert(live.empty());
++}
+diff --git a/test/workflowy_share/tls_stubs/esp_heap_caps.h b/test/workflowy_share/tls_stubs/esp_heap_caps.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f00c1aef51bd2441bec8a3eef7bdd2432e621b91
+--- /dev/null
++++ b/test/workflowy_share/tls_stubs/esp_heap_caps.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <cstddef>
++constexpr int MALLOC_CAP_SPIRAM=1,MALLOC_CAP_8BIT=2;
++size_t heap_caps_get_total_size(int);
++void* heap_caps_calloc(size_t,size_t,int);
+diff --git a/test/workflowy_share/tls_stubs/esp_mem.h b/test/workflowy_share/tls_stubs/esp_mem.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..50b6f27ec3019652f59360d730ae6a8a3a663f43
+--- /dev/null
++++ b/test/workflowy_share/tls_stubs/esp_mem.h
+@@ -0,0 +1,4 @@
++#pragma once
++#include <stddef.h>
++void* esp_mbedtls_mem_calloc(size_t,size_t);
++void esp_mbedtls_mem_free(void*);
+diff --git a/test/workflowy_share/tls_stubs/freertos/FreeRTOS.h b/test/workflowy_share/tls_stubs/freertos/FreeRTOS.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3081b8be195d851ead5ee6d586ee3d4e25cf89f6
+--- /dev/null
++++ b/test/workflowy_share/tls_stubs/freertos/FreeRTOS.h
+@@ -0,0 +1,2 @@
++#pragma once
++using TaskHandle_t=void*;
+diff --git a/test/workflowy_share/tls_stubs/freertos/task.h b/test/workflowy_share/tls_stubs/freertos/task.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b420f8aa82500353d39bdb1e7d3790cbb3867183
+--- /dev/null
++++ b/test/workflowy_share/tls_stubs/freertos/task.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include "FreeRTOS.h"
++TaskHandle_t xTaskGetCurrentTaskHandle();
+diff --git a/test/workflowy_share/tls_stubs/mbedtls/platform.h b/test/workflowy_share/tls_stubs/mbedtls/platform.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ed9e6b09cb57fd94c79b5dfdb3f2c7e37ee85d2
+--- /dev/null
++++ b/test/workflowy_share/tls_stubs/mbedtls/platform.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <cstddef>
++int mbedtls_platform_set_calloc_free(void*(*)(size_t,size_t),void(*)(void*));
