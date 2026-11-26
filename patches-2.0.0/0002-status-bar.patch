@@ -29,7 +29,7 @@ index d25bfd531f79c88dc1572874983d859a4ffafc7f..fe4f53170055833a47b78bb4e69f3bbe
  STR_SLEEP_SCREEN_WALLPAPER: "Wallpaper"
  STR_QUICK_RESUME_TIMEOUT: "Quick Resume on Timeout"
 diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
-index 8f085d640d7d0c58ec916c8b05538dce15768f34..fb73ed92587fa878fe7577fd1b83cfb832eada5b 100644
+index 8f085d640d7d0c58ec916c8b05538dce15768f34..aff2a2fe5f89b13aa823816392114fa27cc374b6 100644
 --- a/src/CrossPointSettings.cpp
 +++ b/src/CrossPointSettings.cpp
 @@ -22,6 +22,7 @@
@@ -40,7 +40,7 @@ index 8f085d640d7d0c58ec916c8b05538dce15768f34..fb73ed92587fa878fe7577fd1b83cfb8
  #include "SettingsList.h"
  #include "fontIds.h"
  #include "util/FrontlightSchedule.h"
-@@ -536,6 +537,13 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
+@@ -536,6 +537,12 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
    doc["filenameFallbackFont"] = filenameFallbackFont;
    doc["language"] = languageCode;
    doc["languageCacheGeneration"] = languageCacheGeneration;
@@ -50,11 +50,10 @@ index 8f085d640d7d0c58ec916c8b05538dce15768f34..fb73ed92587fa878fe7577fd1b83cfb8
 +    statusIconOrderJson.add(slot);
 +  }
 +  doc["statusIconHidden"] = statusIconHidden;
-+  doc["showMemoryUsage"] = showMemoryUsage;
    if (keyboardLayouts != 0) doc["keyboardLayouts"] = keyboardLayouts;
    doc["tiltPageTurnDirectionSchema"] = TILT_DIRECTION_SCHEMA_CURRENT;
    doc["clockDateHasBeenSynced"] = clockDateHasBeenSynced;
-@@ -977,6 +985,37 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
+@@ -977,6 +984,38 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
        }
      }
    }
@@ -86,25 +85,25 @@ index 8f085d640d7d0c58ec916c8b05538dce15768f34..fb73ed92587fa878fe7577fd1b83cfb8
 +      }
 +    }
 +    std::copy(loadedOrder, loadedOrder + StatusIconRow::Count, statusIconOrder);
-+    showMemoryUsage = (doc["showMemoryUsage"] | uint8_t{1}) != 0;
 +    statusIconHidden = (doc["statusIconHidden"] | static_cast<uint8_t>(0)) & StatusIconRow::kAllMask;
++    // Migrate the previous standalone RAM toggle; future saves use the icon mask.
++    if (!doc["showMemoryUsage"].isNull() && !doc["showMemoryUsage"].as<bool>()) statusIconHidden |= 1u << StatusIconRow::Memory;
 +  }
    const uint8_t persistedQuickActionsTrigger =
        doc["quickActionsTrigger"] | static_cast<uint8_t>(QuickActions::Trigger::None);
    const bool unavailableHomeTrigger =
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
-index d08457198cc4ae5c57b24b1ff635fe57d1c65b2f..d57fcffbcded0651d09fba9c1385ee0b7c6aab38 100644
+index d08457198cc4ae5c57b24b1ff635fe57d1c65b2f..d37c1bdff821e98c4865783acc91d66068050947 100644
 --- a/src/CrossPointSettings.h
 +++ b/src/CrossPointSettings.h
-@@ -705,6 +705,11 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+@@ -705,6 +705,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
    // adjacent so old settings files simply retain their default-initialized tail.
    uint8_t quickActionSlots[5] = {IGNORE, IGNORE, IGNORE, IGNORE, IGNORE};
    uint8_t quickActionsTrigger = 0;
 +  // Status bar icons (see StatusIconRow.h): left to right order, and which are switched off
 +  // (stored inverted so an icon added later starts out shown).
-+  uint8_t statusIconOrder[4] = {0, 1, 2, 3};
++  uint8_t statusIconOrder[5] = {0, 1, 2, 3, 4};
 +  uint8_t statusIconHidden = 0;
-+  uint8_t showMemoryUsage = 1;
    // Tilt-based page turning on devices with a supported IMU (X3 and Sticky).
    uint8_t tiltPageTurn = TILT_OFF;
    uint8_t tiltPageTurnDirection = TILT_LEFT_RIGHT;
@@ -122,10 +121,10 @@ index b0db7098527558b7a672e20334f17c513c4602e7..c190549e0de9e1c70fb92c57c4686421
    addDisplaySetting(StrId::STR_UI_THEME);
 diff --git a/src/StatusIconRow.h b/src/StatusIconRow.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae52962b53
+index 0000000000000000000000000000000000000000..83cf81556c9a02854eaf87bc1130eb9f1f4328ba
 --- /dev/null
 +++ b/src/StatusIconRow.h
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,118 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -146,7 +145,7 @@ index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae
 +// icon starts enabled at the end of the row.
 +namespace StatusIconRow {
 +
-+enum Slot : uint8_t { Lamp = 0, Touch = 1, Readest = 2, Highlighter = 3, Count = 4 };
++enum Slot : uint8_t { Lamp = 0, Touch = 1, Readest = 2, Highlighter = 3, Memory = 4, Count = 5 };
 +
 +constexpr int kIconSize = 20;
 +constexpr int kGap = 8;
@@ -156,6 +155,8 @@ index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae
 +// How far past the last icon a tap still counts as a tap on it.
 +constexpr int kEdgeTap = 24;
 +constexpr uint8_t kAllMask = static_cast<uint8_t>((1u << Count) - 1u);
++
++inline bool memoryEnabled(uint8_t hidden) { return !(hidden & (1u << Memory)); }
 +
 +inline bool needsVisualPad(const uint8_t slot) { return slot == Readest || slot == Highlighter; }
 +
@@ -179,7 +180,8 @@ index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae
 +}
 +
 +struct Layout {
-+  uint8_t order[Count] = {0, 1, 2, 3};
++  uint8_t order[Count] = {0, 1, 2, 3, 4};
++  int memoryWidth = kIconSize + 4 + 32;
 +  uint8_t enabledMask = kAllMask;    // what the user switched on
 +  uint8_t availableMask = kAllMask;  // what the device can show right now
 +  int leftX = 0;
@@ -187,6 +189,8 @@ index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae
 +  bool visible(const uint8_t slot) const {
 +    return slot < Count && (enabledMask & availableMask & (1u << slot)) != 0;
 +  }
++
++  int width(uint8_t slot) const { return slot == Memory ? memoryWidth : kIconSize; }
 +
 +  // Left edge of the slot's icon, or -1 when it is not shown.
 +  int x(const uint8_t slot) const {
@@ -198,7 +202,7 @@ index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae
 +      if (!visible(s)) continue;
 +      if (!first && needsVisualPad(s)) cursor += kVisualPad;
 +      if (s == slot) return cursor;
-+      cursor += kIconSize + kGap;
++      cursor += width(s) + kGap;
 +      first = false;
 +    }
 +    return -1;
@@ -219,14 +223,14 @@ index 0000000000000000000000000000000000000000..132f867546d0cc5641d78ca2c98e27ae
 +      if (s == slot) {
 +        seenSelf = true;
 +      } else if (!seenSelf) {
-+        prevRight = x(s) + kIconSize;
++        prevRight = x(s) + width(s);
 +      } else if (nextLeft < 0) {
 +        nextLeft = x(s);
 +      }
 +    }
 +    const int self = x(slot);
 +    left = prevRight < 0 ? 0 : prevRight + (self - prevRight) / 2;
-+    const int selfRight = self + kIconSize;
++    const int selfRight = self + width(slot);
 +    right = nextLeft < 0 ? selfRight + kEdgeTap : selfRight + (nextLeft - selfRight) / 2;
 +    return true;
 +  }
@@ -482,7 +486,7 @@ index 056949fc2817e8461ba30ba9c9136ff775484520..6b1dfab80660692f2992eac6b84dbdf8
 
 diff --git a/src/activities/settings/StatusIconsActivity.cpp b/src/activities/settings/StatusIconsActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..62e966ddc189441f7ad9a80e662f074d7af16a4f
+index 0000000000000000000000000000000000000000..91d93d120701a87cfc6a4c266b50ae394dd85a93
 --- /dev/null
 +++ b/src/activities/settings/StatusIconsActivity.cpp
 @@ -0,0 +1,95 @@
@@ -498,7 +502,7 @@ index 0000000000000000000000000000000000000000..62e966ddc189441f7ad9a80e662f074d
 +
 +namespace {
 +constexpr StrId slotLabels[StatusIconRow::Count] = {StrId::STR_ICON_FRONTLIGHT, StrId::STR_ICON_TOUCHSCREEN,
-+                                                    StrId::STR_ICON_READEST, StrId::STR_ICON_HIGHLIGHTER};
++                                                    StrId::STR_ICON_READEST, StrId::STR_ICON_HIGHLIGHTER, StrId::STR_MEMORY_USAGE};
 +}  // namespace
 +
 +void StatusIconsActivity::onEnter() {
@@ -614,10 +618,10 @@ index 0000000000000000000000000000000000000000..016b8abb25c9eb86683492380c35216e
 +};
 diff --git a/src/components/StatusBarGeometry.h b/src/components/StatusBarGeometry.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e8ccb9c89e2cc0136f5a537532cdd6eee46bc344
+index 0000000000000000000000000000000000000000..4cc0e8060b474152cb72a84a1c36f3bd2fd669a1
 --- /dev/null
 +++ b/src/components/StatusBarGeometry.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,37 @@
 +#pragma once
 +#include <algorithm>
 +#include <cmath>
@@ -626,10 +630,15 @@ index 0000000000000000000000000000000000000000..e8ccb9c89e2cc0136f5a537532cdd6ee
 +#include "util/ReaderStatusBarConfig.h"
 +namespace StatusBarGeometry {
 +constexpr int WifiSpace = 20;
-+inline void memoryText(char* out, size_t length, size_t total, size_t free) {
-+  const size_t used = total - std::min(total, free);
-+  snprintf(out, length, "RAM %u/%uK (%u%%)", unsigned(used / 1024), unsigned(total / 1024),
-+           total ? unsigned(100ULL * used / total) : 0);
++inline unsigned memoryPercent(size_t total, size_t free) {
++  return total ? unsigned(100ULL * (total - std::min(total, free)) / total) : 0;
++}
++// A crisp DIMM board with three memory chips and contact pins, 20x16 pixels.
++template<class Pixel> void drawMemory(int x, int y, Pixel pixel) {
++  for (int py=3; py<13; ++py) for(int px=1; px<19; ++px)
++    if (py<5 || py>=11 || px<3 || px>=17 ||
++        (py>=6 && py<10 && ((px>=4&&px<7)||(px>=9&&px<12)||(px>=14&&px<16)))) pixel(x+px,y+py);
++  for(int px:{3,7,11,15}) for(int py=13;py<16;++py) pixel(x+px,y+py);
 +}
 +struct Bounds { int x, y, width, height; };
 +inline Bounds wifiBounds(int x, int rowTop, int rowHeight, int textTop, int lineHeight) {
@@ -785,33 +794,41 @@ index c497e047c6c276389e98b0a76ae7b99aba0f112a..2497ae7d5409eb3cfdb9b9d34c36ed63
 +}
 diff --git a/test/status_bar_geometry/CMakeLists.txt b/test/status_bar_geometry/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..07e433b5215b9d8e425800695981c48f9ef7ae74
+index 0000000000000000000000000000000000000000..a0f691dea63e30a96342e262bd6968867e94616f
 --- /dev/null
 +++ b/test/status_bar_geometry/CMakeLists.txt
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,11 @@
 +find_package(Python3 COMPONENTS Interpreter REQUIRED)
-+set(STATUS_BAR_INC ${CMAKE_CURRENT_BINARY_DIR}/DisplayStatusBar.inc)
++set(STATUS_BAR_INC ${CMAKE_CURRENT_BINARY_DIR}/DisplayStatusBar.inc ${CMAKE_CURRENT_BINARY_DIR}/StatusSettings.inc)
 +add_custom_command(OUTPUT ${STATUS_BAR_INC}
-+ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStatusBar.py ${REPO_ROOT}/src/components/themes/BaseTheme.cpp ${STATUS_BAR_INC}
-+ DEPENDS ${REPO_ROOT}/src/components/themes/BaseTheme.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStatusBar.py VERBATIM)
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStatusBar.py ${REPO_ROOT}/src/components/themes/BaseTheme.cpp ${CMAKE_CURRENT_BINARY_DIR}/DisplayStatusBar.inc
++ DEPENDS ${REPO_ROOT}/src/CrossPointSettings.cpp ${REPO_ROOT}/src/components/themes/BaseTheme.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ExtractStatusBar.py VERBATIM)
 +add_executable(status_bar_geometry_test StatusBarTest.cpp ${STATUS_BAR_INC})
 +target_include_directories(status_bar_geometry_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${REPO_ROOT}/src)
 +target_compile_options(status_bar_geometry_test PRIVATE -UNDEBUG)
 +add_test(NAME status_bar_geometry COMMAND status_bar_geometry_test)
++
++target_link_libraries(status_bar_geometry_test PRIVATE ArduinoJson)
 diff --git a/test/status_bar_geometry/ExtractStatusBar.py b/test/status_bar_geometry/ExtractStatusBar.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..867ba1260b7b065ae4861b4efd9205f8e2340347
+index 0000000000000000000000000000000000000000..4e89b68ea8f9fc44b95e06cb294a55f15c95ad98
 --- /dev/null
 +++ b/test/status_bar_geometry/ExtractStatusBar.py
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,12 @@
 +from pathlib import Path
 +import sys
 +source = Path(sys.argv[1]).read_text()
 +a = source.index('void BaseTheme::drawDisplayStatusBar(')
 +b = source.index('void BaseTheme::drawHelpText(', a)
 +Path(sys.argv[2]).write_text(source[a:b])
++
++settings=Path(sys.argv[1]).parents[2]/"CrossPointSettings.cpp"
++s=settings.read_text()
++a=s.rfind('  {',0,s.index('    const JsonArrayConst statusIconOrderJson'))
++b=s.index('  const uint8_t persistedQuickActionsTrigger',a)
++Path(sys.argv[2]).with_name('StatusSettings.inc').write_text(s[a:b])
 diff --git a/src/components/themes/BaseTheme.cpp b/src/components/themes/BaseTheme.cpp
-index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282efb017cbce 100644
+index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..ed412791e6bed5fbf410438043ea3a266c6708e4 100644
 --- a/src/components/themes/BaseTheme.cpp
 +++ b/src/components/themes/BaseTheme.cpp
 @@ -7,16 +7,19 @@
@@ -843,7 +860,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
  #include "activities/reader/BookReadingStats.h"
  #include "components/HeaderDate.h"
  #include "components/TouchActionButtons.h"
-@@ -38,6 +43,76 @@ namespace {
+@@ -38,6 +43,78 @@ namespace {
  constexpr int homeMenuMargin = 20;
  constexpr int homeMarginTop = 30;
 
@@ -857,12 +874,14 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +// Where each small status bar icon goes: the user's order and on/off choices
 +// (Settings > CrASHink Settings > Status Bar Icons) applied to what this device
 +// can show right now. Icons that are not shown take no room (see StatusIconRow.h).
-+StatusIconRow::Layout statusIconLayout(const int leftX) {
++StatusIconRow::Layout statusIconLayout(const GfxRenderer& renderer, const int leftX) {
 +  StatusIconRow::Layout layout;
 +  std::copy_n(SETTINGS.statusIconOrder, static_cast<size_t>(StatusIconRow::Count), layout.order);
 +  StatusIconRow::sanitizeOrder(layout.order);
 +  layout.enabledMask = static_cast<uint8_t>(~SETTINGS.statusIconHidden) & StatusIconRow::kAllMask;
-+  layout.availableMask = 0;
++  layout.availableMask = 1u << StatusIconRow::Memory;
++  if (StatusIconRow::memoryEnabled(SETTINGS.statusIconHidden))
++    layout.memoryWidth = StatusIconRow::kIconSize + 4 + std::max(32, renderer.getTextWidth(SMALL_FONT_ID, "100%"));
 +  if (Frontlight.present()) layout.availableMask |= 1u << StatusIconRow::Lamp;
 +  if (gpio.hasTouch()) {
 +    layout.availableMask |= 1u << StatusIconRow::Touch;
@@ -875,11 +894,11 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +}
 +
 +// Right edge of the last icon that is currently shown, or leftX when none is.
-+int statusIconRowRight(const int leftX) {
-+  const auto layout = statusIconLayout(leftX);
++int statusIconRowRight(const GfxRenderer& renderer, const int leftX) {
++  const auto layout = statusIconLayout(renderer, leftX);
 +  int right = leftX;
 +  for (uint8_t slot = 0; slot < StatusIconRow::Count; ++slot) {
-+    if (layout.visible(slot)) right = std::max(right, layout.x(slot) + StatusIconRow::kIconSize);
++    if (layout.visible(slot)) right = std::max(right, layout.x(slot) + layout.width(slot));
 +  }
 +  return right;
 +}
@@ -920,7 +939,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
  }  // namespace
 
  void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
-@@ -125,6 +200,187 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const u
+@@ -125,6 +202,187 @@ void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const u
    fillBatteryIcon(renderer, iconRect, percentage, foregroundBlack);
  }
 
@@ -965,7 +984,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +
 +  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
 +  const int iconY = baseTopY + (statusBarHeight - frontlightStatusIconSize) / 2;
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  if (!layout.visible(StatusIconRow::Lamp)) {
 +    return;
 +  }
@@ -1003,7 +1022,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +  // gap to the neighbouring icons (or well past the last one), since a 20px
 +  // glyph is a hard target to hit precisely with a finger. Follows the user's
 +  // icon order, so it stays right when icons are moved or hidden.
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  int hitLeft = 0;
 +  int hitRight = 0;
 +  if (!layout.hitRange(StatusIconRow::Lamp, hitLeft, hitRight)) {
@@ -1043,7 +1062,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +
 +  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
 +  const int iconY = baseTopY + (statusBarHeight - touchStatusIconSize) / 2;
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  if (!layout.visible(StatusIconRow::Touch)) {
 +    return;
 +  }
@@ -1093,7 +1112,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +  const int baseTopY = topY >= 0 ? topY : orientedMarginTop + metrics.topPadding;
 +  // Zone from the middle of the gap before this icon (or the screen edge) to the
 +  // middle of the gap after it, so it follows the user's icon order.
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  int hitLeft = 0;
 +  int hitRight = 0;
 +  if (!layout.hitRange(StatusIconRow::Touch, hitLeft, hitRight)) {
@@ -1108,14 +1127,14 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
  Rect BaseTheme::buttonMenuTouchTarget(const Rect rowRect, const Rect menuRect, const bool isLastItem,
                                        const int rowSpacing) {
    if (!isLastItem) return rowRect;
-@@ -848,16 +1104,20 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
+@@ -848,16 +1106,20 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
  void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderStatusBarPosition position,
                                      const ReaderStatusBarContent& content,
                                      const ReaderStatusBarConfig* overrideConfig) const {
 -  const ReaderStatusBarConfig config = overrideConfig ? *overrideConfig : SETTINGS.readerStatusBar(position);
 -  if (config.hidden) return;
 +  ReaderStatusBarConfig config = overrideConfig ? *overrideConfig : SETTINGS.readerStatusBar(position);
-+  const bool memoryVisible = position == ReaderStatusBarPosition::Top && SETTINGS.showMemoryUsage;
++  const bool memoryVisible = position == ReaderStatusBarPosition::Top && StatusIconRow::memoryEnabled(SETTINGS.statusIconHidden);
 +  if (config.hidden && !memoryVisible) return;
    const ThemeMetrics& metrics = UITheme::getInstance().getMetrics();
    const int fontId = content.outsideReader ? UITheme::getDisplayStatusBarFontId() : UITheme::getReaderStatusBarFontId();
@@ -1123,17 +1142,16 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
                                                     : UITheme::getReaderStatusBarTextHeight(renderer);
    const bool top = position == ReaderStatusBarPosition::Top;
    const bool foregroundBlack = !content.darkMode;
--  const bool clockAvailable = halClock.isAvailable() || content.previewClock != nullptr;
--  const bool hasText = config.hasTextItems(clockAvailable) || (!top && content.autoTurnLabel != nullptr);
 +  const bool wifiVisible = WiFi.getMode() != WIFI_OFF;
 +  constexpr int wifiSpace = StatusBarGeometry::WifiSpace;
-+  const bool clockAvailable = halClock.isAvailable() || content.previewClock != nullptr || memoryVisible;
+   const bool clockAvailable = halClock.isAvailable() || content.previewClock != nullptr;
+-  const bool hasText = config.hasTextItems(clockAvailable) || (!top && content.autoTurnLabel != nullptr);
 +  if (clockAvailable) placeClockAtRight(config);
 +  const bool hasText = memoryVisible || config.hasTextItems(clockAvailable) || (!top && content.autoTurnLabel != nullptr);
    const int progressHeight = config.progressBar != CrossPointSettings::HIDE_PROGRESS
                                   ? static_cast<int>((config.progressBarThickness + 1) * 2)
                                   : 0;
-@@ -896,6 +1156,20 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
+@@ -896,6 +1158,34 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
      renderer.fillRect(marginLeft + bookmarkOffset, barY, filled, progressHeight, foregroundBlack);
    }
    int bookmarkReserve = 0;
@@ -1141,27 +1159,38 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +    // crASHink status icons (lamp, touch, ...) live at the left of the top bar;
 +    // keep the text items clear of them.
 +    const int iconsLeft = marginLeft + metrics.statusBarHorizontalMargin;
-+    const int iconsRight = statusIconRowRight(iconsLeft);
++    const int iconsRight = statusIconRowRight(renderer, iconsLeft);
 +    if (iconsRight > iconsLeft) {
 +      const int rowTop = edgeY + progressSpace;
 +      drawFrontlightStatusIndicator(renderer, rowTop, content.darkMode);
 +      drawTouchscreenIndicator(renderer, rowTop, content.darkMode);
 +      drawReadestIndicator(renderer, rowTop, content.darkMode);
 +      drawHighlightIndicator(renderer, rowTop, content.darkMode);
++      const auto icons = statusIconLayout(renderer, iconsLeft);
++      if (icons.visible(StatusIconRow::Memory)) {
++        const auto heap = byteHeapSnapshot(MemoryPool::Internal);
++        char percent[5];
++        snprintf(percent, sizeof(percent), "%u%%", StatusBarGeometry::memoryPercent(heap.total, heap.free));
++        const int x = icons.x(StatusIconRow::Memory);
++        StatusBarGeometry::drawMemory(x, rowTop + std::max(0, (textHeight - 16) / 2),
++            [&](int px, int py) { renderer.drawPixel(px, py, foregroundBlack); });
++        renderer.drawText(SMALL_FONT_ID, x + StatusIconRow::kIconSize + 4,
++            rowTop + (textHeight - renderer.getLineHeight(SMALL_FONT_ID)) / 2, percent, foregroundBlack);
++        int hitLeft=0, hitRight=0;
++        if (icons.hitRange(StatusIconRow::Memory, hitLeft, hitRight))
++          TouchRegistry::getInstance().add(Rect{hitLeft, rowTop, hitRight-hitLeft, textHeight}, 0, TouchRegistry::Memory);
++      }
 +      bookmarkReserve = std::max(0, iconsRight - std::max(marginLeft, StatusBarMetrics::sideInset)) + 4;
 +    }
 +  }
    if (!top && content.bookmarked) {
      constexpr int bookmarkWidth = ReaderStatusBarConfig::BOOKMARK_WIDTH;
      constexpr int bookmarkHeight = ReaderStatusBarConfig::BOOKMARK_HEIGHT;
-@@ -918,16 +1192,22 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
+@@ -918,16 +1208,18 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
        content.batteryPercentage >= 0
            ? static_cast<uint16_t>(content.batteryPercentage)
            : (config.contains(ReaderStatusBarItem::Battery) ? powerManager.getBatteryPercentage() : 0);
 +  // Sample once per frame: measuring and painting must use identical digits.
-+  const auto ram = memoryVisible ? byteHeapSnapshot(MemoryPool::Internal) : ByteHeapSnapshot{};
-+  char memoryValue[32]{};
-+  if (memoryVisible) StatusBarGeometry::memoryText(memoryValue, sizeof(memoryValue), ram.total, ram.free);
    const auto itemText = [&](const ReaderStatusBarItem item, char* scratch, const size_t len) -> const char* {
      switch (item) {
        case ReaderStatusBarItem::Date:
@@ -1176,14 +1205,13 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +        char time[24]{};
 +        if (content.previewClock) snprintf(time, sizeof(time), "%s", content.previewClock);
 +        else if (halClock.isAvailable()) halClock.formatTime(time, sizeof(time), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1);
-+        if (memoryVisible) snprintf(scratch, len, "%s%s%s", memoryValue, time[0] ? "  " : "", time);
-+        else snprintf(scratch, len, "%s", time);
++        snprintf(scratch, len, "%s", time);
 +        return scratch;
 +      }
        case ReaderStatusBarItem::Battery:
          // Icon styles are drawn separately; percentage-only renders as plain text.
          snprintf(scratch, len, "%u%%", static_cast<unsigned>(batteryPercentage));
-@@ -973,7 +1253,8 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
+@@ -973,7 +1265,8 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
      }
      char scratch[48];
      const char* value = itemText(item, scratch, sizeof(scratch));
@@ -1193,7 +1221,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
    };
    const auto drawItem = [&](const ReaderStatusBarItem item, const int x, const int allowedWidth,
                              const bool alignRight) {
-@@ -983,11 +1264,7 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
+@@ -983,11 +1276,7 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
        snprintf(percent, sizeof(percent), "%u%%", static_cast<unsigned>(batteryPercentage));
        const bool showPercent = batteryPercent && allowedWidth >= metrics.batteryWidth + batteryPercentSpacing +
                                                                       renderer.getTextWidth(fontId, percent);
@@ -1206,7 +1234,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
          drawBatteryRight(
              renderer, Rect{x + allowedWidth - metrics.batteryWidth, textY, metrics.batteryWidth, metrics.batteryHeight},
              batteryPercentage, showPercent, foregroundBlack, fontId);
-@@ -999,19 +1276,28 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
+@@ -999,19 +1288,24 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
      }
      char scratch[48];
      const char* value = itemText(item, scratch, sizeof(scratch));
@@ -1235,15 +1263,11 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 -      BatteryDiagnosticLog::noteDisplayPercent(batteryPercentage, textY + renderer.getLineHeight(fontId));
 -#endif
 +    const int drawnX = textX + (alignRight ? textAllowed - width : 0);
-+    if (memoryVisible && item == ReaderStatusBarItem::Clock) {
-+      TouchRegistry::getInstance().add(Rect{drawnX, edgeY + progressSpace,
-+          std::min(width, renderer.getTextWidth(fontId, memoryValue)), textHeight}, 0, TouchRegistry::Memory);
-+    }
 +    renderer.drawText(fontId, drawnX, textY, value, foregroundBlack);
    };
 
    constexpr int itemGap = 8;
-@@ -1101,6 +1387,135 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
+@@ -1101,6 +1395,135 @@ void BaseTheme::drawReaderStatusBar(const GfxRenderer& renderer, const ReaderSta
    }
  }
 
@@ -1264,7 +1288,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +  (void)orientedMarginRight;
 +  (void)orientedMarginBottom;
 +
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  if (!layout.visible(StatusIconRow::Readest)) {
 +    return;
 +  }
@@ -1302,7 +1326,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +
 +  // Runs from the middle of the gap before the R box to the middle of the gap
 +  // after it (or well past it when it is last), following the user's icon order.
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  int hitLeft = 0;
 +  int hitRight = 0;
 +  if (!layout.hitRange(StatusIconRow::Readest, hitLeft, hitRight)) {
@@ -1328,7 +1352,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +  (void)orientedMarginRight;
 +  (void)orientedMarginBottom;
 +
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  if (!layout.visible(StatusIconRow::Highlighter)) {
 +    return;
 +  }
@@ -1367,7 +1391,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
 +
 +  // Runs from the middle of the gap before this icon to the middle of the gap
 +  // after it (or well past it when it is last), following the user's icon order.
-+  const auto layout = statusIconLayout(orientedMarginLeft + metrics.statusBarHorizontalMargin);
++  const auto layout = statusIconLayout(renderer, orientedMarginLeft + metrics.statusBarHorizontalMargin);
 +  int hitLeft = 0;
 +  int hitRight = 0;
 +  if (!layout.hitRange(StatusIconRow::Highlighter, hitLeft, hitRight)) {
@@ -1379,7 +1403,7 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
  #ifdef SIMULATOR
  static int g_lastDisplayStatusBarOriginY = -1;
  int BaseTheme::takeLastDisplayStatusBarOriginY() {
-@@ -1114,13 +1529,7 @@ void BaseTheme::drawDisplayStatusBar(const GfxRenderer& renderer, const int topY
+@@ -1114,13 +1537,7 @@ void BaseTheme::drawDisplayStatusBar(const GfxRenderer& renderer, const int topY
    ReaderStatusBarContent content;
    content.outsideReader = true;
    content.horizontalBounds = horizontalBounds;
@@ -1396,13 +1420,16 @@ index 1d4f8daf29701f19e3b571eaf10ed9d67c1bdc4b..594904ede58457fd1832cb3cbb7282ef
  #endif
 diff --git a/test/status_bar_geometry/StatusBarTest.cpp b/test/status_bar_geometry/StatusBarTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..90c3e18afd13854677ed40f3b16f3cc029235c0d
+index 0000000000000000000000000000000000000000..bc9ecba9c3b511300102afc059bbfb251e597bb8
 --- /dev/null
 +++ b/test/status_bar_geometry/StatusBarTest.cpp
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,62 @@
 +#include "components/StatusBarGeometry.h"
 +#include <cassert>
 +#include <cstring>
++#include <array>
++#include <ArduinoJson.h>
++#include "StatusIconRow.h"
 +#include <vector>
 +#include <utility>
 +struct GfxRenderer {};
@@ -1417,11 +1444,39 @@ index 0000000000000000000000000000000000000000..90c3e18afd13854677ed40f3b16f3cc0
 + void drawDisplayStatusBar(const GfxRenderer&,int topY,const Rect* horizontalBounds=nullptr)const;
 +};
 +#include "DisplayStatusBar.inc"
++struct StatusSettings {
++ uint8_t statusIconOrder[StatusIconRow::Count]{};uint8_t statusIconHidden=0;
++ void load(const JsonDocument& doc) {
++#include "StatusSettings.inc"
++ }
++};
 +int main() {
-+ char memory[32];
-+ StatusBarGeometry::memoryText(memory,sizeof(memory),320*1024,80*1024);assert(!strcmp(memory,"RAM 240/320K (75%)"));
-+ StatusBarGeometry::memoryText(memory,sizeof(memory),0,0);assert(!strcmp(memory,"RAM 0/0K (0%)"));
-+ StatusBarGeometry::memoryText(memory,sizeof(memory),1024,2048);assert(!strcmp(memory,"RAM 0/1K (0%)"));
++ assert(StatusBarGeometry::memoryPercent(320*1024,80*1024)==75);
++ assert(StatusBarGeometry::memoryPercent(0,0)==0);
++ assert(StatusBarGeometry::memoryPercent(1024,2048)==0);
++ std::vector<std::pair<int,int>> ramPixels;
++ StatusBarGeometry::drawMemory(0,0,[&](int x,int y){assert(x>=0&&x<20&&y>=0&&y<16);ramPixels.emplace_back(x,y);});
++ assert(ramPixels.size()>50);
++ std::array<uint8_t,StatusIconRow::Count> order{0,1,2,3,4};
++ do {for(unsigned mask=0;mask<=StatusIconRow::kAllMask;++mask) {
++  StatusIconRow::Layout icons;std::copy(order.begin(),order.end(),icons.order);icons.enabledMask=mask;icons.memoryWidth=64;
++  assert(StatusIconRow::isValidOrder(icons.order));
++  int lastRight=-1;
++  for(auto slot:order) if(icons.visible(slot)) {
++   const int x=icons.x(slot);assert(x>=lastRight);lastRight=x+icons.width(slot);
++   assert(icons.hits(slot,x+icons.width(slot)/2));
++   for(unsigned other=0;other<StatusIconRow::Count;++other)
++    if(other!=slot)assert(!icons.hits(other,x+icons.width(slot)/2));
++  }
++ }}while(std::next_permutation(order.begin(),order.end()));
++ StatusSettings stored;JsonDocument doc;
++ assert(!deserializeJson(doc,R"({"statusIconOrder":[3,0,2,1],"showMemoryUsage":false})"));stored.load(doc);
++ assert(stored.statusIconOrder[0]==3&&stored.statusIconOrder[4]==StatusIconRow::Memory);
++ assert(!StatusIconRow::memoryEnabled(stored.statusIconHidden));
++ assert(!deserializeJson(doc,R"({"statusIconOrder":[4,3,0,2,1],"statusIconHidden":0})"));stored.load(doc);
++ assert(stored.statusIconOrder[0]==StatusIconRow::Memory&&StatusIconRow::memoryEnabled(stored.statusIconHidden));
++ assert(!deserializeJson(doc,R"({"statusIconOrder":[3,0,2,1],"showMemoryUsage":0})"));stored.load(doc);
++ assert(!StatusIconRow::memoryEnabled(stored.statusIconHidden));
 + BaseTheme theme;GfxRenderer renderer;
 + for(int headerY:{0,5,10,24,60,120}) {theme.drawDisplayStatusBar(renderer,headerY);assert(theme.origin==10);}
 + for(int height:{0,6,12,19,24}) for(int font:{10,16,28,40}) for(int textTop:{0,10,80}) {
@@ -1432,80 +1487,18 @@ index 0000000000000000000000000000000000000000..90c3e18afd13854677ed40f3b16f3cc0
 + }
 +}
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 12ad1268b5f345a8435a2cca019abb1e6075e1ec..884760252b2e2bc750c941ce2c82fb97fe112c16 100644
+index 12ad1268b5f345a8435a2cca019abb1e6075e1ec..c4c42936213b90e3a861a339fb73abd4c5da2c05 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -56,6 +56,8 @@
 
  ### Fixed
 
-+- Offer a tappable, configurable RAM used/total and percentage indicator with bounded memory diagnostics.
++- Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
 +
  - Fix an occasional reboot when putting an X3 or X4 to sleep with plugins enabled (#973).
  - Index EPUBs faster when many table-of-contents entries point to the same chapter file or chapter files are stored out of reading order.
  - Credit EPUB and XTC reading to the correct local day across midnight. Preserve live stats if a save fails, retry updates after SD errors, and finish pending saves before sleep, reader restart, or USB Drive handoff.
-diff --git a/src/activities/settings/StatusBarSettingsActivity.cpp b/src/activities/settings/StatusBarSettingsActivity.cpp
-index cd99fd11eb3bfe57a259dd25172031dada93230a..a6e4005a2fde2808b9ddb53fe4ea1f31f72672a2 100644
---- a/src/activities/settings/StatusBarSettingsActivity.cpp
-+++ b/src/activities/settings/StatusBarSettingsActivity.cpp
-@@ -40,6 +40,8 @@ enum BarItem {
- constexpr int DISPLAY_BATTERY_ROW = 3;
- constexpr int DISPLAY_TEXT_SIZE_ROW = 4;
- constexpr int ROOT_TEXT_SIZE_ROW = 3;
-+constexpr int DISPLAY_MEMORY_ROW = 5;
-+constexpr int ROOT_MEMORY_ROW = 4;
-
- constexpr ReaderStatusBarItem pickerItems[] = {
-     ReaderStatusBarItem::Clock,
-@@ -122,7 +124,7 @@ const char* thicknessLabel(const uint8_t thickness) {
-
- constexpr StrId textSizeNames[] = {StrId::STR_SMALL, StrId::STR_MEDIUM, StrId::STR_LARGE};
- constexpr StrId rootLabels[] = {StrId::STR_TOP_STATUS_BAR, StrId::STR_BOTTOM_STATUS_BAR, StrId::STR_XTC_STATUS_BAR,
--                                StrId::STR_STATUS_BAR_TEXT_SIZE};
-+                                StrId::STR_STATUS_BAR_TEXT_SIZE, StrId::STR_MEMORY_USAGE};
-
- constexpr StrId batteryStyleNames[] = {StrId::STR_BATTERY_ICON_AND_PERCENT, StrId::STR_BATTERY_ICON_ONLY,
-                                        StrId::STR_BATTERY_PERCENT_ONLY};
-@@ -180,9 +182,9 @@ ReaderStatusBarPosition StatusBarSettingsActivity::selectedPosition() const {
- }
-
- void StatusBarSettingsActivity::refreshItemCount() {
--  visibleItemCount = displayContext ? DISPLAY_TEXT_SIZE_ROW + 1
-+  visibleItemCount = displayContext ? DISPLAY_MEMORY_ROW + 1
-                      : view == View::Root
--                         ? ROOT_TEXT_SIZE_ROW + 1
-+                         ? ROOT_MEMORY_ROW + 1
-                          : (SETTINGS.readerStatusBar(selectedPosition()).centered ? SEPARATOR : CENTER_ITEMS) + 1;
-   selectedIndex = std::clamp(selectedIndex, 0, visibleItemCount - 1);
- }
-@@ -263,6 +265,14 @@ void StatusBarSettingsActivity::loop() {
- }
-
- void StatusBarSettingsActivity::handleSelection() {
-+  if ((displayContext && selectedIndex == DISPLAY_MEMORY_ROW) ||
-+      (!displayContext && view == View::Root && selectedIndex == ROOT_MEMORY_ROW)) {
-+    const auto previous = SETTINGS.showMemoryUsage;
-+    SETTINGS.showMemoryUsage = !previous;
-+    if (!SETTINGS.saveToFile()) SETTINGS.showMemoryUsage = previous;
-+    requestUpdate();
-+    return;
-+  }
-   if (!displayContext && view == View::Root && selectedIndex < 2) {
-     view = selectedIndex == 0 ? View::Top : View::Bottom;
-     selectedIndex = 0;
-@@ -466,7 +476,11 @@ void StatusBarSettingsActivity::buildSettingsScreen(UiApp::ScreenType& screen) {
-   for (int i = 0; i < visibleItemCount; ++i) {
-     fui::ListItem row;
-     row.actionValue = static_cast<int16_t>(i);
--    if (displayContext && i == DISPLAY_TEXT_SIZE_ROW) {
-+    if ((displayContext && i == DISPLAY_MEMORY_ROW) || (!displayContext && view == View::Root && i == ROOT_MEMORY_ROW)) {
-+      row.label = tr(STR_MEMORY_USAGE);
-+      row.toggle = true;
-+      row.toggleChecked = SETTINGS.showMemoryUsage != 0;
-+    } else if (displayContext && i == DISPLAY_TEXT_SIZE_ROW) {
-       row.label = tr(STR_STATUS_BAR_TEXT_SIZE);
-       row.value = I18N.get(textSizeNames[std::min<uint8_t>(SETTINGS.displayStatusBarTextSize, 2)]);
-     } else if (displayContext && i == DISPLAY_BATTERY_ROW) {
 diff --git a/src/components/MemoryDiagnostics.cpp b/src/components/MemoryDiagnostics.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..480534726fdaeef35d42916c7d07c026fc352b03
@@ -1598,16 +1591,24 @@ index 98c641ecaf3ec9a1e8842bd462aae2ded8df47b6..e1a70273dcba67ceb02e023344bd5d6c
    static TouchRegistry& getInstance() {
      static TouchRegistry instance;
 diff --git a/src/components/UITheme.cpp b/src/components/UITheme.cpp
-index e467c4387a6ffd742cd20351d927f2fd0930d45b..0e4c275156b4c273a1e5839d693625d00a84091a 100644
+index e467c4387a6ffd742cd20351d927f2fd0930d45b..cb36dde927c6c36226ef83645651886b8af5dd71 100644
 --- a/src/components/UITheme.cpp
 +++ b/src/components/UITheme.cpp
-@@ -355,8 +355,9 @@ int UITheme::getReaderStatusBarHeight(const ReaderStatusBarPosition position, co
+@@ -17,6 +17,7 @@
+ #include <vector>
+
+ #include "DeviceCapabilities.h"
++#include "StatusIconRow.h"
+ #include "MappedInputManager.h"
+ #include "RecentBooksStore.h"
+ #include "components/themes/BaseTheme.h"
+@@ -355,8 +356,9 @@ int UITheme::getReaderStatusBarHeight(const ReaderStatusBarPosition position, co
                                        const ReaderStatusBarConfig* overrideConfig) {
    const ThemeMetrics& metrics = UITheme::getInstance().getMetrics();
    const auto config = overrideConfig ? *overrideConfig : SETTINGS.readerStatusBar(position);
 -  if (config.hidden) return 0;
 -  const bool hasText = config.hasTextItems(halClock.isAvailable());
-+  const bool memoryVisible = position == ReaderStatusBarPosition::Top && SETTINGS.showMemoryUsage;
++  const bool memoryVisible = position == ReaderStatusBarPosition::Top && StatusIconRow::memoryEnabled(SETTINGS.statusIconHidden);
 +  if (config.hidden && !memoryVisible) return 0;
 +  const bool hasText = memoryVisible || config.hasTextItems(halClock.isAvailable());
    const int progressSpace = config.progressBar != CrossPointSettings::HIDE_PROGRESS

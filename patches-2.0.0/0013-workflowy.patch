@@ -1,12 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 001f73c4e1ee0b0c84eadb9150e2a40e43883d68..f92c0e17d455262c4c87bf3ae70796114ac2f69e 100644
+index 3827720948222411b0f6f2b59c69efaf7be0b65e..f36aaad4bf42e6d647df9b44afa2d45a11ba5515 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -5,6 +5,7 @@
- - Offer a tappable, configurable RAM used/total and percentage indicator with bounded memory diagnostics.
+ - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
  - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
-+- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
 
  - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
  - Group Readest account controls and auto-sync together under Readest in System settings.
@@ -16,7 +16,7 @@ index 001f73c4e1ee0b0c84eadb9150e2a40e43883d68..f92c0e17d455262c4c87bf3ae7079611
 
 +- Show leading Workflowy tags below Calendar event titles without modifying saved task text.
 
- - Hide the redundant File Transfer header arrow even when opened from a book; keep the shared Home ribbon and physical Back navigation.
+ - Hide File Transfer back/Exit controls on every layout pass and retain the shared Home ribbon in reader-launched transfers.
  - Keep the complete Plugins puzzle icon visible, including its top tab.
 @@ -23,6 +25,8 @@
 
@@ -40,10 +40,10 @@ index 3bbf4ec079fc5d9b39b21574906c1d4f3e530e9d..2be1c7b569ce9d9539497637584313cd
    -<network/FirmwareFlasher.cpp>
    -<network/OtaBootSwitch.cpp>
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index c1d6392f70bb5ac933b6c09b685cc820ded94b07..74fea23648fa9cd28ab987a81ca422a222a7bc1b 100644
+index 1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b..fcb3f90cf88fd163aa456ba95f18731921bf8458 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
-@@ -56,12 +56,14 @@
+@@ -59,12 +59,14 @@
  #include "reader/EpubReaderActivity.h"
  #include "reader/GlobalReadingStats.h"
  #include "reader/ReaderActivity.h"
@@ -58,7 +58,7 @@ index c1d6392f70bb5ac933b6c09b685cc820ded94b07..74fea23648fa9cd28ab987a81ca422a2
  #include "util/SwipeAdjustment.h"
  #include "util/TwoFingerSwipe.h"
 
-@@ -657,6 +659,17 @@ void ActivityManager::loop() {
+@@ -672,6 +674,27 @@ void ActivityManager::loop() {
      mappedInput.setPowerAsConfirmInReaderMode(false);
    }
 
@@ -67,16 +67,26 @@ index c1d6392f70bb5ac933b6c09b685cc820ded94b07..74fea23648fa9cd28ab987a81ca422a2
 +      workflowyNoticeVisible = false;
 +      requestUpdate();
 +    }
-+    if (const auto error = workflowy::takeShareError()) {
-+      pushActivity(std::make_unique<OptionSelectionActivity>(
-+          renderer, mappedInput, "WorkflowyShareError", *error, std::vector<std::string>{tr(STR_OK)}, 0, false, true));
++    if (!RenderLock::peek()) {
++      RenderLock lock(RenderLock::Mode::Try);
++      if (lock.ownsLock()) {
++        if (const auto error = workflowy::takeShareError()) {
++          char feedback[160];
++          const int status = workflowy::shareHttpStatus();
++          if (status >= 400) snprintf(feedback, sizeof(feedback), "%s (HTTP %d)", I18n::getInstance().get(*error), status);
++          else snprintf(feedback, sizeof(feedback), "%s", I18n::getInstance().get(*error));
++          GUI.drawPopup(renderer, feedback, true);
++          workflowyNoticeShownAt = millis();
++          workflowyNoticeVisible = true;
++        }
++      }
 +    }
 +  }
 +
    processPendingActivities();
  }
 
-@@ -826,6 +839,26 @@ void ActivityManager::processPendingActivities() {
+@@ -841,6 +864,26 @@ void ActivityManager::processPendingActivities() {
      }
    }
 
@@ -103,7 +113,7 @@ index c1d6392f70bb5ac933b6c09b685cc820ded94b07..74fea23648fa9cd28ab987a81ca422a2
    if (APP_STATE.hasPendingAlert.load(std::memory_order_acquire) && pendingAction == PendingAction::None) {
      APP_STATE.hasPendingAlert.store(false, std::memory_order_relaxed);
      pushActivity(std::make_unique<AlertActivity>(renderer, mappedInput));
-@@ -1286,7 +1319,9 @@ void ActivityManager::popActivity() {
+@@ -1312,7 +1355,9 @@ void ActivityManager::popActivity() {
    pendingAction = PendingAction::Pop;
  }
 
@@ -298,10 +308,10 @@ index 1b38d1497e5b7166b2613b6bb11348b92d5ddfc9..d3160c524b61f771e58160fa724d03f7
            returnAction(true);
 diff --git a/src/activities/reader/WorkflowyShareActivity.h b/src/activities/reader/WorkflowyShareActivity.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..756edd3c4a59b6c0df8dc4fb1a856c2ee32c4777
+index 0000000000000000000000000000000000000000..d8fe44e99b14f7fd4898fd40969e6defbefe1f45
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +#pragma once
 +
 +#include <I18n.h>
@@ -313,6 +323,7 @@ index 0000000000000000000000000000000000000000..756edd3c4a59b6c0df8dc4fb1a856c2e
 +// SIZE_MAX sends all clippings in the current book that match the list filter.
 +void shareClippings(size_t index, int colorFilter = 0);
 +bool shareInProgress();
++int shareHttpStatus();
 +bool shareNoticePending();
 +// Called only after the queued confirmation has been painted.
 +void startQueuedShares();
@@ -1196,10 +1207,10 @@ index 5b5d66915b5537349972a4d0ec72d9c899ab1d03..721f50d7cc29473d7c64eaef382d64c3
    bool readerMode_ = false;
 diff --git a/src/activities/workflowy/WorkflowyDailyActivity.cpp b/src/activities/workflowy/WorkflowyDailyActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f6dec9a039843073c20b30d2d9b1ec9f8febaea5
+index 0000000000000000000000000000000000000000..2794e4751af20b9e640163b2dc637370f2d428b3
 --- /dev/null
 +++ b/src/activities/workflowy/WorkflowyDailyActivity.cpp
-@@ -0,0 +1,5297 @@
+@@ -0,0 +1,5299 @@
 +#include "WorkflowyDailyActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -4976,7 +4987,9 @@ index 0000000000000000000000000000000000000000..f6dec9a039843073c20b30d2d9b1ec9f
 +  std::copy_n(SETTINGS.statusIconOrder, StatusIconRow::Count, icons.order);
 +  StatusIconRow::sanitizeOrder(icons.order);
 +  icons.enabledMask = static_cast<uint8_t>(~SETTINGS.statusIconHidden) & StatusIconRow::kAllMask;
-+  icons.availableMask = Frontlight.present() ? 1u << StatusIconRow::Lamp : 0;
++  icons.availableMask = (Frontlight.present() ? 1u << StatusIconRow::Lamp : 0) | (1u << StatusIconRow::Memory);
++  if (StatusIconRow::memoryEnabled(SETTINGS.statusIconHidden))
++    icons.memoryWidth = StatusIconRow::kIconSize + 4 + std::max(32, renderer.getTextWidth(SMALL_FONT_ID, "100%"));
 +  if (mappedInput.hasTouchHardware()) {
 +    icons.availableMask |= 1u << StatusIconRow::Touch;
 +    if (!SETTINGS.disableReaderTouchscreen)
@@ -4987,7 +5000,7 @@ index 0000000000000000000000000000000000000000..f6dec9a039843073c20b30d2d9b1ec9f
 +  const int rightEdge = renderer.getScreenWidth() - std::max(right, StatusBarMetrics::sideInset);
 +  int iconsRight = icons.leftX;
 +  for (unsigned slot = 0; slot < StatusIconRow::Count; ++slot)
-+    if (icons.visible(slot)) iconsRight = std::max(iconsRight, icons.x(slot) + StatusIconRow::kIconSize);
++    if (icons.visible(slot)) iconsRight = std::max(iconsRight, icons.x(slot) + icons.width(slot));
 +  auto config = SETTINGS.displayStatusBar.asReaderConfig();
 +  if (halClock.isAvailable()) placeClockAtRight(config);
 +  std::array<int, ReaderStatusBarConfig::SLOT_COUNT> widths{};
@@ -8274,7 +8287,7 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#include "Harness.h"
 diff --git a/test/workflowy_share/stubs/Harness.h b/test/workflowy_share/stubs/Harness.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..b2b8150305060bc155de2ddd0101ba86eee591e3
+index 0000000000000000000000000000000000000000..cf1ac7f0195dad3854a849869429823953fb27b0
 --- /dev/null
 +++ b/test/workflowy_share/stubs/Harness.h
 @@ -0,0 +1,96 @@
@@ -8367,11 +8380,11 @@ index 0000000000000000000000000000000000000000..b2b8150305060bc155de2ddd0101ba86
 +inline Http* esp_http_client_init(const esp_http_client_config_t* c){return new Http{*c,c->url,{}};}
 +inline int esp_http_client_set_header(Http*,const char*,const char*){return ESP_OK;}
 +inline int esp_http_client_set_post_field(Http* h,const char* data,size_t n){h->body.assign(data,n);return ESP_OK;}
-+struct Remote {std::string id,parent,name;};inline std::vector<Remote> remote;inline int httpCalls=0;inline bool loseQuoteResponse=false;
-+inline int esp_http_client_perform(Http* h){++httpCalls;if(!online){h->status=0;return ESP_FAIL;}JsonDocument doc;std::string response;
++struct Remote {std::string id,parent,name;};inline std::vector<Remote> remote;inline int httpCalls=0;inline bool loseQuoteResponse=false,loseQuoteWithStatus=false;inline int forcedHttpStatus=0;
++inline int esp_http_client_perform(Http* h){++httpCalls;if(forcedHttpStatus){h->status=forcedHttpStatus;return ESP_OK;}if(!online){h->status=0;return ESP_FAIL;}JsonDocument doc;std::string response;
 + if(h->c.method==HTTP_METHOD_GET){auto parent=h->url.substr(h->url.find("parent_id=")+10);auto a=doc["nodes"].to<JsonArray>();for(auto& n:remote)if(n.parent==parent){auto o=a.add<JsonObject>();o["id"]=n.id;o["name"]=n.name;}}
 + else {JsonDocument body;assert(!deserializeJson(body,h->body));char id[48];std::snprintf(id,sizeof(id),"aaaaaaaa-aaaa-aaaa-aaaa-%012zu",remote.size()+1);remote.push_back({id,body["parent_id"]|"",body["name"]|""});doc["item_id"]=id;
-+ if(loseQuoteResponse&&remote.back().name.find("quote")!=std::string::npos){loseQuoteResponse=false;h->status=0;return ESP_FAIL;}}
++ if((loseQuoteResponse||loseQuoteWithStatus)&&remote.back().name.find("quote")!=std::string::npos){h->status=loseQuoteWithStatus?200:0;loseQuoteResponse=loseQuoteWithStatus=false;return ESP_FAIL;}}
 + serializeJson(doc,response);esp_http_client_event_t e{HTTP_EVENT_ON_DATA,h->c.user_data,response.data(),static_cast<int>(response.size())};return h->c.event_handler(&e);}
 +inline int esp_http_client_get_status_code(Http* h){return h->status;}inline void esp_http_client_cleanup(Http* h){delete h;}
 diff --git a/test/workflowy_share/stubs/I18n.h b/test/workflowy_share/stubs/I18n.h
@@ -8915,10 +8928,10 @@ index 3ec3dc53ba802dbe8ced61e082812469a34c4eff..a6aec6ca59f691d2cccaaa8c8bb4da09
 +STR_WIFI_CONN_FAILED: "Wi-Fi connection failed"
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b19423764
+index 0000000000000000000000000000000000000000..2f179babb83f8f296abc5d336d01c38d3b077ec2
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,533 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -8996,6 +9009,7 @@ index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b
 +std::atomic<bool> pendingKick{false};
 +std::atomic<int> notice{-1};
 +std::atomic<StrId> error{StrId::STR_WORKFLOWY_SENT};
++std::atomic<int> lastHttpStatus{0};
 +
 +std::string oneLine(std::string value) {
 +  for (char& ch : value)
@@ -9093,9 +9107,11 @@ index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b
 +      sink.size += event->data_len; return ESP_OK;
 +    };
 +    const auto heap = byteHeapSnapshot(MemoryPool::Internal);
-+    // Leave 64 KiB after a 48 KiB TLS allowance for live dictionary/render
-+    // work. A deferred share remains on SD; never evict live font owners here.
-+    if (heap.free < 112u * 1024u || heap.largest < 32u * 1024u) {
++    // Reject only critical starvation. Wi-Fi has already allocated its
++    // buffers here; a second 112 KiB/32 KiB gate silently stranded normal
++    // shares. HTTP/TLS report their own fallible allocation/transport errors.
++    if (heap.free < 24u * 1024u || heap.largest < 4u * 1024u) {
++      lastHttpStatus.store(0);
 +      LOG_ERR("WF", "Share deferred: internal free=%u largest=%u", unsigned(heap.free), unsigned(heap.largest));
 +      return -1;
 +    }
@@ -9106,13 +9122,18 @@ index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b
 +    if (post && result == ESP_OK) result = esp_http_client_set_post_field(client, body.data(), body.size());
 +    if (result == ESP_OK) result = esp_http_client_perform(client);
 +    const int status = esp_http_client_get_status_code(client);
++    lastHttpStatus.store(result == ESP_OK ? status : 0);
 +    esp_http_client_cleanup(client);
 +    const bool saved = !capture || response.sync();
 +    response.close();
-+    if (sink.failed || !saved || (capture && result != ESP_OK)) return -3;
++    if (sink.failed || !saved) return -3;
++    if (result != ESP_OK) return -1;
 +    return status > 0 ? status : -1;
 +  }
 +  StrId resolveBook() {
++    // Canonical UUID for the user's Reading Gems link. Normalize queued jobs
++    // made with its short URL suffix too, without changing their receipts.
++    if (destination == DEFAULT_DESTINATION) destination = "60a133fe-f242-4ae2-842a-3dbd4508b236";
 +    std::string encoded; encoded.reserve(destination.size() * 3);
 +    constexpr char hex[] = "0123456789ABCDEF";
 +    for (unsigned char ch : destination) {
@@ -9373,6 +9394,7 @@ index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b
 +  if (!pendingKick.exchange(false) || sending.exchange(true)) return;
 +  const auto sendTask = [](void*) {
 +    workerStartedAt = millis();
++    lastHttpStatus.store(0);
 +    MemoryBudget::logEpubHeapPools("share.start");
 +    bool ownsWifi = false;
 +    const auto releaseWorker = [&](uint32_t generation) {
@@ -9405,7 +9427,8 @@ index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b
 +      const auto result = job->send(); ownsWifi |= job->ownsWifi;
 +      Storage.remove(ShareJob::RESPONSE_FILE);
 +      if (result != StrId::STR_WORKFLOWY_SENT && result != StrId::STR_WORKFLOWY_ALREADY_SENT) {
-+        LOG_ERR("WF", "Share pending locally (reason %d)", static_cast<int>(result));
++        LOG_ERR("WF", "Share pending locally (reason %d, HTTP %d)", static_cast<int>(result), lastHttpStatus.load());
++        finishShare(result);
 +
 +        job.reset();
 +        if (releaseWorker(generation)) continue; break;
@@ -9426,6 +9449,8 @@ index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b
 +    LOG_ERR("WF", "Share remains queued; cannot start network worker");
 +  }
 +}
++
++int workflowy::shareHttpStatus() { return lastHttpStatus.load(); }
 +
 +bool workflowy::shareInProgress() { return sending.load() || pendingKick.load(); }
 +bool workflowy::shareNoticePending() { return notice.load() >= 0; }
@@ -9482,10 +9507,10 @@ index f9a4c85e2fa46f97fc2ced9c422bc631641ae73c..f690b63c1740a302e89c70a9ac1fbf43
    pages.loop();
 diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c4d934dc4b87348a18afadf5bea2a21c3522bf7b
+index 0000000000000000000000000000000000000000..a99894a49b94f96457d24109b6c24ee67ade683f
 --- /dev/null
 +++ b/test/workflowy_share/WorkflowyShareTest.cpp
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,41 @@
 +#include "Harness.h"
 +#include "MemoryBudget.h"
 +#include "activities/reader/WorkflowyShareActivity.h"
@@ -9495,24 +9520,35 @@ index 0000000000000000000000000000000000000000..c4d934dc4b87348a18afadf5bea2a21c
 +int main(){
 + sdRoot=(std::filesystem::temp_directory_path()/"crashink-workflowy-share-test").string();std::filesystem::remove_all(sdRoot);std::filesystem::create_directories(sdRoot);
 + assert(workflowy::writeSetting(workflowy::KEY_FILE,"test-key"));
-+ workflowy::shareClippings(0);assert(workflowy::shareInProgress());assert(httpCalls==0&&jobs()==1&&pendingTask==nullptr);workflowy::startQueuedShares();assert(pendingTask==nullptr&&httpCalls==0);assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_SHARING);for(auto& f:std::filesystem::recursive_directory_iterator(sdRoot))if(f.path().extension()==".job"){std::ifstream in(f.path(),std::ios::binary);std::string data((std::istreambuf_iterator<char>(in)),{});assert(data.find("test-key")==std::string::npos);}runWorker();assert(!workflowy::shareInProgress()&&jobs()==1&&remote.empty());assert(!workflowy::takeShareNotice());assert(!workflowy::takeShareError());
++ workflowy::shareClippings(0);assert(workflowy::shareInProgress());assert(httpCalls==0&&jobs()==1&&pendingTask==nullptr);workflowy::startQueuedShares();assert(pendingTask==nullptr&&httpCalls==0);assert(workflowy::takeShareNotice()==StrId::STR_WORKFLOWY_SHARING);for(auto& f:std::filesystem::recursive_directory_iterator(sdRoot))if(f.path().extension()==".job"){std::ifstream in(f.path(),std::ios::binary);std::string data((std::istreambuf_iterator<char>(in)),{});assert(data.find("test-key")==std::string::npos);}runWorker();assert(!workflowy::shareInProgress()&&jobs()==1&&remote.empty());assert(!workflowy::takeShareNotice());assert(workflowy::takeShareError()==StrId::STR_WORKFLOWY_NETWORK_FAILED);
 + // Change foreground book: queued text and metadata must survive independently.
 + CLIPPINGS.title="Second Book";CLIPPINGS.path="/second.epub";CLIPPINGS.quote="Second quote";online=true;
-+ workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(jobs()==0&&remote.size()==4);assert(remote[0].name=="📘 Book — Author");assert(remote[1].parent==remote[0].id);assert(remote[2].name=="📘 Second Book — Author");assert(remote[3].parent==remote[2].id);assert(!WiFi.connected);assert(remote[1].name.find("📖 Book — Author — ")!=std::string::npos);assert(remote[3].name.find("📖 Second Book — Author — ")!=std::string::npos);
++ workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(jobs()==0&&remote.size()==4);assert(remote[0].parent=="60a133fe-f242-4ae2-842a-3dbd4508b236");assert(remote[0].name=="📘 Book — Author");assert(remote[1].parent==remote[0].id);assert(remote[2].name=="📘 Second Book — Author");assert(remote[3].parent==remote[2].id);assert(!WiFi.connected);assert(remote[1].name.find("📖 Book — Author — ")!=std::string::npos);assert(remote[3].name.find("📖 Second Book — Author — ")!=std::string::npos);
 + const auto count=remote.size();workflowy::shareClippings(0);runWorker();assert(remote.size()==count&&jobs()==0);assert(!workflowy::takeShareNotice());
 + // Two taps while worker is running publish both durable records.
 + CLIPPINGS.quote="Third quote";workflowy::shareClippings(0);CLIPPINGS.quote="Fourth quote";workflowy::shareClippings(0);assert(jobs()==2);runWorker();assert(remote.size()==count+2&&jobs()==0);
 + // Ambiguous POST: server accepted it but response was lost. Retry must not duplicate.
-+ CLIPPINGS.quote="Fifth quote";loseQuoteResponse=true;workflowy::shareClippings(0);runWorker();assert(jobs()==1);auto accepted=remote.size();workflowy::shareClippings(0);runWorker();assert(jobs()==0&&remote.size()==accepted);
++ CLIPPINGS.quote="Fifth quote";loseQuoteResponse=true;workflowy::shareClippings(0);runWorker();assert(jobs()==1);assert(workflowy::takeShareError()==StrId::STR_WORKFLOWY_NETWORK_FAILED);auto accepted=remote.size();workflowy::shareClippings(0);runWorker();assert(jobs()==0&&remote.size()==accepted);
 + JsonDocument nodes;assert(!deserializeJson(nodes,R"({"nodes":[{"id":"abc123","name":"📖 Existing"},{"id":"def456","name":"<b>Existing — Author</b>"}]})"));assert(workflowy::findBookGroup(nodes["nodes"].as<JsonArrayConst>(),"Existing","Author")=="def456");
 + assert(workflowy::bookGroupKey("📘 <b>R&amp;D</b> — Author")==workflowy::bookGroupKey("R&D — Author"));
-+ // Low internal RAM or fragmentation must retain the job without opening TLS.
-+ CLIPPINGS.quote="Low memory quote";
-+ internalFree=100*1024;auto calls=httpCalls;
++ // Normal post-WiFi heap shapes must not strand all shares behind a speculative gate.
++ CLIPPINGS.quote="Normal fragmented heap quote";internalFree=100*1024;internalLargest=16*1024;
++ auto calls=httpCalls;workflowy::shareClippings(0);runWorker();assert(jobs()==0&&httpCalls>calls);
++ // Critical starvation still retains jobs and reports a real failure.
++ CLIPPINGS.quote="Low memory quote";internalFree=16*1024;calls=httpCalls;
 + workflowy::shareClippings(0);runWorker();assert(jobs()==1&&httpCalls==calls&&!WiFi.connected&&!workflowy::shareInProgress());
-+ internalFree=256*1024;internalLargest=16*1024;
++ assert(workflowy::takeShareError()==StrId::STR_WORKFLOWY_NETWORK_FAILED);
++ internalFree=256*1024;internalLargest=2*1024;
 + workflowy::shareClippings(0);runWorker();assert(jobs()==2&&httpCalls==calls&&!WiFi.connected);
++ assert(workflowy::takeShareError()==StrId::STR_WORKFLOWY_NETWORK_FAILED);
 + internalLargest=128*1024;workflowy::shareClippings(0);runWorker();assert(jobs()==0);
++ // A response with status 200 but failed transport must not acknowledge/delete the job.
++ CLIPPINGS.quote="Partial HTTP quote";loseQuoteWithStatus=true;workflowy::shareClippings(0);runWorker();
++ assert(jobs()==1&&workflowy::takeShareError()==StrId::STR_WORKFLOWY_NETWORK_FAILED);auto beforeRetry=remote.size();
++ workflowy::shareClippings(0);runWorker();assert(jobs()==0&&remote.size()==beforeRetry);
++ forcedHttpStatus=401;CLIPPINGS.quote="Authentication quote";workflowy::shareClippings(0);runWorker();
++ assert(jobs()==1&&workflowy::shareHttpStatus()==401&&workflowy::takeShareError()==StrId::STR_WORKFLOWY_AUTH_FAILED);
++ forcedHttpStatus=0;workflowy::shareClippings(0);runWorker();assert(jobs()==0);
 + assert(liveJsonBlocks==0);
 + assert(!workflowy::takeShareError());std::filesystem::remove_all(sdRoot);std::cout<<"Workflowy durable share tests passed\n";
 +}

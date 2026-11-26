@@ -1,5 +1,5 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ad8660eba9288b35a1d9c19642bbe6c96efa230..2cd3372690a208e7b8eec7343d5ceca8230ce110 100644
+index 60508511ca4f9b28ff70b6fa10b13639fa2591d8..d07639ba91524b1d02e1703ce69730fca8ca3ae5 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,7 +1,11 @@
@@ -19,7 +19,7 @@ index 5ad8660eba9288b35a1d9c19642bbe6c96efa230..2cd3372690a208e7b8eec7343d5ceca8
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
 
 +- Restore Library Sync Book actions and return to the selected page, sort and search after syncing.
-+- Hide the redundant File Transfer header arrow even when opened from a book; keep the shared Home ribbon and physical Back navigation.
++- Hide File Transfer back/Exit controls on every layout pass and retain the shared Home ribbon in reader-launched transfers.
 +- Keep the complete Plugins puzzle icon visible, including its top tab.
 +
  - Group reader image display, monochrome, contrast, transparency and inversion controls under Images.
@@ -2665,7 +2665,7 @@ index 76484191366b87f430dcae0569d9075d4e62bc8f..00000000000000000000000000000000
 -  void toggle(int row);
 -};
 diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
-index 2a1d19925ba5fc709c319dd753c8c8834ddc7642..42d14d41bfd05ff3965041c22fc41656ccfc2c13 100644
+index 2a1d19925ba5fc709c319dd753c8c8834ddc7642..d6d8a244c4ef5e0c376846aa1d6d4d4582546098 100644
 --- a/src/activities/network/CrossPointWebServerActivity.cpp
 +++ b/src/activities/network/CrossPointWebServerActivity.cpp
 @@ -539,6 +539,7 @@ void CrossPointWebServerActivity::render(RenderLock&&) {
@@ -2694,20 +2694,30 @@ index 2a1d19925ba5fc709c319dd753c8c8834ddc7642..42d14d41bfd05ff3965041c22fc41656
  }
 
  void CrossPointWebServerActivity::renderServerRunning() const {
+@@ -632,8 +632,7 @@ void CrossPointWebServerActivity::renderServerRunning() const {
+     renderer.drawCenteredText(SMALL_FONT_ID, startY, hostnameUrl.c_str(), true);
+   }
+
+-  const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_EXIT)), "", "", "");
+-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++  // The common ribbon supplies Home; no duplicate Exit/back control.
+ }
+
+ void CrossPointWebServerActivity::renderWifiIndicator(int subHeaderTop) const {
 diff --git a/src/activities/network/CrossPointWebServerActivity.h b/src/activities/network/CrossPointWebServerActivity.h
-index 9bd6211e0ec534fcf1279288f334087c8436031e..98f78cb51330c447452ec7fe4c0b5a74e7817fd1 100644
+index 9bd6211e0ec534fcf1279288f334087c8436031e..5a8c341c0116a88e0112d981b381d998e46faca4 100644
 --- a/src/activities/network/CrossPointWebServerActivity.h
 +++ b/src/activities/network/CrossPointWebServerActivity.h
 @@ -88,6 +88,7 @@ class CrossPointWebServerActivity final : public Activity {
    void onExit() override;
    void loop() override;
    void render(RenderLock&&) override;
-+  AppNavigation::View appNavigationView() const override { return returnBookPath.empty() ? AppNavigation::View::Transfer : AppNavigation::View::None; }
++  AppNavigation::View appNavigationView() const override { return AppNavigation::View::Transfer; }
    bool skipLoopDelay() override { return webServer && webServer->isRunning(); }
    bool preventAutoSleep() override { return webServer && webServer->isRunning(); }
  };
 diff --git a/src/activities/network/NetworkModeSelectionActivity.cpp b/src/activities/network/NetworkModeSelectionActivity.cpp
-index dec30d8cb7a1c638a95c50b449ac1ed47e36377f..a7902e55018856eaca1769191822d5300f3557c9 100644
+index dec30d8cb7a1c638a95c50b449ac1ed47e36377f..ca230137a76bcfc5a760cd5e7ad34ebd84454aa2 100644
 --- a/src/activities/network/NetworkModeSelectionActivity.cpp
 +++ b/src/activities/network/NetworkModeSelectionActivity.cpp
 @@ -129,10 +129,6 @@ void NetworkModeSelectionActivity::onEnter() {
@@ -2730,21 +2740,17 @@ index dec30d8cb7a1c638a95c50b449ac1ed47e36377f..a7902e55018856eaca1769191822d530
    screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
    std::vector<fui::ListItem> items;
-@@ -285,6 +281,13 @@ void NetworkModeSelectionActivity::render(RenderLock&&) {
-   // Header via GUI.drawHeader (already FreeInkUI-themed) for the battery
-   // indicator; the rest of the screen renders through the app.
-   const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
-+  if (mappedInput.hasTouchHardware()) {
-+    TouchHeaderBackButton::draw(renderer, ui.target, header, tr(STR_FILE_TRANSFER), false, 0, nullptr,
-+                                TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, true, false, false);
-+  } else {
-+    GUI.drawHeader(renderer, header, tr(STR_FILE_TRANSFER));
-+  }
-+
-   ui.closeRouting();
-   for (int pass = 0; pass < 8; ++pass) {
-     // Wrapped rows can move the viewport after layout. Erase the previous pass
-@@ -299,9 +302,7 @@ void NetworkModeSelectionActivity::render(RenderLock&&) {
+@@ -291,7 +287,8 @@ void NetworkModeSelectionActivity::render(RenderLock&&) {
+     // before drawing the corrected list, including its section headings.
+     renderer.clearScreen();
+     if (mappedInput.hasTouchHardware()) {
+-      TouchHeaderBackButton::draw(renderer, ui.target, header, tr(STR_FILE_TRANSFER), false);
++      TouchHeaderBackButton::draw(renderer, ui.target, header, tr(STR_FILE_TRANSFER), false, 0, nullptr,
++                                  TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, true, false, false);
+     } else {
+       GUI.drawHeader(renderer, header, tr(STR_FILE_TRANSFER));
+     }
+@@ -299,9 +296,7 @@ void NetworkModeSelectionActivity::render(RenderLock&&) {
      if (!listNav.consumeRebuildNeeded()) break;
    }
 
@@ -5150,7 +5156,7 @@ index 0000000000000000000000000000000000000000..5fd9febed43d4ef3bd72b56d38d38881
 +        out.append(f'inline constexpr freeink::Icon {ident}{{{size}, {size}, {round(sum(ys)/len(ys))}, {ident}_bits}};')
 +(root / 'src/components/icons/launcherIcons.h').write_text('\n'.join(out) + '\n')
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7943afd73 100644
+index b30c5f0e8de1318a15d93f09705b6d150a368c54..1f93f339ea4d55b25dbb5e5b84a802d6dd9f424b 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
 @@ -1,4 +1,6 @@
@@ -5160,11 +5166,12 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
  #include "ActivityManager.h"
 
  #if FREEINK_DEVICE_PICCO && CROSSINK_BATTERY_DIAG_LOG
-@@ -39,11 +41,11 @@
+@@ -39,11 +41,12 @@
  #include "boot_sleep/SleepActivity.h"
  #include "browser/OpdsBookBrowserActivity.h"
  #include "components/TouchRegistry.h"
 +#include "components/MemoryDiagnostics.h"
++#include "StatusIconRow.h"
  #include "components/UITheme.h"
  #include "home/AlertActivity.h"
  #include "home/CrashActivity.h"
@@ -5173,14 +5180,14 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
  #include "home/RecentBookProgress.h"
  #include "library/LibraryActivity.h"
  #include "network/CrossPointWebServerActivity.h"
-@@ -590,7 +592,22 @@ void ActivityManager::loop() {
+@@ -590,7 +593,22 @@ void ActivityManager::loop() {
      finishLiveLightSwipe(twoFingerLightSwipe, *this);
  #endif
 
 -  if (currentActivity) {
 +#if CROSSINK_APP_CAP_TOUCH
 +  int memoryX = 0, memoryY = 0, memoryId = -1;
-+  if (currentActivity && pendingAction == PendingAction::None && SETTINGS.showMemoryUsage &&
++  if (currentActivity && pendingAction == PendingAction::None && StatusIconRow::memoryEnabled(SETTINGS.statusIconHidden) &&
 +      !currentActivity->blocksGlobalInput() && mappedInput.wasScreenTapped(memoryX, memoryY) &&
 +      TouchRegistry::getInstance().hitTest(memoryX, memoryY, TouchRegistry::Memory, memoryId)) {
 +    auto details = makeUniqueNoThrow<DetailsActivity>(renderer, mappedInput, memoryDiagnostics());
@@ -5197,7 +5204,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
      if (mappedInput.isMenuMode() != currentActivity->usesMenuButtonOrientation()) {
        RenderLock lock;
        mappedInput.setMenuMode(currentActivity->usesMenuButtonOrientation());
-@@ -1086,15 +1103,6 @@ void ActivityManager::goToNearbyStatsSync() {
+@@ -1086,15 +1104,6 @@ void ActivityManager::goToNearbyStatsSync() {
 
  void ActivityManager::goToSettings(const bool dismissOnUpSwipe, const bool openLanguageDownloads,
                                     const bool touchscreenRecovery) {
@@ -5213,7 +5220,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
    auto settings = std::make_unique<SettingsActivity>(renderer, mappedInput, dismissOnUpSwipe);
    if (openLanguageDownloads) settings->openLanguageDownloadsOnEnter();
    if (touchscreenRecovery) settings->enableTouchscreenRecovery();
-@@ -1115,6 +1123,26 @@ void ActivityManager::goToLibrary() {
+@@ -1115,6 +1124,26 @@ void ActivityManager::goToLibrary() {
  }
 
  bool ActivityManager::goToPlugins(const bool networkBootReady) {
@@ -5240,7 +5247,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
  #ifndef SIMULATOR
    if (!networkBootReady) {
      // Hub installation and catalog parsing need the same clean heap as OPDS.
-@@ -1188,6 +1216,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
+@@ -1188,6 +1217,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
  }
 
  bool ActivityManager::goToSleep(bool fromTimeout) {
@@ -5249,7 +5256,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
    // Hold the visible page steady from the first sleep indication through reader saves.
    RenderLock lock;
    const bool readerPage = canSnapshotForSleepOverlay();
-@@ -1237,33 +1267,19 @@ void ActivityManager::goToFullScreenMessage(StrId title, StrId message) {
+@@ -1237,33 +1268,19 @@ void ActivityManager::goToFullScreenMessage(StrId title, StrId message) {
  }
 
  void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::RefreshMode initialRefreshMode) {
@@ -5295,7 +5302,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7
  }
  void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
-@@ -1303,7 +1319,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
+@@ -1303,7 +1320,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
 
  bool ActivityManager::blocksGlobalInput() const { return currentActivity && currentActivity->blocksGlobalInput(); }
 
@@ -8496,10 +8503,10 @@ index 0000000000000000000000000000000000000000..aac02a710ac898fe7dcf26cbbc43d32f
 +  bool save() const;
 +};
 diff --git a/src/components/UITheme.cpp b/src/components/UITheme.cpp
-index 0e4c275156b4c273a1e5839d693625d00a84091a..64677b6eb991b31d843ef756dc8f9052fa434cd8 100644
+index cb36dde927c6c36226ef83645651886b8af5dd71..25a0d9837aeef4b6ce2a24190eed424f1581fe71 100644
 --- a/src/components/UITheme.cpp
 +++ b/src/components/UITheme.cpp
-@@ -20,12 +20,7 @@
+@@ -21,12 +21,7 @@
  #include "MappedInputManager.h"
  #include "RecentBooksStore.h"
  #include "components/themes/BaseTheme.h"
@@ -8512,7 +8519,7 @@ index 0e4c275156b4c273a1e5839d693625d00a84091a..64677b6eb991b31d843ef756dc8f9052
  #include "fontIds.h"
 
  namespace {
-@@ -81,8 +76,8 @@ UITheme::UITheme() : currentMetrics(&LyraMetrics::values), currentTheme(std::mak
+@@ -82,8 +77,8 @@ UITheme::UITheme() : currentMetrics(&LyraMetrics::values), currentTheme(std::mak
  }
 
  void UITheme::reload() {
@@ -8523,7 +8530,7 @@ index 0e4c275156b4c273a1e5839d693625d00a84091a..64677b6eb991b31d843ef756dc8f9052
  }
 
  bool UITheme::supportsCoverGrid() {
-@@ -99,57 +94,7 @@ bool UITheme::supportsCoverGrid() {
+@@ -100,57 +95,7 @@ bool UITheme::supportsCoverGrid() {
  }
 
  bool UITheme::hasCoverGridHome() {
@@ -8582,7 +8589,7 @@ index 0e4c275156b4c273a1e5839d693625d00a84091a..64677b6eb991b31d843ef756dc8f9052
  }
 
  void UITheme::rebuildMetricVariants() {
-@@ -415,12 +360,7 @@ Rect UITheme::getHeaderRect(const GfxRenderer& renderer, const int height, const
+@@ -416,12 +361,7 @@ Rect UITheme::getHeaderRect(const GfxRenderer& renderer, const int height, const
  }
 
  int UITheme::getTopStatusBarInset(const GfxRenderer& renderer) {
@@ -9846,3 +9853,67 @@ index 0000000000000000000000000000000000000000..0ceb68cb2e7dbfdc8a3b2b5cacf0d728
 + library.restoreSyncViewport();assert(library.selection==44 && library.topIndex==39);
 + library.syncReturnSelection=20;library.count=0;library.restoreSyncViewport();assert(library.syncReturnSelection==-1);
 +}
+diff --git a/test/settings_menus/CMakeLists.txt b/test/settings_menus/CMakeLists.txt
+index 364121911cce7b758031a36eab1178e1d7b44c19..572e0f589964f36b24a13a2356bca2a0981ec176 100644
+--- a/test/settings_menus/CMakeLists.txt
++++ b/test/settings_menus/CMakeLists.txt
+@@ -11,3 +11,13 @@ target_include_directories(settings_menus_test PRIVATE ${CMAKE_CURRENT_BINARY_DI
+ target_compile_features(settings_menus_test PRIVATE cxx_std_20)
+ target_compile_options(settings_menus_test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+ add_test(NAME settings_menus COMMAND settings_menus_test)
++
++set(TRANSFER_RENDER ${CMAKE_CURRENT_BINARY_DIR}/TransferRender.inc)
++add_custom_command(OUTPUT ${TRANSFER_RENDER}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractTransferRender.py
++ ${REPO_ROOT}/src/activities/network/NetworkModeSelectionActivity.cpp ${TRANSFER_RENDER}
++ DEPENDS ExtractTransferRender.py ${REPO_ROOT}/src/activities/network/NetworkModeSelectionActivity.cpp)
++add_executable(transfer_render_test TransferRenderTest.cpp ${TRANSFER_RENDER})
++target_include_directories(transfer_render_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(transfer_render_test PRIVATE -UNDEBUG)
++add_test(NAME transfer_render COMMAND transfer_render_test)
+diff --git a/test/settings_menus/ExtractTransferRender.py b/test/settings_menus/ExtractTransferRender.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..18adcebf445bb5914fa638b480040a4aa8714b7a
+--- /dev/null
++++ b/test/settings_menus/ExtractTransferRender.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++a=s.index('void NetworkModeSelectionActivity::render(')
++b=s.index('void NetworkModeSelectionActivity::onModeSelected(',a)
++Path(sys.argv[2]).write_text(s[a:b])
+diff --git a/test/settings_menus/TransferRenderTest.cpp b/test/settings_menus/TransferRenderTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..92f0bc0a6cd7bcaf5afa656ea97916fc2ea436ff
+--- /dev/null
++++ b/test/settings_menus/TransferRenderTest.cpp
+@@ -0,0 +1,28 @@
++#include <cassert>
++#include <initializer_list>
++struct RenderLock{};struct Rect{};
++constexpr int STR_FILE_TRANSFER=1;const char* tr(int){return "File Transfer";}
++struct Renderer {int clears=0,frames=0;void clearScreen(){++clears;}void displayBuffer(int){++frames;}};
++struct Input {bool touch=true;bool hasTouchHardware(){return touch;}};
++static int headers=0,ribbons=0;
++namespace TouchHeaderBackButton {
++constexpr int TITLE_VERTICAL_OFFSET=8;
++Rect headerRect(Renderer&,Input&){return {};}
++void draw(Renderer&,int,Rect,const char*,bool,int=0,const char* =nullptr,int=8,bool=true,bool=false,bool showNavigation=true){assert(!showNavigation);++headers;}
++}
++struct {void drawHeader(Renderer&,Rect,const char*){++headers;}}GUI;
++namespace AppNavigation {void draw(Renderer&,int){++ribbons;}}
++class NetworkModeSelectionActivity {
++ public:
++ Renderer renderer;Input mappedInput;
++ struct {int target=0,paints=0;void closeRouting(){}void render(){++paints;}}ui;
++ struct {int remaining=3;bool consumeRebuildNeeded(){return remaining-->0;}}listNav;
++ struct {int modeFor(int){return 0;}}screenTransitionRefresh;
++ int appNavigationView(){return 1;}
++ void render(RenderLock&&);
++};
++#include "TransferRender.inc"
++int main(){for(bool touch:{true,false}){
++ headers=ribbons=0;NetworkModeSelectionActivity screen;screen.mappedInput.touch=touch;screen.render(RenderLock{});
++ assert(headers==4&&ribbons==1&&screen.ui.paints==4&&screen.renderer.clears==4&&screen.renderer.frames==1);
++}}
