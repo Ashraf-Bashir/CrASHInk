@@ -7,7 +7,7 @@ Apply all 17 patches in filename order, then the two SDK patches inside the
 SDK checkout. Never mix these with `patches-1.6.1`. The same feature/domain
 boundaries are retained; see the [domain map](../docs/development/crashink-patch-domains.md).
 
-The X4 Pro firmware build and 75 selected native regression checks have been
+The X4 Pro firmware build and 77 selected native regression checks have been
 validated. On-device rendering, touch, Wi-Fi, and sleep still require a device
 check after installation.
 
@@ -28,6 +28,10 @@ check after installation.
   for 50 ms before committing. Reader idle scans/prewarming pause during touch.
 - Chapter headings and navigation labels stay bold; full/partial chapter layouts
   rebuild once under cache version 119 / `0xE8` to apply the new glyph widths.
+- Highlight colors are Yellow, Green, Red, and Blue. Y/G/R/B swatches use
+  25%, 50%, 75%, and 100% black; filters use the color names. Readest sync maps
+  each named color both ways. Stored IDs 0/1/2 remain Yellow/Red/Blue; Green is
+  appended as ID 3 so existing highlights keep their colors.
 - Multiword touch selections save on release without a Lookup/Clip prompt.
   Single-word holds retain lookup; saved quote controls use non-flashing refreshes.
 - Clipping rewrites use checked scratch allocation and atomic publication.
