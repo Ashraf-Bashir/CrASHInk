@@ -1515,12 +1515,12 @@ index 03b21605357ae90aaf4381e234dfbf593afdfe59..869a551309d47382c22e117d31db3d88
    // Sync the RTC from an NTP server. Requires WiFi to be connected.
    // Blocks for up to ~5s while waiting for SNTP response.
 diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
-index b2dd97f261e021b1db47a84b53a692bdfe3210f3..b97576ccfb2a50c91d56853c68362688e8de46de 100644
+index 613cd4781d964850ab0fa7c32f9a5a46f66a66f3..abcfed1a5d527f6d39d9db815ba252ddc784bd71 100644
 --- a/src/CrossPointSettings.h
 +++ b/src/CrossPointSettings.h
 @@ -465,6 +465,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
    uint8_t screenInverted = 0;
-   enum HIGHLIGHT_COLOR : uint8_t { HIGHLIGHT_LIGHT_GREY, HIGHLIGHT_DARK_GREY, HIGHLIGHT_SOLID, HIGHLIGHT_GREEN, HIGHLIGHT_ORANGE };
+   enum HIGHLIGHT_COLOR : uint8_t { HIGHLIGHT_LIGHT_GREY, HIGHLIGHT_DARK_GREY, HIGHLIGHT_SOLID, HIGHLIGHT_GREEN };
    uint8_t highlightColor = HIGHLIGHT_LIGHT_GREY;
 +  // Readest Auto-Sync: sync the open book with Readest on open, close, wake and sleep.
 +  uint8_t readestAutoSync = 0;
@@ -1850,7 +1850,7 @@ index 0000000000000000000000000000000000000000..1b2492aaf6d559808edf788f60f7e6d2
 +};
 diff --git a/src/activities/reader/ReadestSyncActivity.cpp b/src/activities/reader/ReadestSyncActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7e44d2905382bee09cb96d4e599f101226ad48b0
+index 0000000000000000000000000000000000000000..d28503114e8e353ace5eeb3c1677204fe1f4845f
 --- /dev/null
 +++ b/src/activities/reader/ReadestSyncActivity.cpp
 @@ -0,0 +1,1300 @@
@@ -2490,7 +2490,7 @@ index 0000000000000000000000000000000000000000..7e44d2905382bee09cb96d4e599f1012
 +    local[static_cast<size_t>(li)].claimed = true;
 +    const auto* clip = CLIPPINGS.clippingAt(static_cast<size_t>(li));
 +    const auto shade = static_cast<uint8_t>(clip->color);
-+    if ((link.color <= 4 && shade != link.color) || remote[r].color == HIGHLIGHT_COLOR) {
++    if ((link.color <= 4 && shade != link.color) || (remote[r].color == HIGHLIGHT_COLOR || readest::isLegacyOrange(remote[r].color))) {
 +      toRecolor.emplace_back(r, shade); // local edit or legacy grey migration
 +      link.color = shade;
 +    } else {
@@ -5130,18 +5130,18 @@ index 0000000000000000000000000000000000000000..bd002bf492d6187687784b0252461ac4
 +};
 diff --git a/src/readest/ReadestHighlightColor.h b/src/readest/ReadestHighlightColor.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..fe47eb72e802516e414f896be310f68cfd7a3ee5
+index 0000000000000000000000000000000000000000..d848747fec08265717d107efc1a6d8002ab37836
 --- /dev/null
 +++ b/src/readest/ReadestHighlightColor.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +#pragma once
 +#include <cstdint>
 +#include <string_view>
 +
-+// Stable local IDs: Yellow=0, Red=1, Blue=2, Green=3, Orange=4. Display order is Y G O R B.
++// Stable local IDs: Yellow=0, Red=1, Blue=2, Green=3. Retired Orange ID 4 maps to Yellow. Display order is Y G R B.
 +namespace readest {
 +inline const char* highlightColor(uint8_t shade) {
-+  return shade == 4 ? "orange" : shade == 3 ? "green" : shade == 2 ? "blue" : shade == 1 ? "red" : "yellow";
++  return shade == 3 ? "green" : shade == 2 ? "blue" : shade == 1 ? "red" : "yellow";
 +}
 +inline bool sameHighlightColor(std::string_view a, std::string_view b) {
 +  if (a.size() != b.size()) return false;
@@ -5151,8 +5151,12 @@ index 0000000000000000000000000000000000000000..fe47eb72e802516e414f896be310f68c
 +  }
 +  return true;
 +}
++inline bool isLegacyOrange(std::string_view color) {
++  return sameHighlightColor(color, "orange") || sameHighlightColor(color, "#ff9800") ||
++         sameHighlightColor(color, "#ffa500");
++}
 +inline uint8_t highlightShade(std::string_view color, uint8_t fallback) {
-+  if (sameHighlightColor(color, "orange") || sameHighlightColor(color, "#ff9800") || sameHighlightColor(color, "#ffa500")) return 4;
++  if (isLegacyOrange(color)) return 0;
 +  if (sameHighlightColor(color, "green") || sameHighlightColor(color, "#4caf50")) return 3;
 +  if (sameHighlightColor(color, "blue") || sameHighlightColor(color, "#2196f3")) return 2;
 +  if (sameHighlightColor(color, "red") || sameHighlightColor(color, "#f44336")) return 1;
@@ -5861,7 +5865,7 @@ index 0000000000000000000000000000000000000000..b89737bc4a3cf81f2a0cd6a4eff18f32
 +''')
 diff --git a/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..762d1e4b7c20600b0033675038250e603acaefbc
+index 0000000000000000000000000000000000000000..91d952d58208b2b4d6e2f91703e71d190330166b
 --- /dev/null
 +++ b/test/readest_highlight_safety/ReadestHighlightSafetyTest.cpp
 @@ -0,0 +1,150 @@
@@ -5898,7 +5902,7 @@ index 0000000000000000000000000000000000000000..762d1e4b7c20600b0033675038250e60
 +  return true;
 +}
 +}  // namespace ReadestLinks
-+enum class ClippingColor {LightGrey,DarkGrey,Solid,Green,Orange};
++enum class ClippingColor {LightGrey,DarkGrey,Solid,Green};
 +constexpr const char* HIGHLIGHT_COLOR="#9e9e9e";
 +struct Clipping {
 +  ClippingColor color=ClippingColor::LightGrey;
@@ -5998,15 +6002,15 @@ index 0000000000000000000000000000000000000000..762d1e4b7c20600b0033675038250e60
 +  ReadestSyncActivity changedGreen;changedGreen.client.notes={{"i","intro",false,"green"}};
 +  assert(changedGreen.syncHighlights(book,counts) && changedGreen.recolors==1);
 +  assert(changedGreen.keptLinks[0].color==2);
-+  assert(std::string(readest::highlightColor(4))=="orange");
-+  assert(readest::highlightShade("orange",0)==4);
-+  assert(readest::highlightShade("#ff9800",0)==4);
-+  assert(readest::highlightShade("#FFA500",0)==4);
++  assert(std::string(readest::highlightColor(4))=="yellow");
++  assert(readest::highlightShade("orange",3)==0);
++  assert(readest::highlightShade("#ff9800",3)==0);
++  assert(readest::highlightShade("#FFA500",3)==0);
 +  ReadestLinks::fixture={{"i","intro","intro",0}};
 +  CLIPPINGS.clip.color=ClippingColor::LightGrey;
 +  ReadestSyncActivity orangeRemote;orangeRemote.client.notes={{"i","intro",false,"orange"}};
 +  assert(orangeRemote.syncHighlights(book,counts));
-+  assert(CLIPPINGS.clip.color==ClippingColor::Orange && orangeRemote.keptLinks[0].color==4);
++  assert(CLIPPINGS.clip.color==ClippingColor::LightGrey && orangeRemote.keptLinks[0].color==0 && orangeRemote.recolors==1);
 +  ReadestLinks::fixture={{"i","intro","intro",4}};
 +  CLIPPINGS.clip.color=ClippingColor::Green;
 +  ReadestSyncActivity editedOrange;editedOrange.client.notes={{"i","intro",false,"orange"}};
@@ -6898,7 +6902,7 @@ index 0000000000000000000000000000000000000000..b56fdbd7f060a2b39ce3488ce6121ea7
 +#include <string>
 +namespace ProgressBookIterator { inline void rememberPath(const std::string&, const std::string&) {} }
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index 101ca916d4079b1e93b332dd8eb5d52163a8322f..246f920bb55866237246c60284292c3e12ba9e14 100644
+index f660ab7558c001a914fa7cd7bf5212778229e5be..e355cc24e78e9b8fc396772d5ac765a3627e5664 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
 @@ -44,6 +44,7 @@
