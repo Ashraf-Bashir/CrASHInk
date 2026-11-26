@@ -1,5 +1,5 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 2db74d8c26e73d03abba43bfb4d15087e27406fc..1667ae8a5580d2b3e80adac8bc65d161ace52f30 100644
+index fe36e6445ff0e36bfec358dbf43f194ecacf548b..623dbd1e3d82d58c8acce717e8ef90947ce5cf72 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -1,7 +1,11 @@
@@ -14,9 +14,9 @@ index 2db74d8c26e73d03abba43bfb4d15087e27406fc..1667ae8a5580d2b3e80adac8bc65d161
  - The reader’s swipe-down drawer has a Library shortcut. Display → Frontlight offers independent black border widths from 0 to 16 pixels on each edge to mask light leakage.
  - crASHink adds a reader Library shortcut and independent frontlight leakage borders.
 
-@@ -61,6 +65,10 @@
-
- ### Fixed
+@@ -65,6 +69,10 @@
+ - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available.
+ - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
 
 +- Restore Library Sync Book actions and return to the selected page, sort and search after syncing.
 +- Hide the redundant File Transfer header arrow even when opened from a book; keep the shared Home ribbon and physical Back navigation.
@@ -25,7 +25,7 @@ index 2db74d8c26e73d03abba43bfb4d15087e27406fc..1667ae8a5580d2b3e80adac8bc65d161
  - Group reader image display, monochrome, contrast, transparency and inversion controls under Images.
 
  - Group Readest account controls and auto-sync together under Readest in System settings.
-@@ -116,10 +124,18 @@
+@@ -120,10 +128,18 @@
  - Show the Back button hint while viewing EPUB footnotes on button-only readers.
  - Releasing Power after starting Picco no longer selects a menu item on the first screen.
 
@@ -44,7 +44,7 @@ index 2db74d8c26e73d03abba43bfb4d15087e27406fc..1667ae8a5580d2b3e80adac8bc65d161
  - Clippings are stored in reading order. CrASHInk keeps clippings, Readest data, and library indexes together under `/crashink` and migrates the existing data on startup.
 
  ### Fixed
-@@ -128,6 +144,12 @@
+@@ -132,6 +148,12 @@
 
  - Readest position sync checks for newer matching editions and previews an approximate position when the saved anchor is missing or disagrees with the native location.
 
@@ -57,7 +57,7 @@ index 2db74d8c26e73d03abba43bfb4d15087e27406fc..1667ae8a5580d2b3e80adac8bc65d161
  - Image refresh blanks each image separately, keeping text between inline images visible while images are prepared for display. Pending images use an empty background instead of a temporary box border.
 
  - Saved highlight handles can extend or shorten across adjacent pages in the same chapter; edge dragging loads the actual page and saves once on release.
-@@ -166,6 +188,7 @@
+@@ -170,6 +192,7 @@
  - TTF font support on ESP32-S3 devices. Whole-point sizes from 8pt to 22pt will be automatically available.
  - Separate saved highlights retain clear side/top/bottom gutters, while each highlight stays continuous across its wrapped lines. Extending a saved highlight into another by at least one complete word merges their text and records on commit, including chained overlaps. Drag release and editor Save use the same atomic merge; adjacency, punctuation-only contact, Cancel and unchanged drafts do not merge.
  - Newly created highlights now share the same one-word overlap merge as edited highlights. Saved highlights show same-shade, full-height continuation triangles toward the next/previous page. Separate quotes keep a visible horizontal gap even when tight line spacing overlaps their line boxes; wrapped rows within one quote remain joined.
@@ -5150,7 +5150,7 @@ index 0000000000000000000000000000000000000000..5fd9febed43d4ef3bd72b56d38d38881
 +        out.append(f'inline constexpr freeink::Icon {ident}{{{size}, {size}, {round(sum(ys)/len(ys))}, {ident}_bits}};')
 +(root / 'src/components/icons/launcherIcons.h').write_text('\n'.join(out) + '\n')
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
-index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee02fa171c 100644
+index b30c5f0e8de1318a15d93f09705b6d150a368c54..2a931377f9af3145dad299278338eac7943afd73 100644
 --- a/src/activities/ActivityManager.cpp
 +++ b/src/activities/ActivityManager.cpp
 @@ -1,4 +1,6 @@
@@ -5160,7 +5160,12 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
  #include "ActivityManager.h"
 
  #if FREEINK_DEVICE_PICCO && CROSSINK_BATTERY_DIAG_LOG
-@@ -43,7 +45,6 @@
+@@ -39,11 +41,11 @@
+ #include "boot_sleep/SleepActivity.h"
+ #include "browser/OpdsBookBrowserActivity.h"
+ #include "components/TouchRegistry.h"
++#include "components/MemoryDiagnostics.h"
+ #include "components/UITheme.h"
  #include "home/AlertActivity.h"
  #include "home/CrashActivity.h"
  #include "home/FileBrowserActivity.h"
@@ -5168,11 +5173,23 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
  #include "home/RecentBookProgress.h"
  #include "library/LibraryActivity.h"
  #include "network/CrossPointWebServerActivity.h"
-@@ -590,7 +591,10 @@ void ActivityManager::loop() {
+@@ -590,7 +592,22 @@ void ActivityManager::loop() {
      finishLiveLightSwipe(twoFingerLightSwipe, *this);
  #endif
 
 -  if (currentActivity) {
++#if CROSSINK_APP_CAP_TOUCH
++  int memoryX = 0, memoryY = 0, memoryId = -1;
++  if (currentActivity && pendingAction == PendingAction::None && SETTINGS.showMemoryUsage &&
++      !currentActivity->blocksGlobalInput() && mappedInput.wasScreenTapped(memoryX, memoryY) &&
++      TouchRegistry::getInstance().hitTest(memoryX, memoryY, TouchRegistry::Memory, memoryId)) {
++    auto details = makeUniqueNoThrow<DetailsActivity>(renderer, mappedInput, memoryDiagnostics());
++    if (details) pushActivity(std::move(details));
++    else LOG_ERR("MEM", "Cannot allocate memory diagnostics view");
++    return;
++  }
++#endif
++
 +  const bool appNavigationHandled = currentActivity && pendingAction == PendingAction::None &&
 +      AppNavigation::handleInput(renderer, mappedInput, currentActivity->appNavigationView());
 +
@@ -5180,7 +5197,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
      if (mappedInput.isMenuMode() != currentActivity->usesMenuButtonOrientation()) {
        RenderLock lock;
        mappedInput.setMenuMode(currentActivity->usesMenuButtonOrientation());
-@@ -1086,15 +1090,6 @@ void ActivityManager::goToNearbyStatsSync() {
+@@ -1086,15 +1103,6 @@ void ActivityManager::goToNearbyStatsSync() {
 
  void ActivityManager::goToSettings(const bool dismissOnUpSwipe, const bool openLanguageDownloads,
                                     const bool touchscreenRecovery) {
@@ -5196,7 +5213,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
    auto settings = std::make_unique<SettingsActivity>(renderer, mappedInput, dismissOnUpSwipe);
    if (openLanguageDownloads) settings->openLanguageDownloadsOnEnter();
    if (touchscreenRecovery) settings->enableTouchscreenRecovery();
-@@ -1115,6 +1110,26 @@ void ActivityManager::goToLibrary() {
+@@ -1115,6 +1123,26 @@ void ActivityManager::goToLibrary() {
  }
 
  bool ActivityManager::goToPlugins(const bool networkBootReady) {
@@ -5223,7 +5240,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
  #ifndef SIMULATOR
    if (!networkBootReady) {
      // Hub installation and catalog parsing need the same clean heap as OPDS.
-@@ -1188,6 +1203,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
+@@ -1188,6 +1216,8 @@ void ActivityManager::goToReaderAndRunMenuAction(std::string path, const uint8_t
  }
 
  bool ActivityManager::goToSleep(bool fromTimeout) {
@@ -5232,7 +5249,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
    // Hold the visible page steady from the first sleep indication through reader saves.
    RenderLock lock;
    const bool readerPage = canSnapshotForSleepOverlay();
-@@ -1237,33 +1254,19 @@ void ActivityManager::goToFullScreenMessage(StrId title, StrId message) {
+@@ -1237,33 +1267,19 @@ void ActivityManager::goToFullScreenMessage(StrId title, StrId message) {
  }
 
  void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::RefreshMode initialRefreshMode) {
@@ -5278,7 +5295,7 @@ index b30c5f0e8de1318a15d93f09705b6d150a368c54..7691d54feef1b71f28b688f64f6789ee
  }
  void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
-@@ -1303,7 +1306,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
+@@ -1303,7 +1319,7 @@ bool ActivityManager::requiresExclusiveStorageLoop() const {
 
  bool ActivityManager::blocksGlobalInput() const { return currentActivity && currentActivity->blocksGlobalInput(); }
 
@@ -8479,7 +8496,7 @@ index 0000000000000000000000000000000000000000..aac02a710ac898fe7dcf26cbbc43d32f
 +  bool save() const;
 +};
 diff --git a/src/components/UITheme.cpp b/src/components/UITheme.cpp
-index e467c4387a6ffd742cd20351d927f2fd0930d45b..413741cd19015862db8305a7ec5477080654b219 100644
+index 0e4c275156b4c273a1e5839d693625d00a84091a..64677b6eb991b31d843ef756dc8f9052fa434cd8 100644
 --- a/src/components/UITheme.cpp
 +++ b/src/components/UITheme.cpp
 @@ -20,12 +20,7 @@
@@ -8565,7 +8582,7 @@ index e467c4387a6ffd742cd20351d927f2fd0930d45b..413741cd19015862db8305a7ec547708
  }
 
  void UITheme::rebuildMetricVariants() {
-@@ -414,12 +359,7 @@ Rect UITheme::getHeaderRect(const GfxRenderer& renderer, const int height, const
+@@ -415,12 +360,7 @@ Rect UITheme::getHeaderRect(const GfxRenderer& renderer, const int height, const
  }
 
  int UITheme::getTopStatusBarInset(const GfxRenderer& renderer) {

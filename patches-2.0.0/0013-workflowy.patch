@@ -1,8 +1,16 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 4baa56fba120d530e8a99461d4f406ed71340848..8a0b3bc89efd3b372e07a7a0308c766aaeb565f9 100644
+index 82e35b8b45ab47e5ed56bfe0fd853fb335a6e419..00ec1a3e6b51405db5ff7d19867d3a590a295756 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -11,6 +11,7 @@
+@@ -5,6 +5,7 @@
+ - Offer a tappable, configurable RAM used/total and percentage indicator with bounded memory diagnostics.
+ - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available.
+ - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion.
+
+ - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
+ - Group Readest account controls and auto-sync together under Readest in System settings.
+@@ -15,6 +16,7 @@
 
  - Store quotes in stock-compatible CrossInk v7 files, with checked color/note companions and lossless legacy migration; retain higher quote limits.
 
@@ -10,7 +18,7 @@ index 4baa56fba120d530e8a99461d4f406ed71340848..8a0b3bc89efd3b372e07a7a0308c766a
 
  - Hide the redundant File Transfer header arrow even when opened from a book; keep the shared Home ribbon and physical Back navigation.
  - Keep the complete Plugins puzzle icon visible, including its top tab.
-@@ -19,6 +20,8 @@
+@@ -23,6 +25,8 @@
 
  ### Added
 
@@ -8266,10 +8274,10 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#include "Harness.h"
 diff --git a/test/workflowy_share/stubs/Harness.h b/test/workflowy_share/stubs/Harness.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f6f81a32c1fa53cec7c19e60537eed2911c14afe
+index 0000000000000000000000000000000000000000..b2b8150305060bc155de2ddd0101ba86eee591e3
 --- /dev/null
 +++ b/test/workflowy_share/stubs/Harness.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,96 @@
 +#pragma once
 +#include <ArduinoJson.h>
 +#include <algorithm>
@@ -8341,7 +8349,10 @@ index 0000000000000000000000000000000000000000..f6f81a32c1fa53cec7c19e60537eed29
 +struct RenderLock {};
 +template<class T>std::unique_ptr<T> makeUniqueNoThrow(){return std::make_unique<T>();}
 +constexpr int MALLOC_CAP_SPIRAM=1,MALLOC_CAP_8BIT=2;
-+inline void* heap_caps_malloc(size_t n,int){return std::malloc(n);}inline void heap_caps_free(void* p){std::free(p);}inline void* heap_caps_realloc(void* p,size_t n,int){return std::realloc(p,n);}
++inline size_t liveJsonBlocks=0;
++inline void* heap_caps_malloc(size_t n,int){auto* p=std::malloc(n);if(p)++liveJsonBlocks;return p;}
++inline void heap_caps_free(void* p){if(p){assert(liveJsonBlocks);--liveJsonBlocks;}std::free(p);}
++inline void* heap_caps_realloc(void* p,size_t n,int){auto* result=std::realloc(p,n);if(!p&&result)++liveJsonBlocks;else if(p&&!n)--liveJsonBlocks;return result;}
 +struct Clipping {int spineIndex=0,startPage=0,startWordIndex=0,color=0;};
 +struct Clippings {std::string title="Book",author="Author",path="/book.epub",quote="First quote";Clipping clip;
 + std::string getBookTitle(){return title;}std::string getBookAuthor(){return author;}std::string getBookFilePath(){return path;}
@@ -8351,7 +8362,7 @@ index 0000000000000000000000000000000000000000..f6f81a32c1fa53cec7c19e60537eed29
 +using esp_err_t=int;constexpr int ESP_OK=0,ESP_FAIL=-1,HTTP_METHOD_POST=1,HTTP_METHOD_GET=0,HTTP_EVENT_ON_DATA=1;
 +struct esp_http_client_event_t {int event_id;void* user_data;void* data;int data_len;};
 +inline int esp_crt_bundle_attach(void*){return 0;}
-+struct esp_http_client_config_t {const char* url=nullptr;int method=0;int(*crt_bundle_attach)(void*)=nullptr;const char* user_agent=nullptr;int timeout_ms=0;bool disable_auto_redirect=false;int max_authorization_retries=0;void* user_data=nullptr;esp_err_t(*event_handler)(esp_http_client_event_t*)=nullptr;};
++struct esp_http_client_config_t {const char* url=nullptr;int method=0;int(*crt_bundle_attach)(void*)=nullptr;const char* user_agent=nullptr;int timeout_ms=0;int buffer_size=0,buffer_size_tx=0;bool disable_auto_redirect=false;int max_authorization_retries=0;void* user_data=nullptr;esp_err_t(*event_handler)(esp_http_client_event_t*)=nullptr;};
 +struct Http {esp_http_client_config_t c;std::string url,body;int status=200;};
 +inline Http* esp_http_client_init(const esp_http_client_config_t* c){return new Http{*c,c->url,{}};}
 +inline int esp_http_client_set_header(Http*,const char*,const char*){return ESP_OK;}
@@ -8796,10 +8807,10 @@ index 0000000000000000000000000000000000000000..cfe2c231d8a9b3b1e0ae1ab0efdb1018
 +  assert(busy.tapArrow(460,80) && busy.zoomOut==1);
 +}
 diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
-index d741086b2af19e6b5c8bbbc3ff74cf4c614fc063..04fa5c6398a823b77eadacbd79601218bb640c8f 100644
+index 3ec3dc53ba802dbe8ced61e082812469a34c4eff..a6aec6ca59f691d2cccaaa8c8bb4da0983669a58 100644
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -575,6 +575,27 @@ STR_DELETE_CACHE: "Delete Book Cache"
+@@ -580,6 +580,27 @@ STR_DELETE_CACHE: "Delete Book Cache"
  STR_SAVE_CLIPPING: "Create Clipping"
  STR_VIEW_CLIPPINGS: "View Clippings"
  STR_CLIPPINGS: "Clippings"
@@ -8827,7 +8838,7 @@ index d741086b2af19e6b5c8bbbc3ff74cf4c614fc063..04fa5c6398a823b77eadacbd79601218
  STR_BOOKMARKS_AND_CLIPPINGS: "Bookmarks & Clippings"
  STR_NO_CLIPPINGS: "No clippings yet"
  STR_DELETE_CLIPPINGS: "Clear Clippings"
-@@ -1210,3 +1231,74 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
+@@ -1215,3 +1236,74 @@ STR_LIBRARY_BATCH_ACTIONS: "Actions"
  STR_LIBRARY_BATCH_COUNT: "%u selected · %d/%d"
  STR_LIBRARY_BATCH_DELETE_MESSAGE: "Delete %u selected books?"
  STR_LIBRARY_BATCH_RESULT: "Updated %u of %u books"
@@ -8904,10 +8915,10 @@ index d741086b2af19e6b5c8bbbc3ff74cf4c614fc063..04fa5c6398a823b77eadacbd79601218
 +STR_WIFI_CONN_FAILED: "Wi-Fi connection failed"
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc4b58b724
+index 0000000000000000000000000000000000000000..87c732f6a37b9f71395bf8f0067b7f3b19423764
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,521 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -8920,6 +8931,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +#include <esp_heap_caps.h>
 +#include <esp_random.h>
 +#include <Memory.h>
++#include <MemoryBudget.h>
 +#include <freertos/task.h>
 +
 +#include <algorithm>
@@ -9009,6 +9021,10 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +      void* reallocate(void* p, size_t size) override { return heap_caps_realloc(p, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
 +};
 +
++// Stateless allocator shared by foreground staging and the network worker.
++// JSON strings/slots belong to each document and are freed with that document.
++ShareJsonAllocator shareJsonAllocator;
++
 +struct ShareJob {
 +  std::string key;
 +  std::string receiptPath, spoolPath;
@@ -9041,6 +9057,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    if (!last.empty() && trySaved(last)) return true;
 +    const int count = WiFi.scanNetworks();
 +    std::vector<std::string> visible;
++    visible.reserve(networks.size());
 +    for (int i = 0; i < count && visible.size() < networks.size(); ++i) {
 +      std::string ssid = WiFi.SSID(i).c_str();
 +      if (ssid != last && WIFI_STORE.hasSavedCredential(ssid) &&
@@ -9061,6 +9078,9 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    esp_http_client_config_t config{};
 +    config.url = url.c_str(); config.method = post ? HTTP_METHOD_POST : HTTP_METHOD_GET;
 +    config.crt_bundle_attach = esp_crt_bundle_attach; config.user_agent = "CrASHInk/Workflowy";
++    // HTTP's small streaming buffers must not compete with font/dictionary
++    // buffers. TLS still uses internal RAM in the shipped ESP32 framework.
++    config.buffer_size = 512; config.buffer_size_tx = 512;
 +    config.timeout_ms = 12000; config.disable_auto_redirect = true; config.max_authorization_retries = -1;
 +    config.user_data = &sink;
 +    config.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
@@ -9072,6 +9092,13 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +      }
 +      sink.size += event->data_len; return ESP_OK;
 +    };
++    const auto heap = byteHeapSnapshot(MemoryPool::Internal);
++    // Leave 64 KiB after a 48 KiB TLS allowance for live dictionary/render
++    // work. A deferred share remains on SD; never evict live font owners here.
++    if (heap.free < 112u * 1024u || heap.largest < 32u * 1024u) {
++      LOG_ERR("WF", "Share deferred: internal free=%u largest=%u", unsigned(heap.free), unsigned(heap.largest));
++      return -1;
++    }
 +    const auto client = esp_http_client_init(&config);
 +    if (!client) return -1;
 +    auto result = esp_http_client_set_header(client, "Authorization", auth.c_str());
@@ -9100,7 +9127,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    if (status != 200) return failure(status);
 +    // Response bytes stay on SD; only filtered child IDs/names use PSRAM.
 +    ShareJsonAllocator allocator;
-+    JsonDocument nodes(&allocator), filter;
++    JsonDocument nodes(&allocator), filter(&shareJsonAllocator);
 +    filter["nodes"][0]["id"] = true; filter["nodes"][0]["name"] = true;
 +    FsFile response;
 +    if (!Storage.openFileForRead("WF", RESPONSE_FILE, response)) return StrId::STR_WORKFLOWY_READ_FAILED;
@@ -9110,7 +9137,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    bookParent = workflowy::findBookGroup(nodes["nodes"].as<JsonArrayConst>(), bookTitle, bookAuthor);
 +    nodes.clear();
 +    if (!bookParent.empty()) return StrId::STR_WORKFLOWY_SENT;
-+    JsonDocument create;
++    JsonDocument create(&shareJsonAllocator);
 +    create["parent_id"] = destination;
 +    create["name"] = oneLine(workflowy::bookGroupLabel(bookTitle, bookAuthor));
 +    create["position"] = "bottom";
@@ -9118,7 +9145,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    if (!serializeJson(create, body) || create.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
 +    status = request(API_URL, true, body, true);
 +    if (status < 200 || status >= 300) return failure(status);
-+    JsonDocument result;
++    JsonDocument result(&shareJsonAllocator);
 +    if (!Storage.openFileForRead("WF", RESPONSE_FILE, response)) return StrId::STR_WORKFLOWY_READ_FAILED;
 +    const auto error = deserializeJson(result, response);
 +    response.close();
@@ -9147,7 +9174,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    if (file.read(&bytes, sizeof(bytes)) != sizeof(bytes) || !bytes || bytes > 4096 || bytes > file.size() - sizeof(bytes)) return false;
 +    std::string header(bytes, '\0');
 +    if (file.read(header.data(), bytes) != static_cast<int>(bytes)) return false;
-+    JsonDocument metadata;
++    JsonDocument metadata(&shareJsonAllocator);
 +    if (deserializeJson(metadata, header) || metadata["version"].as<int>() != 1) return false;
 +    destination = metadata["destination"] | ""; bookTitle = metadata["title"] | ""; bookAuthor = metadata["author"] | "";
 +    accountHash = metadata["account"].as<uint64_t>();
@@ -9184,7 +9211,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +        if (grouped != StrId::STR_WORKFLOWY_SENT) return grouped;
 +        connected = true;
 +      }
-+      JsonDocument quote;
++      JsonDocument quote(&shareJsonAllocator);
 +      if (deserializeJson(quote, body)) return StrId::STR_WORKFLOWY_READ_FAILED;
 +      quote["parent_id"] = bookParent;
 +      if (checkRemoteQuote) {
@@ -9194,7 +9221,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +        if (listed != 200) return StrId::STR_WORKFLOWY_NETWORK_FAILED;
 +        FsFile response;
 +        ShareJsonAllocator allocator;
-+        JsonDocument children(&allocator), filter;
++        JsonDocument children(&allocator), filter(&shareJsonAllocator);
 +        filter["nodes"][0]["name"] = true;
 +        if (!Storage.openFileForRead("WF", RESPONSE_FILE, response) ||
 +            deserializeJson(children, response, DeserializationOption::Filter(filter)) || !children["nodes"].is<JsonArray>()) return StrId::STR_WORKFLOWY_READ_FAILED;
@@ -9258,12 +9285,12 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +  const auto temporary = job.spoolPath + ".tmp";
 +  FsFile spool = Storage.open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
 +  if (!spool) return StrId::STR_WORKFLOWY_SAVE_FAILED;
-+  JsonDocument metadata;
++  JsonDocument metadata(&shareJsonAllocator);
 +  metadata["version"] = 1; metadata["destination"] = job.destination; metadata["title"] = job.bookTitle;
 +  metadata["author"] = job.bookAuthor; metadata["account"] = job.key.empty() ? 0 : receiptHash(job.key);
 +  metadata["receipt"] = std::string(path).substr(std::string(path).find_last_of('/') + 1, 16);
 +  std::string header;
-+  serializeJson(metadata, header);
++  if (!serializeJson(metadata, header) || metadata.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
 +  const uint32_t headerLength = header.size();
 +  if (!headerLength || headerLength > 4096 || spool.write(&headerLength, sizeof(headerLength)) != sizeof(headerLength) ||
 +      spool.write(header.data(), header.size()) != header.size()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
@@ -9282,7 +9309,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +    auto name = oneLine(quote);
 +    if (!citation.empty()) name += "\n\n" + citation;
 +    if (!note.empty()) name += "\n\n📝 " + oneLine(note);
-+    JsonDocument request;
++    JsonDocument request(&shareJsonAllocator);
 +    request["parent_id"] = destination.empty() ? DEFAULT_DESTINATION : destination;
 +    request["name"] = name;
 +    request["position"] = "bottom";
@@ -9346,10 +9373,15 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +  if (!pendingKick.exchange(false) || sending.exchange(true)) return;
 +  const auto sendTask = [](void*) {
 +    workerStartedAt = millis();
++    MemoryBudget::logEpubHeapPools("share.start");
 +    bool ownsWifi = false;
 +    const auto releaseWorker = [&](uint32_t generation) {
 +      // Finish network cleanup before another Share can start a replacement worker.
 +      if (ownsWifi) { WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); ownsWifi = false; }
++      MemoryBudget::logEpubHeapPools("share.cleaned");
++#if defined(ARDUINO_ARCH_ESP32) && !defined(SIMULATOR)
++      if (!heap_caps_check_integrity_all(false)) LOG_ERR("WF", "Heap integrity failure after quote sharing");
++#endif
 +      sending.store(false);
 +      if (shareGeneration.load() != generation && !sending.exchange(true)) { workerStartedAt = millis(); return true; }
 +      return false;
@@ -9367,6 +9399,7 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +        LOG_ERR("WF", "Invalid outbox item retained for recovery");
 +        Storage.rename(path.c_str(), (path + ".bad").c_str());
 +
++        job.reset();
 +        if (releaseWorker(generation)) continue; break;
 +      }
 +      const auto result = job->send(); ownsWifi |= job->ownsWifi;
@@ -9374,10 +9407,12 @@ index 0000000000000000000000000000000000000000..a8a33599bf1ceafb11f8adf2e07911bc
 +      if (result != StrId::STR_WORKFLOWY_SENT && result != StrId::STR_WORKFLOWY_ALREADY_SENT) {
 +        LOG_ERR("WF", "Share pending locally (reason %d)", static_cast<int>(result));
 +
++        job.reset();
 +        if (releaseWorker(generation)) continue; break;
 +      }
 +      if (!Storage.remove(path.c_str())) {
 +        LOG_ERR("WF", "Cannot remove acknowledged outbox item; receipts prevent resending");
++        job.reset();
 +        if (releaseWorker(generation)) continue; break;
 +      }
 +      Storage.remove((path + ".started").c_str());
@@ -9447,11 +9482,12 @@ index f9a4c85e2fa46f97fc2ced9c422bc631641ae73c..f690b63c1740a302e89c70a9ac1fbf43
    pages.loop();
 diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..267575ef8a079a4226c6312ec0db5259e3bd06e2
+index 0000000000000000000000000000000000000000..c4d934dc4b87348a18afadf5bea2a21c3522bf7b
 --- /dev/null
 +++ b/test/workflowy_share/WorkflowyShareTest.cpp
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,30 @@
 +#include "Harness.h"
++#include "MemoryBudget.h"
 +#include "activities/reader/WorkflowyShareActivity.h"
 +#include "workflowy/WorkflowySettings.h"
 +#include "workflowy/WorkflowyBookGroup.h"
@@ -9470,5 +9506,26 @@ index 0000000000000000000000000000000000000000..267575ef8a079a4226c6312ec0db5259
 + CLIPPINGS.quote="Fifth quote";loseQuoteResponse=true;workflowy::shareClippings(0);runWorker();assert(jobs()==1);auto accepted=remote.size();workflowy::shareClippings(0);runWorker();assert(jobs()==0&&remote.size()==accepted);
 + JsonDocument nodes;assert(!deserializeJson(nodes,R"({"nodes":[{"id":"abc123","name":"📖 Existing"},{"id":"def456","name":"<b>Existing — Author</b>"}]})"));assert(workflowy::findBookGroup(nodes["nodes"].as<JsonArrayConst>(),"Existing","Author")=="def456");
 + assert(workflowy::bookGroupKey("📘 <b>R&amp;D</b> — Author")==workflowy::bookGroupKey("R&D — Author"));
++ // Low internal RAM or fragmentation must retain the job without opening TLS.
++ CLIPPINGS.quote="Low memory quote";
++ internalFree=100*1024;auto calls=httpCalls;
++ workflowy::shareClippings(0);runWorker();assert(jobs()==1&&httpCalls==calls&&!WiFi.connected&&!workflowy::shareInProgress());
++ internalFree=256*1024;internalLargest=16*1024;
++ workflowy::shareClippings(0);runWorker();assert(jobs()==2&&httpCalls==calls&&!WiFi.connected);
++ internalLargest=128*1024;workflowy::shareClippings(0);runWorker();assert(jobs()==0);
++ assert(liveJsonBlocks==0);
 + assert(!workflowy::takeShareError());std::filesystem::remove_all(sdRoot);std::cout<<"Workflowy durable share tests passed\n";
 +}
+diff --git a/test/workflowy_share/stubs/MemoryBudget.h b/test/workflowy_share/stubs/MemoryBudget.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b5eb56ac3f11ed1b516b9c3a63238855650faab
+--- /dev/null
++++ b/test/workflowy_share/stubs/MemoryBudget.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include "Harness.h"
++enum class MemoryPool {Internal,Psram};
++struct ByteHeapSnapshot {size_t total,free,largest;};
++inline size_t internalFree=256*1024, internalLargest=128*1024;
++inline ByteHeapSnapshot byteHeapSnapshot(MemoryPool){return {320*1024,internalFree,internalLargest};}
++namespace MemoryBudget {inline void logEpubHeapPools(const char*){}}

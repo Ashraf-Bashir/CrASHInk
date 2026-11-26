@@ -941,15 +941,191 @@ index e996ff03ca5f2ad909069f071e44133340a348bc..ea065bc21b0c6a428e7a24777c597a64
      return renderer.getSpaceAdvance(fontId, leftCodepoint, GUIDE_DOT_CODEPOINT, left.style) +
             renderer.getTextAdvanceX(fontId, GUIDE_DOT_UTF8, EpdFontFamily::REGULAR, 0, characterSpacing) +
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 1dab73c78f31a82176dfd5fa147da9d5dfd69392..9633807319a754fd7712ac733947f4f49e892078 100644
+index 39bdf04565e67094d7c49b092d63f444b70d41bb..ee44bd5c841e3693baa964e8887f5cadfa982ad5 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -56,6 +56,8 @@
-
+@@ -57,6 +57,9 @@
  ### Fixed
 
-+- Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
+ - Offer a tappable, configurable RAM used/total and percentage indicator with bounded memory diagnostics.
++- Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available.
 +
++- Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
+
  - Fix an occasional reboot when putting an X3 or X4 to sleep with plugins enabled (#973).
  - Index EPUBs faster when many table-of-contents entries point to the same chapter file or chapter files are stored out of reading order.
- - Credit EPUB and XTC reading to the correct local day across midnight. Preserve live stats if a save fails, retry updates after SD errors, and finish pending saves before sleep, reader restart, or USB Drive handoff.
+diff --git a/docs/crashink-memory-review.md b/docs/crashink-memory-review.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2623d3b5f06214e5c22da35e43032509f193989e
+--- /dev/null
++++ b/docs/crashink-memory-review.md
+@@ -0,0 +1,35 @@
++# Memory review: patched 1.6.1 versus patched 2.0.0
++
++The archived 1.6.1 patch stack was replayed from its pinned commit
++9914146eeae7b46b300f475a16c32426fc02ec1f. This is a source comparison,
++not an on-device before/after RAM benchmark.
++
++| Area | 1.6.1 | 2.0.0 / correction |
++| --- | --- | --- |
++| Quote sharing | 12 KiB worker stack, HTTP cleanup, Wi-Fi shutdown, durable SD outbox | Same mechanism before this fix; no newly introduced share-worker leak established. Release failure-path job payloads before announcing completion. |
++| TLS | HTTP client uses framework TLS allocator | Current X4 Pro framework selects internal-memory TLS. Small HTTP streaming buffers and internal free/largest-block admission now keep tight-memory shares queued. The allowance is conservative policy, not a guaranteed TLS peak. |
++| Share JSON | Child-list JSON in PSRAM; other documents on default heap | All sharing JSON documents now explicitly use PSRAM. Failed metadata serialization is rejected before publishing a job. |
++| Compressed fonts | Allocate/free inflate scratch per group | 2.0 reuses one call-local scratch buffer, reducing allocation churn. Pixel payloads, hot group and scratch now prefer PSRAM, with the existing default fallback on non-PSRAM devices. |
++| Dictionary rendering | Prewarm scope ends before word overlay | Same lifetime bug persisted in 2.0; now survives through overlay drawing. Regression test uses the actual render block. This does not prove it was the sole cause of the reported corruption. |
++| Scalable fonts | Bounded PSRAM workspace and pixel arena | Same capacity constants; new implementation adds bounded cache admission and inactive-font release. No reason found to halve these arenas indiscriminately. |
++| Highlight geometry | Reserves metadata for 10,000 words up front | Short auto-highlights now reserve only their known word count; other selections start at 512 and grow with heap checks. The 10,000-word limit remains. |
++| Diagnostics | Serial heap figures | Optional, allocation-free top-bar used/total internal byte heap and percentage. On-demand pool totals, largest free block, ten smallest task stack headrooms. No polling worker or periodic e-ink refresh. |
++
++The current SDK does not enable per-task heap allocation tracking. Task stack
++headroom is minimum free stack, **not total RAM consumption**, and is labelled
++accordingly. Task numbers are copied from the scheduler snapshot; task-name
++pointers are deliberately not dereferenced after a worker may have exited.
++
++## Hardware verification
++
++On X4 Pro, record the RAM indicator and `share.start`/`share.cleaned` serial
++pool snapshots. Repeatedly share a quote, wait for Wi-Fi to disappear, then
++look up words, including selecting words inside dictionary definitions.
++Expect legible fonts, no monotonic heap loss, no heap-integrity errors, and
++queued shares preserved if internal RAM cannot admit TLS. A first network
++connection may initialize shared framework infrastructure; distinguish that
++one-time change from a leak growing on every share. No cache reset is needed.
++
++Test new and existing highlight endpoint drags at both screen edges, in both
++orientations. Brief contact gaps must not save early; deliberate edge dwell
++must turn one page without skipping pages while the finger is stationary.
+diff --git a/lib/EpdFont/FontDecompressor.cpp b/lib/EpdFont/FontDecompressor.cpp
+index 13ab102a9627c9eb2732cbd10b5446c2c3cc9a9c..bc20eeae9890ec83b3418fc0cac29e5735eecce3 100644
+--- a/lib/EpdFont/FontDecompressor.cpp
++++ b/lib/EpdFont/FontDecompressor.cpp
+@@ -8,6 +8,19 @@
+ #include <cstdlib>
+ #include <cstring>
+
++namespace {
++// Glyph pixels and inflate scratch are byte-addressed, never DMA/ISR buffers.
++// Prefer X4 Pro PSRAM; retain the existing default-heap path without PSRAM.
++HeapByteBuffer fontPixelBuffer(size_t bytes) {
++  const auto psram = byteHeapSnapshot(MemoryPool::Psram);
++  if (psram.total && bytes <= psram.free && psram.free - bytes >= 128u * 1024u) {
++    auto buffer = makePsramByteBufferNoThrow(bytes);
++    if (buffer) return buffer;
++  }
++  return makeDefaultByteBufferNoThrow(bytes);
++}
++}  // namespace
++
+ FontDecompressor::~FontDecompressor() { deinit(); }
+
+ bool FontDecompressor::init() {
+@@ -50,7 +63,7 @@ bool FontDecompressor::ensureCapacity(uint8_t*& buf, uint32_t& capacity, uint32_
+   // Grow-only, free-then-malloc: every caller fully rewrites the buffer after a grow, so the
+   // old contents are dead -- freeing first gives the allocator its best shot on a tight heap.
+   free(buf);
+-  buf = static_cast<uint8_t*>(malloc(needed));  // owned by FontDecompressor, freed in freeHotGroup()
++  buf = fontPixelBuffer(needed).release();  // owned by FontDecompressor, freed in freeHotGroup()
+   capacity = buf ? needed : 0;
+   return buf != nullptr;
+ }
+@@ -363,7 +376,7 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
+
+   // Step 3: Allocate page buffer and lookup table
+   PageSlot& slot = pageSlots[pageSlotCount];
+-  slot.buffer = static_cast<uint8_t*>(malloc(totalBytes));
++  slot.buffer = fontPixelBuffer(totalBytes).release();
+   slot.glyphs = static_cast<PageGlyphEntry*>(malloc(glyphCount * sizeof(PageGlyphEntry)));
+   if (!slot.buffer || !slot.glyphs) {
+     LOG_ERR("FDC", "Failed to allocate page buffer (%u bytes, %u glyphs)", totalBytes, glyphCount);
+@@ -479,7 +492,7 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
+
+     if (!tempBuf || tempCapacity < group.uncompressedSize) {
+       tempBuf.reset();
+-      tempBuf = makeDefaultByteBufferNoThrow(group.uncompressedSize);
++      tempBuf = fontPixelBuffer(group.uncompressedSize);
+       tempCapacity = tempBuf ? group.uncompressedSize : 0;
+     }
+     if (!tempBuf) {
+diff --git a/src/activities/reader/DictionaryDefinitionActivity.cpp b/src/activities/reader/DictionaryDefinitionActivity.cpp
+index 2637d0681c58f1a3cef9cb20ebcbd7a1bcbf07ae..0ce9c97783349a87b01c098d20fc74cf4b68143d 100644
+--- a/src/activities/reader/DictionaryDefinitionActivity.cpp
++++ b/src/activities/reader/DictionaryDefinitionActivity.cpp
+@@ -1631,12 +1631,13 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
+   // reader background above may have replaced that cache, so scan the visible
+   // title and definition page before drawing them. The .dict reader was closed
+   // by loadPage(), keeping font and dictionary SD access serialized.
++  // Keep glyph owners alive until the word-selection overlay has also drawn.
++  std::optional<FontCacheManager::PrewarmScope> definitionRenderScope;
+   bool definitionTextRendered = false;
+   if (renderer.isSdCardFont(bodyFontId)) {
+     if (auto* fcm = renderer.getFontCacheManager()) {
+       // Keep this alive through the word-select overlay below. Its destructor
+       // clears SD glyph bitmaps, and that overlay redraws the selected word.
+-      std::optional<FontCacheManager::PrewarmScope> definitionRenderScope;
+       const auto prewarmAndRender = [&]() {
+         definitionRenderScope.emplace(*fcm, FontCacheManager::PreparationPolicy::DictionaryLean);
+         renderTitle();
+diff --git a/test/font_cache_manager/CMakeLists.txt b/test/font_cache_manager/CMakeLists.txt
+index 5d4f09402d569ceadf2696a40668196e21f3fec6..5132cf752c357c8d1469fd0e4c7a13dba429df68 100644
+--- a/test/font_cache_manager/CMakeLists.txt
++++ b/test/font_cache_manager/CMakeLists.txt
+@@ -26,3 +26,14 @@ target_include_directories(IdleScalablePrewarmTest PRIVATE
+   ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${REPO_ROOT}/lib/GfxRenderer ${REPO_ROOT}/lib/Utf8)
+ target_link_libraries(IdleScalablePrewarmTest PRIVATE crosspoint_test_common GTest::gtest_main)
+ gtest_discover_tests(IdleScalablePrewarmTest)
++
++set(DEFINITION_SCOPE ${CMAKE_CURRENT_BINARY_DIR}/DefinitionScope.inc)
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++add_custom_command(OUTPUT ${DEFINITION_SCOPE}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractDefinitionScope.py
++ ${REPO_ROOT}/src/activities/reader/DictionaryDefinitionActivity.cpp ${DEFINITION_SCOPE}
++ DEPENDS ExtractDefinitionScope.py ${REPO_ROOT}/src/activities/reader/DictionaryDefinitionActivity.cpp)
++add_executable(definition_scope_test DefinitionScopeTest.cpp ${DEFINITION_SCOPE})
++target_include_directories(definition_scope_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_options(definition_scope_test PRIVATE -UNDEBUG)
++add_test(NAME definition_scope COMMAND definition_scope_test)
+diff --git a/test/font_cache_manager/DefinitionScopeTest.cpp b/test/font_cache_manager/DefinitionScopeTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1f78d57b81e6b62dd9320c2d586b225b1c77573
+--- /dev/null
++++ b/test/font_cache_manager/DefinitionScopeTest.cpp
+@@ -0,0 +1,27 @@
++#include <cassert>
++#include <optional>
++#define LOG_ERR(...) ((void)0)
++static bool prepared=false;
++struct FontCacheManager {
++ enum class PreparationPolicy {DictionaryLean};
++ struct PrewarmScope {
++  PrewarmScope(FontCacheManager&,PreparationPolicy){prepared=false;}
++  ~PrewarmScope(){prepared=false;}
++  bool endScanAndPrewarm(){prepared=true;return true;}
++ };
++};
++struct Renderer {
++ FontCacheManager manager;
++ bool isSdCardFont(int){return true;}
++ FontCacheManager* getFontCacheManager(){return &manager;}
++ void releaseSdCardFontForLowMemory(int,bool){prepared=false;}
++};
++void renderDefinition() {
++ Renderer renderer;int bodyFontId=1;
++ auto renderTitle=[]{};auto renderBody=[]{};
++ auto useBuiltInDefinitionFontFallback=[]{};auto requestUpdate=[]{};
++#include "DefinitionScope.inc"
++ // The later selected-word overlay still needs these same glyph owners.
++ assert(prepared);
++}
++int main(){renderDefinition();assert(!prepared);}
+diff --git a/test/font_cache_manager/ExtractDefinitionScope.py b/test/font_cache_manager/ExtractDefinitionScope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f10e43187c9089ba7ef5384567404946cf8778f
+--- /dev/null
++++ b/test/font_cache_manager/ExtractDefinitionScope.py
+@@ -0,0 +1,6 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++a=s.index('  std::optional<FontCacheManager::PrewarmScope> definitionRenderScope;')
++b=s.index('  const char* inlineStatusMessage',a)
++Path(sys.argv[2]).write_text(s[a:b])
