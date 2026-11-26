@@ -941,14 +941,14 @@ index e996ff03ca5f2ad909069f071e44133340a348bc..ea065bc21b0c6a428e7a24777c597a64
      return renderer.getSpaceAdvance(fontId, leftCodepoint, GUIDE_DOT_CODEPOINT, left.style) +
             renderer.getTextAdvanceX(fontId, GUIDE_DOT_UTF8, EpdFontFamily::REGULAR, 0, characterSpacing) +
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 2368185392505aa5b9c3e57b7c3a273aa2a0440d..9cc54b26863c5ae9ab035d3c2df433a90b2aaf60 100644
+index 2368185392505aa5b9c3e57b7c3a273aa2a0440d..9f803198a6ff2668735c8393990cf46a5e9a009a 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -57,6 +57,9 @@
  ### Fixed
 
  - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
-+- Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
++- Use PSRAM for compressed-dictionary history and admit PSRAM-backed dictionary fonts with 40 KiB of internal headroom while retaining the non-PSRAM safety gate. Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
 +
 +- Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
 
@@ -1322,10 +1322,10 @@ index 0000000000000000000000000000000000000000..1f10e43187c9089ba7ef538456740494
 +Path(sys.argv[2]).write_text(s[a:b])
 diff --git a/src/DictionaryFontAdmission.h b/src/DictionaryFontAdmission.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..6d515a35b69356380c2e0b7fe2083486562ed20e
+index 0000000000000000000000000000000000000000..ad97ddeb72883f5a9e28e579bed2b222785ff5e4
 --- /dev/null
 +++ b/src/DictionaryFontAdmission.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,11 @@
 +#pragma once
 +#include <Memory.h>
 +namespace DictionaryFontAdmission {
@@ -1333,7 +1333,8 @@ index 0000000000000000000000000000000000000000..6d515a35b69356380c2e0b7fe2083486
 +// devices need small internal blocks, not a contiguous 32 KiB font buffer.
 +inline bool allows(const ByteHeapSnapshot& internal, const ByteHeapSnapshot& external) {
 +  const bool externalReady = external.total && external.free >= 256U * 1024U && external.largest >= 128U * 1024U;
-+  return internal.free >= 64U * 1024U && internal.largest >= (externalReady ? 8U * 1024U : 32U * 1024U);
++  return internal.free >= (externalReady ? 40U * 1024U : 64U * 1024U) &&
++         internal.largest >= (externalReady ? 8U * 1024U : 32U * 1024U);
 +}
 +}
 diff --git a/src/SdCardFontSystem.cpp b/src/SdCardFontSystem.cpp
@@ -1419,10 +1420,10 @@ index d49a988446a1ef1ef82b7dc2ef29622a538d1cef..adb2e12e481b96e04957014ea96d32e9
    bool skipInitialModalBackgroundRedraw_ = false;
 diff --git a/test/font_cache_manager/DictionaryFontRecoveryTest.cpp b/test/font_cache_manager/DictionaryFontRecoveryTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..939660298b71200c515aa1f9cde4334cc0c378e7
+index 0000000000000000000000000000000000000000..50ecab2b91c05680f82f3e42c002ff16ef7802c2
 --- /dev/null
 +++ b/test/font_cache_manager/DictionaryFontRecoveryTest.cpp
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,63 @@
 +#include <cassert>
 +#include <map>
 +#include <string>
@@ -1479,10 +1480,11 @@ index 0000000000000000000000000000000000000000..939660298b71200c515aa1f9cde4334c
 + DictionaryDefinitionActivity unconfigured;unconfigured.dictionaryFontFamilyName_[0]=0;assert(!unconfigured.visibleArabicFontMissing());
 + DictionaryDefinitionActivity latin;latin.pagePool_="English only";assert(!latin.visibleArabicFontMissing());
 + DictionaryDefinitionActivity removed;removed.renderer.fonts.clear();assert(removed.visibleArabicFontMissing());
++ assert(!DictionaryFontAdmission::allows({320*1024,39*1024,16*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
 + // 60% used can still leave <32 KiB contiguous. X4 Pro must use PSRAM.
 + assert(DictionaryFontAdmission::allows({320*1024,128*1024,16*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
 + assert(!DictionaryFontAdmission::allows({320*1024,128*1024,16*1024},{0,0,0}));
-+ assert(!DictionaryFontAdmission::allows({320*1024,40*1024,16*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
++ assert(DictionaryFontAdmission::allows({320*1024,40*1024,16*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
 + assert(!DictionaryFontAdmission::allows({320*1024,128*1024,4*1024},{8*1024*1024,4*1024*1024,2*1024*1024}));
 +}
 diff --git a/test/font_cache_manager/ExtractDictionaryFontRecovery.py b/test/font_cache_manager/ExtractDictionaryFontRecovery.py
@@ -1555,4 +1557,111 @@ index 0000000000000000000000000000000000000000..ea24ba11f65d3d7dbb555ae1f47c323d
 +    if(dictionary.hasCodepoint(cp)) assert(dictionary.probeGlyph(cp,16));
 +  }
 + }
++}
+diff --git a/src/util/DictZip.cpp b/src/util/DictZip.cpp
+index aaa7ed84ddc74a9b2ac8fac547cba4c450465c40..884d80df92ae82e7f960c7d9a8f29088c69b719d 100644
+--- a/src/util/DictZip.cpp
++++ b/src/util/DictZip.cpp
+@@ -258,11 +258,20 @@ bool extractEntry(const char* path, uint32_t offset, uint32_t size, HalFile& out
+   // large free runs before the small buffers split them. These buffers are
+   // too large for the task stack and are freed before definition layout.
+   std::unique_ptr<uint8_t[]> window[InflateReader::RING_SEGMENTS];
++  HeapByteBuffer externalWindow[InflateReader::RING_SEGMENTS];
+   uint8_t* segments[InflateReader::RING_SEGMENTS];
+   for (size_t i = 0; i < InflateReader::RING_SEGMENTS; i++) {
+-    window[i] = makeUniqueNoThrow<uint8_t[]>(InflateReader::RING_SEGMENT_BYTES);
+-    if (!window[i]) return fail(ExtractError::LowMemory);
+-    segments[i] = window[i].get();
++    if (psramHeapAvailable()) {
++      // The 32 KiB history is ordinary byte storage. Keep it off the internal
++      // Wi-Fi heap; all segments are freed before definition layout begins.
++      externalWindow[i] = makePsramByteBufferNoThrow(InflateReader::RING_SEGMENT_BYTES);
++      if (!externalWindow[i]) return fail(ExtractError::LowMemory);
++      segments[i] = externalWindow[i].get();
++    } else {
++      window[i] = makeUniqueNoThrow<uint8_t[]>(InflateReader::RING_SEGMENT_BYTES);
++      if (!window[i]) return fail(ExtractError::LowMemory);
++      segments[i] = window[i].get();
++    }
+   }
+
+   auto src = makeUniqueNoThrow<ChunkSource>();
+diff --git a/test/dictionary_lookup/CMakeLists.txt b/test/dictionary_lookup/CMakeLists.txt
+index ee39f6c951c6d976e77b329ac89edb9bf69ca8d9..38d8fc4d658905d5813061fe95725e06ff1c5841 100644
+--- a/test/dictionary_lookup/CMakeLists.txt
++++ b/test/dictionary_lookup/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_executable(DictionaryLookupTest
+   ${REPO_ROOT}/lib/Utf8/Utf8.cpp
+ )
+ target_include_directories(DictionaryLookupTest PRIVATE
++  memory_stubs
+   stubs
+   ${REPO_ROOT}/src/util
+   ${REPO_ROOT}/lib/Utf8
+diff --git a/test/dictionary_lookup/DictZipTest.cpp b/test/dictionary_lookup/DictZipTest.cpp
+index bc1e05f29683a06c398434d2da1cd2c1aa6f07ea..94f621ce73bffcfebd57894c40b272b22a941f79 100644
+--- a/test/dictionary_lookup/DictZipTest.cpp
++++ b/test/dictionary_lookup/DictZipTest.cpp
+@@ -1,4 +1,5 @@
+ #include <DictZip.h>
++#include <Memory.h>
+ #include <Dictionary.h>
+ #include <InflateReader.h>
+ #include <gtest/gtest.h>
+@@ -100,6 +101,8 @@ class DictZipTest : public ::testing::Test {
+     Dictionary::setLookupDictPathOverride("/test");
+   }
+   void TearDown() override {
++    dictionary_memory_test::external=false;dictionary_memory_test::fail=false;
++    dictionary_memory_test::allocations=0;
+     failAllocationAfter = -1;
+     largestAllowedAllocation = SIZE_MAX;
+     Dictionary::clearLookupDictPathOverride();
+@@ -312,3 +315,26 @@ TEST_F(DictZipTest, OneShotInflateAndExactSizeChecksRemainIntact) {
+   EXPECT_FALSE(reader.readExact(output.data(), data.size()));
+ }
+ }  // namespace
++
++TEST_F(DictZipTest, ExternalHistoryAllowsLookupWithSmallInternalBlocks) {
++  const std::string text=std::string(70000,'a')+"Arabic dictionary definition";
++  files["/test.dict.dz"]=dictzip(text);
++  largestAllowedAllocation=4096;
++  DictZip::ExtractError error;
++  EXPECT_FALSE(extract(0,text.size(),&error));
++  EXPECT_EQ(error,DictZip::ExtractError::LowMemory);
++  dictionary_memory_test::external=true;
++  EXPECT_TRUE(extract(0,text.size(),&error));
++  EXPECT_EQ(files["/output"],text);
++  EXPECT_EQ(dictionary_memory_test::allocations,InflateReader::RING_SEGMENTS);
++}
++TEST_F(DictZipTest, ExternalHistoryAllocationFailureRemainsRecoverable) {
++  files["/test.dict.dz"]=dictzip("definition");
++  dictionary_memory_test::external=true;dictionary_memory_test::fail=true;
++  DictZip::ExtractError error;
++  EXPECT_FALSE(extract(0,10,&error));
++  EXPECT_EQ(error,DictZip::ExtractError::LowMemory);
++  dictionary_memory_test::fail=false;
++  EXPECT_TRUE(extract(0,10,&error));
++  EXPECT_EQ(files["/output"],"definition");
++}
+diff --git a/test/dictionary_lookup/memory_stubs/Memory.h b/test/dictionary_lookup/memory_stubs/Memory.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6060947a9358389f4847eaaf2ffc1253fcb545d0
+--- /dev/null
++++ b/test/dictionary_lookup/memory_stubs/Memory.h
+@@ -0,0 +1,15 @@
++#pragma once
++#define psramHeapAvailable defaultPsramHeapAvailable
++#define makePsramByteBufferNoThrow defaultMakePsramByteBufferNoThrow
++#include "../../../lib/Memory/Memory.h"
++#undef psramHeapAvailable
++#undef makePsramByteBufferNoThrow
++namespace dictionary_memory_test {
++inline bool external=false,fail=false;
++inline size_t allocations=0;
++}
++inline bool psramHeapAvailable(){return dictionary_memory_test::external;}
++inline HeapByteBuffer makePsramByteBufferNoThrow(size_t n){
++ ++dictionary_memory_test::allocations;
++ return HeapByteBuffer(dictionary_memory_test::fail?nullptr:static_cast<uint8_t*>(std::malloc(n)));
 +}

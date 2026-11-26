@@ -1,12 +1,12 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3827720948222411b0f6f2b59c69efaf7be0b65e..19841c3220cd8d15441e81c0d05cc25a3bfd329a 100644
+index e1870e6ff929443872ce4ea3ce05d439abc2746a..bb984a705850b46273d5236a8f0b1b87855e82bc 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -5,6 +5,7 @@
  - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
- - Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
+ - Use PSRAM for compressed-dictionary history and admit PSRAM-backed dictionary fonts with 40 KiB of internal headroom while retaining the non-PSRAM safety gate. Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
  - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
-+- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Allocate quote-sharing TLS buffers in PSRAM through a boot-installed task-scoped allocator, preserving live fonts and the SDK allocation policy for other clients. Display complete share failures in the reusable scrollable Workflowy error screen, including transport, certificate and internal-RAM diagnostics. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
++- Move quote-sharing JSON to PSRAM, defer TLS under low internal RAM and release job payloads before network-worker completion. Reconnect enabled-but-disconnected Wi-Fi, allow 20 seconds per saved network and expose transport failure details. Fit Day and Week calendars to their earliest and latest events automatically while preserving manual pan/zoom. Keep outgoing quote payloads in PSRAM and use the standard 8 KiB network-worker stack to preserve lookup headroom. Allocate quote-sharing TLS buffers in PSRAM through a boot-installed task-scoped allocator, preserving live fonts and the SDK allocation policy for other clients. Display complete share failures in the reusable scrollable Workflowy error screen, including transport, certificate and internal-RAM diagnostics. Offer manual Wi-Fi selection and retry retained quotes after connecting. Remove the duplicate Calendar action from the task toolbar; use the dedicated app icon. Permit normal post-Wi-Fi heap shapes, retry queued quotes using the canonical Reading Gems destination and show delivery failures without blocking reading.
 
  - Keep Settings lists and Font Options clear of the shared bottom app ribbon, including calibrated edges.
  - Group Readest account controls and auto-sync together under Readest in System settings.
@@ -8414,12 +8414,21 @@ index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a8
 +#include "Harness.h"
 diff --git a/test/workflowy_share/stubs/Memory.h b/test/workflowy_share/stubs/Memory.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
+index 0000000000000000000000000000000000000000..a49a04d4eab42405f46218b79d343f768255ede8
 --- /dev/null
 +++ b/test/workflowy_share/stubs/Memory.h
-@@ -0,0 +1,2 @@
+@@ -0,0 +1,11 @@
 +#pragma once
 +#include "Harness.h"
++
++struct HeapByteBufferDeleter {void operator()(uint8_t* p)const{heap_caps_free(p);}};
++using HeapByteBuffer=std::unique_ptr<uint8_t[],HeapByteBufferDeleter>;
++inline bool failPayloadAllocation=false;
++inline size_t largestPayloadAllocation=0;
++inline HeapByteBuffer makePsramByteBufferNoThrow(size_t n){
++ largestPayloadAllocation=std::max(largestPayloadAllocation,n);
++ return HeapByteBuffer(failPayloadAllocation?nullptr:static_cast<uint8_t*>(heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)));
++}
 diff --git a/test/workflowy_share/stubs/WiFi.h b/test/workflowy_share/stubs/WiFi.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..11754f01524b8518eabd59caee9424a887bc3cd2
@@ -8937,10 +8946,10 @@ index 3ec3dc53ba802dbe8ced61e082812469a34c4eff..a6aec6ca59f691d2cccaaa8c8bb4da09
 +STR_WIFI_CONN_FAILED: "Wi-Fi connection failed"
 diff --git a/src/activities/reader/WorkflowyShareActivity.cpp b/src/activities/reader/WorkflowyShareActivity.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d460112eb
+index 0000000000000000000000000000000000000000..eb3312dd273e10ab4eeb4fd7f9bc89d93e55ef1c
 --- /dev/null
 +++ b/src/activities/reader/WorkflowyShareActivity.cpp
-@@ -0,0 +1,596 @@
+@@ -0,0 +1,603 @@
 +#include "WorkflowyShareActivity.h"
 +
 +#include <ArduinoJson.h>
@@ -9108,7 +9117,7 @@ index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d
 +  }
 +
 +  static constexpr const char* RESPONSE_FILE = "/.crashink/.workflowy/share-response.tmp";
-+  int request(const std::string& url, bool post, const std::string& body, bool capture) {
++  int request(const std::string& url, bool post, std::string_view body, bool capture) {
 +    workflowy::tlsmemory::Scope tlsMemory;
 +    externalTls.store(tlsMemory.external());
 +    FsFile response;
@@ -9256,8 +9265,10 @@ index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d
 +      uint32_t length = 0; uint64_t receipt = 0;
 +      if (!spool.seek(offset) || spool.read(&receipt, sizeof(receipt)) != sizeof(receipt) ||
 +          spool.read(&length, sizeof(length)) != sizeof(length) || !length || length > 256u * 1024u || length > spool.size() - spool.position()) return StrId::STR_WORKFLOWY_READ_FAILED;
-+      std::string body(length, '\0');
-+      if (spool.read(body.data(), length) != static_cast<int>(length)) return StrId::STR_WORKFLOWY_READ_FAILED;
++      // Spool payloads may be 256 KiB; never retain them in the Wi-Fi heap.
++      auto body = makePsramByteBufferNoThrow(length);
++      if (!body) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++      if (spool.read(body.get(), length) != static_cast<int>(length)) return StrId::STR_WORKFLOWY_READ_FAILED;
 +      offset = spool.position(); spool.close();
 +      const int recorded = receiptSeen(receipt);
 +      if (recorded < 0) return StrId::STR_WORKFLOWY_READ_FAILED;
@@ -9270,7 +9281,8 @@ index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d
 +        connected = true;
 +      }
 +      JsonDocument quote(&shareJsonAllocator);
-+      if (deserializeJson(quote, body)) return StrId::STR_WORKFLOWY_READ_FAILED;
++      if (deserializeJson(quote, reinterpret_cast<const char*>(body.get()), length)) return StrId::STR_WORKFLOWY_READ_FAILED;
++      body.reset();
 +      quote["parent_id"] = bookParent;
 +      if (checkRemoteQuote) {
 +        // A previous POST may have reached Workflowy before its response was lost.
@@ -9296,10 +9308,14 @@ index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d
 +        const uint8_t value = 1;
 +        if (!marker || marker.write(&value, 1) != 1 || !marker.sync()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
 +      }
-+      body.clear();
-+      if (!serializeJson(quote, body) || quote.overflowed()) return StrId::STR_WORKFLOWY_SAVE_FAILED;
++      const size_t encoded = measureJson(quote);
++      body = makePsramByteBufferNoThrow(encoded + 1);
++      if (!body || serializeJson(quote, reinterpret_cast<char*>(body.get()), encoded + 1) != encoded || quote.overflowed())
++        return StrId::STR_WORKFLOWY_SAVE_FAILED;
 +      requestStage.store("Send quote");
-+      const int status = request(API_URL, true, body, false);
++      const int status = request(API_URL, true,
++          std::string_view(reinterpret_cast<const char*>(body.get()), encoded), false);
++      body.reset();
 +      if (status == 401 || status == 403) return StrId::STR_WORKFLOWY_AUTH_FAILED;
 +      if (status < 200 || status >= 300) return status <= 0 ? StrId::STR_WORKFLOWY_NETWORK_FAILED : StrId::STR_WORKFLOWY_SEND_FAILED;
 +      if (!saveReceipt(receipt)) return StrId::STR_WORKFLOWY_RECEIPT_FAILED;
@@ -9490,7 +9506,7 @@ index 0000000000000000000000000000000000000000..b50ad086fd674e87d0b645091a55b88d
 +    if (ownsWifi) { WiFi.disconnect(false, false); WiFi.mode(WIFI_OFF); }
 +    vTaskDelete(nullptr);
 +  };
-+  if (xTaskCreate(sendTask, "wf-share", 12288, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
++  if (xTaskCreate(sendTask, "wf-share", 8192, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
 +    sending.store(false);
 +    LOG_ERR("WF", "Share remains queued; cannot start network worker");
 +  }
@@ -9579,12 +9595,13 @@ index f9a4c85e2fa46f97fc2ced9c422bc631641ae73c..f690b63c1740a302e89c70a9ac1fbf43
    pages.loop();
 diff --git a/test/workflowy_share/WorkflowyShareTest.cpp b/test/workflowy_share/WorkflowyShareTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a82af5d20c2b5d4790e6d5dff3435896c8d53ce1
+index 0000000000000000000000000000000000000000..1d87314eb76e7c8bab1840a47d68e3d7bb5e39e2
 --- /dev/null
 +++ b/test/workflowy_share/WorkflowyShareTest.cpp
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,64 @@
 +#include "Harness.h"
 +#include "MemoryBudget.h"
++#include "Memory.h"
 +#include "activities/reader/WorkflowyShareActivity.h"
 +#include "workflowy/WorkflowySettings.h"
 +#include "workflowy/WorkflowyBookGroup.h"
@@ -9637,6 +9654,12 @@ index 0000000000000000000000000000000000000000..a82af5d20c2b5d4790e6d5dff3435896
 + online=true;WiFi.modeValue=WIFI_STA;WiFi.connected=true;
 + workflowy::retryQueuedSharesAfterWifi();runWorker();
 + assert(jobs()==0&&!workflowy::shareNeedsWifiPicker()&&!WiFi.connected);
++ // Large payloads use the explicit external buffer path and survive failure/retry.
++ CLIPPINGS.quote=std::string(48*1024,'q');largestPayloadAllocation=0;
++ workflowy::shareClippings(0);failPayloadAllocation=true;runWorker();
++ assert(jobs()==1&&workflowy::takeShareError()==StrId::STR_WORKFLOWY_SAVE_FAILED);
++ failPayloadAllocation=false;workflowy::shareClippings(0);runWorker();
++ assert(jobs()==0&&largestPayloadAllocation>=48*1024);
 + assert(liveJsonBlocks==0);
 + assert(!workflowy::takeShareError());std::filesystem::remove_all(sdRoot);std::cout<<"Workflowy durable share tests passed\n";
 +}
