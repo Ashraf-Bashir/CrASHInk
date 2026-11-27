@@ -1,8 +1,16 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3a3e3cd82d3f0a500a656b2c94af309b5e105a14..f37402211cf726a164ff0784b4bc54793219e95f 100644
+index 0eec268343406b3a9738731fd8b30b33caf5fb9e..d5e5ebd7f3d514ddb5242d3bf1cf4b428549b0d0 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -114,12 +114,16 @@
+@@ -64,6 +64,7 @@
+ - Offer a configurable RAM icon and percentage beside the other status icons, with tappable diagnostics and migration of previous visibility preferences.
+ - Use PSRAM for compressed-dictionary history and admit PSRAM-backed dictionary fonts with 40 KiB of internal headroom while retaining the non-PSRAM safety gate. Keep dictionary glyph caches alive through selection overlays and place compressed-font pixel buffers in PSRAM when available. Restore the requested Arabic dictionary font after network use instead of silently drawing with the Latin reader font.
+ - Look up single words automatically without obsolete action choices, tolerate touch gaps and allow highlight drags to page in both directions.
++- Center reader text within the cropped light-leak viewport, with equal horizontal gutters and matching reflow/touch geometry.
+
+ - Group reader image display, monochrome, contrast, transparency and inversion controls under Images.
+
+@@ -128,12 +129,16 @@
 
  ### Fixed
 
@@ -754,10 +762,27 @@ index 56ddcce223ad075caefd4cad0b1533d73865811a..80ae81f005a63fb160f855e33499ccfc
    recentBadgeWork.reset();
    if (initialScanPending) {
 diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
-index c3a1294551768e94af953256249055e7cd0d9d95..c9d6af1fd2619f0845cad15155ed2436842cc360 100644
+index 904a14f7eaeb08d04759ec95e51249705bc8d7aa..527bebfc8775ca353c3b1a3bf83f4e808155ff3a 100644
 --- a/src/activities/reader/EpubReaderActivity.cpp
 +++ b/src/activities/reader/EpubReaderActivity.cpp
-@@ -7056,6 +7056,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
+@@ -1261,6 +1261,16 @@ ReaderViewportLayout computeReaderViewportLayout(GfxRenderer& renderer, const bo
+   layout.marginRight = std::max(0, layout.marginRight);
+   layout.marginTop = std::max(0, layout.marginTop);
+
++  const auto& border = renderer.getLightLeakInsets();
++  if (border.left || border.right) {
++    // Calibrated bezel padding is reduced by the physical mask. Restore an
++    // equal gutter on each side of the cropped viewport, including any
++    // publisher-number clearance, so reflow and hit testing share its center.
++    const int gutter = std::max(layout.marginLeft, layout.marginRight);
++    layout.marginLeft = gutter;
++    layout.marginRight = gutter;
++  }
++
+   layout.viewportWidth = renderer.getScreenWidth() - layout.marginLeft - layout.marginRight;
+   layout.viewportHeight = renderer.getScreenHeight() - layout.marginTop - layout.marginBottom;
+   return layout;
+@@ -7096,6 +7106,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
        renderer, automaticPageTurnActive, activeFootnotePreview || !pendingFootnotePreviewAnchor.empty());
    const uint16_t viewportWidth = layout.viewportWidth;
    const uint16_t viewportHeight = layout.viewportHeight;
@@ -1180,4 +1205,123 @@ index 6157efbb6821cc65fe11d21fb2b5342dcff90cd3..f5d52d43c381c6def3052f6ef8ba08ae
 +  EXPECT_FALSE(FrontlightSchedule::shouldRestoreLightOnStart(preserve, true, false));
 +  EXPECT_FALSE(FrontlightSchedule::shouldApplyOnWakeSchedule(preserve, false, true));
 +  EXPECT_FALSE(FrontlightSchedule::shouldPreserveLightAcrossRestart(false, false));
++}
+diff --git a/test/epub_grayscale/CMakeLists.txt b/test/epub_grayscale/CMakeLists.txt
+index ab46d4bb8d43959b58b6ddff3be01891fc7c248f..3389bea69fd7c65031b22f1e015a59e48f3ac9ba 100644
+--- a/test/epub_grayscale/CMakeLists.txt
++++ b/test/epub_grayscale/CMakeLists.txt
+@@ -71,3 +71,18 @@ target_include_directories(IdleTextScanTest PRIVATE scalable_stubs ${idle_text_i
+ target_compile_definitions(IdleTextScanTest PRIVATE ${idle_text_definitions} CROSSINK_SCALABLE_FONTS=1)
+ target_link_libraries(IdleTextScanTest PRIVATE crosspoint_test_common GTest::gtest_main)
+ gtest_discover_tests(IdleTextScanTest)
++
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++set(READER_VIEWPORT_INC ${CMAKE_CURRENT_BINARY_DIR}/ReaderViewport.inc)
++add_custom_command(OUTPUT ${READER_VIEWPORT_INC}
++ COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ExtractReaderViewport.py
++ ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp ${READER_VIEWPORT_INC}
++ ${REPO_ROOT}/lib/GfxRenderer/GfxRenderer.cpp
++ DEPENDS ExtractReaderViewport.py ${REPO_ROOT}/src/activities/reader/EpubReaderActivity.cpp
++ ${REPO_ROOT}/lib/GfxRenderer/GfxRenderer.cpp)
++add_executable(reader_viewport_test ReaderViewportTest.cpp ${READER_VIEWPORT_INC})
++target_include_directories(reader_viewport_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++target_compile_definitions(reader_viewport_test PRIVATE CROSSINK_APP_CAP_TOUCH=1)
++target_compile_features(reader_viewport_test PRIVATE cxx_std_20)
++target_compile_options(reader_viewport_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
++add_test(NAME reader_viewport COMMAND reader_viewport_test)
+diff --git a/test/epub_grayscale/ExtractReaderViewport.py b/test/epub_grayscale/ExtractReaderViewport.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..705c7172198b74b794ff974937a073b9910a769c
+--- /dev/null
++++ b/test/epub_grayscale/ExtractReaderViewport.py
+@@ -0,0 +1,15 @@
++from pathlib import Path
++import sys
++s=Path(sys.argv[1]).read_text()
++def function(name):
++ a=s.index(name);b=s.index('{',a);depth=1;end=b+1
++ while depth:
++  depth+=(s[end]=='{')-(s[end]=='}');end+=1
++ return s[a:end]
++a=s.index('struct ReaderViewportLayout {');b=s.index('};',a)+2
++Path(sys.argv[2]).write_text(function('int effectiveReaderLeftMargin()')+'\n'+s[a:b]+'\n'+function('ReaderViewportLayout computeReaderViewportLayout(')+'\n')
++
++s=Path(sys.argv[3]).read_text()
++with Path(sys.argv[2]).open('a') as out:
++ for name in ['void GfxRenderer::setOrientation(', 'int GfxRenderer::getScreenWidth()', 'int GfxRenderer::getScreenHeight()']:
++  out.write('\n'+function(name)+'\n')
+diff --git a/test/epub_grayscale/ReaderViewportTest.cpp b/test/epub_grayscale/ReaderViewportTest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2097170939302969001c70b2ac5908516711627
+--- /dev/null
++++ b/test/epub_grayscale/ReaderViewportTest.cpp
+@@ -0,0 +1,69 @@
++#include <algorithm>
++#include <array>
++#include <cassert>
++#include <cstdint>
++struct Rect{int x,y,width,height;};
++constexpr int PUBLISHER_PAGE_NUMBER_LEFT_MARGIN_MIN=20;
++struct {int horizontal=8,vertical=0;bool publisherPageNumbers=false;
++ int marginHorizontal()const{return horizontal;}int marginVertical()const{return vertical;}
++} SETTINGS;
++struct GfxRenderer {
++ enum Orientation{Portrait,LandscapeClockwise,PortraitInverted,LandscapeCounterClockwise};
++ struct Border{int top=0,right=0,bottom=0,left=0;} portraitBorder,viewportBorder;
++ Orientation orientation=Portrait;
++ int panelWidth=800,panelHeight=480;
++ std::array<int,4> bezel{8,8,8,8};
++ const auto& getLightLeakInsets()const{return viewportBorder;}
++ int getScreenWidth()const;
++ int getScreenHeight()const;
++ void setOrientation(Orientation);
++ void getOrientedViewableTRBL(int*t,int*r,int*b,int*l)const{
++ *t=std::max(0,bezel[0]-viewportBorder.top);*r=std::max(0,bezel[1]-viewportBorder.right);
++ *b=std::max(0,bezel[2]-viewportBorder.bottom);*l=std::max(0,bezel[3]-viewportBorder.left);}
++};
++
++namespace ReaderUtils {
++constexpr int TOP_STATUS_BAR_TEXT_PADDING=0;
++int getTopStatusBarReservedHeight(const GfxRenderer&){return 0;}
++int getReaderFooterReservedHeight(const GfxRenderer&,bool){return 0;}
++}
++namespace TouchHeaderBackButton {
++Rect compactHeaderRect(const GfxRenderer&r){return {0,0,r.getScreenWidth(),30};}
++}
++#include "ReaderViewport.inc"
++int main(){
++ GfxRenderer r;
++ const auto original=computeReaderViewportLayout(r,false);
++ assert(original.viewportWidth==448&&original.marginLeft==16&&original.marginRight==16);
++ for(auto orientation:{GfxRenderer::Portrait,GfxRenderer::LandscapeClockwise,
++                       GfxRenderer::PortraitInverted,GfxRenderer::LandscapeCounterClockwise})
++ for(int left:{0,1,8,16})for(int right:{0,1,8,16})
++ for(int margin:{-8,0,8,20})for(bool publisher:{false,true}) {
++  SETTINGS.horizontal=margin;SETTINGS.publisherPageNumbers=publisher;
++  r.portraitBorder={0,right,0,left};r.setOrientation(orientation);
++  const auto view=computeReaderViewportLayout(r,false);
++  const auto border=r.getLightLeakInsets();
++  if(border.left||border.right) {
++   assert(view.marginLeft==view.marginRight);
++   assert(view.marginLeft+(view.viewportWidth/2.0)==r.getScreenWidth()/2.0);
++   if(publisher)assert(view.marginLeft>=20);
++  }
++  assert(view.viewportWidth==r.getScreenWidth()-view.marginLeft-view.marginRight);
++ }
++ SETTINGS.horizontal=8;SETTINGS.publisherPageNumbers=false;r=GfxRenderer{};
++ r.portraitBorder.right=8;r.setOrientation(GfxRenderer::Portrait);
++ auto cropped=computeReaderViewportLayout(r,false);
++ assert(cropped.viewportWidth==original.viewportWidth-8);
++ r.portraitBorder={};r.setOrientation(GfxRenderer::Portrait);
++ auto restored=computeReaderViewportLayout(r,false);
++ assert(restored.viewportWidth==original.viewportWidth);
++ r.portraitBorder={8,0,16,0};r.setOrientation(GfxRenderer::Portrait);
++ auto vertical=computeReaderViewportLayout(r,false);
++ assert(vertical.marginLeft==16&&vertical.marginRight==16);
++ // A portrait-right mask stays on the same physical edge through rotations.
++ r.portraitBorder={0,8,0,0};
++ r.setOrientation(GfxRenderer::Portrait);assert(r.viewportBorder.right==8);
++ r.setOrientation(GfxRenderer::LandscapeClockwise);assert(r.viewportBorder.bottom==8);
++ r.setOrientation(GfxRenderer::PortraitInverted);assert(r.viewportBorder.left==8);
++ r.setOrientation(GfxRenderer::LandscapeCounterClockwise);assert(r.viewportBorder.top==8);
 +}
